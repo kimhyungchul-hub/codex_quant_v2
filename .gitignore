@@ -1,0 +1,17 @@
+# Cursor & Editor 관련
+.cursor/
+.cursorrules
+
+# 데이터 및 상태 파일 (가장 중요)
+state/
+*.json
+*.log
+*.db
+bot_data.db
+
+# 파이썬 가상환경 및 캐시
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.env
