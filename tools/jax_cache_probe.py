@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import bootstrap  # ensure JAX/XLA env is set before jax imports
 import argparse
 import os
 import shutil

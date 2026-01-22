@@ -4,6 +4,7 @@
 # 빠른 테스트 (3개 종목 x 2개 전략)
 # ================================================================
 
+import bootstrap  # ensure JAX/XLA env is set for quick tests
 import sys
 from pathlib import Path
 

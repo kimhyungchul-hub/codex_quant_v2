@@ -13,6 +13,8 @@ Author: codex_quant
 Date: 2026-01-19
 """
 
+import bootstrap  # ensure JAX/XLA env is set for any spawned processes
+
 import json
 import sys
 import time

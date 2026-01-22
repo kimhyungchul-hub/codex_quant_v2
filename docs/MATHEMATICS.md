@@ -591,12 +591,197 @@ $$
 
 ---
 
+## 8. Exit Policy (청산 로직)
+
+### 8.1 개요
+
+**목적**: 몬테카를로 시뮬레이션에서 각 경로별 최적 청산 시점을 결정하여 정확한 EV 계산
+
+**기본 설정**: `SKIP_EXIT_POLICY=false` — 모든 청산 로직을 MC 시뮬레이션에 반영
+
+**5가지 청산 조건**:
+1. **TP (Take Profit)**: 목표 수익률 도달 시 청산
+2. **SL (Stop Loss)**: 손절 수준 도달 시 청산
+3. **Time Stop**: 최대 보유 시간 초과 시 청산
+4. **Drawdown Stop**: 미실현 손실 임계값 초과 시 청산
+5. **Dynamic Policy**: 확률 기반 동적 청산 (레짐별)
+
+---
+
+### 8.2 TP/SL 타겟 계산 (변동성 기반)
+
+**목적**: 각 지평(horizon)별로 변동성에 비례한 TP/SL 레벨 설정
+
+**수학식**:
+$$
+\text{TP\_target\_ROE} = k_{\text{horizon}} \cdot \sigma \cdot \sqrt{\frac{h}{T}} \cdot m_{\text{TP}}
+$$
+$$
+\text{SL\_target\_ROE} = -k_{\text{horizon}} \cdot \sigma \cdot \sqrt{\frac{h}{T}} \cdot m_{\text{SL}}
+$$
+
+여기서:
+- $h$: 지평 시간 (초)
+- $T$: 1년 (31,536,000초)
+- $\sigma$: 연율 변동성
+- $k_{\text{horizon}}$: 지평별 배수 (60s → 0.5, 300s → 1.0, 600s → 1.5, ...)
+- $m_{\text{TP}}$, $m_{\text{SL}}$: TP/SL 배수 (기본값: 2.0 / 1.0)
+
+**레버리지 반영**:
+$$
+\text{TP\_final} = \text{TP\_target\_ROE} \times L
+$$
+$$
+\text{SL\_final} = \text{SL\_target\_ROE} \times L
+$$
+여기서 $L$은 레버리지.
+
+**구현 위치**:
+- `engines/mc/exit_policy.py` → `tp_sl_targets_for_horizon()`
+
+---
+
+### 8.3 Drawdown Stop (미실현 손실 청산)
+
+**목적**: 보유 중 미실현 손실이 일정 수준 이상 발생하면 조기 청산
+
+**수학식**:
+$$
+\text{DD\_ROE}(t) = \frac{P(t) - P_{\text{entry}}}{P_{\text{entry}}} \times L \times \text{direction}
+$$
+$$
+\text{if } \text{DD\_ROE}(t) \leq \text{DD\_STOP\_ROE} \Rightarrow \text{청산}
+$$
+
+여기서:
+- $P(t)$: 현재 가격
+- $P_{\text{entry}}$: 진입 가격
+- $L$: 레버리지
+- $\text{direction}$: +1 (LONG) or -1 (SHORT)
+- $\text{DD\_STOP\_ROE}$: 임계값 (기본값: -0.02, 즉 -2%)
+
+**구현 위치**:
+- `engines/mc/exit_policy.py` → `simulate_exit_policy_multi_symbol_jax()` 내부
+
+---
+
+### 8.4 Dynamic Policy (확률 기반 동적 청산)
+
+**목적**: 레짐별 확률 임계값을 기준으로 보유/청산 결정
+
+**청산 조건**:
+| 조건 | 트리거 | 설명 |
+|------|--------|------|
+| **score_flip** | `P(pos) < 0.5` & `confirmed` | 롱→숏 또는 숏→롱 신호 반전 |
+| **hold_bad** | `P(pos) < P_hold_floor` for N ticks | 보유 확률이 임계값 이하로 지속 |
+
+**레짐별 확률 임계값**:
+
+```python
+# 진입 시 최소 확률
+POLICY_P_POS_ENTER = {
+    "bull": 0.52,
+    "bear": 0.50,
+    "chop": 0.52,
+    "volatile": 0.55
+}
+
+# 보유 시 최소 확률 (이하면 청산)
+POLICY_P_POS_HOLD = {
+    "bull": 0.50,
+    "bear": 0.48,
+    "chop": 0.50,
+    "volatile": 0.52
+}
+
+# SL 최대 허용 확률
+POLICY_P_SL_ENTER_MAX = {
+    "bull": 0.20,
+    "bear": 0.25,
+    "chop": 0.20,
+    "volatile": 0.15
+}
+
+# TP 최소 요구 확률
+POLICY_P_TP_ENTER_MIN = {
+    "bull": 0.15,
+    "bear": 0.12,
+    "chop": 0.15,
+    "volatile": 0.18
+}
+```
+
+**구현 위치**:
+- `engines/mc/exit_policy.py` → `ExitPolicyMixin.POLICY_P_POS_ENTER_BY_REGIME` 등
+
+---
+
+### 8.5 Exit Policy 계산 프로세스
+
+**알고리즘 플로우**:
+```
+for each path in paths:
+    t = 0
+    while t < horizon_sec:
+        # 1. TP/SL 체크
+        if ROE(t) >= tp_target:
+            exit(reason="TP", ROE=ROE(t))
+        if ROE(t) <= sl_target:
+            exit(reason="SL", ROE=ROE(t))
+        
+        # 2. Drawdown Stop 체크
+        if unrealized_dd(t) <= dd_stop_roe:
+            exit(reason="DD_STOP", ROE=ROE(t))
+        
+        # 3. Dynamic Policy 체크 (매 decision_dt_sec)
+        if t % decision_dt_sec == 0:
+            p_pos = compute_p_pos(path, t)
+            if score_flip(p_pos):
+                exit(reason="SCORE_FLIP", ROE=ROE(t))
+            if hold_bad(p_pos, regime):
+                exit(reason="HOLD_BAD", ROE=ROE(t))
+        
+        t += step_sec
+    
+    # 4. Time Stop (만기 청산)
+    exit(reason="TIME_STOP", ROE=ROE(horizon_sec))
+
+# EV 계산
+EV = mean([ROE - fee_roundtrip for each exited path])
+```
+
+**구현 위치**:
+- `engines/mc/exit_policy.py` → `compute_exit_policy_metrics_multi_symbol()`
+- JAX 커널: `engines/mc/jax_backend.py` → `simulate_exit_policy_multi_symbol_jax()`
+
+---
+
+### 8.6 `SKIP_EXIT_POLICY` 플래그
+
+**기본값**: `false` (모든 청산 로직 반영)
+
+**`SKIP_EXIT_POLICY=true` 설정 시**:
+- 청산 로직 생략
+- 단순 만기 평균 수익으로 EV 근사:
+  $$
+  \text{EV\_simplified} = \mathbb{E}[\text{ROE}(T)] - \text{fee\_roundtrip}
+  $$
+- 속도 향상: 첫 실행 시 ~10-15초 단축 (JAX JIT 컴파일 생략)
+- 정확도 하락: TP/SL/DD Stop 무시, 과대/과소평가 가능
+- **프로덕션 환경에서는 권장하지 않음**
+
+**구현 위치**:
+- `engines/mc/entry_evaluation.py` → `SKIP_EXIT_POLICY` 플래그
+
+---
+
 ## 변경 로그
 
 | 날짜 | 변경 내용 | 관련 파일 |
 |------|----------|----------|
 | 2026-01-18 | 초기 문서 작성 | `docs/MATHEMATICS.md` |
 | 2026-01-19 | AlphaHit 엔트로피 가중치, 변동성 TP, PMaker 역선택 비용 수식 추가 | `core/orchestrator.py`, `engines/mc/entry_evaluation_new.py`, `engines/mc/monte_carlo_engine.py` |
+| 2026-01-22 | Exit Policy (청산 로직) 섹션 추가 — TP/SL/DD Stop/Dynamic Policy 수식 및 프로세스 명시 | `engines/mc/exit_policy.py`, `engines/mc/entry_evaluation.py` |
 
 ---
 

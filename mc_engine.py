@@ -1,4 +1,5 @@
 # engines/mc_engine.py
+import bootstrap  # ensure JAX/XLA env is set before jax imports
 import math
 import time
 import os
@@ -8,10 +9,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # JAX platform 설정 - GPU 전용 모드 (CPU 폴백 없음)
 # 반드시 JAX import보다 먼저 실행됩니다. GPU가 없으면 초기화에서 실패합니다.
 platform_env = os.environ.get("JAX_PLATFORMS", "").strip()
-if not platform_env:
-    # On macOS we request the Metal backend explicitly (uppercase 'METAL').
-    # This enforces GPU-only execution; initialization will fail if Metal is unavailable.
-    os.environ["JAX_PLATFORMS"] = "METAL"
+if platform_env.lower() == "metal":
+    os.environ.pop("JAX_PLATFORMS", None)
+platform_name_env = os.environ.get("JAX_PLATFORM_NAME", "").strip()
+if platform_name_env.lower() == "metal":
+    os.environ.pop("JAX_PLATFORM_NAME", None)
 
 import numpy as np
 from engines.base import BaseEngine
@@ -23,20 +25,38 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # - meta에 멀티호라이즌(예: 60s/180s) 보조 필드를 넣어
 #   상위 오케스트레이터에서 mid_boost/필터를 더 세밀하게 적용할 수 있게 한다.
 
-# optional JAX acceleration
-try:
-    import jax  # type: ignore
-    import jax.numpy as jnp  # type: ignore
-    from jax import random, lax  # type: ignore
-    from jax import random as jrand  # type: ignore
-except Exception:  # pragma: no cover
-    jax = None
-    jnp = None
-    random = None
-    lax = None
-    jrand = None
+# optional JAX acceleration - lazy import to avoid premature GPU memory allocation
+jax = None
+jnp = None
+random = None
+lax = None
+jrand = None
+_JAX_OK = False
 
-_JAX_OK = jax is not None
+
+def ensure_jax():
+    """Lazily import jax and related symbols. Call before using JAX APIs."""
+    global jax, jnp, random, lax, jrand, _JAX_OK
+    if jax is not None:
+        return
+    try:
+        import jax as _jax  # type: ignore
+        import jax.numpy as _jnp  # type: ignore
+        from jax import random as _random  # type: ignore
+        from jax import lax as _lax  # type: ignore
+        jax = _jax
+        jnp = _jnp
+        random = _random
+        lax = _lax
+        jrand = _random
+        _JAX_OK = True
+    except Exception:
+        jax = None
+        jnp = None
+        random = None
+        lax = None
+        jrand = None
+        _JAX_OK = False
 def _jax_mc_device():
     """Return a device to run MC kernels on.
     On Apple Metal backend, some ops/paths may crash with:
@@ -44,6 +64,7 @@ def _jax_mc_device():
     We keep using JAX, but run these kernels on CPU by default.
     Override with env JAX_MC_DEVICE=default to force default backend.
     """
+    ensure_jax()
     if jax is None:
         return None
     try:
@@ -54,11 +75,13 @@ def _jax_mc_device():
         # auto: if default backend is metal, prefer cpu for stability
         backend = None
         try:
-            backend = jax.default_backend()
+            devs = jax.devices()
+            if devs:
+                backend = getattr(devs[0], "platform", None)
         except Exception:
             backend = None
 
-        if pref in ("cpu",) or backend == "metal":
+        if pref in ("cpu",) or (backend and str(backend).lower() == "metal"):
             devs = jax.devices("cpu")
             if devs:
                 return devs[0]
@@ -275,9 +298,11 @@ class MonteCarloEngine(BaseEngine):
         # horizons(초) - GPU 실행 가정, 더 촘촘하게 확장
         self.horizons = (15, 30, 60, 120, 180, 300, 600)
         self.dt = 1.0 / 31536000.0  # seconds/year
-        # Bybit taker round-trip(0.06% * 2) 기준, 레버리지와 무관한 고정 비용
-        self.fee_roundtrip_base = 0.0012
-        self.slippage_perc = 0.0003
+        # Bybit maker round-trip(0.01% * 2) 기준, 레버리지와 무관한 고정 비용
+        # USE_MAKER_ORDERS=true일 때 0.0002, 아니면 0.0012
+        _use_maker = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
+        self.fee_roundtrip_base = 0.0002 if _use_maker else 0.0012
+        self.slippage_perc = 0.0001 if _use_maker else 0.0003  # 지정가는 슬리피지 거의 없음
         # tail mode defaults
         self.default_tail_mode = "student_t"  # "gaussian" | "student_t" | "bootstrap"
         self.default_student_t_df = 6.0
@@ -844,8 +869,8 @@ class MonteCarloEngine(BaseEngine):
         # entry gating: 비용을 충분히 이길 때만, 승률/꼬리/중기 필터
         cost_floor = float(fee_rt)
         # 더 높은 EV 기준: 비용 + 추가 버퍼
-        ev_floor = max(params.profit_target, cost_floor * 1.0 + 0.0008)
-        win_floor = max(params.min_win - 0.02, 0.53)
+        ev_floor = max(params.profit_target, cost_floor * 1.0 + 0.0005)
+        win_floor = max(params.min_win - 0.03, 0.50)
         cvar_floor_abs = cost_floor * 3.0  # 요구: cvar_agg > -cvar_floor_abs
 
         can_enter = False
@@ -969,6 +994,416 @@ class MonteCarloEngine(BaseEngine):
             "event_t_mean": event_metrics.get("event_t_mean"),
             "horizon_weights": horizon_weights,
         }
+
+    def decide_batch(self, ctx_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        [OPTIMIZATION] Global Batching for GPU with JAX vmap
+        여러 심볼의 context를 받아 단일 GPU 커널 호출로 결과를 반환합니다.
+        
+        구현:
+        1. ctx_list → JAX 배열로 변환 (s0, mu, sigma, leverage, fee 등)
+        2. jax.vmap으로 모든 심볼의 가격 경로 병렬 생성
+        3. summarize_gbm_horizons_multi_symbol_jax로 메트릭 계산
+        4. 결과를 decision 포맷으로 변환
+        5. 실패 시 순차 폴백
+        """
+        if not ctx_list:
+            return []
+        
+        n_symbols = len(ctx_list)
+        
+        # vmap 사용 가능 여부 확인
+        use_vmap = _JAX_OK and jax is not None and jnp is not None
+        
+        if use_vmap:
+            try:
+                return self._decide_batch_vmap(ctx_list)
+            except Exception as e:
+                import traceback
+                print(f"⚠️ [VMAP] Batch execution failed, falling back to sequential: {e}")
+                traceback.print_exc()
+        
+        # Fallback: 순차 실행
+        return self._decide_batch_sequential(ctx_list)
+    
+    def _decide_batch_vmap(self, ctx_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        JAX vmap을 사용한 완전 병렬 배치 처리
+        
+        Note: Apple Metal 백엔드에서는 일부 연산이 지원되지 않아
+        CPU 디바이스에서 실행됩니다.
+        """
+        from engines.mc.jax_backend import summarize_gbm_horizons_multi_symbol_jax
+        
+        # Metal 백엔드 감지 - CPU 디바이스 강제 사용
+        cpu_device = _jax_mc_device()
+        
+        n_symbols = len(ctx_list)
+        batch_seed_base = int(time.time() // 3) & 0xFFFFFFFF
+        
+        # ====== 1. 데이터 준비: ctx_list → 배열 ======
+        symbols = []
+        prices = []
+        mus = []
+        sigmas = []
+        directions = []
+        leverages = []
+        fee_rts = []
+        regimes = []
+        params_list = []
+        
+        for i, ctx in enumerate(ctx_list):
+            symbol = str(ctx.get("symbol", f"sym_{i}"))
+            symbols.append(symbol)
+            
+            price = float(ctx.get("price", 0.0))
+            prices.append(price)
+            
+            # mu/sigma 준비
+            mu_base = float(ctx.get("mu_base", 0.0))
+            sigma = float(max(ctx.get("sigma", 0.0), 1e-6))
+            
+            # regime 기반 조정
+            regime_str = str(ctx.get("regime", "chop"))
+            session = str(ctx.get("session", ""))
+            regime_ctx = {"regime": regime_str, "session": session} if session else {"regime": regime_str}
+            mu_adj, sigma_adj = adjust_mu_sigma(mu_base, sigma, regime_ctx)
+            
+            # OFI 반영
+            params = self._get_params(regime_str, ctx)
+            ofi_score = float(ctx.get("ofi_score", 0.0))
+            direction = int(ctx.get("direction") or self._trend_direction(price, ctx.get("closes") or []))
+            ofi_impact = ofi_score * params.ofi_weight
+            if (direction == 1 and ofi_score < 0) or (direction == -1 and ofi_score > 0):
+                ofi_impact *= 2.0
+            
+            mu_final = mu_adj + ofi_impact
+            
+            # 레버리지 및 수수료
+            lev = float(ctx.get("leverage", 5.0) or 5.0)
+            liq_score = float(ctx.get("liquidity_score", 1.0) or 1.0)
+            slippage_dyn = self._estimate_slippage(lev, sigma_adj, liq_score, ofi_z_abs=abs(ofi_score))
+            fee_rt = self.fee_roundtrip_base + slippage_dyn
+            
+            mus.append(mu_final)
+            sigmas.append(sigma_adj)
+            directions.append(direction)
+            leverages.append(lev)
+            fee_rts.append(fee_rt)
+            regimes.append(regime_str)
+            params_list.append(params)
+        
+        # ====== 2. JAX 배열 변환 (CPU 디바이스에서) ======
+        # Metal 백엔드 문제 회피: CPU에서 실행
+        if cpu_device is not None:
+            with jax.default_device(cpu_device):
+                return self._run_vmap_on_device(
+                    symbols, prices, mus, sigmas, directions, leverages, fee_rts,
+                    regimes, params_list, ctx_list, batch_seed_base
+                )
+        else:
+            return self._run_vmap_on_device(
+                symbols, prices, mus, sigmas, directions, leverages, fee_rts,
+                regimes, params_list, ctx_list, batch_seed_base
+            )
+    
+    def _run_vmap_on_device(
+        self,
+        symbols: List[str],
+        prices: List[float],
+        mus: List[float],
+        sigmas: List[float],
+        directions: List[int],
+        leverages: List[float],
+        fee_rts: List[float],
+        regimes: List[str],
+        params_list: List,
+        ctx_list: List[Dict[str, Any]],
+        batch_seed_base: int,
+    ) -> List[Dict[str, Any]]:
+        """실제 vmap 연산 수행 (특정 디바이스에서)"""
+        from engines.mc.jax_backend import summarize_gbm_horizons_multi_symbol_jax
+        
+        n_symbols = len(symbols)
+        
+        s0_arr = jnp.array(prices, dtype=jnp.float32)
+        mu_arr = jnp.array(mus, dtype=jnp.float32)
+        sigma_arr = jnp.array(sigmas, dtype=jnp.float32)
+        dir_arr = jnp.array(directions, dtype=jnp.float32)
+        lev_arr = jnp.array(leverages, dtype=jnp.float32)
+        fee_arr = jnp.array(fee_rts, dtype=jnp.float32)
+        
+        # ====== 3. 가격 경로 병렬 생성 (vmap) ======
+        n_paths = int(params_list[0].n_paths)
+        max_steps = int(max(self.horizons))
+        dt = self.dt
+        
+        # PRNG 키 벡터화
+        master_key = jrand.PRNGKey(batch_seed_base)
+        keys = jrand.split(master_key, n_symbols)
+        
+        # 경로 생성 함수 (단일 심볼)
+        def generate_paths_single(key, s0, mu, sigma):
+            drift = (mu - 0.5 * sigma * sigma) * dt
+            diffusion = sigma * math.sqrt(dt)
+            z = jrand.normal(key, shape=(n_paths, max_steps))
+            logret = jnp.cumsum(drift + diffusion * z, axis=1)
+            # 시작가격 포함: (n_paths, max_steps+1)
+            paths = s0 * jnp.concatenate([jnp.ones((n_paths, 1)), jnp.exp(logret)], axis=1)
+            return paths
+        
+        # vmap으로 모든 심볼 병렬 생성
+        generate_paths_batch = jax.vmap(generate_paths_single, in_axes=(0, 0, 0, 0))
+        
+        t0 = time.perf_counter()
+        price_paths_batch = generate_paths_batch(keys, s0_arr, mu_arr, sigma_arr)
+        # shape: (n_symbols, n_paths, max_steps+1)
+        
+        # ====== 4. 메트릭 계산 (vmap) ======
+        horizon_indices = jnp.array(self.horizons, dtype=jnp.int32)
+        cvar_alpha = float(params_list[0].cvar_alpha)
+        
+        # summarize_gbm_horizons_multi_symbol_jax 호출
+        metrics_batch = summarize_gbm_horizons_multi_symbol_jax(
+            price_paths_batch,
+            s0_arr,
+            lev_arr,
+            fee_arr,
+            horizon_indices,
+            cvar_alpha
+        )
+        
+        # GPU 동기화 및 numpy 변환
+        metrics_np = jax.tree_util.tree_map(lambda x: np.array(x), metrics_batch)
+        t1 = time.perf_counter()
+        
+        print(f"🚀 [VMAP] Global batch: {n_symbols} symbols × {len(self.horizons)} horizons in {(t1-t0)*1000:.1f}ms")
+        
+        # ====== 5. 결과 포맷팅 ======
+        results = []
+        for i in range(n_symbols):
+            ctx = ctx_list[i]
+            direction = directions[i]
+            params = params_list[i]
+            regime_str = regimes[i]
+            price = prices[i]
+            
+            # direction에 따라 long/short 선택
+            if direction == 1:
+                ev_by_h = metrics_np["ev_long"][i]  # (n_horizons,)
+                win_by_h = metrics_np["win_long"][i]
+                cvar_by_h = metrics_np["cvar_long"][i]
+            else:
+                ev_by_h = metrics_np["ev_short"][i]
+                win_by_h = metrics_np["win_short"][i]
+                cvar_by_h = metrics_np["cvar_short"][i]
+            
+            # 최적 horizon 선택 (EV 기준)
+            best_idx = int(np.argmax(ev_by_h))
+            best_h = self.horizons[best_idx]
+            ev = float(ev_by_h[best_idx])
+            win = float(win_by_h[best_idx])
+            cvar = float(cvar_by_h[best_idx])
+            
+            # 진입 조건 체크
+            cost_floor = fee_rts[i]
+            ev_floor = max(params.profit_target, cost_floor * 1.0 + 0.0005)
+            win_floor = max(params.min_win - 0.03, 0.50)
+            cvar_floor_abs = cost_floor * 3.0
+            
+            can_enter = ev > ev_floor and win >= win_floor and cvar > -cvar_floor_abs
+            
+            # Kelly 계산
+            variance_proxy = float(sigmas[i] ** 2)
+            kelly_raw = max(0.0, ev / max(variance_proxy, 1e-6))
+            leverage_penalty = max(1.0, abs(leverages[i]) / 5.0)
+            cvar_penalty = max(0.05, 1.0 - params.cvar_scale * abs(cvar) * leverage_penalty)
+            kelly_cap = params.max_kelly / leverage_penalty
+            kelly = min(kelly_raw * cvar_penalty, kelly_cap)
+            size_frac = float(max(0.0, kelly * win))
+            
+            # 액션 결정
+            action = "WAIT"
+            if can_enter:
+                action = "LONG" if direction == 1 else "SHORT"
+            
+            best_desc = f"{best_h}초" if best_h else "-"
+            
+            # 중간 horizon 메트릭 (180초 근처)
+            mid_idx = min(range(len(self.horizons)), key=lambda x: abs(self.horizons[x] - 180))
+            ev_mid = float(ev_by_h[mid_idx]) if len(ev_by_h) > mid_idx else None
+            win_mid = float(win_by_h[mid_idx]) if len(win_by_h) > mid_idx else None
+            cvar_mid = float(cvar_by_h[mid_idx]) if len(cvar_by_h) > mid_idx else None
+            
+            ensemble_mid_boost = 1.0
+            if win_mid is not None:
+                try:
+                    ensemble_mid_boost = 0.85 + 0.6 * max(0.0, min(1.0, (win_mid - 0.52) / 0.18))
+                except Exception:
+                    pass
+            
+            result = {
+                "action": action,
+                "ev": ev,
+                "confidence": win,
+                "reason": f"MC_VMAP({best_desc}) {regime_str} EV {ev*100:.2f}% Win {win*100:.1f}% CVaR {cvar*100:.2f}%",
+                "meta": {
+                    "regime": regime_str,
+                    "best_horizon_desc": best_desc,
+                    "best_horizon_steps": int(best_h),
+                    "ev": ev,
+                    "ev1": ev,  # lev1 별도 계산 생략 (vmap에서는 단일 레버리지 사용)
+                    "win_rate": win,
+                    "win_rate1": win,
+                    "cvar05": cvar,
+                    "cvar05_lev1": cvar,
+                    "ev_mid": ev_mid,
+                    "win_mid": win_mid,
+                    "cvar_mid": cvar_mid,
+                    "ev_by_horizon": [float(x) for x in ev_by_h],
+                    "win_by_horizon": [float(x) for x in win_by_h],
+                    "cvar_by_horizon": [float(x) for x in cvar_by_h],
+                    "horizon_seq": list(self.horizons),
+                    "horizon_weights": None,  # vmap에서는 가중치 없이 직접 계산
+                    "ev_60": None,
+                    "win_60": None,
+                    "cvar_60": None,
+                    "ev_180": ev_mid,
+                    "win_180": win_mid,
+                    "cvar_180": cvar_mid,
+                    "ensemble_mid_boost": ensemble_mid_boost,
+                    "ev_entry_threshold": ev_floor,
+                    "win_entry_threshold": win_floor,
+                    "cvar_entry_threshold": cvar_floor_abs,
+                    "kelly": kelly,
+                    "size_fraction": size_frac,
+                    "direction": direction,
+                    "mu_adjusted": mus[i],
+                    "event_p_tp": None,  # first-passage는 별도 계산 필요
+                    "event_p_sl": None,
+                    "event_p_timeout": None,
+                    "event_ev_r": None,
+                    "event_cvar_r": None,
+                    "event_ev_pct": None,
+                    "event_cvar_pct": None,
+                    "event_t_median": None,
+                    "event_t_mean": None,
+                    "params": {
+                        "min_win": params.min_win,
+                        "profit_target": params.profit_target,
+                        "ofi_weight": params.ofi_weight,
+                        "max_kelly": params.max_kelly,
+                        "cvar_alpha": params.cvar_alpha,
+                        "cvar_scale": params.cvar_scale,
+                        "n_paths": params.n_paths,
+                    },
+                    "batch_mode": "vmap",
+                },
+                "size_frac": size_frac,
+            }
+            results.append(result)
+        
+        return results
+    
+    def _decide_batch_sequential(self, ctx_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        순차 폴백: 기존 decide()를 반복 호출
+        """
+        batch_seed_base = int(time.time() // 3) & 0xFFFFFFFF
+        
+        results = []
+        for i, ctx in enumerate(ctx_list):
+            # 심볼별 고유 시드 (배치 시드 + 심볼 해시)
+            symbol = str(ctx.get("symbol", f"sym_{i}"))
+            seed = int((hash(symbol) ^ batch_seed_base) & 0xFFFFFFFF)
+            
+            # 파라미터 결정
+            regime_ctx = str(ctx.get("regime", "chop"))
+            params = self._get_params(regime_ctx, ctx)
+            
+            # 메트릭 계산 (기존 로직 재사용)
+            metrics = self.evaluate_entry_metrics(ctx, params, seed=seed)
+            
+            # 액션 결정
+            action = "WAIT"
+            if metrics["can_enter"]:
+                action = "LONG" if metrics["direction"] == 1 else "SHORT"
+            
+            price = float(ctx.get("price", 0.0))
+            best_desc = f"{metrics['best_h']}초" if metrics["best_h"] else "-"
+            
+            # 멀티호라이즌 보조 메타
+            ev_180 = metrics.get("ev_mid")
+            win_180 = metrics.get("win_mid")
+            cvar_180 = metrics.get("cvar_mid")
+            ensemble_mid_boost = 1.0
+            if win_180 is not None:
+                try:
+                    ensemble_mid_boost = 0.85 + 0.6 * max(0.0, min(1.0, (win_180 - 0.52) / 0.18))
+                except Exception:
+                    ensemble_mid_boost = 1.0
+            
+            result = {
+                "action": action,
+                "ev": float(metrics["ev"]),
+                "confidence": float(metrics["win"]),
+                "reason": f"MC({best_desc}) {regime_ctx} EV {metrics['ev']*100:.2f}% Win {metrics['win']*100:.1f}% CVaR {metrics['cvar']*100:.2f}%",
+                "meta": {
+                    "regime": regime_ctx,
+                    "best_horizon_desc": best_desc,
+                    "best_horizon_steps": int(metrics["best_h"]),
+                    "ev": float(metrics["ev"]),
+                    "ev1": float(metrics.get("ev1", metrics["ev"])),
+                    "win_rate": float(metrics["win"]),
+                    "win_rate1": float(metrics.get("win1", metrics["win"])),
+                    "cvar05": float(metrics["cvar"]),
+                    "cvar05_lev1": float(metrics.get("cvar1", metrics["cvar"])),
+                    "ev_mid": ev_180,
+                    "win_mid": win_180,
+                    "cvar_mid": cvar_180,
+                    "ev_by_horizon": metrics.get("ev_by_horizon"),
+                    "win_by_horizon": metrics.get("win_by_horizon"),
+                    "cvar_by_horizon": metrics.get("cvar_by_horizon"),
+                    "horizon_seq": metrics.get("horizon_seq"),
+                    "horizon_weights": metrics.get("horizon_weights"),
+                    "ev_60": None,
+                    "win_60": None,
+                    "cvar_60": None,
+                    "ev_180": ev_180,
+                    "win_180": win_180,
+                    "cvar_180": cvar_180,
+                    "ensemble_mid_boost": ensemble_mid_boost,
+                    "ev_entry_threshold": metrics.get("ev_floor"),
+                    "win_entry_threshold": metrics.get("win_floor"),
+                    "cvar_entry_threshold": metrics.get("cvar_floor"),
+                    "kelly": float(metrics["kelly"]),
+                    "size_fraction": float(metrics["size_frac"]),
+                    "direction": int(metrics["direction"]),
+                    "mu_adjusted": float(metrics.get("mu_adj", 0.0)),
+                    "event_p_tp": metrics.get("event_p_tp"),
+                    "event_p_sl": metrics.get("event_p_sl"),
+                    "event_p_timeout": metrics.get("event_p_timeout"),
+                    "event_ev_r": metrics.get("event_ev_r"),
+                    "event_cvar_r": metrics.get("event_cvar_r"),
+                    "event_ev_pct": metrics.get("event_ev_pct"),
+                    "event_cvar_pct": metrics.get("event_cvar_pct"),
+                    "event_t_median": metrics.get("event_t_median"),
+                    "event_t_mean": metrics.get("event_t_mean"),
+                    "params": {
+                        "min_win": params.min_win,
+                        "profit_target": params.profit_target,
+                        "ofi_weight": params.ofi_weight,
+                        "max_kelly": params.max_kelly,
+                        "cvar_alpha": params.cvar_alpha,
+                        "cvar_scale": params.cvar_scale,
+                        "n_paths": params.n_paths,
+                    },
+                },
+                "size_frac": float(metrics["size_frac"]),
+            }
+            results.append(result)
+        
+        return results
 
     def decide(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
         symbol = str(ctx.get("symbol", ""))

@@ -4,19 +4,22 @@ import argparse
 import asyncio
 import os
 
+# Ensure bootstrap runs before any potential `jax` import.
+import bootstrap  # sets XLA/JAX env vars and cache dir
+
 # JAX platform 설정 - GPU 전용 모드 (CPU 폴백 없음)
 # 반드시 JAX import보다 먼저 실행됩니다. GPU가 없으면 초기화에서 실패합니다.
 platform_env = os.environ.get("JAX_PLATFORMS", "").strip()
-if not platform_env:
-    # On macOS we request the Metal backend explicitly (uppercase 'METAL').
-    # This enforces GPU-only execution; initialization will fail if Metal is unavailable.
-    os.environ["JAX_PLATFORMS"] = "METAL"
+if platform_env.lower() == "metal":
+    os.environ.pop("JAX_PLATFORMS", None)
+platform_name_env = os.environ.get("JAX_PLATFORM_NAME", "").strip()
+if platform_name_env.lower() == "metal":
+    os.environ.pop("JAX_PLATFORM_NAME", None)
 
 import config
 from core.dashboard_server import DashboardServer
 from core.orchestrator import LiveOrchestrator, build_exchange, build_data_exchange
-import core.orchestrator as orch_mod
-print(f"🚀 [INIT_DEBUG] LiveOrchestrator file: {orch_mod.__file__}")
+from utils.helpers import normalize_symbol
 from engines import (
     alpha_features_methods,
     cvar_methods,
@@ -50,9 +53,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--symbols",
-        type=str,
+        nargs="+",
         default=None,
-        help='Comma-separated symbols (e.g. "BTC/USDT:USDT,ETH/USDT:USDT").',
+        help='Symbols list (space-separated or comma-separated), e.g. "BTC/USDT:USDT ETH/USDT:USDT".',
     )
     parser.add_argument(
         "--port",
@@ -69,6 +72,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--paper", dest="paper", action="store_true", help="Enable paper trading loop.")
     parser.add_argument("--no-paper", dest="paper", action="store_false", help="Disable paper trading loop.")
     parser.set_defaults(paper=None)
+    parser.add_argument("--live", dest="live", action="store_true", help="Enable live orders (disable paper trading).")
     parser.add_argument("--paper-size-frac", type=float, default=None, help="Default paper position size fraction (0~1).")
     parser.add_argument("--paper-leverage", type=float, default=None, help="Default paper leverage.")
     parser.add_argument("--mc-n-paths-live", type=int, default=None, help="MC live n_paths override (ctx.n_paths).")
@@ -161,6 +165,13 @@ async def main() -> None:
     ):
         _apply_default_run_mode()
 
+    if args.live:
+        os.environ["ENABLE_LIVE_ORDERS"] = "1"
+        os.environ["PAPER_TRADING"] = "0"
+        config.ENABLE_LIVE_ORDERS = True
+    if args.paper is not None:
+        os.environ["PAPER_TRADING"] = "1" if args.paper else "0"
+
     if args.exec_mode:
         # evaluation code reads EXEC_MODE from env at runtime
         os.environ["EXEC_MODE"] = str(args.exec_mode).strip().lower()
@@ -199,8 +210,12 @@ async def main() -> None:
         )
     symbols = None
     if args.symbols:
-        parts = [p.strip() for p in str(args.symbols).split(",")]
-        symbols = [p for p in parts if p]
+        raw = []
+        for item in args.symbols:
+            raw.extend([p.strip() for p in str(item).split(",")])
+        symbols = [p for p in raw if p]
+        # Normalize user-provided symbols to internal canonical form
+        symbols = [normalize_symbol(s) for s in symbols]
 
     # Validate symbols against exchange markets to avoid startup stalls/errors
     # (e.g. one invalid symbol breaks fetch_tickers for all symbols).
@@ -230,7 +245,17 @@ async def main() -> None:
         except Exception as e:
             print(f"[WARN] data_exchange.load_markets failed; using symbols as-is: {e}")
 
-    orchestrator = LiveOrchestrator(exchange, symbols if symbols else config.SYMBOLS, data_exchange=data_exchange)
+    # Create LiveOrchestrator with new mixin-based signature:
+    # __init__(symbols, balance, leverage, exchange, hub, state_dir, **kwargs)
+    orchestrator = LiveOrchestrator(
+        symbols=symbols if symbols else config.SYMBOLS,
+        balance=10000.0,  # Initial balance
+        leverage=config.DEFAULT_LEVERAGE,
+        exchange=exchange,
+        hub=None,  # Will be initialized inside orchestrator
+        state_dir="state",
+        data_exchange=data_exchange,  # Pass as kwarg
+    )
 
     # CLI overrides (runtime tuning defaults)
     if args.decision_refresh_sec is not None:
@@ -259,12 +284,12 @@ async def main() -> None:
 
     try:
         if config.PRELOAD_ON_START and (not args.no_preload):
-            await orchestrator.data.preload_all_ohlcv(limit=int(config.OHLCV_PRELOAD_LIMIT))
+            await orchestrator.preload_all_ohlcv()
 
         tasks = [
-            asyncio.create_task(orchestrator.data.fetch_prices_loop()),
-            asyncio.create_task(orchestrator.data.fetch_ohlcv_loop()),
-            asyncio.create_task(orchestrator.data.fetch_orderbook_loop()),
+            asyncio.create_task(orchestrator.fetch_prices_loop()),
+            asyncio.create_task(orchestrator.fetch_ohlcv_loop()),
+            asyncio.create_task(orchestrator.fetch_orderbook_loop()),
             asyncio.create_task(orchestrator.live_sync_loop()) if bool(orchestrator.enable_orders) else None,
             asyncio.create_task(orchestrator.decision_worker_loop()),
             asyncio.create_task(orchestrator.decision_loop()),

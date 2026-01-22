@@ -10,21 +10,17 @@ import numpy as np
 
 from engines.cvar_methods import cvar_ensemble
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
-from engines.mc.jax_backend import (
-    _JAX_OK,
-    _jax_mc_device,
-    jax,
-    jnp,
-    lax,
-    jrand,
-    jax_covariance,
-    summarize_gbm_horizons_jax,
-    summarize_gbm_horizons_multi_symbol_jax,
-)
+from engines.mc import jax_backend as jax_backend
 from engines.mc.params import MCParams
 from engines.mc.config import config
 from engines.simulation_methods import mc_first_passage_tp_sl_jax
 from regime import adjust_mu_sigma
+
+# ✅ Exit Policy Flag - Full exit policy calculation by default to include all exit logic in MC simulation
+# Set SKIP_EXIT_POLICY=true to use simplified summary-based EV (faster but less accurate)
+# Default: false (empty string or "false" → full exit policy calculation)
+_skip_env = os.environ.get("SKIP_EXIT_POLICY", "").strip().lower()
+SKIP_EXIT_POLICY = _skip_env in ("1", "true", "yes")
 
 # ✅ Clean evaluator for horizon processing (fixes IndexError bug)
 try:
@@ -72,13 +68,15 @@ class MonteCarloEntryEvaluationMixin:
         """
         Helper to calculate execution costs for batch processing.
         Simplified extraction from evaluate_entry_metrics logic.
+        USE_MAKER_ORDERS=true일 때 Maker 수수료 적용 (0.02% roundtrip)
         """
-        # Defaults
+        # Defaults - Maker 우선 사용
+        _use_maker = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
         fee_taker = float(ctx.get("fee_taker", 0.0006))
         fee_maker = float(ctx.get("fee_maker", 0.0001))
         
-        # PMaker params
-        pmaker_entry = float(ctx.get("pmaker_entry", 0.9))
+        # PMaker params - Maker 주문 우선시 pmaker_entry를 높게 설정
+        pmaker_entry = float(ctx.get("pmaker_entry", 0.95 if _use_maker else 0.9))
         exec_mode = "maker_then_market"
         
         if params:
@@ -754,45 +752,56 @@ class MonteCarloEntryEvaluationMixin:
             dtype=np.int32,
         )
         
-        # Calculate all stats on GPU (with CPU fallback)
-        force_dev = _jax_mc_device()
+        # Calculate all stats on GPU (with CPU/NumPy fallback)
         try:
-            if force_dev:
-                with jax.default_device(force_dev):
-                    res_summary = summarize_gbm_horizons_jax(
-                        price_paths=price_paths,
+            res_summary = jax_backend.summarize_gbm_horizons_jax(
+                price_paths=price_paths,
+                s0=s0_f,
+                leverage=lev_f,
+                fee_rt_total_roe=fee_rt_total_roe_f,
+                horizons_indices=h_indices,
+                alpha=params.cvar_alpha
+            )
+            # DEV_MODE returns NumPy directly, JAX needs device_get
+            from engines.mc.jax_backend import DEV_MODE as _DEV_MODE
+            if _DEV_MODE:
+                res_summary_cpu = res_summary  # Already NumPy
+            else:
+                # ensure jax is initialized on-demand and use module jax
+                jax_backend.ensure_jax()
+                if jax_backend.jax is None:
+                    raise RuntimeError("JAX unavailable for device_get")
+                res_summary_cpu = jax_backend.jax.device_get(res_summary)
+        except Exception as e:
+            logger.warning(f"⚠️ [JAX_FALLBACK] evaluate_entry_metrics failed: {e}. Falling back to JAX-CPU.")
+            # Re-ensure JAX is properly initialized before using jax.devices()
+            jax_backend.ensure_jax()
+            from engines.mc.jax_backend import jax as jax_module, DEV_MODE as _DEV_MODE
+            
+            # DEV_MODE: use NumPy fallback directly
+            if _DEV_MODE:
+                from engines.mc.jax_backend import summarize_gbm_horizons_numpy
+                res_summary_cpu = summarize_gbm_horizons_numpy(
+                    np.asarray(price_paths),
+                    s0_f, lev_f, fee_rt_total_roe_f,
+                    h_indices, params.cvar_alpha
+                )
+            elif jax_module is None:
+                raise RuntimeError("JAX is not available for CPU fallback") from e
+            else:
+                cpu_dev = jax_module.devices("cpu")[0]
+                with jax_module.default_device(cpu_dev):
+                    # We need to make sure price_paths is on CPU if it was on GPU
+                    cpu_paths = jax_module.device_put(price_paths, cpu_dev)
+                    res_summary = jax_backend.summarize_gbm_horizons_jax(
+                        price_paths=cpu_paths,
                         s0=s0_f,
                         leverage=lev_f,
                         fee_rt_total_roe=fee_rt_total_roe_f,
                         horizons_indices=h_indices,
                         alpha=params.cvar_alpha
                     )
-                    res_summary_cpu = jax.device_get(res_summary)
-            else:
-                res_summary = summarize_gbm_horizons_jax(
-                    price_paths=price_paths,
-                    s0=s0_f,
-                    leverage=lev_f,
-                    fee_rt_total_roe=fee_rt_total_roe_f,
-                    horizons_indices=h_indices,
-                    alpha=params.cvar_alpha
-                )
-                res_summary_cpu = jax.device_get(res_summary)
-        except Exception as e:
-            logger.warning(f"⚠️ [JAX_FALLBACK] evaluate_entry_metrics failed on {force_dev}: {e}. Falling back to JAX-CPU.")
-            cpu_dev = jax.devices("cpu")[0]
-            with jax.default_device(cpu_dev):
-                # We need to make sure price_paths is on CPU if it was on GPU
-                cpu_paths = jax.device_put(price_paths, cpu_dev)
-                res_summary = summarize_gbm_horizons_jax(
-                    price_paths=cpu_paths,
-                    s0=s0_f,
-                    leverage=lev_f,
-                    fee_rt_total_roe=fee_rt_total_roe_f,
-                    horizons_indices=h_indices,
-                    alpha=params.cvar_alpha
-                )
-                res_summary_cpu = jax.device_get(res_summary)
+                    res_summary_cpu = jax_module.device_get(res_summary)
         
         ev_L_arr = res_summary_cpu["ev_long"]
         win_L_arr = res_summary_cpu["win_long"]
@@ -3120,12 +3129,12 @@ self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         num_symbols = len(tasks)
         pad_size = self.JAX_STATIC_BATCH_SIZE
         
-        # Original inputs
+        # Original inputs (None 값 방어)
         seeds_orig = np.array([t["seed"] for t in tasks], dtype=np.uint32)
         s0s_orig = np.array(s0s, dtype=np.float32)
         mus_orig = np.array(mus, dtype=np.float32)
         sigmas_orig = np.array(sigmas, dtype=np.float32)
-        leverages_orig = np.array([float(t["ctx"].get("leverage", 1.0)) for t in tasks], dtype=np.float32)
+        leverages_orig = np.array([float(t["ctx"].get("leverage") or 1.0) for t in tasks], dtype=np.float32)
         fees_orig = np.array([(float(self.fee_roundtrip_base) + float(self.slippage_perc)) for _ in tasks], dtype=np.float32)
 
         # Padding
@@ -3146,9 +3155,10 @@ self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         t_prep0 = time.perf_counter()
 
         n_paths = int(config.n_paths_live)
-        dt = float(self.dt)
         step_sec = int(getattr(self, "time_step_sec", 1) or 1)
         step_sec = int(max(1, step_sec))
+        # CRITICAL FIX: dt must account for step_sec (step_sec/SECONDS_PER_YEAR)
+        dt = float(step_sec) / float(SECONDS_PER_YEAR)  # step_sec seconds per step, annualized
         max_h_sec = int(max(getattr(self, "horizons", (3600,))))
         max_steps = int(math.ceil(max_h_sec / float(step_sec))) if max_h_sec > 0 else 0
         
@@ -3165,154 +3175,277 @@ self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         t_prep1 = time.perf_counter()
 
         price_paths_batch = None
-        force_dev = _jax_mc_device()
         t_sim0 = time.perf_counter()
         
-        try:
-            # Try METAL first
-            if force_dev:
-                with jax.default_device(force_dev):
+        print(f"[BATCH_TIMING] prep={(t_prep1-t_prep0):.3f}s n_paths={n_paths} max_steps={max_steps} step_sec={step_sec} dt={dt:.2e}", flush=True)
+        
+        # Ensure JAX is initialized before GPU operations
+        ensure_jax()
+        from engines.mc.jax_backend import jax as jax_module, DEV_MODE as _DEV_MODE
+        
+        # ✅ DEV_MODE: NumPy sequential fallback
+        if _DEV_MODE:
+            print("[BATCH_TIMING] DEV_MODE: Using NumPy sequential fallback...", flush=True)
+            from engines.mc.jax_backend import summarize_gbm_horizons_numpy
+            
+            # Sequential path simulation (NumPy)
+            price_paths_batch = self.simulate_paths_price_batch(
+                seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
+                n_paths=n_paths, n_steps=max_steps, dt=dt
+            )
+            t_sim1 = time.perf_counter()
+            print(f"[BATCH_TIMING] simulate_paths_price_batch (NumPy) done t={(t_sim1-t_sim0):.3f}s", flush=True)
+            
+            # Sequential summary (NumPy)
+            t_sum0 = time.perf_counter()
+            summary_cpu = {
+                "ev_long": [], "win_long": [], "cvar_long": [],
+                "ev_short": [], "win_short": [], "cvar_short": []
+            }
+            for i in range(num_symbols):
+                r = summarize_gbm_horizons_numpy(
+                    np.asarray(price_paths_batch[i]),
+                    float(s0s_jax[i]), float(leverages_jax[i]), float(fees_jax[i] * leverages_jax[i]),
+                    h_indices, 0.05
+                )
+                for k in summary_cpu:
+                    summary_cpu[k].append(r[k])
+            for k in summary_cpu:
+                summary_cpu[k] = np.array(summary_cpu[k])
+            t_sum1 = time.perf_counter()
+            print(f"[BATCH_TIMING] summarize_gbm_horizons (NumPy) done t={(t_sum1-t_sum0):.3f}s", flush=True)
+        else:
+            if jax_module is None:
+                raise RuntimeError("JAX is not available for batch evaluation")
+            
+            try:
+                print("[BATCH_TIMING] Starting simulate_paths_price_batch (implicit device)...", flush=True)
+                price_paths_batch = self.simulate_paths_price_batch(
+                    seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
+                    n_paths=n_paths, n_steps=max_steps, dt=dt
+                )
+                print("[BATCH_TIMING] simulate_paths_price_batch returned, blocking...", flush=True)
+                jax_module.block_until_ready(price_paths_batch)
+                print(f"[BATCH_TIMING] simulate_paths_price_batch done t={(time.perf_counter()-t_sim0):.3f}s", flush=True)
+
+                t_sim1 = time.perf_counter()
+                t_sum0 = time.perf_counter()
+                use_cpu_summary = str(os.environ.get("MC_SUMMARY_CPU", "")).lower() in ("1", "true", "yes")
+                try:
+                    if not use_cpu_summary:
+                        devs = jax_module.devices()
+                        if devs and str(getattr(devs[0], "platform", "")).upper() == "METAL":
+                            use_cpu_summary = True
+                except Exception:
+                    pass
+
+                if use_cpu_summary:
+                    print(f"[BATCH_TIMING] Using CPU summary path (Metal detected)", flush=True)
+                    t_xfer_start = time.perf_counter()
+                    price_paths_cpu = np.asarray(jax_module.device_get(price_paths_batch), dtype=np.float64)
+                    print(f"[BATCH_TIMING] device_get done t={(time.perf_counter()-t_xfer_start):.3f}s shape={price_paths_cpu.shape}", flush=True)
+                    
+                    s0s_cpu = np.asarray(s0s_jax, dtype=np.float64)
+                    lev_cpu = np.asarray(leverages_jax, dtype=np.float64)
+                    # Fee는 leverage와 독립 - 명목금액 기준 수수료이므로 ROE에서는 leverage 곱하지 않음
+                    fee_cpu = np.asarray(fees_jax, dtype=np.float64)
+
+                    t_calc_start = time.perf_counter()
+                    # h_indices is array of step indices, select those columns
+                    # price_paths_cpu shape: (n_symbols, n_paths, n_steps+1)
+                    # We want: (n_symbols, n_paths, len(h_indices))
+                    tp = price_paths_cpu[:, :, h_indices]  # This works if h_indices is 1D array
+                    print(f"[BATCH_TIMING] tp extraction done shape={tp.shape}", flush=True)
+                    
+                    denom = np.maximum(1e-12, s0s_cpu[:, None, None])
+                    gross = (tp - s0s_cpu[:, None, None]) / denom
+
+                    net_long = gross * lev_cpu[:, None, None] - fee_cpu[:, None, None]
+                    net_short = -gross * lev_cpu[:, None, None] - fee_cpu[:, None, None]
+
+                    ev_long = net_long.mean(axis=1)
+                    win_long = (net_long > 0).mean(axis=1)
+                    ev_short = net_short.mean(axis=1)
+                    win_short = (net_short > 0).mean(axis=1)
+
+                    k = max(1, int(0.05 * n_paths))
+                    part_long = np.partition(net_long, kth=k - 1, axis=1)
+                    part_short = np.partition(net_short, kth=k - 1, axis=1)
+                    cvar_long = part_long[:, :k, :].mean(axis=1)
+                    cvar_short = part_short[:, :k, :].mean(axis=1)
+
+                    summary_cpu = {
+                        "ev_long": ev_long,
+                        "win_long": win_long,
+                        "cvar_long": cvar_long,
+                        "ev_short": ev_short,
+                        "win_short": win_short,
+                        "cvar_short": cvar_short,
+                    }
+                    t_sum1 = time.perf_counter()
+                    print(f"[BATCH_TIMING] CPU summary done t={(t_sum1-t_calc_start):.3f}s", flush=True)
+                else:
+                    summary_results = summarize_gbm_horizons_multi_symbol_jax(
+                        price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
+                    )
+                    jax_module.block_until_ready(summary_results)
+                    t_sum1 = time.perf_counter()
+
+            except Exception as e:
+                logger.warning(f"⚠️ [JAX_FALLBACK] Metal failed: {e}. Falling back to JAX-CPU (PARALLEL).")
+                ensure_jax()
+                from engines.mc.jax_backend import jax as jax_module
+                if jax_module is None:
+                    raise RuntimeError("JAX is not available for CPU fallback") from e
+                cpu_dev = jax_module.devices("cpu")[0]
+                with jax_module.default_device(cpu_dev):
                     price_paths_batch = self.simulate_paths_price_batch(
                         seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
                         n_paths=n_paths, n_steps=max_steps, dt=dt
                     )
-                    jax.block_until_ready(price_paths_batch)
-
+                    jax_module.block_until_ready(price_paths_batch)
                     t_sim1 = time.perf_counter()
                     t_sum0 = time.perf_counter()
-                    
                     summary_results = summarize_gbm_horizons_multi_symbol_jax(
                         price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
                     )
-                    jax.block_until_ready(summary_results)
+                    jax_module.block_until_ready(summary_results)
                     t_sum1 = time.perf_counter()
-            else:
-                price_paths_batch = self.simulate_paths_price_batch(
-                    seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
-                    n_paths=n_paths, n_steps=max_steps, dt=dt
-                )
-                jax.block_until_ready(price_paths_batch)
-                t_sim1 = time.perf_counter()
-                t_sum0 = time.perf_counter()
-                summary_results = summarize_gbm_horizons_multi_symbol_jax(
-                    price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
-                )
-                jax.block_until_ready(summary_results)
-                t_sum1 = time.perf_counter()
-                
-        except Exception as e:
-            logger.warning(f"⚠️ [JAX_FALLBACK] Metal failed: {e}. Falling back to JAX-CPU (PARALLEL).")
-            cpu_dev = jax.devices("cpu")[0]
-            with jax.default_device(cpu_dev):
-                price_paths_batch = self.simulate_paths_price_batch(
-                    seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
-                    n_paths=n_paths, n_steps=max_steps, dt=dt
-                )
-                jax.block_until_ready(price_paths_batch)
-                t_sim1 = time.perf_counter()
-                t_sum0 = time.perf_counter()
-                summary_results = summarize_gbm_horizons_multi_symbol_jax(
-                    price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
-                )
-                jax.block_until_ready(summary_results)
-                t_sum1 = time.perf_counter()
 
-        t_xfer0 = time.perf_counter()
-        summary_cpu = jax.device_get(summary_results)
-        t_xfer1 = time.perf_counter()
+            t_xfer0 = time.perf_counter()
+            if "summary_cpu" not in locals():
+                summary_cpu = jax_module.device_get(summary_results)
+            t_xfer1 = time.perf_counter()
+            print(f"[BATCH_TIMING] device_get done t={(t_xfer1-t_xfer0):.3f}s shape={price_paths_batch.shape}", flush=True)
         
-        # ✅ GLOBAL BATCH EXIT POLICY
+        # ✅ GLOBAL BATCH EXIT POLICY (can be skipped with SKIP_EXIT_POLICY=true)
         t_exit_prep0 = time.perf_counter()
-        # Prepare arguments for all slots (including padding)
-        exit_policy_args = []
-        # Fixed horizons and directions for all slots to maximize JIT efficiency
-        policy_horizons = [60, 300, 600, 1800, 3600]
-        directions = [1, -1] # LONG/SHORT
-        batch_h_fixed = []
-        batch_d_fixed = []
-        for h in policy_horizons:
-            for d in directions:
-                batch_h_fixed.append(h)
-                batch_d_fixed.append(d)
-        
-        batch_h_np = np.array(batch_h_fixed, dtype=np.int32)
-        batch_d_np = np.array(batch_d_fixed, dtype=np.int32)
-        dd_stop_base = np.array([float(os.getenv("PAPER_EXIT_POLICY_DD_STOP_ROE", "-0.02")) for _ in batch_h_fixed], dtype=np.float32)
-
-        for i in range(pad_size):
-            if i < num_symbols:
-                t = tasks[i]
-                cost_m = self._get_execution_costs(t["ctx"], t["params"])
-                leverage = float(leverages_jax[i])
-                sigma_val = float(sigmas_jax[i])
-                tp_targets = []
-                sl_targets = []
-                for h in batch_h_fixed:
-                    tp_r, sl_r = self.tp_sl_targets_for_horizon(float(h), sigma_val)
-                    tp_targets.append(float(tp_r) * leverage)
-                    sl_targets.append(float(sl_r) * leverage)
-                tp_targets_arr = np.array(tp_targets, dtype=np.float32)
-                sl_targets_arr = np.array(sl_targets, dtype=np.float32)
-                arg = {
-                    "symbol": t["ctx"].get("symbol"),
-                    "price": s0s_jax[i],
-                    "mu": mus_jax[i],
-                    "sigma": sigmas_jax[i],
-                    "leverage": leverages_jax[i],
-                    "fee_roundtrip": cost_m["fee_roundtrip"],
-                    "exec_oneway": cost_m["exec_oneway"],
-                    "impact_cost": cost_m["impact_cost"],
-                    "regime": t["ctx"].get("regime", "chop"),
-                    "batch_directions": batch_d_np,
-                    "batch_horizons": batch_h_np,
-                    "tp_target_roe_batch": tp_targets_arr,
-                    "sl_target_roe_batch": sl_targets_arr,
-                    "dd_stop_roe_batch": dd_stop_base,
-                    "price_paths": price_paths_batch[i]
-                }
-            else:
-                # Padding slot
-                tp_targets = []
-                sl_targets = []
-                for h in batch_h_fixed:
-                    tp_r, sl_r = self.tp_sl_targets_for_horizon(float(h), None)
-                    tp_targets.append(float(tp_r))
-                    sl_targets.append(float(sl_r))
-                tp_targets_arr = np.array(tp_targets, dtype=np.float32)
-                sl_targets_arr = np.array(sl_targets, dtype=np.float32)
-                arg = {
-                    "symbol": "PAD",
-                    "price": 100.0,
-                    "mu": 0.0,
-                    "sigma": 0.1,
-                    "leverage": 1.0,
-                    "fee_roundtrip": 0.0006,
-                    "exec_oneway": 0.0003,
-                    "impact_cost": 0.0,
-                    "regime": "chop",
-                    "batch_directions": batch_d_np,
-                    "batch_horizons": batch_h_np,
-                    "tp_target_roe_batch": tp_targets_arr,
-                    "sl_target_roe_batch": sl_targets_arr,
-                    "dd_stop_roe_batch": dd_stop_base,
-                    "price_paths": price_paths_batch[i]
-                }
-            exit_policy_args.append(arg)
-
-        t_exit_prep1 = time.perf_counter()
-            
-        exit_policy_results = None
+        t_exit_prep1 = t_exit_prep0  # default
         t_exit0 = time.perf_counter()
-        try:
-            exit_policy_results = self.compute_exit_policy_metrics_multi_symbol(exit_policy_args)
-        except Exception as e:
-            logger.warning(f"⚠️ [METAL_FAILURE] Exit Policy failed: {e}. Falling back to JAX-CPU.")
-            # Use CPU device to force JAX-CPU execution
-            cpu_dev = jax.devices("cpu")[0]
-            with jax.default_device(cpu_dev):
-                exit_policy_results = self.compute_exit_policy_metrics_multi_symbol(exit_policy_args)
+        t_exit1 = t_exit0  # default
+        exit_policy_results = None
+        
+        if SKIP_EXIT_POLICY:
+            # Skip Exit Policy - use simplified EV from summary_cpu
+            print("[BATCH_TIMING] SKIP_EXIT_POLICY=true, using summary-based EV", flush=True)
+            # Debug: Print EV values for first few symbols
+            for dbg_i in range(min(3, num_symbols)):
+                sym_name = tasks[dbg_i]["ctx"].get("symbol", f"sym{dbg_i}")
+                ev_l = summary_cpu["ev_long"][dbg_i]  # shape (n_horizons,)
+                ev_s = summary_cpu["ev_short"][dbg_i]
+                mu_val = float(mus[dbg_i])
+                sigma_val = float(sigmas[dbg_i])
+                fee_val = float(fees_jax[dbg_i])
+                lev_val = float(leverages_jax[dbg_i])
+                print(f"[EV_DEBUG] {sym_name}: mu={mu_val:.4f} sigma={sigma_val:.4f} fee={fee_val:.6f} lev={lev_val:.1f} ev_long={ev_l.max():.6f} ev_short={ev_s.max():.6f}", flush=True)
+            # Build simplified results from summary_cpu
+            exit_policy_results = []
+            h_list = [60, 300, 600, 1800, 3600]
+            directions = [1, -1]
+            for i in range(pad_size):
+                slot_results = []
+                for h_idx, h_val in enumerate(h_list):
+                    for d in directions:
+                        # Use ev_long or ev_short from summary depending on direction
+                        if d == 1:
+                            ev_val = float(summary_cpu["ev_long"][i, h_idx]) if i < num_symbols else 0.0
+                        else:
+                            ev_val = float(summary_cpu["ev_short"][i, h_idx]) if i < num_symbols else 0.0
+                        slot_results.append({"ev_exit_policy": ev_val})
+                exit_policy_results.append(slot_results)
+            t_exit_prep1 = time.perf_counter()
+            t_exit1 = t_exit_prep1
+        else:
+            # Full Exit Policy calculation
+            # Prepare arguments for all slots (including padding)
+            exit_policy_args = []
+            # Fixed horizons and directions for all slots to maximize JIT efficiency
+            policy_horizons = [60, 300, 600, 1800, 3600]
+            directions = [1, -1] # LONG/SHORT
+            batch_h_fixed = []
+            batch_d_fixed = []
+            for h in policy_horizons:
+                for d in directions:
+                    batch_h_fixed.append(h)
+                    batch_d_fixed.append(d)
+            
+            batch_h_np = np.array(batch_h_fixed, dtype=np.int32)
+            batch_d_np = np.array(batch_d_fixed, dtype=np.int32)
+            dd_stop_base = np.array([float(os.getenv("PAPER_EXIT_POLICY_DD_STOP_ROE", "-0.02")) for _ in batch_h_fixed], dtype=np.float32)
 
-        t_exit1 = time.perf_counter()
+            for i in range(pad_size):
+                if i < num_symbols:
+                    t = tasks[i]
+                    cost_m = self._get_execution_costs(t["ctx"], t["params"])
+                    leverage = float(leverages_jax[i])
+                    sigma_val = float(sigmas_jax[i])
+                    tp_targets = []
+                    sl_targets = []
+                    for h in batch_h_fixed:
+                        tp_r, sl_r = self.tp_sl_targets_for_horizon(float(h), sigma_val)
+                        tp_targets.append(float(tp_r) * leverage)
+                        sl_targets.append(float(sl_r) * leverage)
+                    tp_targets_arr = np.array(tp_targets, dtype=np.float32)
+                    sl_targets_arr = np.array(sl_targets, dtype=np.float32)
+                    arg = {
+                        "symbol": t["ctx"].get("symbol"),
+                        "price": s0s_jax[i],
+                        "mu": mus_jax[i],
+                        "sigma": sigmas_jax[i],
+                        "leverage": leverages_jax[i],
+                        "fee_roundtrip": cost_m["fee_roundtrip"],
+                        "exec_oneway": cost_m["exec_oneway"],
+                        "impact_cost": cost_m["impact_cost"],
+                        "regime": t["ctx"].get("regime", "chop"),
+                        "batch_directions": batch_d_np,
+                        "batch_horizons": batch_h_np,
+                        "tp_target_roe_batch": tp_targets_arr,
+                        "sl_target_roe_batch": sl_targets_arr,
+                        "dd_stop_roe_batch": dd_stop_base,
+                        "price_paths": price_paths_batch[i]
+                    }
+                else:
+                    # Padding slot
+                    tp_targets = []
+                    sl_targets = []
+                    for h in batch_h_fixed:
+                        tp_r, sl_r = self.tp_sl_targets_for_horizon(float(h), None)
+                        tp_targets.append(float(tp_r))
+                        sl_targets.append(float(sl_r))
+                    tp_targets_arr = np.array(tp_targets, dtype=np.float32)
+                    sl_targets_arr = np.array(sl_targets, dtype=np.float32)
+                    arg = {
+                        "symbol": "PAD",
+                        "price": 100.0,
+                        "mu": 0.0,
+                        "sigma": 0.1,
+                        "leverage": 1.0,
+                        "fee_roundtrip": 0.0006,
+                        "exec_oneway": 0.0003,
+                        "impact_cost": 0.0,
+                        "regime": "chop",
+                        "batch_directions": batch_d_np,
+                        "batch_horizons": batch_h_np,
+                        "tp_target_roe_batch": tp_targets_arr,
+                        "sl_target_roe_batch": sl_targets_arr,
+                        "dd_stop_roe_batch": dd_stop_base,
+                        "price_paths": price_paths_batch[i]
+                    }
+                exit_policy_args.append(arg)
+
+            t_exit_prep1 = time.perf_counter()
+                
+            t_exit0 = time.perf_counter()
+            try:
+                exit_policy_results = self.compute_exit_policy_metrics_multi_symbol(exit_policy_args)
+            except Exception as e:
+                logger.warning(f"⚠️ [METAL_FAILURE] Exit Policy failed: {e}. Falling back to JAX-CPU.")
+                # Use CPU device to force JAX-CPU execution
+                cpu_dev = jax_module.devices("cpu")[0]
+                with jax_module.default_device(cpu_dev):
+                    exit_policy_results = self.compute_exit_policy_metrics_multi_symbol(exit_policy_args)
+
+            t_exit1 = time.perf_counter()
         
         # 6. Final Assembly (per symbol)
         t_asm0 = time.perf_counter()

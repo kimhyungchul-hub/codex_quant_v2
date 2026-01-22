@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
-# Remove jax.scipy.stats to avoid direct dependency if possible, or keep it.
-# We need standard numpy/scipy for the numpy fallback
+from engines.mc.jax_backend import ensure_jax, lazy_jit, jnp, jax
+# We keep numpy/scipy for the numpy fallback
 import numpy as np
 from scipy.stats import norm as scipy_norm
-from jax.scipy.stats import norm as jax_norm
 
-@jax.jit
+@lazy_jit()
 def _erf_approx(x):
     # Polynomial approximation of erf(x) for Metal/MPS which doesn't support mhlo.erf
     # erf(x) ≈ 1 - (a1*t + a2*t^2 + a3*t^3 + a4*t^4 + a5*t^5) * exp(-x^2)
@@ -26,12 +23,12 @@ def _erf_approx(x):
     y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * jnp.exp(-abs_x * abs_x)
     return sign * y
 
-@jax.jit
+@lazy_jit()
 def _norm_cdf_jax(x):
     # norm.cdf(x) = 0.5 * (1 + erf(x / sqrt(2)))
     return 0.5 * (1.0 + _erf_approx(x / jnp.sqrt(2.0)))
 
-@jax.jit
+@lazy_jit()
 def _approx_p_pos_and_ev_hold_jax(
     mu: float,
     sigma: float,
@@ -73,7 +70,7 @@ def _approx_p_pos_and_ev_hold_jax(
     
     return p_pos, ev
 
-@jax.jit
+@lazy_jit()
 def _prob_max_geq_jax(mu0: float, sig0: float, T: float, a: float) -> jnp.ndarray:
     T = jnp.maximum(0.0, T)
     sig0 = jnp.float32(sig0)
@@ -96,7 +93,7 @@ def _prob_max_geq_jax(mu0: float, sig0: float, T: float, a: float) -> jnp.ndarra
     
     return jnp.clip(p, 0.0, 1.0)
 
-@jax.jit
+@lazy_jit()
 def _prob_min_leq_jax(mu0: float, sig0: float, T: float, neg_a: float) -> jnp.ndarray:
     a = jnp.abs(neg_a)
     return _prob_max_geq_jax(-mu0, sig0, T, a)

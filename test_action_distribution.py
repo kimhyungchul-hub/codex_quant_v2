@@ -2,6 +2,8 @@
 """
 빠른 테스트: 기존 모델이 정말 아무것도 안하는지 확인
 """
+import bootstrap  # ensure JAX/XLA env is set for tests that may spawn GPU workloads
+
 import os
 import sys
 import numpy as np

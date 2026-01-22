@@ -17,91 +17,91 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 
-# JAX Metal support
-from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand, jax_covariance
+# JAX Metal support - use lazy initialization from jax_backend
+import engines.mc.jax_backend as jax_backend
 
-# -----------------------------
-# JAX Kernels (JIT Optimized)
-# -----------------------------
 
-if _JAX_OK:
-    @jax.jit
-    def _jnp_bps_to_mult(bps: float):
-        return 1.0 + bps / 10000.0
+@jax_backend.lazy_jit()
+def _jnp_bps_to_mult(bps: float):
+    return 1.0 + bps / 10000.0
 
-    @jax.jit
-    def _jnp_first_hit_index(mask: jnp.ndarray):
-        """Finds first True index per row using argmax."""
-        sims, days = mask.shape
-        idx = jnp.argmax(mask, axis=1)
-        has = jnp.any(mask, axis=1)
-        return jnp.where(has, idx, days + 999)
 
-    @jax.jit
-    def _symbol_realized_pnl_jax(
-        price0: float,
-        paths: jnp.ndarray,               # (sims, days)
-        tp: float,
-        sl: float,
-        liq_price: float,
-        jump_mask_any: jnp.ndarray,       # (sims, days) bool
-        slippage_bps: float,
-        jump_slippage_mult: float,
-        liq_penalty_bps: float,
-    ):
-        """Vectorized PnL calculation on GPU."""
-        sims, days = paths.shape
-        
-        tp_mask = paths >= tp
-        sl_mask = paths <= sl
-        liq_mask = paths <= liq_price
-        
-        tp_i = _jnp_first_hit_index(tp_mask)
-        sl_i = _jnp_first_hit_index(sl_mask)
-        liq_i = _jnp_first_hit_index(liq_mask)
-        
-        first = jnp.minimum(tp_i, jnp.minimum(sl_i, liq_i))
-        
-        hit_tp = (tp_i == first) & (tp_i < days)
-        hit_sl = (sl_i == first) & (sl_i < days) & ~hit_tp
-        hit_liq = (liq_i == first) & (liq_i < days) & ~hit_tp & ~hit_sl
-        hit_none = ~(hit_tp | hit_sl | hit_liq)
-        
-        slip = _jnp_bps_to_mult(slippage_bps)
-        liq_pen = _jnp_bps_to_mult(liq_penalty_bps)
-        
-        # We need indices for gathering jump info
-        batch_idx = jnp.arange(sims)
-        
-        # TP PnL
-        tp_days = jnp.clip(tp_i, 0, days - 1)
-        tp_jump_extra = jnp.where(jump_mask_any[batch_idx, tp_days], jump_slippage_mult, 1.0)
-        tp_fill = tp / (slip * tp_jump_extra)
-        pnl_tp = (tp_fill - price0) / price0
-        
-        # SL PnL
-        sl_days = jnp.clip(sl_i, 0, days - 1)
-        sl_jump_extra = jnp.where(jump_mask_any[batch_idx, sl_days], jump_slippage_mult, 1.0)
-        sl_fill = sl * (slip * sl_jump_extra)
-        pnl_sl = (sl_fill - price0) / price0
-        
-        # LIQ PnL
-        liq_days = jnp.clip(liq_i, 0, days - 1)
-        liq_jump_extra = jnp.where(jump_mask_any[batch_idx, liq_days], jump_slippage_mult, 1.0)
-        liq_fill = liq_price * (slip * liq_jump_extra) * liq_pen
-        pnl_liq = (liq_fill - price0) / price0
-        
-        # NONE PnL (last day)
-        pnl_none = ((paths[:, -1] / slip) - price0) / price0
-        
-        # Combine
-        final_pnl = jnp.zeros(sims)
-        final_pnl = jnp.where(hit_tp, pnl_tp, final_pnl)
-        final_pnl = jnp.where(hit_sl, pnl_sl, final_pnl)
-        final_pnl = jnp.where(hit_liq, pnl_liq, final_pnl)
-        final_pnl = jnp.where(hit_none, pnl_none, final_pnl)
-        
-        return final_pnl, hit_tp, hit_sl, hit_liq
+@jax_backend.lazy_jit()
+def _jnp_first_hit_index(mask):
+    """Finds first True index per row using argmax."""
+    jnp = jax_backend.jnp
+    sims, days = mask.shape
+    idx = jnp.argmax(mask, axis=1)
+    has = jnp.any(mask, axis=1)
+    return jnp.where(has, idx, days + 999)
+
+
+@jax_backend.lazy_jit()
+def _symbol_realized_pnl_jax(
+    price0: float,
+    paths,               # (sims, days)
+    tp: float,
+    sl: float,
+    liq_price: float,
+    jump_mask_any=None,       # (sims, days) bool
+    slippage_bps: float=0.0,
+    jump_slippage_mult: float=1.0,
+    liq_penalty_bps: float=0.0,
+):
+    """Vectorized PnL calculation on GPU."""
+    jnp = jax_backend.jnp
+    sims, days = paths.shape
+    
+    tp_mask = paths >= tp
+    sl_mask = paths <= sl
+    liq_mask = paths <= liq_price
+    
+    tp_i = _jnp_first_hit_index(tp_mask)
+    sl_i = _jnp_first_hit_index(sl_mask)
+    liq_i = _jnp_first_hit_index(liq_mask)
+    
+    first = jnp.minimum(tp_i, jnp.minimum(sl_i, liq_i))
+    
+    hit_tp = (tp_i == first) & (tp_i < days)
+    hit_sl = (sl_i == first) & (sl_i < days) & ~hit_tp
+    hit_liq = (liq_i == first) & (liq_i < days) & ~hit_tp & ~hit_sl
+    hit_none = ~(hit_tp | hit_sl | hit_liq)
+    
+    slip = _jnp_bps_to_mult(slippage_bps)
+    liq_pen = _jnp_bps_to_mult(liq_penalty_bps)
+    
+    # We need indices for gathering jump info
+    batch_idx = jnp.arange(sims)
+    
+    # TP PnL
+    tp_days = jnp.clip(tp_i, 0, days - 1)
+    tp_jump_extra = jnp.where(jump_mask_any[batch_idx, tp_days], jump_slippage_mult, 1.0)
+    tp_fill = tp / (slip * tp_jump_extra)
+    pnl_tp = (tp_fill - price0) / price0
+    
+    # SL PnL
+    sl_days = jnp.clip(sl_i, 0, days - 1)
+    sl_jump_extra = jnp.where(jump_mask_any[batch_idx, sl_days], jump_slippage_mult, 1.0)
+    sl_fill = sl * (slip * sl_jump_extra)
+    pnl_sl = (sl_fill - price0) / price0
+    
+    # LIQ PnL
+    liq_days = jnp.clip(liq_i, 0, days - 1)
+    liq_jump_extra = jnp.where(jump_mask_any[batch_idx, liq_days], jump_slippage_mult, 1.0)
+    liq_fill = liq_price * (slip * liq_jump_extra) * liq_pen
+    pnl_liq = (liq_fill - price0) / price0
+    
+    # NONE PnL (last day)
+    pnl_none = ((paths[:, -1] / slip) - price0) / price0
+    
+    # Combine
+    final_pnl = jnp.zeros(sims)
+    final_pnl = jnp.where(hit_tp, pnl_tp, final_pnl)
+    final_pnl = jnp.where(hit_sl, pnl_sl, final_pnl)
+    final_pnl = jnp.where(hit_liq, pnl_liq, final_pnl)
+    final_pnl = jnp.where(hit_none, pnl_none, final_pnl)
+    
+    return final_pnl, hit_tp, hit_sl, hit_liq
 
 # -----------------------------
 # Config

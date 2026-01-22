@@ -19,8 +19,11 @@ class EngineHub:
     def _sanitize(obj):
         # JAX -> host
         try:
-            from jax import device_get  # type: ignore
-            obj = device_get(obj)
+            # Lazily initialize JAX and use module-level jax if available
+            import engines.mc.jax_backend as jax_backend
+            jax_backend.ensure_jax()
+            if getattr(jax_backend, "jax", None) is not None:
+                obj = jax_backend.jax.device_get(obj)
         except Exception:
             pass
 

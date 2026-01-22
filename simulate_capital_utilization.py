@@ -4,6 +4,7 @@
 # 자본 효율성 개선 시뮬레이션 (레버리지 & 포지션 사이징)
 # ================================================================
 
+import bootstrap  # ensure JAX/XLA env is set for simulation scripts
 import sys
 import pandas as pd
 import numpy as np

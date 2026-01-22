@@ -37,13 +37,20 @@ class MCConfig:
     jax_device: str = field(default_factory=lambda: os.environ.get("JAX_MC_DEVICE", "").strip().lower())
     
     # --- Alpha / Signal Features ---
-    mu_alpha_cap: float = field(default_factory=lambda: get_env_float("MU_ALPHA_CAP", 1000.0))
-    alpha_scaling_factor: float = field(default_factory=lambda: get_env_float("ALPHA_SCALING_FACTOR", 10.0))
-    mu_mom_lr_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_LR_CAP", 0.10))
-    mu_mom_tau_floor_sec: float = field(default_factory=lambda: get_env_float("MU_MOM_TAU_FLOOR_SEC", 1800.0))
-    mu_mom_ann_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_ANN_CAP", 50.0))
-    mu_alpha_floor: float = field(default_factory=lambda: get_env_float("MU_ALPHA_FLOOR", -10.0))
-    mu_ofi_scale: float = field(default_factory=lambda: get_env_float("MU_OFI_SCALE", 100.0))
+    # ALPHA_SIGNAL_BOOST: 신호 강화 모드 (true면 공격적 설정 적용)
+    alpha_signal_boost: bool = field(default_factory=lambda: get_env_bool("ALPHA_SIGNAL_BOOST", False))
+    # mu_alpha_cap: 연율 기대수익 상한
+    mu_alpha_cap: float = field(default_factory=lambda: get_env_float("MU_ALPHA_CAP", 15.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 5.0))
+    # alpha_scaling_factor: 신호 강화 시 1.5, 기본 1.0 (normalized from 3.0)
+    alpha_scaling_factor: float = field(default_factory=lambda: get_env_float("ALPHA_SCALING_FACTOR", 1.5 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 1.0))
+    mu_mom_lr_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_LR_CAP", 0.15 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 0.10))
+    mu_mom_tau_floor_sec: float = field(default_factory=lambda: get_env_float("MU_MOM_TAU_FLOOR_SEC", 900.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 1800.0))
+    # mu_mom_ann_cap: 연율 모멘텀 상한 (신호 강화 시 10.0)
+    mu_mom_ann_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_ANN_CAP", 10.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 3.0))
+    # mu_alpha_floor: mu_alpha 하한
+    mu_alpha_floor: float = field(default_factory=lambda: get_env_float("MU_ALPHA_FLOOR", -10.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else -3.0))
+    # mu_ofi_scale: OFI의 연율 알파 변환 계수 (신호 강화 시 15.0, normalized from 30.0)
+    mu_ofi_scale: float = field(default_factory=lambda: get_env_float("MU_OFI_SCALE", 15.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 10.0))
     mu_alpha_scale_min: float = field(default_factory=lambda: get_env_float("MU_ALPHA_SCALE_MIN", 0.5))
     mu_alpha_chop_window_bars: int = field(default_factory=lambda: get_env_int("MU_ALPHA_CHOP_WINDOW_BARS", 60))
     mu_alpha_w_mom_base: float = field(default_factory=lambda: get_env_float("MU_ALPHA_W_MOM_BASE", 0.50))

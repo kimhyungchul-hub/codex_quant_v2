@@ -6,8 +6,6 @@ Clean Entry Evaluation Wrapper using Global Batching
 검증된 Global Batching을 사용하여 horizon 처리를 수행합니다.
 """
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import time
 import os

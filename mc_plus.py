@@ -1,9 +1,14 @@
 # mc_plus.py 전체를 이 코드로 덮어쓰세요.
 
+import bootstrap  # ensure JAX/XLA env is set before jax imports
+
 import numpy as np
 import pandas as pd
-import jax.numpy as jnp
-from jax import jit
+from typing import Dict, List, Tuple
+
+from engines.mc.jax_backend import ensure_jax, lazy_jit
+
+# Use lazy_jit to avoid JAX initialization at module import time
 from typing import Dict, List, Tuple
 
 class KalmanFilter1D:
@@ -37,19 +42,22 @@ class OUProcess:
 
 class LSMModel:
     @staticmethod
-    @jit
+    @lazy_jit()
     def calculate_values(paths, entry_price, direction, leverage, discount=0.9999):
         # paths shape: (sims, steps)
+        import engines.mc.jax_backend as _jb
+        _jb.ensure_jax()
+        jnp = _jb.jnp
         current_price = jnp.mean(paths[:, 0])
         exercise_value = (current_price - entry_price) / entry_price * direction * leverage
         
         future_prices = paths[:, 1:]
         future_pnl = (future_prices - entry_price) / entry_price * direction * leverage
-        
+
         n_steps = future_pnl.shape[1]
         discount_factors = jnp.power(discount, jnp.arange(1, n_steps + 1))
         discounted_pnl = future_pnl * discount_factors[None, :]
-        
+
         continuation_value = jnp.mean(jnp.sum(discounted_pnl, axis=1))
         return exercise_value, continuation_value
 

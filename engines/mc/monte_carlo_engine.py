@@ -148,9 +148,12 @@ class MonteCarloEngine(
         self.time_step_sec = int(max(1, self.time_step_sec))
         # dt is year-fraction per simulation step.
         self.dt = float(self.time_step_sec) / 31536000.0
-        self.fee_roundtrip_base = 0.0006  # Reduced from 0.0012 (12bp → 6bp) to match Binance taker fee
-        self.fee_roundtrip_maker_base = 0.0001  # Reduced from 0.0002 (2bp → 1bp)
-        self.slippage_perc = 0.00015  # Reduced from 0.0003 (3bp → 1.5bp)
+        
+        # Fee settings: USE_MAKER_ORDERS=true → Maker fee (0.02% roundtrip)
+        _use_maker = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
+        self.fee_roundtrip_base = 0.0002 if _use_maker else 0.0012  # Maker: 0.02%, Taker: 0.12%
+        self.fee_roundtrip_maker_base = 0.0002  # 0.01% * 2 sides
+        self.slippage_perc = 0.0001 if _use_maker else 0.0003  # Maker: ~0, Taker: slippage
 
         self.default_tail_mode = "student_t"
         self.default_student_t_df = 6.0

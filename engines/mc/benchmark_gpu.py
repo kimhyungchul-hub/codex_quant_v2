@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import time
 import numpy as np
-import jax
-import jax.numpy as jnp
+from engines.mc.jax_backend import ensure_jax, jax, jnp
 from engines.mc.exit_policy_jax import simulate_exit_policy_rollforward_jax
 from engines.exit_policy_methods import simulate_exit_policy_rollforward
 
@@ -32,7 +31,14 @@ def benchmark():
     price_paths = np.column_stack([np.full(n_paths, s0), price_paths])
     
     print(f"Benchmarking with {n_paths} paths, {h_pts} steps...")
-    
+
+    # Ensure JAX is available and configure
+    ensure_jax()
+    if jax is None:
+        raise RuntimeError("JAX not available for GPU benchmark")
+    jax.config.update('jax_platform_name', 'METAL')
+    jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
+
     # JAX - Warmup
     print("Warming up JAX...")
     _ = simulate_exit_policy_rollforward_jax(

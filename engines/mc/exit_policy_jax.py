@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
-from jax import lax
+from engines.mc.jax_backend import ensure_jax, lazy_jit, jax, jnp, lax
 from functools import partial
 from engines.mc.probability_jax import _approx_p_pos_and_ev_hold_jax, _prob_max_geq_jax, _prob_min_leq_jax
 
-@partial(jax.jit, static_argnames=("decision_dt_sec", "step_sec", "horizon_sec", "min_hold_sec", "flip_confirm_ticks", "hold_bad_ticks", "enable_dd_stop"))
+@lazy_jit(static_argnames=("decision_dt_sec", "step_sec", "horizon_sec", "min_hold_sec", "flip_confirm_ticks", "hold_bad_ticks", "enable_dd_stop"))
 def simulate_exit_policy_rollforward_jax(
     price_paths: jnp.ndarray,  # (n_paths, h_pts)
     s0: float,
@@ -158,7 +156,7 @@ def simulate_exit_policy_rollforward_jax(
 
 from engines.mc.jax_backend import _cvar_jax
 
-@partial(jax.jit, static_argnames=("decision_dt_sec", "step_sec", "max_horizon_sec", "flip_confirm_ticks", "hold_bad_ticks", "enable_dd_stop"))
+@lazy_jit(static_argnames=("decision_dt_sec", "step_sec", "max_horizon_sec", "flip_confirm_ticks", "hold_bad_ticks", "enable_dd_stop"))
 def simulate_exit_policy_rollforward_batched_vmap_jax(
 
     price_paths: jnp.ndarray,  # (n_paths, h_pts) -> Shared across batch
@@ -314,16 +312,92 @@ def simulate_exit_policy_rollforward_batched_vmap_jax(
 
 # ✅ GLOBAL BATCHING: Multi-symbol version of exit policy simulation
 # This vmaps over the entire symbol dimension.
-simulate_exit_policy_multi_symbol_jax = jax.vmap(
-    simulate_exit_policy_rollforward_batched_vmap_jax,
-    in_axes=(
-        0, 0, 0, 0, 0, 0, 0, 0,  # paths, s0, mu, sigma, lev, fee, exec, impact
-        None, None, None,        # decision_dt_sec, step_sec, max_horizon_sec (static)
-        0, 0, 0, 0, 0,           # batched args (side, horizon, min_hold, tp, sl)
-        0, 0, 0, 0, 0, 0, 0, 0, 0,  # policy thresholds
-        None,                    # enable_dd_stop
-        0,                       # dd_stop_roe_batch
-        None, None,              # ticks
-        None, None               # fee_exit_only, cvar_alpha
+def simulate_exit_policy_multi_symbol_jax(
+    price_paths_batch,
+    s0_batch,
+    mu_ps_batch,
+    sigma_ps_batch,
+    leverage_batch,
+    fee_roundtrip_batch,
+    exec_oneway_batch,
+    impact_cost_batch,
+    decision_dt_sec,
+    step_sec,
+    max_horizon_sec,
+    side_now_batch,
+    horizon_sec_batch,
+    min_hold_sec_batch,
+    tp_target_roe_batch,
+    sl_target_roe_batch,
+    p_pos_floor_enter,
+    p_pos_floor_hold,
+    p_sl_enter_ceiling,
+    p_sl_hold_ceiling,
+    p_sl_emergency,
+    p_tp_floor_enter,
+    p_tp_floor_hold,
+    score_margin,
+    soft_floor,
+    enable_dd_stop,
+    dd_stop_roe_batch,
+    flip_confirm_ticks,
+    hold_bad_ticks,
+    fee_exit_only_override,
+    cvar_alpha,
+):
+    """Lazily create and run a vmap over symbols for the batched rollforward.
+
+    This avoids creating the vmap at module import time (which would touch JAX).
+    """
+    from engines.mc import jax_backend as _jb
+    _jb.ensure_jax()
+    if not _jb._JAX_OK:
+        raise RuntimeError("JAX is not available for simulate_exit_policy_multi_symbol_jax")
+
+    vm = _jb.jax.vmap(
+        simulate_exit_policy_rollforward_batched_vmap_jax,
+        in_axes=(
+            0, 0, 0, 0, 0, 0, 0, 0,  # paths, s0, mu, sigma, lev, fee, exec, impact
+            None, None, None,        # decision_dt_sec, step_sec, max_horizon_sec (static)
+            0, 0, 0, 0, 0,           # batched args (side, horizon, min_hold, tp, sl)
+            0, 0, 0, 0, 0, 0, 0, 0, 0,  # policy thresholds
+            None,                    # enable_dd_stop
+            0,                       # dd_stop_roe_batch
+            None, None,              # ticks
+            None, None               # fee_exit_only, cvar_alpha
+        )
     )
-)
+
+    return vm(
+        price_paths_batch,
+        s0_batch,
+        mu_ps_batch,
+        sigma_ps_batch,
+        leverage_batch,
+        fee_roundtrip_batch,
+        exec_oneway_batch,
+        impact_cost_batch,
+        decision_dt_sec,
+        step_sec,
+        max_horizon_sec,
+        side_now_batch,
+        horizon_sec_batch,
+        min_hold_sec_batch,
+        tp_target_roe_batch,
+        sl_target_roe_batch,
+        p_pos_floor_enter,
+        p_pos_floor_hold,
+        p_sl_enter_ceiling,
+        p_sl_hold_ceiling,
+        p_sl_emergency,
+        p_tp_floor_enter,
+        p_tp_floor_hold,
+        score_margin,
+        soft_floor,
+        enable_dd_stop,
+        dd_stop_roe_batch,
+        flip_confirm_ticks,
+        hold_bad_ticks,
+        fee_exit_only_override,
+        cvar_alpha,
+    )

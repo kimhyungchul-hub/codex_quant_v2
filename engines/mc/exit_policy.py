@@ -10,9 +10,7 @@ import numpy as np
 from engines.cvar_methods import cvar_ensemble
 from engines.exit_policy_methods import simulate_exit_policy_rollforward
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
-import jax
-import jax.numpy as jnp
-from engines.mc.jax_backend import _JAX_OK
+from engines.mc.jax_backend import _JAX_OK, ensure_jax, jax, jnp
 from engines.mc.config import config
 
 logger = logging.getLogger(__name__)
@@ -254,6 +252,11 @@ class MonteCarloExitPolicyMixin:
         
         if use_jax:
             try:
+                # Ensure JAX is initialized before converting arrays / calling JAX functions
+                ensure_jax()
+                if not _JAX_OK:
+                    raise RuntimeError("JAX not available after ensure_jax")
+
                 # JAX version
                 res_jax = simulate_exit_policy_rollforward_jax(
                     price_paths=jnp.asarray(pp, dtype=jnp.float32),

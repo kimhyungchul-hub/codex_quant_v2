@@ -2,6 +2,8 @@
 """
 횡보장 공격적 스캘핑 전략 백테스트
 """
+import bootstrap  # ensure JAX/XLA env is set for spawned processes/tests
+
 import ccxt
 import pandas as pd
 import numpy as np

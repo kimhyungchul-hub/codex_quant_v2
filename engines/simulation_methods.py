@@ -7,20 +7,40 @@ import numpy as np
 
 from engines.cvar_methods import _cvar_jnp
 
-try:
-    import jax  # type: ignore
-    import jax.numpy as jnp  # type: ignore
-    from jax import lax, random  # type: ignore
-except Exception:  # pragma: no cover
-    jax = None
-    jnp = None
-    lax = None
-    random = None
+# Defer importing jax until first use to guarantee environment variables
+# (XLA_PYTHON_CLIENT_PREALLOCATE, ALLOCATOR, MEM_FRACTION) are set.
+jax = None
+jnp = None
+lax = None
+random = None
+_JAX_OK = False
 
-_JAX_OK = jax is not None
+
+def ensure_jax():
+    """Lazily import jax and related symbols. Safe to call multiple times."""
+    global jax, jnp, lax, random, _JAX_OK
+    if jax is not None:
+        return
+    try:
+        import jax as _jax  # type: ignore
+        import jax.numpy as _jnp  # type: ignore
+        from jax import lax as _lax  # type: ignore
+        from jax import random as _random  # type: ignore
+        jax = _jax
+        jnp = _jnp
+        lax = _lax
+        random = _random
+        _JAX_OK = True
+    except Exception:
+        jax = None
+        jnp = None
+        lax = None
+        random = None
+        _JAX_OK = False
 
 
 def _sample_noise(key, shape, dist: str = "gaussian", df: float = 6.0, boot=None):
+    ensure_jax()
     if jnp is None or random is None:  # pragma: no cover
         raise RuntimeError("JAX is not available")
     if dist == "bootstrap" and boot is not None:
@@ -51,6 +71,7 @@ def _mc_first_passage_tp_sl_jax_core(
     boot_jnp,
     cvar_alpha: float,
 ):
+    ensure_jax()
     if jnp is None or lax is None:  # pragma: no cover
         raise RuntimeError("JAX is not available")
     eps = _sample_noise(key, (n_paths, max_steps), dist=dist, df=df, boot=boot_jnp)
@@ -99,13 +120,24 @@ def _mc_first_passage_tp_sl_jax_core(
     return p_tp, p_sl, p_to, ev_r, cvar_r, t_vals
 
 
-if _JAX_OK:
-    _mc_first_passage_tp_sl_jax_core_jit = jax.jit(  # type: ignore[attr-defined]
-        _mc_first_passage_tp_sl_jax_core,
-        static_argnames=("dist", "max_steps", "n_paths"),
-    )
-else:  # pragma: no cover
-    _mc_first_passage_tp_sl_jax_core_jit = None
+_mc_first_passage_tp_sl_jax_core_jit = None
+
+
+def _maybe_compile_jit_wrappers():
+    """Compile JIT wrappers on first real JAX use."""
+    global _mc_first_passage_tp_sl_jax_core_jit, _JAX_OK
+    if _mc_first_passage_tp_sl_jax_core_jit is not None:
+        return
+    ensure_jax()
+    if not _JAX_OK:
+        _mc_first_passage_tp_sl_jax_core_jit = None
+        return
+    try:
+        _mc_first_passage_tp_sl_jax_core_jit = jax.jit(
+            _mc_first_passage_tp_sl_jax_core, static_argnames=("dist", "max_steps", "n_paths")
+        )
+    except Exception:
+        _mc_first_passage_tp_sl_jax_core_jit = None
 
 
 def _generate_and_check_paths_jax_core(
@@ -122,6 +154,7 @@ def _generate_and_check_paths_jax_core(
     boot_jnp,
     cvar_alpha: float,
 ):
+    ensure_jax()
     if jnp is None or lax is None:  # pragma: no cover
         raise RuntimeError("JAX is not available")
     eps = _sample_noise(key, (n_paths, max_steps), dist=dist, df=df, boot=boot_jnp)
@@ -170,13 +203,23 @@ def _generate_and_check_paths_jax_core(
     return p_tp, p_sl, p_to, ev_r, cvar_r, t_vals
 
 
-if _JAX_OK:
-    _generate_and_check_paths_jax_core_jit = jax.jit(  # type: ignore[attr-defined]
-        _generate_and_check_paths_jax_core,
-        static_argnames=("dist", "max_steps", "n_paths"),
-    )
-else:  # pragma: no cover
-    _generate_and_check_paths_jax_core_jit = None
+_generate_and_check_paths_jax_core_jit = None
+
+
+def _maybe_compile_generate_jit():
+    global _generate_and_check_paths_jax_core_jit, _JAX_OK
+    if _generate_and_check_paths_jax_core_jit is not None:
+        return
+    ensure_jax()
+    if not _JAX_OK:
+        _generate_and_check_paths_jax_core_jit = None
+        return
+    try:
+        _generate_and_check_paths_jax_core_jit = jax.jit(
+            _generate_and_check_paths_jax_core, static_argnames=("dist", "max_steps", "n_paths")
+        )
+    except Exception:
+        _generate_and_check_paths_jax_core_jit = None
 
 
 def mc_first_passage_tp_sl_jax(
@@ -194,6 +237,7 @@ def mc_first_passage_tp_sl_jax(
     boot_rets: np.ndarray | None = None,
     cvar_alpha: float = 0.05,
 ) -> Dict[str, Any]:
+    ensure_jax()
     if jax is None or jnp is None or random is None or tp_pct <= 0 or sl_pct <= 0 or sigma <= 0:
         return {}
 
@@ -203,6 +247,8 @@ def mc_first_passage_tp_sl_jax(
     key = random.PRNGKey(seed & 0xFFFFFFFF)  # type: ignore[attr-defined]
     boot_jnp = None if boot_rets is None else jnp.asarray(boot_rets, dtype=jnp.float32)  # type: ignore[attr-defined]
 
+    # Ensure JIT wrapper is compiled lazily
+    _maybe_compile_jit_wrappers()
     if _mc_first_passage_tp_sl_jax_core_jit is not None:
         p_tp, p_sl, p_to, ev_r, cvar_r, t_vals = _mc_first_passage_tp_sl_jax_core_jit(
             key, s0, tp_pct, sl_pct, drift, vol, max_steps, n_paths, dist, df, boot_jnp, cvar_alpha

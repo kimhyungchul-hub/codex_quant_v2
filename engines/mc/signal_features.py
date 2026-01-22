@@ -215,11 +215,20 @@ class MonteCarloSignalFeaturesMixin:
         # ✅ Apply dynamic scaling factor
         scaling = config.alpha_scaling_factor
         mu_alpha_raw_before = mu_alpha_raw
-        mu_alpha_raw = mu_alpha_raw * scaling
+        
+        # ✅ NEW: Trend strength boost - 추세가 강할수록 신호 증폭
+        # er (efficiency ratio)가 높으면 추세가 강함 → 부스터 적용
+        trend_boost = 1.0
+        if config.alpha_signal_boost and er is not None:
+            # er=1.0 (perfect trend) → boost=1.5, er=0.0 (chop) → boost=1.0
+            # Normalized from 2.0 max to 1.5 max for stability
+            trend_boost = 1.0 + 0.5 * float(er)  # 1.0 ~ 1.5
+        
+        mu_alpha_raw = mu_alpha_raw * scaling * trend_boost
         
         # Debug: Print scaling factor (first time only)
         if not hasattr(config, '_scaling_logged'):
-            print(f"[ALPHA_SCALING_DEBUG] alpha_scaling_factor={scaling}, mu_alpha_raw_before={mu_alpha_raw_before:.6f}, mu_alpha_raw_after={mu_alpha_raw:.6f}")
+            print(f"[ALPHA_SCALING_DEBUG] alpha_scaling_factor={scaling}, trend_boost={trend_boost:.2f}, mu_alpha_raw_before={mu_alpha_raw_before:.6f}, mu_alpha_raw_after={mu_alpha_raw:.6f}")
             config._scaling_logged = True
 
         mu_cap = config.mu_alpha_cap
@@ -255,6 +264,7 @@ class MonteCarloSignalFeaturesMixin:
             "mu_ofi": float(mu_ofi),
             "mu_mom": float(mu_mom),
             "alpha_scaling_factor": float(scaling),
+            "trend_boost": float(trend_boost),
             "mu_alpha_raw_before": float(mu_alpha_raw_before),
             "mu_alpha_raw": float(mu_alpha_raw),
             "mu_alpha_cap": float(mu_cap),

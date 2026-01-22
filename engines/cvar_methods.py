@@ -5,10 +5,9 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-try:
-    import jax.numpy as jnp  # type: ignore
-except Exception:  # pragma: no cover
-    jnp = None
+import engines.mc.jax_backend as jax_backend
+
+
 
 
 def _cvar_empirical(pnl: np.ndarray, alpha: float = 0.05) -> float:
@@ -52,15 +51,17 @@ def _cvar_tail_inflate(pnl: np.ndarray, alpha: float = 0.05, inflate: float = 1.
 
 
 def cvar_ensemble(pnl: Sequence[float], alpha: float = 0.05) -> float:
-    if jnp is not None:
-        try:
+    # Attempt to initialize JAX lazily and use jnp if available
+    try:
+        jax_backend.ensure_jax()
+        jnp = jax_backend.jnp
+        if jnp is not None:
             x = jnp.asarray(pnl, dtype=jnp.float32)
             if x.size < 50:
                 return float(_cvar_jnp(x, alpha))
-            # Simplified ensemble for JAX to avoid bootstrap overhead
             return float(_cvar_jnp(x, alpha))
-        except Exception:
-            pass
+    except Exception:
+        pass
             
     x = np.asarray(pnl, dtype=np.float64)
     if x.size < 50:
@@ -72,9 +73,25 @@ def cvar_ensemble(pnl: Sequence[float], alpha: float = 0.05) -> float:
 
 
 def _cvar_jnp(x: "jnp.ndarray", alpha: float) -> "jnp.ndarray":  # type: ignore[name-defined]
+    """
+    JAX-compatible CVaR calculation.
+    Uses a mask-based approach to avoid dynamic slicing issues in JIT.
+    """
     if jnp is None:  # pragma: no cover
         raise RuntimeError("JAX is not available")
+    
     xs = jnp.sort(x)  # type: ignore[attr-defined]
-    k = jnp.asarray(xs.shape[0] * alpha, dtype=jnp.int32)  # type: ignore[attr-defined]
-    k = jnp.maximum(1, k)  # type: ignore[attr-defined]
-    return jnp.mean(xs[:k])  # type: ignore[attr-defined]
+    n = xs.shape[0]
+    
+    # Use mask-based approach for JIT compatibility
+    # Create a mask for the bottom alpha fraction
+    indices = jnp.arange(n)  # type: ignore[attr-defined]
+    threshold = n * alpha
+    mask = indices < threshold  # True for indices in the tail
+    
+    # Weighted mean: only consider tail values
+    # Add small epsilon to avoid division by zero
+    count = jnp.sum(mask) + 1e-8  # type: ignore[attr-defined]
+    cvar = jnp.sum(jnp.where(mask, xs, 0.0)) / count  # type: ignore[attr-defined]
+    
+    return cvar

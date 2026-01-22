@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import math
 from typing import Dict, Sequence
 
 import numpy as np
 
-from engines.mc.jax_backend import _JAX_OK, _jax_mc_device, jax, jnp, jrand
+from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand, DEV_MODE
 
 logger = logging.getLogger(__name__)
 
@@ -159,22 +160,72 @@ class MonteCarloPathSimulationMixin:
         df = float(getattr(self, "_student_t_df", self.default_student_t_df))
         br = getattr(self, "_bootstrap_returns", None)
         
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
+        # ✅ DEV_MODE: JAX 완전 비활성화
+        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK and not DEV_MODE
         
         if use_jax and _simulate_paths_price_batch_jax is not None:
-            # PRNGKeys for each symbol
-            # Generate keys more stable way
-            master_key = jrand.PRNGKey(int(seeds[0]) & 0xFFFFFFFF)
-            keys = jrand.split(master_key, len(seeds))
-            boot_jnp = None if br is None else jnp.asarray(br, dtype=jnp.float32)
+            try:
+                # Pre-padding on CPU: 고정 shape (num_symbols, n_paths, n_steps)
+                z_np = np.empty((num_symbols, n_paths_i, n_steps_i), dtype=np.float32)
+                for i in range(num_symbols):
+                    rng = np.random.default_rng(int(seeds[i]) & 0xFFFFFFFF)
+                    z_np[i] = self._sample_increments_np(
+                        rng,
+                        (n_paths_i, n_steps_i),
+                        mode=mode,
+                        df=df,
+                        bootstrap_returns=br,
+                    )
+
+                drifts_np = drifts[:, None, None].astype(np.float32, copy=False)
+                diffusions_np = diffusions[:, None, None].astype(np.float32, copy=False)
+                s0s_j = jnp.asarray(s0s, dtype=jnp.float32)[:, None, None]
+
+                # CPU pre-cumsum (Metal mhlo.pad 회피) + GPU exp
+                logret_np = np.cumsum(drifts_np + diffusions_np * z_np, axis=2, dtype=np.float64)
+                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                if not np.isfinite(logret_np).all() or np.any(np.abs(logret_np) > clip_val):
+                    logger.warning(
+                        "[MC] logret overflow/NaN detected in batch; applying clip "
+                        f"(+/-{clip_val}) and nan_to_num"
+                    )
+                logret_np = np.nan_to_num(logret_np, nan=0.0, posinf=clip_val, neginf=-clip_val)
+                logret_np = np.clip(logret_np, -clip_val, clip_val)
+                logret_j = jnp.asarray(logret_np, dtype=jnp.float32)
+                prices_1 = s0s_j * jnp.exp(logret_j)
+                prices_jnp = jnp.concatenate(
+                    [jnp.broadcast_to(s0s_j, (num_symbols, n_paths_i, 1)), prices_1],
+                    axis=2,
+                )
+                return prices_jnp
+            except Exception as e:
+                logger.warning(f"[MC] JAX batch path simulation failed, falling back to NumPy: {e}")
+                use_jax = False
+        
+        # NumPy fallback for DEV_MODE or when JAX is unavailable
+        paths_all = np.empty((num_symbols, n_paths_i, n_steps_i + 1), dtype=np.float64)
+        for i in range(num_symbols):
+            rng = np.random.default_rng(int(seeds[i]) & 0xFFFFFFFF)
             
-            # vmapped path generation
-            paths_jnp = _simulate_paths_price_batch_jax(
-                keys, s0s, drifts, diffusions, n_paths_i, n_steps_i, mode, df, boot_jnp
-            )
-            return paths_jnp
+            if mode == "bootstrap" and br is not None and len(br) > 0:
+                # Bootstrap sampling
+                idxs = rng.integers(0, len(br), size=(n_paths_i, n_steps_i))
+                innovations = br[idxs]
+            elif mode == "student_t" and df > 0:
+                # Student-t distribution
+                innovations = rng.standard_t(df, size=(n_paths_i, n_steps_i))
+            else:
+                # Normal distribution
+                innovations = rng.standard_normal(size=(n_paths_i, n_steps_i))
             
-        raise RuntimeError("JAX batch simulation requested but JAX is not available.")
+            # GBM path construction
+            log_returns = drifts[i] + diffusions[i] * innovations
+            log_prices = np.zeros((n_paths_i, n_steps_i + 1), dtype=np.float64)
+            log_prices[:, 0] = np.log(s0s[i])
+            log_prices[:, 1:] = np.cumsum(log_returns, axis=1) + np.log(s0s[i])
+            paths_all[i] = np.exp(log_prices)
+        
+        return paths_all
 
 
 
@@ -192,7 +243,7 @@ class MonteCarloPathSimulationMixin:
         fee_roundtrip: float,
     ) -> Dict[int, np.ndarray]:
         """
-        horizon별 net_pnl paths 반환
+        horizon별 net_pnl paths 반환 (JAX Metal 호환성 수정: 명시적 디바이스 지정 제거)
         """
         # ✅ Step A: MC 입력이 진짜 0인지 확인
         if not hasattr(self, "_sim_input_logged"):
@@ -202,7 +253,6 @@ class MonteCarloPathSimulationMixin:
                 f"dir={direction} dt={dt} horizons={list(horizons)} s0={s0:.2f} n_paths={n_paths}"
             )
         
-        rng = np.random.default_rng(seed)
         max_steps = int(max(horizons))
         drift = (mu - 0.5 * sigma * sigma) * dt
         diffusion = sigma * math.sqrt(dt)
@@ -214,50 +264,36 @@ class MonteCarloPathSimulationMixin:
 
         prices: np.ndarray
         if use_jax:
-            # ✅ GPU 우선: default backend (GPU/Metal) 사용
-            force_cpu_dev = _jax_mc_device()
             try:
-                if force_cpu_dev is None:
-                    # GPU/Metal default backend 사용
-                    key = jrand.PRNGKey(int(seed) & 0xFFFFFFFF)  # type: ignore[attr-defined]
-                    key, z_j = self._sample_increments_jax(
-                        key,
-                        (int(n_paths), int(max_steps)),
-                        mode=mode,
-                        df=df,
-                        bootstrap_returns=br,
-                    )
-                    if z_j is None:
-                        use_jax = False
-                    else:
-                        z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
-                        logret = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
-                        prices = float(s0) * jnp.exp(logret)  # type: ignore[attr-defined]
-                        prices = np.asarray(jax.device_get(prices), dtype=np.float64)  # type: ignore[attr-defined]
+                key = jrand.PRNGKey(int(seed) & 0xFFFFFFFF)  # type: ignore[attr-defined]
+                key, z_j = self._sample_increments_jax(
+                    key,
+                    (int(n_paths), int(max_steps)),
+                    mode=mode,
+                    df=df,
+                    bootstrap_returns=br,
+                )
+
+                if z_j is None:
+                    use_jax = False
                 else:
-                    # CPU로 강제된 경우만 CPU 사용 (env JAX_MC_DEVICE=cpu)
-                    with jax.default_device(force_cpu_dev):  # type: ignore[attr-defined]
-                        key = jrand.PRNGKey(int(seed) & 0xFFFFFFFF)  # type: ignore[attr-defined]
-                        key, z_j = self._sample_increments_jax(
-                            key,
-                            (int(n_paths), int(max_steps)),
-                            mode=mode,
-                            df=df,
-                            bootstrap_returns=br,
-                        )
-                        if z_j is None:
-                            use_jax = False
-                        else:
-                            z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
-                            logret = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
-                            prices = float(s0) * jnp.exp(logret)  # type: ignore[attr-defined]
-                            prices = np.asarray(jax.device_get(prices), dtype=np.float64)  # type: ignore[attr-defined]
-            except Exception:
+                    z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
+                    logret = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
+                    prices_jnp = float(s0) * jnp.exp(logret)  # type: ignore[attr-defined]
+                    prices = np.asarray(jax.device_get(prices_jnp), dtype=np.float64)  # type: ignore[attr-defined]
+            except Exception as e:
+                logger.warning(f"[MC] JAX path simulation failed, falling back to NumPy: {e}")
                 use_jax = False
 
-
         if not use_jax:
-            z = self._sample_increments_np(rng, (n_paths, max_steps), mode=mode, df=df, bootstrap_returns=br)
+            rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+            z = self._sample_increments_np(
+                rng,
+                (int(n_paths), int(max_steps)),
+                mode=mode,
+                df=df,
+                bootstrap_returns=br,
+            )
             logret = np.cumsum(drift + diffusion * z, axis=1)
             prices = s0 * np.exp(logret)
 

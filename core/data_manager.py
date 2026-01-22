@@ -12,7 +12,16 @@ class DataManager:
         # Use a dedicated public-data exchange when provided (so live orders can be testnet
         # while MC inputs match paper/mainnet market data distribution).
         self.exchange = data_exchange or getattr(orchestrator, "data_exchange", None) or orchestrator.exchange
-        self.symbols = symbols if symbols is not None else SYMBOLS
+        # Ensure symbols are canonical (accept user shorthand)
+        from utils.helpers import normalize_symbol
+
+        if symbols is not None:
+            raw_symbols = list(symbols)
+            self.symbols = [normalize_symbol(s) for s in symbols]
+            print(f"[DATA_DEBUG] DataManager.__init__: raw_symbols={raw_symbols[:3]} -> normalized={self.symbols[:3]}", flush=True)
+        else:
+            self.symbols = SYMBOLS
+            print(f"[DATA_DEBUG] DataManager.__init__: using config SYMBOLS={self.symbols[:3]}", flush=True)
         
         self.market = {s: {"price": None, "last": None, "bid": None, "ask": None, "ts": 0} for s in self.symbols}
         self.ohlcv_buffer = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in self.symbols}
@@ -33,7 +42,16 @@ class DataManager:
     def _valid_symbols(self):
         markets = getattr(self.exchange, "markets", {}) or {}
         if markets:
-            return [s for s in self.symbols if s in markets]
+            valid = [s for s in self.symbols if s in markets]
+            # 디버그: 심볼 매칭 상태 출력 (첫 5회만)
+            if not hasattr(self, "_valid_symbols_debug_count"):
+                self._valid_symbols_debug_count = 0
+            self._valid_symbols_debug_count += 1
+            if self._valid_symbols_debug_count <= 5:
+                missing = [s for s in self.symbols if s not in markets]
+                market_samples = list(markets.keys())[:5]
+                print(f"[DATA_DEBUG] _valid_symbols: self.symbols={self.symbols[:3]} | valid={valid[:3]} | missing={missing[:3]} | market_samples={market_samples}", flush=True)
+            return valid
         return list(self.symbols)
 
     async def fetch_prices_loop(self):
@@ -55,8 +73,17 @@ class DataManager:
                 ok_any = False
                 if count % 10 == 0:
                     print(f"DEBUG: valid_syms count={len(valid_syms)} samples={valid_syms[:2]}", flush=True)
+                    ticker_keys_sample = list(tickers.keys())[:5] if tickers else []
+                    print(f"DEBUG: tickers keys sample={ticker_keys_sample}", flush=True)
                     print(f"DEBUG: tickers sample for {valid_syms[0]}: {tickers.get(valid_syms[0])}", flush=True)
                 for s in valid_syms:
+                    base = s.split(":")[0] if isinstance(s, str) else s
+                    t = (tickers.get(s) or tickers.get(base) or {})
+                    # 추가 디버그: 첫 3회에는 ticker 매칭 상태 출력
+                    if count <= 3:
+                        t_direct = tickers.get(s)
+                        t_base = tickers.get(base)
+                        print(f"[TICKER_DEBUG] {s} | direct={t_direct is not None} | base={base} base_found={t_base is not None} | last={t.get('last')}", flush=True)
                     base = s.split(":")[0] if isinstance(s, str) else s
                     t = (tickers.get(s) or tickers.get(base) or {})
                     last = t.get("last")

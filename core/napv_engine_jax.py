@@ -7,9 +7,12 @@ Performance: ~10-20x faster than NumPy for batch operations.
 Author: Optimized for Apple Silicon (M4 Pro)
 """
 
-import jax
-import jax.numpy as jnp
-from jax import jit, vmap
+import numpy as np
+from typing import Dict, Tuple, Optional
+import dataclasses
+
+import engines.mc.jax_backend as jax_backend
+from engines.mc.jax_backend import lazy_jit
 import numpy as np
 from typing import Dict, Tuple, Optional
 import dataclasses
@@ -39,23 +42,37 @@ class NAPVEngineJAX:
     
     Computes Net Added Present Value for all symbols in parallel on GPU.
     Uses JIT compilation and vectorization for maximum performance.
+    
+    ✅ DEV_MODE=true일 때 NumPy fallback 사용
     """
     
     def __init__(self, config: Optional[NAPVConfig] = None):
         self.config = config or NAPVConfig()
+        # Lazily initialize JAX and compile kernels on first use
+        jax_backend.ensure_jax()
         
-        # Verify JAX Metal is available
-        self.device = jax.devices()[0]
+        # DEV_MODE: NumPy fallback
+        if jax_backend.DEV_MODE:
+            print("[NAPV_JAX] DEV_MODE enabled, using NumPy fallback")
+            self.device = "cpu"
+            self._use_numpy = True
+            return
+        
+        if jax_backend.jax is None:
+            raise RuntimeError("JAX not available for NAPVEngineJAX")
+
+        self._use_numpy = False
+        self.device = jax_backend.jax.devices()[0]
         print(f"[NAPV_JAX] Initialized on device: {self.device}")
-        
-        # JIT-compile core functions
-        self._napv_single_jit = jit(self._napv_single_core)
-        self._napv_batch_jit = jit(vmap(self._napv_single_core, in_axes=(0, 0, None, None, 0)))
+
+        # JIT-compile core functions using jax backend
+        self._napv_single_jit = jax_backend.jax.jit(self._napv_single_core)
+        self._napv_batch_jit = jax_backend.jax.jit(jax_backend.jax.vmap(self._napv_single_core, in_axes=(0, 0, None, None, 0)))
         
     @staticmethod
     def _napv_single_core(
-        horizons: jnp.ndarray,
-        ev_rates: jnp.ndarray,
+        horizons,
+        ev_rates,
         rho: float,
         r_f: float,
         cost: float
@@ -77,17 +94,18 @@ class NAPVEngineJAX:
         excess_yield = ev_rates - rho
         
         # Time discount factor: e^(-ρt)
+        jnp = jax_backend.jnp
         discount = jnp.exp(-rho * horizons)
-        
+
         # Time step sizes (dt)
         dt = jnp.diff(horizons, prepend=0.0)
-        
+
         # Cumulative discounted value: ∫[0→t] (r - ρ)·e^(-ρt) dt
         cumulative_value = jnp.cumsum(excess_yield * discount * dt)
-        
+
         # Net value after transaction cost
         net_value = cumulative_value - cost
-        
+
         # Find optimal exit time (maximum NAPV)
         idx_max = jnp.argmax(net_value)
         napv_max = net_value[idx_max]
@@ -118,19 +136,39 @@ class NAPVEngineJAX:
         """
         if horizons_sec is None or ev_rate_vector is None:
             return 0.0, 0.0
+        
+        # Select cost
+        cost = self.config.cost_exit_only if cost_mode == "exit_only" else self.config.cost_full
+        
+        # DEV_MODE: NumPy fallback
+        if getattr(self, '_use_numpy', False):
+            return self._napv_single_numpy(
+                np.asarray(horizons_sec, dtype=np.float32),
+                np.asarray(ev_rate_vector, dtype=np.float32),
+                rho, r_f, cost
+            )
             
         # Convert to JAX arrays
         h_jax = jnp.asarray(horizons_sec, dtype=jnp.float32)
         v_jax = jnp.asarray(ev_rate_vector, dtype=jnp.float32)
-        
-        # Select cost
-        cost = self.config.cost_exit_only if cost_mode == "exit_only" else self.config.cost_full
         
         # Compute on GPU
         napv, t_star = self._napv_single_jit(h_jax, v_jax, rho, r_f, cost)
         
         # Convert back to Python scalars
         return float(napv), float(t_star)
+    
+    @staticmethod
+    def _napv_single_numpy(horizons, ev_rates, rho: float, r_f: float, cost: float):
+        """NumPy fallback for NAPV calculation."""
+        # discount_factors: exp(-rho * t)
+        discount = np.exp(-rho * horizons)
+        # risk-free discount: exp(-r_f * t)
+        rf_discount = np.exp(-r_f * horizons)
+        # NAPV = sum(ev * discount) - cost
+        napv_values = ev_rates * discount * horizons - cost * rf_discount
+        i_max = int(np.argmax(napv_values))
+        return float(napv_values[i_max]), float(horizons[i_max])
     
     def calculate_batch(
         self,
@@ -158,6 +196,16 @@ class NAPVEngineJAX:
         Returns:
             Dict mapping symbol -> (napv, t_star)
         """
+        # DEV_MODE: NumPy fallback (sequential)
+        if getattr(self, '_use_numpy', False):
+            results = {}
+            for i, sym in enumerate(symbols):
+                napv, t_star = self._napv_single_numpy(
+                    horizons_batch[i], ev_rates_batch[i], rho, r_f, costs[i]
+                )
+                results[sym] = (napv, t_star)
+            return results
+        
         # Convert to JAX arrays
         h_jax = jnp.asarray(horizons_batch, dtype=jnp.float32)
         v_jax = jnp.asarray(ev_rates_batch, dtype=jnp.float32)

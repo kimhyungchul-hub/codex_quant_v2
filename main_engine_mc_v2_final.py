@@ -1,13 +1,50 @@
 from __future__ import annotations
+
+import os
+
+# [메모리 최적화 설정] JAX가 메모리를 무조건 선점하지 않도록 설정
+# 반드시 어떤 다른 모듈보다도 가장 먼저 위치해야 합니다.
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # 90% 선점 기능 끄기
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform" # 필요할 때만 메모리 할당
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.40" # 혹시 선점하더라도 최대 40%까지만
+
+import sys
+
+# ============================================================================
+# JAX Memory Preallocation Prevention (CRITICAL)
+# ============================================================================
+# These MUST be set BEFORE any module that imports JAX
+# ONLY WORKS with JAX 0.4.20 + jax-metal 0.0.5
+# Print immediately to confirm these are set BEFORE any imports
+print(f"🗃️ [BOOTSTRAP] JAX env set: PREALLOCATE={os.environ['XLA_PYTHON_CLIENT_PREALLOCATE']}, MEM_FRACTION={os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION', 'N/A')}")
+
+# Now import bootstrap (which validates version)
+import bootstrap
+
+from pathlib import Path
+import config
+from concurrent.futures import ThreadPoolExecutor
+
+# ============================================================================
+# GPU Thread Pool (prevents asyncio blocking during GPU operations)
+# ============================================================================
+# GPU 연산은 메인 asyncio 루프를 블로킹하므로 별도 스레드에서 실행
+GPU_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu_worker")
+
+# JAX platform 설정 - GPU 전용 모드 (CPU 폴백 없음)
+platform_env = os.environ.get("JAX_PLATFORMS", "").strip()
+if platform_env.lower() == "metal":
+    os.environ.pop("JAX_PLATFORMS", None)
+platform_name_env = os.environ.get("JAX_PLATFORM_NAME", "").strip()
+if platform_name_env.lower() == "metal":
+    os.environ.pop("JAX_PLATFORM_NAME", None)
+
 import asyncio
 import json
-import os
-import sys
 import time
 import math
 import random
 import numpy as np
-from pathlib import Path
 from collections import deque
 from typing import Optional
 from aiohttp import web
@@ -15,7 +52,13 @@ import ccxt.async_support as ccxt
 import aiohttp
 
 from engines.engine_hub import EngineHub
+from engines.remote_engine_hub import RemoteEngineHub, create_engine_hub
 from core.risk_manager import RiskManager
+
+
+# 원격 엔진 서버 사용 여부 (환경 변수로 제어)
+USE_REMOTE_ENGINE = os.environ.get("USE_REMOTE_ENGINE", "0").lower() in ("1", "true", "yes")
+ENGINE_SERVER_URL = os.environ.get("ENGINE_SERVER_URL", "http://localhost:8000")
 
 # -------------------------------------------------------------------
 # aiohttp 일부 macOS 환경에서 TCP keepalive 설정 시 OSError(22)가 날 수 있다.
@@ -39,14 +82,14 @@ from engines.mc_engine import mc_first_passage_tp_sl_jax
 from engines.mc_risk import compute_cvar, kelly_with_cvar, PyramidTracker, ExitPolicy, should_exit_position
 from regime import adjust_mu_sigma, time_regime, get_regime_mu_sigma
 from engines.running_stats import RunningStats
+from engines.kelly_allocator import KellyAllocator
+from core.continuous_opportunity import ContinuousOpportunityChecker
+from core.napv_engine_jax import get_napv_engine, NAPVEngineJAX
+from core.multi_timeframe_scoring import check_position_switching
 
 PORT = 9999
 
-SYMBOLS = [
-    "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",
-    "XRP/USDT:USDT", "ADA/USDT:USDT", "DOGE/USDT:USDT",
-    "AVAX/USDT:USDT", "DOT/USDT:USDT", "LINK/USDT:USDT"
-]
+SYMBOLS = list(config.SYMBOLS)
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_DIR = BASE_DIR / "templates"
@@ -102,6 +145,12 @@ EV_DROP = {"bull": 0.0010, "bear": 0.0010, "chop": 0.0008, "volatile": 0.0008}
 PSL_RISE = {"bull": 0.05, "bear": 0.05, "chop": 0.03, "volatile": 0.03}
 MAX_DRAWDOWN_LIMIT = 0.10           # Kill Switch 기준 (10% DD)
 EXECUTION_MODE = "maker_dynamic"   # maker_dynamic | market
+
+# ---- Portfolio Selection (TOP N 종목 선택)
+TOP_N_SYMBOLS = int(os.environ.get("TOP_N_SYMBOLS", "4"))  # 상위 N개 종목만 진입
+USE_KELLY_ALLOCATION = os.environ.get("USE_KELLY_ALLOCATION", "true").lower() in ("1", "true", "yes")
+USE_CONTINUOUS_OPPORTUNITY = os.environ.get("USE_CONTINUOUS_OPPORTUNITY", "true").lower() in ("1", "true", "yes")
+SWITCHING_COST_MULT = float(os.environ.get("SWITCHING_COST_MULT", "2.0"))  # 교체 비용 승수 (수수료 × 승수)
 MAKER_TIMEOUT_SEC = 2.0
 VOLATILITY_MARKET_THRESHOLD = 0.012
 
@@ -123,9 +172,13 @@ SPREAD_PAIRS = [
 # 스프레드 상한 (entry gate)
 SPREAD_PCT_MAX = 0.0005  # 0.05%
 
-# Bybit USDT-Perp 기본 수수료(보수적으로 Taker 가정)
-BYBIT_TAKER_FEE = 0.0006  # 0.06% per side
-BYBIT_MAKER_FEE = 0.0001  # 0.01% per side
+# Bybit USDT-Perp 기본 수수료
+# Maker 주문 우선 사용으로 수수료 절감 (0.12% → 0.02%)
+BYBIT_TAKER_FEE = 0.0006  # 0.06% per side (시장가)
+BYBIT_MAKER_FEE = 0.0001  # 0.01% per side (지정가)
+TAKER_FEE_RATE = BYBIT_TAKER_FEE  # alias for portfolio switching cost
+MAKER_FEE_RATE = BYBIT_MAKER_FEE  # alias for portfolio switching cost
+USE_MAKER_ORDERS = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
 
 # EV auto-tuning (p95 of recent EVs)
 EV_TUNE_WINDOW_SEC = 30 * 60   # 30 minutes
@@ -147,7 +200,13 @@ def now_ms() -> int:
 
 class LiveOrchestrator:
     def __init__(self, exchange):
-        self.hub = EngineHub()
+        # 환경 변수에 따라 로컬 또는 원격 엔진 허브 선택
+        if USE_REMOTE_ENGINE:
+            print(f"[LiveOrchestrator] Using RemoteEngineHub @ {ENGINE_SERVER_URL}")
+            self.hub = RemoteEngineHub(url=ENGINE_SERVER_URL, fallback_local=True)
+        else:
+            print("[LiveOrchestrator] Using local EngineHub")
+            self.hub = EngineHub()
         self.exchange = exchange
         self._net_sem = asyncio.Semaphore(MAX_INFLIGHT_REQ)
         self._ob_sem = asyncio.Semaphore(ORDERBOOK_MAX_INFLIGHT_REQ)
@@ -183,8 +242,9 @@ class LiveOrchestrator:
         # 수수료 설정 (Bybit taker/maker)
         self.fee_taker = BYBIT_TAKER_FEE
         self.fee_maker = BYBIT_MAKER_FEE
-        self.fee_mode = "taker"  # 기본 taker 가정
-        self._decision_log_every = 10
+        # Maker 주문 사용시 수수료 0.02% (왕복), Taker는 0.12%
+        self.fee_mode = "maker" if USE_MAKER_ORDERS else "taker"
+        self._decision_log_every = int(os.environ.get("DECISION_LOG_EVERY", "10"))
         self._decision_cycle = 0
         self.spread_pairs = SPREAD_PAIRS
         self.spread_enabled = SPREAD_ENABLED
@@ -254,16 +314,27 @@ class LiveOrchestrator:
         self._init_initial_equity()
         # 러닝 통계
         self.stats = RunningStats(maxlen=5000)
+        
+        # ---- Portfolio Management (TOP N 선택 + Kelly 배분 + 교체 비용 평가)
+        self.kelly_allocator = KellyAllocator(max_leverage=MAX_LEVERAGE, half_kelly=0.5)
+        self.opportunity_checker = ContinuousOpportunityChecker(self)
+        self.napv_engine = get_napv_engine()
+        self._symbol_scores: dict[str, float] = {}  # sym -> score (EV or NAPV)
+        self._symbol_ranks: dict[str, int] = {}     # sym -> rank (1=best)
+        self._top_n_symbols: list[str] = []         # TOP N 종목 리스트
+        self._last_ranking_ts = 0                   # 마지막 순위 갱신 시각
+        self._kelly_allocations: dict[str, float] = {}  # sym -> allocation weight
+        self._log(f"[INIT] Portfolio Management: TOP_N={TOP_N_SYMBOLS}, Kelly={USE_KELLY_ALLOCATION}, Opportunity={USE_CONTINUOUS_OPPORTUNITY}")
 
     def _log(self, text: str):
         ts = time.strftime("%H:%M:%S")
         self.logs.append({"time": ts, "level": "INFO", "msg": text})
-        print(text)
+        print(text, flush=True)
 
     def _log_err(self, text: str):
         ts = time.strftime("%H:%M:%S")
         self.logs.append({"time": ts, "level": "ERROR", "msg": text})
-        print(text)
+        print(text, flush=True)
 
     def _should_alert(self, key: str, *, now_ts: float | None = None, throttle_sec: int | float = ALERT_THROTTLE_SEC) -> bool:
         now_ts = time.time() if now_ts is None else float(now_ts)
@@ -505,6 +576,41 @@ class LiveOrchestrator:
         except Exception:
             return float(default)
 
+    @staticmethod
+    def _extract_filter_states(decision: dict) -> dict:
+        """decision 객체에서 filter_states 추출 (여러 위치에서 찾기)"""
+        # 기본값: 모든 필터 통과 (회색 표시)
+        default_filter_states = {
+            "napv": True,
+            "ev": True,
+            "winrate": True,
+            "cvar": True,
+            "event_cvar": True,
+            "direction": True,
+        }
+        
+        if not decision:
+            return default_filter_states
+        
+        # 1. decision 최상위
+        if decision.get("filter_states"):
+            return decision["filter_states"]
+        # 2. decision.meta
+        meta = decision.get("meta") or {}
+        if meta.get("filter_states"):
+            return meta["filter_states"]
+        # 3. decision.details 내부
+        for d in decision.get("details", []):
+            if isinstance(d, dict):
+                if d.get("filter_states"):
+                    return d["filter_states"]
+                # details 내부의 meta
+                dm = d.get("meta") or {}
+                if dm.get("filter_states"):
+                    return dm["filter_states"]
+        
+        # 아무것도 찾지 못하면 기본값 반환
+        return default_filter_states
     def _row(self, sym, price, ts, decision, candles, ctx=None):
         status = "WAIT"
         ai = "-"
@@ -580,7 +686,7 @@ class LiveOrchestrator:
         cvar_by_h = meta.get("cvar_by_horizon")
         horizon_seq = meta.get("horizon_seq")
 
-        return {
+        row = {
             "symbol": sym,
             "price": price,
             "status": status,
@@ -630,7 +736,23 @@ class LiveOrchestrator:
             "mc_hit_rate": self._safe_float(mc_meta.get("hit_rate", 0.0), 0.0),
 
             "details": (decision.get("details", []) if decision else []),
+            
+            # ✅ 진입 필터 상태 (신호등 표시용)
+            "filter_states": self._extract_filter_states(decision),
         }
+        
+        # 디버깅: filter_states 확인 (항상 로그 출력)
+        fs = self._extract_filter_states(decision)
+        if fs:
+            blocked = [k for k, v in fs.items() if v == False]
+            if blocked:
+                self._log(f"[FILTER] {sym} blocked: {blocked}")
+            else:
+                self._log(f"[FILTER] {sym} all_pass: {list(fs.keys())}")
+        else:
+            self._log(f"[FILTER] {sym} NO filter_states extracted!")
+        
+        return row
 
     def _total_open_notional(self) -> float:
         return sum(float(pos.get("notional", 0.0)) for pos in self.positions.values())
@@ -653,7 +775,8 @@ class LiveOrchestrator:
         ev = float(decision.get("ev", 0.0) or 0.0)
         win = float(decision.get("confidence", 0.0) or 0.0)
         ev_thr = float(meta.get("ev_entry_threshold", 0.0) or 0.0)
-        win_thr = float(meta.get("win_entry_threshold", 0.55) or 0.55)
+        # win_thr: 0.55 -> 0.50으로 완화 (EV가 합리적 수준으로 내려가면 50% 승률도 의미 있음)
+        win_thr = float(meta.get("win_entry_threshold", 0.50) or 0.50)
         ev_thr_dyn = meta.get("ev_entry_threshold_dyn")
         if ev_thr_dyn is not None:
             try:
@@ -683,7 +806,7 @@ class LiveOrchestrator:
             return False, "threshold"
         return True, ""
 
-    def _calc_position_size(self, decision: dict, price: float, leverage: float, size_frac_override: float | None = None) -> tuple[float, float, float]:
+    def _calc_position_size(self, decision: dict, price: float, leverage: float, size_frac_override: float | None = None, symbol: str | None = None) -> tuple[float, float, float]:
         meta = (decision or {}).get("meta", {}) or {}
         size_frac = size_frac_override if size_frac_override is not None else decision.get("size_frac") or meta.get("size_fraction") or self.default_size_frac
         cap_frac = meta.get("regime_cap_frac")
@@ -692,6 +815,13 @@ class LiveOrchestrator:
                 size_frac = min(size_frac, float(cap_frac))
             except Exception:
                 pass
+        
+        # ---- Kelly 배분 적용 (TOP N 선택된 심볼에 대해) ----
+        if USE_KELLY_ALLOCATION and symbol and symbol in self._kelly_allocations:
+            kelly_frac = self._kelly_allocations[symbol]
+            # Kelly 비중을 size_frac에 곱해서 적용 (전체 자본 중 해당 심볼 할당 비율)
+            size_frac = size_frac * kelly_frac
+        
         # 상한 제거: 신호가 강하면 엔진이 제시한 비중을 그대로 사용
         size_frac = float(max(0.0, size_frac))
         notional = float(max(0.0, self.balance * size_frac * leverage))
@@ -939,7 +1069,7 @@ class LiveOrchestrator:
         leverage_override: float | None = None,
     ):
         lev = leverage_override if leverage_override is not None else self.leverage
-        size_frac, notional, qty = self._calc_position_size(decision, price, lev, size_frac_override=size_frac_override)
+        size_frac, notional, qty = self._calc_position_size(decision, price, lev, size_frac_override=size_frac_override, symbol=sym)
         can_enter, reason = self._can_enter_position(notional)
         if not can_enter or qty <= 0:
             self._log(f"[{sym}] skip entry ({reason})")
@@ -1081,7 +1211,7 @@ class LiveOrchestrator:
         if not pos or price is None:
             return
         lev = leverage_override if leverage_override is not None else pos.get("leverage", self.leverage)
-        target_size_frac, target_notional, target_qty = self._calc_position_size(decision, price, lev)
+        target_size_frac, target_notional, target_qty = self._calc_position_size(decision, price, lev, symbol=sym)
         if target_notional <= 0:
             # 목표 노출이 0이면 전량 청산
             self._close_position(sym, price, "rebalance to zero")
@@ -1455,6 +1585,419 @@ class LiveOrchestrator:
                 self._log(f"[SPREAD] {base}/{quote} z={z:.2f} -> {base_side}/{quote_side}")
                 self._last_actions[base] = "SPREAD_ENTER"
                 self._last_actions[quote] = "SPREAD_ENTER"
+
+    # ======================================================================
+    # [REFACTOR] 3-Stage Decision Pipeline: Context → Decide → Apply
+    # ======================================================================
+
+    def _build_decision_context(self, sym: str, ts: int) -> dict | None:
+        """
+        Stage 1: 단일 심볼에 대한 의사결정 컨텍스트 생성.
+        Returns None if symbol data is not ready (e.g., price=None).
+        """
+        price = self.market[sym]["price"]
+        closes = list(self.ohlcv_buffer[sym])
+        candles = len(closes)
+
+        if price is None:
+            return None
+
+        mu_bar, sigma_bar = self._compute_returns_and_vol(closes)
+        regime = self._infer_regime(closes)
+
+        # Orderbook spread
+        spread_pct = None
+        ob = self.orderbook.get(sym)
+        if ob and ob.get("ready"):
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if bids and asks and len(bids[0]) >= 2 and len(asks[0]) >= 2:
+                bid = float(bids[0][0])
+                ask = float(asks[0][0])
+                mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
+                if mid > 0:
+                    spread_pct = (ask - bid) / mid
+
+        # Annualized μ/σ
+        mu_base, sigma = (0.0, 0.0)
+        if mu_bar is not None and sigma_bar is not None:
+            mu_base, sigma = self._annualize_mu_sigma(mu_bar, sigma_bar, bar_seconds=60.0)
+
+        # Regime table blend
+        session = time_regime()
+        mu_tab, sig_tab = get_regime_mu_sigma(regime, session, symbol=sym)
+        if mu_tab is not None and sig_tab is not None:
+            w = 0.35
+            mu_base = float((1.0 - w) * float(mu_base) + w * float(mu_tab))
+            sigma = float(max(1e-6, (1.0 - w) * float(sigma) + w * float(sig_tab)))
+
+        ofi_score = float(self._compute_ofi_score(sym))
+        tuner = getattr(self, "tuner", None)
+        regime_params = None
+        if tuner and hasattr(tuner, "get_params"):
+            try:
+                regime_params = tuner.get_params(regime)
+            except Exception:
+                pass
+
+        # Bootstrap returns for tail
+        bootstrap_returns = None
+        if closes is not None and len(closes) >= 64:
+            try:
+                x = np.asarray(closes, dtype=np.float64)
+                bootstrap_returns = np.diff(np.log(np.maximum(x, 1e-12))).astype(np.float64)[-512:]
+            except Exception:
+                pass
+
+        is_dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
+
+        return {
+            "symbol": sym,
+            "price": float(price),
+            "bar_seconds": 60.0,
+            "closes": closes,
+            "candles": candles,
+            "direction": self._direction_bias(closes),
+            "regime": regime,
+            "ofi_score": float(ofi_score),
+            "liquidity_score": self._liquidity_score(sym),
+            "leverage": None,
+            "mu_base": float(mu_base),
+            "sigma": float(max(sigma, 0.0)),
+            "regime_params": regime_params,
+            "session": session,
+            "spread_pct": spread_pct,
+            "use_jax": not is_dev_mode,
+            "tail_mode": "student_t",
+            "tail_model": "student_t",
+            "tail_df": 6.0,
+            "student_t_df": 6.0,
+            "bootstrap_returns": bootstrap_returns,
+            "ev": None,
+        }
+
+    def _apply_decision(
+        self,
+        sym: str,
+        decision: dict,
+        ctx: dict,
+        ts: int,
+        log_this_cycle: bool,
+    ) -> dict:
+        """
+        Stage 3: 의사결정 결과를 포지션/주문에 적용.
+        Returns a row dict for dashboard broadcast.
+        개별 심볼 예외는 내부에서 격리하여 처리.
+        """
+        price = ctx["price"]
+        candles = ctx.get("candles", 0)
+        regime = ctx.get("regime", "chop")
+        session = ctx.get("session", "OFF")
+        ofi_score = ctx.get("ofi_score", 0.0)
+
+        try:
+            # DEBUG: TP/SL keys from decision.meta
+            if log_this_cycle and decision:
+                meta = decision.get("meta") or {}
+                keys = [
+                    "mc_tp", "mc_sl", "tp", "sl",
+                    "profit_target", "stop_loss",
+                    "tp_pct", "sl_pct", "params",
+                ]
+                picked = {}
+                for k in keys:
+                    if k in meta:
+                        picked[k] = meta.get(k)
+                params = meta.get("params") or {}
+                if isinstance(params, dict):
+                    for k in ["profit_target", "stop_loss", "tp_pct", "sl_pct", "tp", "sl", "n_paths"]:
+                        if k in params:
+                            picked[f"params.{k}"] = params.get(k)
+                self._log(f"[DBG_META_TPSL] {sym} action={decision.get('action')} picked={json.dumps(picked, ensure_ascii=False)}")
+
+            ctx["ev"] = decision.get("ev", 0.0)
+            side = decision.get("action_type") or decision.get("action")
+
+            # MC cache
+            price_bucket = round(float(price), 3)
+            cache_key = (sym, side, regime, price_bucket)
+            now_cache = time.time()
+            cached = self.mc_cache.get(cache_key)
+            if cached and (now_cache - cached[0] <= self.mc_cache_ttl):
+                decision_meta = decision.get("meta") or {}
+                decision_meta.update(cached[1])
+                decision["meta"] = decision_meta
+            else:
+                self.mc_cache[cache_key] = (now_cache, decision.get("meta", {}))
+
+            # Running stats update
+            def _s(val, default=0.0):
+                try:
+                    return float(val) if val is not None else float(default)
+                except Exception:
+                    return float(default)
+
+            self.stats.push("ev", (regime, session), _s(decision.get("ev")))
+            self.stats.push("cvar", (regime, session), _s(decision.get("cvar")))
+            spread_val = _s(decision.get("meta", {}).get("spread_pct", ctx.get("spread_pct")), 0.0)
+            self.stats.push("spread", (regime, session), spread_val)
+            self.stats.push("liq", (regime, session), _s(self._liquidity_score(sym)))
+            self.stats.push("ofi", (regime, session), _s(ofi_score))
+            ofi_mean = self.stats.ema_update("ofi_mean", (regime, session), ofi_score, half_life_sec=900)
+            ofi_res = ofi_score - ofi_mean
+            self.stats.push("ofi_res", (regime, session), ofi_res)
+
+            # Dynamic leverage
+            dyn_leverage = float(decision.get("leverage") or decision.get("meta", {}).get("lev") or self.leverage)
+            ctx["leverage"] = dyn_leverage
+
+            # Regime size cap
+            cap_map = {"bull": 0.25, "bear": 0.25, "chop": 0.10, "volatile": 0.08}
+            cap_frac_regime = cap_map.get(regime, 0.10)
+            decision = dict(decision)
+            decision_meta = dict(decision.get("meta") or {})
+            decision_meta["regime_cap_frac"] = cap_frac_regime
+            decision["meta"] = decision_meta
+            sz = decision.get("size_frac") or decision_meta.get("size_fraction") or self.default_size_frac
+            decision["size_frac"] = float(min(max(0.0, sz), cap_frac_regime))
+
+            # Hard gates: spread_pct, event_cvar_r
+            spread_pct_now = decision_meta.get("spread_pct", ctx.get("spread_pct"))
+            ev_cvar_r = decision_meta.get("event_cvar_r")
+            spread_cap_map = {"bull": 0.0020, "bear": 0.0020, "chop": 0.0012, "volatile": 0.0008}
+            spread_cap = spread_cap_map.get(regime, SPREAD_PCT_MAX)
+            if spread_pct_now is not None and spread_cap is not None and spread_pct_now > spread_cap:
+                decision["action"] = "WAIT"
+                decision["reason"] = f"{decision.get('reason', '')} | spread_cap"
+
+            cvar_floor_map = {"bull": -1.2, "bear": -1.2, "chop": -1.0, "volatile": -0.8}
+            cvar_floor_regime = cvar_floor_map.get(regime, -1.0)
+            if ev_cvar_r is not None and ev_cvar_r < cvar_floor_regime:
+                decision["action"] = "WAIT"
+                decision["reason"] = f"{decision.get('reason', '')} | event_cvar_floor"
+
+            # Dynamic EV entry threshold
+            ev_net_now = float(decision.get("ev", 0.0) or 0.0)
+            hist_sym = self._ev_tune_hist[sym]
+            hist_sym.append((ts, ev_net_now))
+            cutoff = ts - int(EV_TUNE_WINDOW_SEC * 1000)
+            while hist_sym and hist_sym[0][0] < cutoff:
+                hist_sym.popleft()
+
+            regime_key = (regime or "chop", session or "OFF")
+            hist_reg = self._ev_regime_hist.setdefault(regime_key, deque(maxlen=4000))
+            hist_reg.append((ts, ev_net_now))
+            while hist_reg and hist_reg[0][0] < cutoff:
+                hist_reg.popleft()
+
+            dyn_enter_floor = None
+            ev_vals = [x[1] for x in hist_reg]
+            if len(ev_vals) >= EV_TUNE_MIN_SAMPLES:
+                try:
+                    raw_thr = float(np.percentile(ev_vals, 80))
+                    prev = self._ev_thr_ema.get(regime_key)
+                    prev_ts = self._ev_thr_ema_ts.get(regime_key, ts)
+                    dt_sec = max(1.0, (ts - prev_ts) / 1000.0)
+                    alpha = 1.0 - math.exp(-math.log(2) * dt_sec / 600.0)
+                    ema = raw_thr if prev is None else (alpha * raw_thr + (1 - alpha) * prev)
+                    ema = float(max(EV_ENTER_FLOOR_MIN, min(EV_ENTER_FLOOR_MAX, ema)))
+                    self._ev_thr_ema[regime_key] = ema
+                    self._ev_thr_ema_ts[regime_key] = ts
+                    dyn_enter_floor = ema
+                except Exception:
+                    pass
+
+            if dyn_enter_floor is not None:
+                decision = dict(decision)
+                meta_tmp = dict(decision.get("meta") or {})
+                meta_tmp["ev_entry_threshold_dyn"] = dyn_enter_floor
+                decision["meta"] = meta_tmp
+
+            # Consensus action
+            consensus_action, consensus_score = self._consensus_action(decision, ctx)
+            if decision.get("action") == "WAIT" and consensus_action in ("LONG", "SHORT") and decision.get("ev", 0.0) > 0 and decision.get("confidence", 0.0) >= 0.60:
+                decision = dict(decision)
+                decision["action"] = consensus_action
+                decision["reason"] = f"{decision.get('reason', '')} | consensus {consensus_action} score={consensus_score:.2f}"
+                decision["details"] = decision.get("details", [])
+                decision["details"].append({
+                    "_engine": "consensus",
+                    "_weight": 0.5,
+                    "action": consensus_action,
+                    "ev": decision.get("ev", 0.0),
+                    "confidence": decision.get("confidence", 0.0),
+                    "reason": f"consensus {consensus_score:.2f}",
+                    "meta": {"consensus_score": consensus_score, "consensus_used": True},
+                })
+                decision["size_frac"] = decision.get("size_frac") or decision.get("meta", {}).get("size_fraction") or self.default_size_frac
+
+            # HOLD/EXIT using event MC
+            exited_by_event = False
+            pos = self.positions.get(sym)
+            if pos and decision and ctx.get("mu_base") is not None and ctx.get("sigma", 0.0) > 0:
+                exited_by_event = self._evaluate_event_exit(sym, pos, decision, ctx, ts, price)
+
+            # Policy-based event MC exit
+            if (not exited_by_event) and sym in self.positions and decision:
+                pos = self.positions.get(sym) or {}
+                meta = decision.get("meta") or {}
+                age_sec = (ts - int(pos.get("entry_time", ts))) / 1000.0
+                do_exit, reason = should_exit_position(pos, meta, age_sec=age_sec, policy=self.exit_policy)
+                if do_exit:
+                    self._close_position(sym, float(price), f"MC_EXIT:{reason}")
+                    exited_by_event = True
+                else:
+                    exited_by_event = self._check_ema_ev_exit(sym, decision, regime, price, ts)
+
+            self._maybe_exit_position(sym, float(price), decision, ts)
+
+            # Update leverage on open positions
+            if sym in self.positions:
+                self.positions[sym]["leverage"] = dyn_leverage
+
+            if not exited_by_event:
+                if decision.get("action") in ("LONG", "SHORT") and sym in self.positions:
+                    self._rebalance_position(sym, float(price), decision, leverage_override=dyn_leverage)
+
+                # EV drop exit
+                if sym in self.positions:
+                    exited_by_event = self._check_ev_drop_exit(sym, decision, regime, price, ts)
+
+                if decision.get("action") in ("LONG", "SHORT") and sym not in self.positions:
+                    permit, deny_reason = self._entry_permit(sym, decision, ts)
+                    if permit:
+                        self._enter_position(sym, decision["action"], float(price), decision, ts, ctx=ctx, leverage_override=dyn_leverage)
+                    else:
+                        if log_this_cycle:
+                            self._log(f"[{sym}] skip entry (permit: {deny_reason}) ev={decision.get('ev', 0):.4f} win={decision.get('confidence', 0):.2f}")
+
+            if log_this_cycle and decision:
+                meta = decision.get("meta") or {}
+                self._log(
+                    f"[DECISION] {sym} action={decision.get('action')} "
+                    f"ev={decision.get('ev', 0.0):.4f} "
+                    f"win={decision.get('confidence', 0.0):.2f} "
+                    f"size={decision.get('size_frac', meta.get('size_fraction', 0.0)):.3f} "
+                    f"reason={decision.get('reason', '')}"
+                )
+
+            return self._row(sym, float(price), ts, decision, candles)
+
+        except Exception as e:
+            import traceback
+            err_text = f"{e} {traceback.format_exc()}"
+            self._log_err(f"[ERR] _apply_decision {sym}: {err_text}")
+            self._note_runtime_error(f"apply_decision:{sym}", err_text)
+            return self._row(sym, ctx.get("price"), ts, None, ctx.get("candles", 0))
+
+    def _evaluate_event_exit(self, sym: str, pos: dict, decision: dict, ctx: dict, ts: int, price: float) -> bool:
+        """Event-based MC exit evaluation. Returns True if exited."""
+        mu_evt, sigma_evt = adjust_mu_sigma(
+            float(ctx.get("mu_base", 0.0)),
+            float(ctx.get("sigma", 0.0)),
+            str(ctx.get("regime", "chop")),
+        )
+        seed_evt = int(time.time()) ^ hash(sym)
+        entry = float(pos.get("entry_price", price))
+        price_now = float(price)
+
+        meta = decision.get("meta") or {}
+        if not meta:
+            for d in decision.get("details", []):
+                if d.get("_engine") in ("mc_barrier", "mc_engine", "mc"):
+                    meta = d.get("meta") or {}
+                    break
+        params_meta = meta.get("params") or {}
+        tp_pct = decision.get("mc_tp") or meta.get("mc_tp") or params_meta.get("profit_target") or 0.001
+        sl_pct = decision.get("mc_sl") or meta.get("mc_sl") or (tp_pct * 0.8)
+        tp_pct = float(max(tp_pct, 1e-6))
+        sl_pct = float(max(sl_pct, 1e-6))
+
+        tp_rem = max((entry * (1 + tp_pct) / price_now) - 1.0, 1e-6)
+        sl_rem = max(1.0 - (entry * (1 - sl_pct) / price_now), 1e-6)
+
+        m_evt = mc_first_passage_tp_sl_jax(
+            s0=price_now,
+            tp_pct=tp_rem,
+            sl_pct=sl_rem,
+            mu=mu_evt,
+            sigma=sigma_evt,
+            dt=1.0,
+            max_steps=240,
+            n_paths=int(decision.get("n_paths", meta.get("params", {}).get("n_paths", 2048))),
+            seed=seed_evt,
+            dist=ctx.get("tail_model", "student_t"),
+            df=ctx.get("tail_df", 6.0),
+            boot_rets=ctx.get("bootstrap_returns"),
+        )
+
+        if m_evt:
+            ev_r_evt = float(m_evt.get("event_ev_r", 0.0) or 0.0)
+            cvar_r_evt = float(m_evt.get("event_cvar_r", 0.0) or 0.0)
+            p_sl_evt = float(m_evt.get("event_p_sl", 0.0) or 0.0)
+            ev_pct_evt = ev_r_evt * sl_rem
+            cvar_pct_evt = cvar_r_evt * sl_rem
+        else:
+            ev_pct_evt, cvar_pct_evt, p_sl_evt = 0.0, 0.0, 0.0
+
+        if m_evt and ((ev_pct_evt < -0.0005) or (cvar_pct_evt < -0.006) or p_sl_evt >= 0.55):
+            self._log(
+                f"[{sym}] EXIT by MC "
+                f"(EV%={ev_pct_evt*100:.2f}%, "
+                f"CVaR%={cvar_pct_evt*100:.2f}%, "
+                f"P_SL={p_sl_evt:.2f})"
+            )
+            self._close_position(sym, price_now, "event_mc_exit")
+            return True
+        return False
+
+    def _check_ema_ev_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
+        """EMA-based EV/PSL deterioration exit. Returns True if exited."""
+        meta = decision.get("meta") or {}
+        ev_now = float(decision.get("ev", 0.0) or 0.0)
+        p_sl_now = float(meta.get("event_p_sl", 0.0) or 0.0)
+        ev_ema = self._ema_update(self._ema_ev, sym, ev_now, half_life_sec=30, ts_ms=ts)
+        psl_ema = self._ema_update(self._ema_psl, sym, p_sl_now, half_life_sec=30, ts_ms=ts)
+        d_ev = ev_now - ev_ema
+        d_psl = p_sl_now - psl_ema
+        ev_floor_reg = EV_EXIT_FLOOR.get(regime, -0.0002)
+        ev_drop_reg = EV_DROP.get(regime, 0.0008)
+        psl_rise_reg = PSL_RISE.get(regime, 0.03)
+        persist_need = 1 if regime in ("bull", "bear") else 2
+
+        if (ev_now < ev_floor_reg) and (d_ev < -ev_drop_reg) and (d_psl > psl_rise_reg):
+            self._exit_bad_ticks[sym] = self._exit_bad_ticks.get(sym, 0) + 1
+        else:
+            self._exit_bad_ticks[sym] = 0
+
+        if self._exit_bad_ticks[sym] >= persist_need:
+            self._close_position(sym, float(price), "ev_psl_ema_exit", exit_kind="RISK")
+            return True
+        return False
+
+    def _check_ev_drop_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
+        """EV drop exit logic. Returns True if exited."""
+        ev_now = float(decision.get("ev", 0.0) or 0.0)
+        meta_now = decision.get("meta") or {}
+        ev_floor = float(meta_now.get("ev_entry_threshold_dyn") or meta_now.get("ev_entry_threshold") or 0.0)
+        prev_ev = self._ev_drop_state[sym].get("prev")
+        delta_ev = None
+        if prev_ev is not None:
+            delta_ev = ev_now - prev_ev
+
+        strong_signal = decision.get("confidence", 0.0) >= 0.65
+        needed_ticks = 1 if strong_signal else 2
+        if ev_now < ev_floor and (delta_ev is not None) and (delta_ev < -EV_DROP_THRESHOLD):
+            self._ev_drop_state[sym]["streak"] += 1
+        else:
+            self._ev_drop_state[sym]["streak"] = 0
+        self._ev_drop_state[sym]["prev"] = ev_now
+
+        if self._ev_drop_state[sym]["streak"] >= needed_ticks:
+            self._close_position(sym, float(price), "ev_drop_exit", exit_kind="RISK")
+            return True
+        return False
+
     def _decide_v3(self, ctx: dict) -> dict:
         """
         v3 flow:
@@ -1546,6 +2089,13 @@ class LiveOrchestrator:
         win1 = float(decision1.get("confidence", 0.0) or 0.0)
         cvar1 = float(decision1.get("cvar", 0.0) or 0.0)
         meta1 = decision1.get("meta") or {}
+        
+        # ✅ DEBUG: Log MC direction vs alpha_side for verification
+        mc_dir_stage3 = int(meta1.get("direction", 0))
+        mc_side_stage3 = "LONG" if mc_dir_stage3 == 1 else "SHORT" if mc_dir_stage3 == -1 else "WAIT"
+        mu_alpha = float(meta1.get("mu_alpha", 0.0) or 0.0)
+        if mc_side_stage3 != alpha_side:
+            print(f"[DIR_MISMATCH] {sym} | alpha_side={alpha_side} mc_side={mc_side_stage3} mu={mu_alpha:.4f} (MC direction will be used)", flush=True)
 
         p_sl = float(meta1.get("event_p_sl", 0.0) or 0.0)
         event_cvar_r = meta1.get("event_cvar_r")
@@ -1600,9 +2150,22 @@ class LiveOrchestrator:
         ctxF["leverage"] = lev
         decisionF = self.hub.decide(ctxF)
 
-        # enforce alpha side: if hub returns opposite, prefer alpha side unless you want flip logic
+        # ✅ FIX: Use MC engine's direction (from EV comparison), NOT alpha_side from _direction_bias
+        # MC engine calculates ev_long vs ev_short based on mu (drift), which is the true signal
         decisionF = dict(decisionF)
-        decisionF["action"] = alpha_side if decisionF.get("action") in ("LONG", "SHORT") else "WAIT"
+        mc_direction = int((decisionF.get("meta") or {}).get("direction", 0))
+        if mc_direction == 1:
+            mc_side = "LONG"
+        elif mc_direction == -1:
+            mc_side = "SHORT"
+        else:
+            mc_side = "WAIT"
+        
+        # Only use mc_side if MC engine gave a valid direction, otherwise fall back to WAIT
+        if decisionF.get("action") in ("LONG", "SHORT") and mc_side in ("LONG", "SHORT"):
+            decisionF["action"] = mc_side
+        else:
+            decisionF["action"] = "WAIT"
 
         metaF = dict(decisionF.get("meta") or {})
         metaF.update({
@@ -1836,6 +2399,10 @@ class LiveOrchestrator:
 
     async def broadcast(self, rows):
         try:
+            # DEBUG: rows 개수 확인
+            if not rows:
+                self._log("[WARN] broadcast: rows empty!")
+            
             equity, unreal, util, pos_list = self._compute_portfolio()
             if self.risk_manager.check_emergency_stop(equity):
                 self._register_anomaly("kill_switch", "critical", f"DD stop triggered equity={equity:.2f}")
@@ -1893,409 +2460,192 @@ class LiveOrchestrator:
             self._note_runtime_error("broadcast", err_text)
 
     async def decision_loop(self):
+        """
+        [REFACTORED] 3-Stage Decision Pipeline:
+          1. Context Collection: _build_decision_context() per symbol
+          2. Batch Decision: hub.decide_batch(ctx_list)
+          3. Result Application: _apply_decision() per symbol (isolated exceptions)
+        """
         while True:
             rows = []
             ts = now_ms()
             self._decision_cycle = (self._decision_cycle + 1) % self._decision_log_every
             log_this_cycle = (self._decision_cycle == 0)
-            try:
-                for sym in SYMBOLS:
-                    price = self.market[sym]["price"]
-                    closes = list(self.ohlcv_buffer[sym])
-                    candles = len(closes)
 
-                    if price is None:
+            # ====== Stage 1: Context Collection ======
+            ctx_list = []
+            ctx_sym_map = {}  # sym -> ctx for later lookup
+
+            for sym in SYMBOLS:
+                try:
+                    ctx = self._build_decision_context(sym, ts)
+                    if ctx is None:
+                        # Price not ready
+                        candles = len(self.ohlcv_buffer[sym])
                         rows.append(self._row(sym, None, ts, None, candles))
                         continue
+                    ctx_list.append(ctx)
+                    ctx_sym_map[sym] = ctx
+                except Exception as e:
+                    self._log_err(f"[ERR] build_ctx {sym}: {e}")
+                    candles = len(self.ohlcv_buffer[sym])
+                    rows.append(self._row(sym, None, ts, None, candles))
 
-                    mu_bar, sigma_bar = self._compute_returns_and_vol(closes)
-                    regime = self._infer_regime(closes)
+            # ====== Stage 2: Batch Decision Execution (GPU in separate thread) ======
+            batch_decisions = []
+            if ctx_list:
+                try:
+                    # GPU 연산을 별도 스레드에서 실행하여 asyncio 블로킹 방지
+                    loop = asyncio.get_event_loop()
+                    batch_decisions = await loop.run_in_executor(
+                        GPU_EXECUTOR, 
+                        self.hub.decide_batch, 
+                        ctx_list
+                    )
+                except Exception as e:
+                    import traceback
+                    self._log_err(f"[ERR] decide_batch: {e} {traceback.format_exc()}")
+                    self._note_runtime_error("decide_batch", str(e))
+                    # Fallback: create empty decisions
+                    batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_error"} for _ in ctx_list]
 
-                    spread_pct = None
-                    ob = self.orderbook.get(sym)
-                    if ob and ob.get("ready"):
-                        bids = ob.get("bids") or []
-                        asks = ob.get("asks") or []
-                        if bids and asks and len(bids[0]) >= 2 and len(asks[0]) >= 2:
-                            bid = float(bids[0][0])
-                            ask = float(asks[0][0])
-                            mid = (bid + ask) / 2.0 if (bid and ask) else 0.0
-                            if mid > 0:
-                                spread_pct = (ask - bid) / mid
+            # ====== Stage 2.5: Portfolio Ranking & TOP N Selection + Kelly Allocation ======
+            if batch_decisions and USE_KELLY_ALLOCATION:
+                try:
+                    # 2.5.1 — 모든 심볼의 EV 수집 (EV 기반 Kelly 배분)
+                    sym_ev_map: dict[str, float] = {}
+                    
+                    for i, dec in enumerate(batch_decisions):
+                        sym = ctx_list[i]["symbol"]
+                        # decision dict에서 ev 직접 추출 (절대값 사용)
+                        ev_val = abs(float(dec.get("ev", 0.0) or 0.0))
+                        # ev_raw도 확인 (더 정확한 값일 수 있음)
+                        ev_raw = abs(float(dec.get("ev_raw", ev_val) or ev_val))
+                        sym_ev_map[sym] = max(ev_val, ev_raw)
+                    
+                    # 2.5.2 — EV 기준 순위 정렬 및 TOP N 선택
+                    sorted_syms = sorted(sym_ev_map.keys(), key=lambda s: sym_ev_map[s], reverse=True)
+                    self._symbol_scores = sym_ev_map.copy()
+                    self._symbol_ranks = {s: rank + 1 for rank, s in enumerate(sorted_syms)}
+                    self._top_n_symbols = sorted_syms[:TOP_N_SYMBOLS]
+                    
+                    # Always log TOP N selection (critical for debugging)
+                    top_info = [(s, f"{sym_ev_map[s]:.4f}") for s in self._top_n_symbols]
+                    self._log(f"[PORTFOLIO] TOP {TOP_N_SYMBOLS}: {top_info}")
+                    
+                    # 2.5.3 — Kelly 배분 계산 (EV 비례 배분)
+                    if self._top_n_symbols:
+                        import numpy as np
+                        n_top = len(self._top_n_symbols)
+                        
+                        # EV 기반 Kelly 배분 (EV가 높을수록 더 많은 자본 배분)
+                        evs = np.array([sym_ev_map[s] for s in self._top_n_symbols])
+                        self._log(f"[KELLY_DEBUG] EVs for TOP {n_top}: {dict(zip(self._top_n_symbols, evs.tolist()))}")
+                        
+                        # EV 비례 배분 (음수 EV는 0으로 처리)
+                        evs_positive = np.clip(evs, 0, None)
+                        total_ev = evs_positive.sum()
+                        
+                        if total_ev > 0:
+                            # EV 비례 배분 (더 높은 EV → 더 많은 자본)
+                            kelly_norm = evs_positive / total_ev
+                        else:
+                            # EV가 모두 0이거나 음수면 균등 배분
+                            kelly_norm = np.ones(n_top) / n_top
+                        
+                        self._kelly_allocations = {s: float(kelly_norm[i]) for i, s in enumerate(self._top_n_symbols)}
+                        
+                        # Always log Kelly allocations (critical for debugging)
+                        alloc_info = [(s, f"{self._kelly_allocations[s]:.2%}") for s in self._top_n_symbols]
+                        self._log(f"[KELLY] Allocations: {alloc_info}")
+                    
+                    # 2.5.4 — TOP N에 없는 심볼의 진입 차단 (action을 WAIT로 변경)
+                    for i, dec in enumerate(batch_decisions):
+                        sym = ctx_list[i]["symbol"]
+                        action = dec.get("action", "WAIT")
+                        
+                        if action in ("LONG", "SHORT") and sym not in self._top_n_symbols:
+                            # 현재 포지션이 없는 경우에만 차단 (기존 포지션 청산은 허용)
+                            pos = self.positions.get(sym, {})
+                            if pos.get("qty", 0) == 0:
+                                dec["action"] = "WAIT"
+                                dec["reason"] = f"NOT_IN_TOP_{TOP_N_SYMBOLS}"
+                                # Always log blocked symbols (critical for debugging)
+                                self._log(f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT (not in TOP {TOP_N_SYMBOLS})")
+                    
+                except Exception as e:
+                        import traceback
+                        self._log_err(f"[ERR] portfolio_ranking: {e} {traceback.format_exc()}")
+                        self._note_runtime_error("portfolio_ranking", str(e))
 
-                    # 1) realized (annualized)
-                    mu_base, sigma = (0.0, 0.0)
-                    if mu_bar is not None and sigma_bar is not None:
-                        mu_base, sigma = self._annualize_mu_sigma(mu_bar, sigma_bar, bar_seconds=60.0)
-
-                    # 2) regime μ/σ table blend (session aware)
-                    session = time_regime()
-                    mu_tab, sig_tab = get_regime_mu_sigma(regime, session, symbol=sym)
-                    if mu_tab is not None and sig_tab is not None:
-                        w = 0.35
-                        mu_base = float((1.0 - w) * float(mu_base) + w * float(mu_tab))
-                        sigma = float(max(1e-6, (1.0 - w) * float(sigma) + w * float(sig_tab)))
-
-                    ofi_score = float(self._compute_ofi_score(sym))
-                    tuner = getattr(self, "tuner", None)
-                    if tuner and hasattr(tuner, "get_params"):
-                        try:
-                            regime_params = tuner.get_params(regime)
-                        except Exception:
-                            regime_params = None
-                    else:
-                        regime_params = None
-
-                    # bootstrap returns for tail (optional)
-                    bootstrap_returns = None
-                    if closes is not None and len(closes) >= 64:
-                        try:
-                            x = np.asarray(closes, dtype=np.float64)
-                            bootstrap_returns = np.diff(np.log(np.maximum(x, 1e-12))).astype(np.float64)[-512:]
-                        except Exception:
-                            bootstrap_returns = None
-
-                    ctx = {
-                        "symbol": sym,
-                        "price": float(price),
-                        "bar_seconds": 60.0,
-                        "closes": closes,
-                        "direction": self._direction_bias(closes),
-                        "regime": regime,
-                        "ofi_score": float(ofi_score),
-                        "liquidity_score": self._liquidity_score(sym),
-                        "leverage": None,  # placeholder; set below
-                        "mu_base": float(mu_base),
-                        "sigma": float(max(sigma, 0.0)),
-                        "regime_params": regime_params,
-                        "session": session,
-                        "spread_pct": spread_pct,
-                        # ---- MC tail + JAX knobs ----
-                        "use_jax": True,
-                        "tail_mode": "student_t",
-                        "tail_model": "student_t",
-                        "tail_df": 6.0,
-                        "student_t_df": 6.0,
-                        "bootstrap_returns": bootstrap_returns,
-                        "ev": None,  # filled post decision
-                    }
-
-                    decision = self.hub.decide(ctx)
-
-                    # ---- DEBUG: dump TP/SL-ish keys from decision.meta (once per N cycles)
-                    if log_this_cycle and decision:
-                        meta = decision.get("meta") or {}
-
-                        keys = [
-                            "mc_tp", "mc_sl", "tp", "sl",
-                            "profit_target", "stop_loss",
-                            "tp_pct", "sl_pct",
-                            "params",
-                        ]
-
-                        picked = {}
-                        for k in keys:
-                            if k in meta:
-                                picked[k] = meta.get(k)
-
-                        params = meta.get("params") or {}
-                        if isinstance(params, dict):
-                            for k in ["profit_target", "stop_loss", "tp_pct", "sl_pct", "tp", "sl", "n_paths"]:
-                                if k in params:
-                                    picked[f"params.{k}"] = params.get(k)
-
-                        self._log(f"[DBG_META_TPSL] {sym} action={decision.get('action')} picked={json.dumps(picked, ensure_ascii=False)}")
-
-                    ctx["ev"] = decision.get("ev", 0.0)
-                    side = decision.get("action_type") or decision.get("action")
-
-                    price_bucket = round(float(price), 3)
-                    cache_key = (sym, side, regime, price_bucket)
-                    now_cache = time.time()
-                    cached = self.mc_cache.get(cache_key)
-                    if cached and (now_cache - cached[0] <= self.mc_cache_ttl):
-                        # 메타 재사용
-                        decision_meta = decision.get("meta") or {}
-                        decision_meta.update(cached[1])
-                        decision["meta"] = decision_meta
-                    else:
-                        self.mc_cache[cache_key] = (now_cache, decision.get("meta", {}))
-
-                    # 러닝 통계 업데이트 (regime/session)
-                    def _s(val, default=0.0):
-                        try:
-                            if val is None:
-                                return float(default)
-                            return float(val)
-                        except Exception:
-                            return float(default)
-
-                    self.stats.push("ev", (regime, session), _s(decision.get("ev")))
-                    self.stats.push("cvar", (regime, session), _s(decision.get("cvar")))
-                    spread_val = _s(decision.get("meta", {}).get("spread_pct", ctx.get("spread_pct")), 0.0)
-                    self.stats.push("spread", (regime, session), spread_val)
-                    self.stats.push("liq", (regime, session), _s(self._liquidity_score(sym)))
-                    self.stats.push("ofi", (regime, session), _s(ofi_score))
-                    ofi_mean = self.stats.ema_update("ofi_mean", (regime, session), ofi_score, half_life_sec=900)
-                    ofi_res = ofi_score - ofi_mean
-                    self.stats.push("ofi_res", (regime, session), ofi_res)
-
-                    # 동적 레버리지(리스크 기반)
-                    dyn_leverage = float(decision.get("leverage") or decision.get("meta", {}).get("lev") or self.leverage)
-                    ctx["leverage"] = dyn_leverage
-
-
-                    # 레짐별 사이즈 상한 적용
-                    cap_map = {"bull": 0.25, "bear": 0.25, "chop": 0.10, "volatile": 0.08}
-                    cap_frac_regime = cap_map.get(regime, 0.10)
-                    decision = dict(decision)
-                    decision_meta = dict(decision.get("meta") or {})
-                    decision_meta["regime_cap_frac"] = cap_frac_regime
-                    decision["meta"] = decision_meta
-                    sz = decision.get("size_frac") or decision_meta.get("size_fraction") or self.default_size_frac
-                    decision["size_frac"] = float(min(max(0.0, sz), cap_frac_regime))
-
-                    # 추가 하드 게이트: event_cvar_r, spread_pct 상한
-                    spread_pct_now = decision_meta.get("spread_pct", ctx.get("spread_pct"))
-                    ev_cvar_r = decision_meta.get("event_cvar_r")
-                    # 레짐별 스프레드 상한
-                    spread_cap_map = {
-                        "bull": 0.0020,
-                        "bear": 0.0020,
-                        "chop": 0.0012,
-                        "volatile": 0.0008,
-                    }
-                    spread_cap = spread_cap_map.get(regime, SPREAD_PCT_MAX)
-                    if spread_pct_now is not None and spread_cap is not None and spread_pct_now > spread_cap:
-                        decision["action"] = "WAIT"
-                        decision["reason"] = f"{decision.get('reason','')} | spread_cap"
-                    # 레짐별 event_cvar_r 하한
-                    cvar_floor_map = {
-                        "bull": -1.2,
-                        "bear": -1.2,
-                        "chop": -1.0,
-                        "volatile": -0.8,
-                    }
-                    cvar_floor_regime = cvar_floor_map.get(regime, -1.0)
-                    if ev_cvar_r is not None and ev_cvar_r < cvar_floor_regime:
-                        decision["action"] = "WAIT"
-                        decision["reason"] = f"{decision.get('reason','')} | event_cvar_floor"
-
-                    # EV 동적 진입 문턱: 최근 30분 EV의 p80 (레짐별) EMA(half-life 10m)
-                    ev_net_now = float(decision.get("ev", 0.0) or 0.0)
-                    hist_sym = self._ev_tune_hist[sym]
-                    hist_sym.append((ts, ev_net_now))
-                    cutoff = ts - int(EV_TUNE_WINDOW_SEC * 1000)
-                    while hist_sym and hist_sym[0][0] < cutoff:
-                        hist_sym.popleft()
-
-                    regime_key = (regime or "chop", session or "OFF")
-                    hist_reg = self._ev_regime_hist.setdefault(regime_key, deque(maxlen=4000))
-                    hist_reg.append((ts, ev_net_now))
-                    while hist_reg and hist_reg[0][0] < cutoff:
-                        hist_reg.popleft()
-
-                    dyn_enter_floor = None
-                    ev_vals = [x[1] for x in hist_reg]
-                    if len(ev_vals) >= EV_TUNE_MIN_SAMPLES:
-                        try:
-                            raw_thr = float(np.percentile(ev_vals, 80))
-                            # EMA half-life 10m (600s)
-                            prev = self._ev_thr_ema.get(regime_key)
-                            prev_ts = self._ev_thr_ema_ts.get(regime_key, ts)
-                            dt_sec = max(1.0, (ts - prev_ts) / 1000.0)
-                            alpha = 1.0 - math.exp(-math.log(2) * dt_sec / 600.0)
-                            ema = raw_thr if prev is None else (alpha * raw_thr + (1 - alpha) * prev)
-                            ema = float(max(EV_ENTER_FLOOR_MIN, min(EV_ENTER_FLOOR_MAX, ema)))
-                            self._ev_thr_ema[regime_key] = ema
-                            self._ev_thr_ema_ts[regime_key] = ts
-                            dyn_enter_floor = ema
-                        except Exception:
-                            dyn_enter_floor = None
-
-                    if dyn_enter_floor is not None:
-                        decision = dict(decision)
-                        meta_tmp = dict(decision.get("meta") or {})
-                        meta_tmp["ev_entry_threshold_dyn"] = dyn_enter_floor
-                        decision["meta"] = meta_tmp
-
-                    consensus_action, consensus_score = self._consensus_action(decision, ctx)
-                    if decision.get("action") == "WAIT" and consensus_action in ("LONG", "SHORT") and decision.get("ev",0.0) > 0 and decision.get("confidence",0.0) >= 0.60:
-                        decision = dict(decision)
-                        decision["action"] = consensus_action
-                        decision["reason"] = f"{decision.get('reason', '')} | consensus {consensus_action} score={consensus_score:.2f}"
-                        decision["details"] = decision.get("details", [])
-                        decision["details"].append({
-                            "_engine": "consensus",
-                            "_weight": 0.5,
-                            "action": consensus_action,
-                            "ev": decision.get("ev", 0.0),
-                            "confidence": decision.get("confidence", 0.0),
-                            "reason": f"consensus {consensus_score:.2f}",
-                            "meta": {"consensus_score": consensus_score, "consensus_used": True},
-                        })
-                        decision["size_frac"] = decision.get("size_frac") or decision.get("meta", {}).get("size_fraction") or self.default_size_frac
-
-                    # ---- HOLD / EXIT decision using event-based MC (remaining TP/SL) ----
-                    exited_by_event = False
-                    pos = self.positions.get(sym)
-                    if pos and decision and ctx.get("mu_base") is not None and ctx.get("sigma", 0.0) > 0:
-                        mu_evt, sigma_evt = adjust_mu_sigma(
-                            float(ctx.get("mu_base", 0.0)),
-                            float(ctx.get("sigma", 0.0)),
-                            str(ctx.get("regime", "chop")),
-                        )
-                        seed_evt = int(time.time()) ^ hash(sym)
-                        entry = float(pos.get("entry_price", price))
-                        price_now = float(price)
-
-                        meta = decision.get("meta") or {}
-                        if not meta:
-                            for d in decision.get("details", []):
-                                if d.get("_engine") in ("mc_barrier", "mc_engine", "mc"):
-                                    meta = d.get("meta") or {}
+            # ====== Stage 2.6: Continuous Opportunity Evaluation (Switching Cost) ======
+            if batch_decisions and USE_CONTINUOUS_OPPORTUNITY:
+                try:
+                    # 현재 포지션 보유 심볼과 TOP N 비교
+                    current_positions = [s for s, p in self.positions.items() if p.get("qty", 0) != 0]
+                    
+                    for held_sym in current_positions:
+                        if held_sym in self._top_n_symbols:
+                            continue  # 이미 TOP N에 포함 → 유지
+                        
+                        # 가장 높은 EV를 가진 진입 후보와 비교
+                        best_candidate = self._top_n_symbols[0] if self._top_n_symbols else None
+                        if not best_candidate:
+                            continue
+                        
+                        held_ev = self._symbol_scores.get(held_sym, 0)
+                        cand_ev = self._symbol_scores.get(best_candidate, 0)
+                        
+                        # 거래 비용 추정 (현재 심볼 청산 + 새 심볼 진입)
+                        fee_rate = MAKER_FEE_RATE if USE_MAKER_ORDERS else TAKER_FEE_RATE
+                        switching_cost = fee_rate * 2 * SWITCHING_COST_MULT  # 왕복 + 마진
+                        
+                        # 교체 조건: 후보 EV > 보유 EV + 교체 비용
+                        if cand_ev > held_ev + switching_cost:
+                            if log_this_cycle:
+                                self._log(f"[SWITCH] {held_sym}(ev={held_ev:.4f}) → {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
+                            # 청산 시그널 발생 (기존 포지션)
+                            for i, dec in enumerate(batch_decisions):
+                                if ctx_list[i]["symbol"] == held_sym:
+                                    dec["action"] = "CLOSE"
+                                    dec["reason"] = f"SWITCH_TO_{best_candidate}"
                                     break
-                        params_meta = meta.get("params") or {}
-                        tp_pct = decision.get("mc_tp") or meta.get("mc_tp") or params_meta.get("profit_target") or 0.001
-                        sl_pct = decision.get("mc_sl") or meta.get("mc_sl") or (tp_pct * 0.8)
-                        tp_pct = float(max(tp_pct, 1e-6))
-                        sl_pct = float(max(sl_pct, 1e-6))
-
-                        tp_rem = max((entry * (1 + tp_pct) / price_now) - 1.0, 1e-6)
-                        sl_rem = max(1.0 - (entry * (1 - sl_pct) / price_now), 1e-6)
-
-                        m_evt = mc_first_passage_tp_sl_jax(
-                            s0=price_now,
-                            tp_pct=tp_rem,
-                            sl_pct=sl_rem,
-                            mu=mu_evt,
-                            sigma=sigma_evt,
-                            dt=1.0,
-                            max_steps=240,
-                            n_paths=int(decision.get("n_paths", meta.get("params", {}).get("n_paths", 2048))),
-                            seed=seed_evt,
-                            dist=ctx.get("tail_model", "student_t"),
-                            df=ctx.get("tail_df", 6.0),
-                            boot_rets=ctx.get("bootstrap_returns"),
-                        )
-
-                        if m_evt:
-                            ev_r_evt = float(m_evt.get("event_ev_r", 0.0) or 0.0)
-                            cvar_r_evt = float(m_evt.get("event_cvar_r", 0.0) or 0.0)
-                            p_sl_evt = float(m_evt.get("event_p_sl", 0.0) or 0.0)
-                            ev_pct_evt = ev_r_evt * sl_rem
-                            cvar_pct_evt = cvar_r_evt * sl_rem
                         else:
-                            ev_pct_evt = 0.0
-                            cvar_pct_evt = 0.0
-                            p_sl_evt = 0.0
+                            if log_this_cycle:
+                                self._log(f"[HOLD] {held_sym}(ev={held_ev:.4f}) kept vs {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
+                                
+                except Exception as e:
+                    import traceback
+                    self._log_err(f"[ERR] opportunity_eval: {e} {traceback.format_exc()}")
+                    self._note_runtime_error("opportunity_eval", str(e))
 
-                        if m_evt and (
-                            (ev_pct_evt < -0.0005)
-                            or (cvar_pct_evt < -0.006)
-                            or p_sl_evt >= 0.55
-                        ):
-                            self._log(
-                                f"[{sym}] EXIT by MC "
-                                f"(EV%={ev_pct_evt*100:.2f}%, "
-                                f"CVaR%={cvar_pct_evt*100:.2f}%, "
-                                f"P_SL={p_sl_evt:.2f})"
-                            )
-                            self._close_position(sym, price_now, "event_mc_exit")
-                            exited_by_event = True
+            # ====== Stage 3: Result Application (per-symbol isolation) ======
+            for i, decision in enumerate(batch_decisions):
+                ctx = ctx_list[i]
+                sym = ctx["symbol"]
+                try:
+                    row = self._apply_decision(sym, decision, ctx, ts, log_this_cycle)
+                    rows.append(row)
+                except Exception as e:
+                    import traceback
+                    self._log_err(f"[ERR] apply_decision {sym}: {e} {traceback.format_exc()}")
+                    self._note_runtime_error(f"apply_decision:{sym}", str(e))
+                    rows.append(self._row(sym, ctx.get("price"), ts, None, ctx.get("candles", 0)))
 
-                    # 정책 기반 event MC exit (메타값 기반)
-                    if (not exited_by_event) and sym in self.positions and decision:
-                        pos = self.positions.get(sym) or {}
-                        meta = decision.get("meta") or {}
-                        age_sec = (ts - int(pos.get("entry_time", ts))) / 1000.0
-                        do_exit, reason = should_exit_position(pos, meta, age_sec=age_sec, policy=self.exit_policy)
-                        if do_exit:
-                            self._close_position(sym, float(price), f"MC_EXIT:{reason}")
-                            exited_by_event = True
-                        else:
-                            # EMA 기반 EV/PSL 악화 감지
-                            ev_now = float(decision.get("ev", 0.0) or 0.0)
-                            p_sl_now = float(meta.get("event_p_sl", 0.0) or 0.0)
-                            ev_ema = self._ema_update(self._ema_ev, sym, ev_now, half_life_sec=30, ts_ms=ts)
-                            psl_ema = self._ema_update(self._ema_psl, sym, p_sl_now, half_life_sec=30, ts_ms=ts)
-                            d_ev = ev_now - ev_ema
-                            d_psl = p_sl_now - psl_ema
-                            ev_floor_reg = EV_EXIT_FLOOR.get(regime, -0.0002)
-                            ev_drop_reg = EV_DROP.get(regime, 0.0008)
-                            psl_rise_reg = PSL_RISE.get(regime, 0.03)
-                            persist_need = 1 if regime in ("bull", "bear") else 2
-                            if (ev_now < ev_floor_reg) and (d_ev < -ev_drop_reg) and (d_psl > psl_rise_reg):
-                                self._exit_bad_ticks[sym] = self._exit_bad_ticks.get(sym, 0) + 1
-                            else:
-                                self._exit_bad_ticks[sym] = 0
-                            if self._exit_bad_ticks[sym] >= persist_need:
-                                self._close_position(sym, float(price), "ev_psl_ema_exit", exit_kind="RISK")
-                                exited_by_event = True
-
-                    self._maybe_exit_position(sym, float(price), decision, ts)
-
-                    # 열린 포지션에도 최신 동적 레버리지 반영
-                    if sym in self.positions:
-                        self.positions[sym]["leverage"] = dyn_leverage
-
-                    if not exited_by_event:
-                        if decision.get("action") in ("LONG", "SHORT") and sym in self.positions:
-                            self._rebalance_position(sym, float(price), decision, leverage_override=dyn_leverage)
-
-                        # EV 급락 기반 추가 exit
-                        if sym in self.positions:
-                            ev_now = float(decision.get("ev", 0.0) or 0.0)
-                            meta_now = decision.get("meta") or {}
-                            ev_floor = float(meta_now.get("ev_entry_threshold_dyn") or meta_now.get("ev_entry_threshold") or 0.0)
-                            prev_ev = self._ev_drop_state[sym].get("prev")
-                            delta_ev = None
-                            if prev_ev is not None:
-                                delta_ev = ev_now - prev_ev
-                            # 강신호 판정
-                            strong_signal = decision.get("confidence", 0.0) >= 0.65
-                            needed_ticks = 1 if strong_signal else 2
-                            if ev_now < ev_floor and (delta_ev is not None) and (delta_ev < -EV_DROP_THRESHOLD):
-                                self._ev_drop_state[sym]["streak"] += 1
-                            else:
-                                self._ev_drop_state[sym]["streak"] = 0
-                            self._ev_drop_state[sym]["prev"] = ev_now
-                            if self._ev_drop_state[sym]["streak"] >= needed_ticks:
-                                self._close_position(sym, float(price), "ev_drop_exit", exit_kind="RISK")
-                                exited_by_event = True
-
-                        if decision.get("action") in ("LONG", "SHORT") and sym not in self.positions:
-                            permit, deny_reason = self._entry_permit(sym, decision, ts)
-                            if permit:
-                                self._enter_position(sym, decision["action"], float(price), decision, ts, ctx=ctx, leverage_override=dyn_leverage)
-                            else:
-                                if log_this_cycle:
-                                    self._log(f"[{sym}] skip entry (permit: {deny_reason}) ev={decision.get('ev',0):.4f} win={decision.get('confidence',0):.2f}")
-
-                    if log_this_cycle and decision:
-                        meta = decision.get("meta") or {}
-                        self._log(
-                            f"[DECISION] {sym} action={decision.get('action')} "
-                            f"ev={decision.get('ev', 0.0):.4f} "
-                            f"win={decision.get('confidence', 0.0):.2f} "
-                            f"size={decision.get('size_frac', meta.get('size_fraction', 0.0)):.3f} "
-                            f"reason={decision.get('reason', '')}"
-                        )
-
-                    rows.append(self._row(sym, float(price), ts, decision, candles))
-            except Exception as e:
-                import traceback
-                err_text = f"{e} {traceback.format_exc()}"
-                self._log_err(f"[ERR] decision_loop: {err_text}")
-                self._note_runtime_error("decision_loop", err_text)
-
+            # ====== Stage 4: Spread Management & Broadcast (always execute) ======
             try:
                 if self.spread_enabled:
                     self._manage_spreads(ts)
+            except Exception as e:
+                self._log_err(f"[ERR] manage_spreads: {e}")
+                self._note_runtime_error("manage_spreads", str(e))
+            
+            try:
                 await self.broadcast(rows)
-            except Exception as e2:
-                self._log_err(f"[ERR] broadcast: {e2}")
-                self._note_runtime_error("broadcast", str(e2))
+            except Exception as e:
+                import traceback
+                self._log_err(f"[ERR] broadcast: {e} {traceback.format_exc()}")
+                self._note_runtime_error("broadcast", str(e))
 
             await asyncio.sleep(0.1)
 

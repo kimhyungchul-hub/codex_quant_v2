@@ -144,3 +144,60 @@ def _calc_rsi(closes, period: int = 14):
         return 100.0 - (100.0 / (1.0 + rs))
     except Exception:
         return 50.0
+
+
+def normalize_symbol(sym: str, default_quote: str = "USDT") -> str:
+    """
+    Normalize many shorthand symbol formats into canonical form used across the codebase:
+      - Accepts: `BTCUSDT`, `BTC/USDT`, `BTC-USDT`, `BTC_USDT`, `BTC/USDT:USDT`, `BTCUSDT:USDT` etc.
+      - Returns: `BASE/QUOTE:QUOTE` (e.g. `BTC/USDT:USDT`).
+
+    The trailing `:QUOTE` is kept/normalized; if missing, `:USDT` is appended by default.
+    This aims to make user-provided symbols robustly map to `config.SYMBOLS` style keys.
+    """
+    try:
+        s = str(sym or "").strip()
+        if not s:
+            return ""
+
+        # Split optional suffix after ':' (margin/collateral token)
+        if ":" in s:
+            left, right = s.split(":", 1)
+            right = right.strip().upper() or default_quote
+        else:
+            left = s
+            right = default_quote
+
+        left = left.strip()
+        # Normalize separators to '/'
+        if "/" in left:
+            parts = [p.strip().upper() for p in left.split("/") if p.strip()]
+        elif "-" in left:
+            parts = [p.strip().upper() for p in left.split("-") if p.strip()]
+        elif "_" in left:
+            parts = [p.strip().upper() for p in left.split("_") if p.strip()]
+        else:
+            # e.g. BTCUSDT -> split by known quote suffix if present
+            u = left.upper()
+            if u.endswith(right.upper()) and len(u) > len(right):
+                base = u[: -len(right)]
+                parts = [base, right.upper()]
+            elif u.endswith("USDT") and len(u) > 4:
+                base = u[:-4]
+                parts = [base, "USDT"]
+            else:
+                # Fallback: assume quote is default_quote
+                parts = [u, default_quote]
+
+        if len(parts) == 1:
+            parts = [parts[0], right]
+
+        base = parts[0].upper()
+        quote = parts[1].upper()
+        pair = f"{base}/{quote}"
+        return f"{pair}:{quote}"
+    except Exception:
+        try:
+            return str(sym)
+        except Exception:
+            return ""

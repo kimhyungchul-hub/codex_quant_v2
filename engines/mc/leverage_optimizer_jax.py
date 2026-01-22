@@ -7,25 +7,19 @@ import logging
 from typing import Tuple, Sequence
 import numpy as np
 
-from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand
+import engines.mc.jax_backend as jax_backend
 
 logger = logging.getLogger(__name__)
 
-if _JAX_OK:
-    @jax.jit
-    def _compute_scores_jax(
-        mu_horizon: float,
-        fee_base: float,
-        lev_array: jnp.ndarray
-    ) -> jnp.ndarray:
-        """Vectorized core for leverage scoring."""
-        # Score = max(EV_long, EV_short)
-        ev_long = mu_horizon * lev_array - fee_base * lev_array
-        ev_short = -mu_horizon * lev_array - fee_base * lev_array
-        return jnp.maximum(ev_long, ev_short)
 
-else:
-    _compute_scores_jax = None
+@jax_backend.lazy_jit()
+def _compute_scores_jax(mu_horizon: float, fee_base: float, lev_array):
+    """Vectorized core for leverage scoring (lazy JAX)."""
+    jnp = jax_backend.jnp
+    # Score = max(EV_long, EV_short)
+    ev_long = mu_horizon * lev_array - fee_base * lev_array
+    ev_short = -mu_horizon * lev_array - fee_base * lev_array
+    return jnp.maximum(ev_long, ev_short)
 
 
 def find_optimal_leverage_gpu(

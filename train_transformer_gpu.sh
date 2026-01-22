@@ -28,6 +28,12 @@ fi
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
+# Ensure JAX/XLA env for any python GPU workloads launched from this script.
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.40
+export JAX_COMPILATION_CACHE_DIR="$SCRIPT_DIR/.jax_cache"
+
 echo "======================================================================"
 echo "🔥 Starting Training..."
 echo "======================================================================"

@@ -62,7 +62,7 @@
     .panel h3 .sub{color:var(--muted);font-weight:600;font-size:12px}
     .panel .body{padding:10px 12px}
     .tight{padding:0}
-    .tableWrap{overflow:auto;max-height:520px}
+    .tableWrap{overflow:visible;max-height:none}
     table{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px}
     thead th{
       position:sticky;top:0;z-index:3;
@@ -89,6 +89,23 @@
     .down{color:var(--bad)}
     .wait{color:var(--warn)}
     .muted{color:var(--muted)}
+    /* ✅ 필터 신호등 스타일 - 필터에 걸리면 빨간불 */
+    .filter-lights{
+      display:flex;gap:2px;align-items:center;
+    }
+    .filter-light{
+      width:16px;height:16px;border-radius:3px;
+      font-size:7px;font-weight:700;
+      display:flex;align-items:center;justify-content:center;
+      color:#fff;cursor:help;
+      transition:background 0.2s;
+    }
+    .filter-light.ok{background:#d1d5db;color:#6b7280}  /* 통과: 회색 (꺼진 상태) */
+    .filter-light.blocked{background:var(--bad);box-shadow:0 0 6px rgba(220,38,38,0.5)}  /* 차단: 빨간불 */
+    .filter-light.na{background:#e5e7eb;color:#9ca3af}
+    /* 테이블 열 간격 줄이기 */
+    thead th{padding:7px 6px !important;font-size:11px !important}
+    tbody td{padding:6px !important}
     .right{display:flex;flex-direction:column;gap:12px}
     .charts{display:grid;grid-template-columns:1fr;gap:12px}
     canvas{width:100% !important;height:240px !important}
@@ -117,44 +134,28 @@
       <div class="spacer"></div>
       <div class="controls">
         <input id="search" class="input" placeholder="심볼/상태/레짐 검색 (예: BTC, LONG, chop)" />
-        <button id="toggleSparks" class="btn">스파크라인: ON</button>
         <button id="clearTrades" class="btn">트레이드 테이프 비우기</button>
-        <label style="font-size:12px;color:#475569;">분봉</label>
-        <select id="tfSel" class="input" style="min-width:90px;">
-          <option value="1">1m</option>
-          <option value="5">5m</option>
-          <option value="15">15m</option>
-          <option value="60">1h</option>
-          <option value="240">4h</option>
-          <option value="1440">1d</option>
-        </select>
       </div>
     </div>
 
     <div class="panel tight">
-      <h3>시장/신호 테이블 <span class="sub">키워드 중심 · 클릭하면 우측 차트가 해당 심볼로 전환</span></h3>
+      <h3>시장/신호 테이블 <span class="sub">실시간 랭킹 · Top-4는 자본 배분 대상</span></h3>
+      <!-- Top-4 capital allocation summary -->
+      <div id="top4Panel" style="padding:10px 12px; display:flex; gap:10px; flex-wrap:wrap; border-bottom:1px solid var(--line)"></div>
       <div class="tableWrap" id="mktWrap">
         <table id="mktTable">
           <thead>
             <tr>
+              <th data-k="rank">RANK</th>
               <th data-k="symbol">SYM</th>
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
-              <th data-k="regime">REGIME</th>
-              <th data-k="action_type">ACTION</th>
+              <th data-k="filters">FILTERS</th>
+              <th data-k="ev_score">EV_SCORE</th>
               <th data-k="evp">EV%</th>
-              <th data-k="confp">CONF%</th>
-              <th data-k="event_p_tp">EventWin%</th>
-              <th data-k="event_p_timeout">Timeout%</th>
-              <th data-k="event_t_median">Tmed</th>
-              <th data-k="mc_win_rate">WIN%</th>
-              <th data-k="mc_cvar">CVaR</th>
               <th data-k="kelly">KELLY</th>
               <th data-k="pos_roe">ROE%</th>
               <th data-k="pos_leverage">LEV</th>
-              <th data-k="pos_cap_frac">CAP%</th>
-              <th data-k="pos_pnl">PNL</th>
-              <th data-k="spark">TREND</th>
             </tr>
           </thead>
           <tbody id="mktBody"></tbody>
@@ -222,16 +223,9 @@
 
   const $ = (id)=>document.getElementById(id);
   const ksEl=$('ks'), eqEl=$('eq'), wsEl=$('ws'), feedEl=$('feed'), utilEl=$('util'), brierEl=$('brier'), hitEl=$('hit');
-  const selSymEl=$('selSym'), searchEl=$('search'), tfSel=$('tfSel');
+  const selSymEl=$('selSym'), searchEl=$('search');
   const mktBody=$('mktBody'), posBody=$('posBody'), tradeBody=$('tradeBody'), logsEl=$('logs'), alertsEl=$('alerts');
   const balKpi=$('balKpi'), eqKpi=$('eqKpi'), ddKpi=$('ddKpi');
-
-  let showSparks = true;
-  $('toggleSparks').onclick=()=>{
-    showSparks = !showSparks;
-    $('toggleSparks').textContent = `스파크라인: ${showSparks?'ON':'OFF'}`;
-    if(latestPayload && latestPayload.market) renderMarketTable(latestPayload.market);
-  };
 
   $('clearTrades').onclick=()=>{
     tradeTape.length = 0;
@@ -302,6 +296,31 @@
     return 'muted';
   }
 
+  // ✅ 필터 신호등 렌더링 함수
+  // 필터에 "걸리면" (false) 빨간불, 통과하면 (true) 회색 (꺼진 상태)
+  // 라벨: N=NAPV, E=EV, W=Win%, C=CVaR, X=EvtCVaR, D=Direction
+  function renderFilterLights(filterStates){
+    const filters = [
+      { key: 'napv', label: 'N', title: 'NAPV (순현재가치)' },
+      { key: 'ev', label: 'E', title: 'EV (기대값 > 0)' },
+      { key: 'winrate', label: 'W', title: 'Win% (승률)' },
+      { key: 'cvar', label: 'C', title: 'CVaR (위험)' },
+      { key: 'event_cvar', label: 'X', title: 'Event CVaR' },
+      { key: 'direction', label: 'D', title: 'Direction (방향)' },
+    ];
+    let html = '<div class="filter-lights">';
+    for(const f of filters){
+      // filterStates가 없으면 기본값은 true (모두 통과)
+      const val = filterStates ? filterStates[f.key] : true;
+      // val === true: 통과 → 회색 (ok), val === false: 차단 → 빨간불 (blocked)
+      const cls = (val === false) ? 'blocked' : (val === true) ? 'ok' : 'na';
+      const statusText = (val === false) ? '❌ 차단' : (val === true) ? '✓ 통과' : '?';
+      html += `<span class="filter-light ${cls}" title="${f.title}: ${statusText}">${f.label}</span>`;
+    }
+    html += '</div>';
+    return html;
+  }
+
   // ✅ trade type badge (ENTER/EXIT/REBAL/SPREAD clearly visible)
   function tradeTypeBadge(type){
     if(!type) return '<span class="pill muted">-</span>';
@@ -367,7 +386,7 @@
   }
 
   function buildEquitySeries(){
-    const tfMin = Number(tfSel.value||1);
+    const tfMin = 1; // Fixed 1-minute timeframe
     const bucketMs = tfMin * 60 * 1000;
     if(!equityHist.length) return {labels:[], values:[]};
     const buckets = new Map();
@@ -402,26 +421,6 @@
     if(sp.length>60) sp.shift();
   }
 
-  // tiny sparkline as inline SVG
-  function sparkSvg(sym){
-    if(!showSparks) return '<span class="muted">-</span>';
-    const sp = sparkHist.get(sym) || [];
-    if(sp.length<2) return '<span class="muted">-</span>';
-    const w=86,h=20,pad=2;
-    const min=Math.min(...sp), max=Math.max(...sp);
-    const den = (max-min) || 1;
-    const pts = sp.map((v,i)=>{
-      const x = pad + (i*(w-2*pad))/(sp.length-1);
-      const y = pad + (h-2*pad)*(1-(v-min)/den);
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    }).join(' ');
-    const up = sp[sp.length-1] >= sp[0];
-    const stroke = up ? '#16a34a' : '#dc2626';
-    return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-label="trend">
-      <polyline fill="none" stroke="${stroke}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${pts}"/>
-    </svg>`;
-  }
-
   // ---------- rendering ----------
   function renderMarketTable(rows){
     const q = (searchEl.value||'').trim().toLowerCase();
@@ -438,6 +437,29 @@
         (x.meta && (x.meta.action_type || x.meta.event || x.meta.trade_event)) ||
         '-';
 
+      // ✅ 필터 상태 추출
+      let filter_states = x.filter_states || null;
+      if(!filter_states && x.meta){
+        filter_states = x.meta.filter_states || null;
+      }
+      if(!filter_states && x.details && Array.isArray(x.details)){
+        for(const d of x.details){
+          if(d && d.filter_states){
+            filter_states = d.filter_states;
+            break;
+          }
+          if(d && d.meta && d.meta.filter_states){
+            filter_states = d.meta.filter_states;
+            break;
+          }
+        }
+      }
+      
+      // 디버깅: filter_states 추출 로그 (모든 심볼)
+      if(!filter_states){
+        console.warn(`[FILTER_MISSING] ${sym}: filter_states not found. x.filter_states=${x.filter_states}, x.meta.filter_states=${x.meta?.filter_states}, x.details.length=${x.details?.length}`);
+      }
+
       return {
         raw:x,
         symbol:sym,
@@ -445,24 +467,35 @@
         status: x.status || 'WAIT',
         regime: x.regime || '-',
         action_type: action_type || '-',
+        filter_states: filter_states,  // ✅ 필터 상태 추가
         evp,
         confp,
-        event_p_tp: x.event_p_tp===null||x.event_p_tp===undefined?null:Number(x.event_p_tp*100),
-        event_p_timeout: x.event_p_timeout===null||x.event_p_timeout===undefined?null:Number(x.event_p_timeout*100),
-        event_t_median: x.event_t_median===null||x.event_t_median===undefined?null:Number(x.event_t_median),
-        mc_win_rate: mc_win,
-        mc_cvar: x.mc_cvar ?? x.mc_cvar_pct ?? null,
+        ev_score: (function(){
+          if(x.policy_ev_score_long!==undefined && x.policy_ev_score_long!==null) return Number(x.policy_ev_score_long);
+          if(x.policy_ev_score_short!==undefined && x.policy_ev_score_short!==null) return Number(x.policy_ev_score_short);
+          if(x.ev!==undefined && x.ev!==null) return Number(x.ev);
+          if(Array.isArray(x.details)){
+            for(const d of x.details){
+              if(d && d.meta){
+                if(d.meta.policy_ev_score_long!==undefined) return Number(d.meta.policy_ev_score_long);
+                if(d.meta.policy_ev_score_short!==undefined) return Number(d.meta.policy_ev_score_short);
+              }
+            }
+          }
+          return 0;
+        })(),
         kelly: x.kelly ?? x.kelly_frac ?? null,
         pos_roe,
         pos_leverage: x.pos_leverage ?? null,
-        pos_cap_frac: x.pos_cap_frac===null||x.pos_cap_frac===undefined?null:Number(x.pos_cap_frac*100),
-        pos_pnl: x.pos_pnl ?? null,
       };
     }).filter(r=>{
       if(!q) return true;
-      const hay = `${r.symbol} ${r.status} ${r.regime} ${r.action_type}`.toLowerCase();
+      const hay = `${r.symbol} ${r.status}`.toLowerCase();
       return hay.includes(q);
     });
+
+    // compute ranking by evp (or ev_score if evp is zero)
+    data.forEach((d)=>{ d._score_for_rank = (isNum(d.evp) && d.evp!==0) ? d.evp : (isNum(d.ev_score)? d.ev_score*100 : 0); });
 
     data.sort((a,b)=>{
       const va = a[sortKey], vb = b[sortKey];
@@ -473,6 +506,14 @@
       return 0;
     });
 
+    // If user is sorting by default (symbol), inject a computed rank by score
+    if(sortKey === 'symbol'){
+      const byScore = data.slice().sort((a,b)=> b._score_for_rank - a._score_for_rank);
+      const rankMap = new Map();
+      byScore.forEach((d,i)=> rankMap.set(d.symbol, i+1));
+      data.forEach(d=> d.rank = rankMap.get(d.symbol) || null);
+    }
+
     // ✅ smooth: reuse <tr> nodes, reorder with fragment
     const frag = document.createDocumentFragment();
 
@@ -481,7 +522,7 @@
       if(!cached){
         const tr = document.createElement('tr');
         const cells = [];
-        for(let i=0;i<18;i++){
+        for(let i=0;i<10;i++){  // 10열로 변경
           const td = document.createElement('td');
           cells.push(td);
           tr.appendChild(td);
@@ -502,30 +543,41 @@
       else tr.classList.remove('sel');
 
       const cls = statusClass(r.status);
+      
+      // Top-4 표시: rank 1~4는 굵게 표시
+      const isTop4 = (r.rank!==null && r.rank!==undefined && r.rank <= 4);
 
-      c[0].className = 'mono'; c[0].innerHTML = `<b>${r.symbol}</b>`;
-      c[1].className = 'mono'; c[1].textContent = (r.price!==null?f2(r.price):'-');
-      c[2].className = '';     c[2].innerHTML = `<span class="pill ${cls}">${r.status}</span>`;
-      c[3].className = 'mono'; c[3].textContent = r.regime;
-      c[4].className = 'mono'; c[4].textContent = r.action_type;
-
-      c[5].className = `mono ${(r.evp>=0)?'up':'down'}`; c[5].textContent = r.evp.toFixed(2);
-      c[6].className = 'mono'; c[6].textContent = r.confp.toFixed(1);
-
-      c[7].className = 'mono'; c[7].textContent = (r.event_p_tp===null?'-':r.event_p_tp.toFixed(1));
-      c[8].className = 'mono'; c[8].textContent = (r.event_p_timeout===null?'-':r.event_p_timeout.toFixed(1));
-      c[9].className = 'mono'; c[9].textContent = (r.event_t_median===null?'-':r.event_t_median.toFixed(0));
-
-      c[10].className='mono'; c[10].textContent = r.mc_win_rate.toFixed(1);
-      c[11].className='mono'; c[11].textContent = (r.mc_cvar===null?'-':f2(r.mc_cvar));
-      c[12].className='mono'; c[12].textContent = (r.kelly===null?'-':f2(r.kelly));
-
-      c[13].className=`mono ${(r.pos_roe>=0)?'up':'down'}`; c[13].textContent = r.pos_roe.toFixed(2);
-      c[14].className='mono'; c[14].textContent = (r.pos_leverage===null?'-':r.pos_leverage);
-      c[15].className='mono'; c[15].textContent = (r.pos_cap_frac===null?'-':r.pos_cap_frac.toFixed(2));
-      c[16].className=`mono ${((r.pos_pnl||0)>=0)?'up':'down'}`; c[16].textContent = (r.pos_pnl===null?'-':f2(r.pos_pnl));
-
-      c[17].className=''; c[17].innerHTML = sparkSvg(r.symbol);
+      // column mapping: rank, symbol, price, status, filters, ev_score, ev%, kelly, roe%, lev
+      c[0].className = 'mono'; 
+      c[0].innerHTML = isTop4 ? `<b style="color:var(--accent)">${r.rank}</b>` : (r.rank!==null && r.rank!==undefined ? String(r.rank) : '-');
+      
+      c[1].className = 'mono'; 
+      c[1].innerHTML = `<b>${r.symbol}</b>`;
+      
+      c[2].className = 'mono'; 
+      c[2].textContent = (r.price!==null?f2(r.price):'-');
+      
+      c[3].className = ''; 
+      c[3].innerHTML = `<span class="pill ${cls}">${r.status}</span>`;
+      
+      // ✅ 필터 신호등 (FILTERS 열)
+      c[4].className = ''; 
+      c[4].innerHTML = renderFilterLights(r.filter_states);
+      
+      c[5].className = 'mono'; 
+      c[5].textContent = (isNum(r.ev_score) ? (Number(r.ev_score)*100).toFixed(2) : '-');
+      
+      c[6].className = `mono ${(r.evp>=0)?'up':'down'}`; 
+      c[6].textContent = (r.evp===null||r.evp===undefined)?'-':(isNum(r.evp)?r.evp.toFixed(2):r.evp);
+      
+      c[7].className = 'mono'; 
+      c[7].textContent = (r.kelly===null?'-':(isNum(r.kelly)?f2(r.kelly):r.kelly));
+      
+      c[8].className = `mono ${(r.pos_roe>=0)?'up':'down'}`; 
+      c[8].textContent = (r.pos_roe===null||r.pos_roe===undefined)?'-':(isNum(r.pos_roe)?r.pos_roe.toFixed(2):r.pos_roe);
+      
+      c[9].className='mono'; 
+      c[9].textContent = (r.pos_leverage===null?'-':(isNum(r.pos_leverage)?r.pos_leverage:r.pos_leverage));
 
       frag.appendChild(tr);
     });
@@ -681,7 +733,6 @@
   searchEl.addEventListener('input', ()=>{
     if(latestPayload && latestPayload.market) renderMarketTable(latestPayload.market);
   });
-  tfSel.addEventListener('change', ()=>{ updateEquityChart(); });
 
   function applyUpdate(d){
     if(d.type !== 'full_update') return;
@@ -736,6 +787,8 @@
       const price = Number(x.price || 0);
       pushSymPoint(sym, t, price);
     });
+    // render top-4 summary and full market table
+    renderTop4(rows);
     renderMarketTable(rows);
 
     // positions
@@ -769,6 +822,60 @@
       });
     }
   };
+
+  // ---------- Top-4 rendering ----------
+  function renderTop4(rows){
+    const out = $('top4Panel');
+    if(!out) return;
+    
+    const data = (rows||[]).map(x=>{
+      const sym = normSym(x.symbol);
+      const evp = (x.ev||0)*100;
+      return {
+        raw:x,
+        symbol:sym,
+        ev_score: (x.policy_ev_score_long!==undefined && x.policy_ev_score_long!==null) ? Number(x.policy_ev_score_long) : 
+                  (x.policy_ev_score_short!==undefined && x.policy_ev_score_short!==null) ? Number(x.policy_ev_score_short) :
+                  (x.ev!==undefined && x.ev!==null ? Number(x.ev) : 0),
+        evp: evp,
+        price: x.price ?? null,
+        status: x.status || 'WAIT',
+        regime: x.regime || '-',
+      };
+    });
+    
+    // EV score 기준 정렬
+    const byScore = data.slice().sort((a,b)=> (b.ev_score||0) - (a.ev_score||0));
+    const top = byScore.slice(0,4);
+    
+    out.innerHTML = '';
+    if(top.length===0){
+      out.innerHTML = '<div class="muted" style="padding:8px">Top-4: 데이터 없음</div>';
+      return;
+    }
+    
+    top.forEach((t,i)=>{
+      const pct = 25; // 각 25%
+      const card = document.createElement('div');
+      card.style.cssText = 'padding:10px 14px;border:2px solid var(--accent);border-radius:12px;background:linear-gradient(135deg, #fff 0%, #f8fafc 100%);min-width:180px;flex:1';
+      
+      const statusCls = (t.status==='LONG')?'up':(t.status==='SHORT')?'down':'muted';
+      
+      card.innerHTML = `
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <div style="font-size:20px;font-weight:900;color:var(--accent)">#${i+1}</div>
+          <div style="font-size:16px;font-weight:700">${t.symbol}</div>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px">자본 배분: <b style="color:var(--accent)">${pct}%</b></div>
+        <div style="display:flex;gap:12px;font-size:12px">
+          <div><span style="color:var(--muted)">EV:</span> <b class="${(t.evp>=0)?'up':'down'}">${t.evp.toFixed(2)}%</b></div>
+          <div><span style="color:var(--muted)">Status:</span> <span class="pill ${statusCls}" style="font-size:10px;padding:2px 6px">${t.status}</span></div>
+        </div>
+        <div style="margin-top:4px;font-size:11px;color:var(--muted)">Regime: ${t.regime}</div>
+      `;
+      out.appendChild(card);
+    });
+  }
 </script>
 </body>
 </html>

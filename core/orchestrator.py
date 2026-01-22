@@ -1809,6 +1809,17 @@ class LiveOrchestrator:
         closes = list(self.ohlcv_buffer.get(sym) or [])
         candles = len(closes)
 
+        # ✅ FIX: price가 None이지만 closes가 있으면 마지막 close 사용
+        if price is None and closes:
+            price = closes[-1]
+            # 디버그: 폴백 사용
+            if not hasattr(self, "_price_fallback_debug"):
+                self._price_fallback_debug = set()
+            if sym not in self._price_fallback_debug:
+                print(f"[PRICE_FALLBACK] {sym} using last close={price:.2f} (ticker not yet available)", flush=True)
+                self._price_fallback_debug.add(sym)
+        candles = len(closes)
+
         best_bid = None
         best_ask = None
         try:
@@ -1903,13 +1914,25 @@ class LiveOrchestrator:
         except Exception:
             min_candles = 20
 
+        # 디버그: ctx 구축 실패 원인 추적
+        if not hasattr(self, "_ctx_debug_count"):
+            self._ctx_debug_count = {}
+        self._ctx_debug_count[sym] = self._ctx_debug_count.get(sym, 0) + 1
+        debug_this = (self._ctx_debug_count[sym] <= 5)  # 심볼당 처음 5회만
+
         if price is None or candles < min_candles:
+            if debug_this:
+                print(f"[CTX_DEBUG] {sym} SKIP: price={price} candles={candles} min_candles={min_candles}", flush=True)
             return None
         try:
             px = float(price)
         except Exception:
+            if debug_this:
+                print(f"[CTX_DEBUG] {sym} SKIP: price not float-able: {price}", flush=True)
             return None
         if px <= 0:
+            if debug_this:
+                print(f"[CTX_DEBUG] {sym} SKIP: px <= 0: {px}", flush=True)
             return None
 
         regime = self._infer_regime(closes)
@@ -1974,6 +1997,11 @@ class LiveOrchestrator:
             ctx["pmaker_adverse_move"] = float(self._pmaker_paper_adverse_ema.get(sym, 0.0) or 0.0)
         except Exception:
             pass
+        
+        # 디버그: ctx 구축 성공
+        if debug_this:
+            print(f"[CTX_DEBUG] {sym} OK: price={px:.2f} candles={candles} mu_sim={mu_sim:.6f} sigma_sim={sigma_sim:.6f} regime={regime}", flush=True)
+        
         return ctx
 
     def _rows_snapshot(self, ts_ms: int, *, apply_trades: bool = False) -> list[Dict[str, Any]]:

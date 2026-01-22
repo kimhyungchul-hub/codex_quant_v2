@@ -10,8 +10,9 @@ Global Batching Entry Evaluation with JAX vmap
 3. 단일 JIT 함수 호출 (asyncio 루프 제거)
 """
 
-import jax
-import jax.numpy as jnp
+from __future__ import annotations
+
+from engines.mc.jax_backend import ensure_jax, lazy_jit, jax, jnp, _JAX_OK, DEV_MODE
 import numpy as np
 import time
 from typing import Dict, List, Any, Tuple
@@ -23,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Level 1: 단일 심볼, 단일 horizon에 대한 시뮬레이션 및 통계 계산
 # ============================================================================
 
-@jax.jit
+@lazy_jit()
 def compute_horizon_metrics_jax(
     price_paths: jnp.ndarray,  # (n_paths, n_steps+1)
     horizon_idx: int,
@@ -132,13 +133,14 @@ def compute_all_horizons_jax(
     
     vmap을 사용하여 horizon 차원을 병렬화
     """
-    # vmap over horizon dimension
+    # vmap over horizon dimension (created at runtime)
+    ensure_jax()
     def compute_single_horizon(h_idx, tp_tgt, sl_tgt):
         return compute_horizon_metrics_jax(
             price_paths, h_idx, leverage, fee_roundtrip,
             tp_tgt, sl_tgt, cvar_alpha
         )
-    
+
     # vmap: horizon별로 병렬 실행
     results = jax.vmap(compute_single_horizon)(
         horizon_indices, tp_targets, sl_targets
@@ -151,7 +153,7 @@ def compute_all_horizons_jax(
 # Level 3: 여러 심볼 병렬 처리 (vmap Level 2 - Global Batching)
 # ============================================================================
 
-@jax.jit
+@lazy_jit()
 def compute_portfolio_metrics_jax(
     price_paths_batch: jnp.ndarray,  # (n_symbols, n_paths, n_steps+1)
     horizon_indices: jnp.ndarray,  # (n_horizons,)
@@ -177,8 +179,9 @@ def compute_portfolio_metrics_jax(
             paths, horizon_indices, lev, fee,
             tp_tgts, sl_tgts, cvar_alpha
         )
-    
-    # vmap: 심볼별로 병렬 실행
+
+    # vmap: 심볼별로 병렬 실행 (ensure jax first)
+    ensure_jax()
     results = jax.vmap(compute_symbol_metrics)(
         price_paths_batch,
         leverages,
@@ -201,10 +204,9 @@ class GlobalBatchEvaluator:
     
     def __init__(self, dt: float = 1.0):
         self.dt = dt
-        
-        # JIT 컴파일된 함수 (워밍업 필요)
-        self.jit_compute = jax.jit(compute_portfolio_metrics_jax)
-        
+        # JIT 컴파일된 함수 (워밍업 필요) - delay until warmup/runtime
+        self.jit_compute = None
+
         # 워밍업 플래그
         self.warmed_up = False
     
@@ -213,17 +215,28 @@ class GlobalBatchEvaluator:
         if self.warmed_up:
             return
         
+        # DEV_MODE: JAX 없이 NumPy fallback 사용, warmup 스킵
+        if DEV_MODE:
+            logger.info("[VMAP] DEV_MODE enabled, skipping JIT warmup (using NumPy)")
+            self.warmed_up = True
+            return
+        
         logger.info("[VMAP] Warming up JIT compilation...")
         
         # 더미 데이터로 워밍업
+        ensure_jax()
+        if not _JAX_OK:
+            raise RuntimeError("Cannot warm up GlobalBatchEvaluator: JAX not available")
+
         dummy_paths = jnp.ones((2, 100, 301))  # 2 symbols, 100 paths, 300 steps
         dummy_horizons = jnp.array([60, 180])
         dummy_leverages = jnp.ones(2)
         dummy_fees = jnp.ones(2) * 0.001
         dummy_tp = jnp.ones((2, 2)) * 0.01
         dummy_sl = jnp.ones((2, 2)) * -0.005
-        
-        
+
+        # Create compiled JIT function now that JAX is available
+        self.jit_compute = jax.jit(compute_portfolio_metrics_jax)
         result = self.jit_compute(
             dummy_paths, dummy_horizons, dummy_leverages,
             dummy_fees, dummy_tp, dummy_sl
@@ -254,6 +267,53 @@ class GlobalBatchEvaluator:
         if not self.warmed_up:
             self.warmup()
         
+        # DEV_MODE: NumPy fallback (sequential)
+        if DEV_MODE:
+            from engines.mc.jax_backend import summarize_gbm_horizons_numpy
+            n_symbols = len(leverages)
+            n_horizons = len(horizons)
+            n_steps = price_paths_batch.shape[2] - 1  # (n_symbols, n_paths, n_steps+1)
+            
+            # horizons를 인덱스로 변환 (초 단위 → 스텝 인덱스)
+            # horizons가 이미 인덱스인 경우도 있으므로, max보다 큰지 확인
+            horizons_arr = np.array(horizons, dtype=np.int32)
+            horizons_indices = np.clip(horizons_arr, 0, n_steps)
+            
+            # Initialize result arrays
+            results = {
+                "ev_long": np.zeros((n_symbols, n_horizons)),
+                "ev_short": np.zeros((n_symbols, n_horizons)),
+                "p_pos_long": np.zeros((n_symbols, n_horizons)),
+                "p_pos_short": np.zeros((n_symbols, n_horizons)),
+                "cvar_long": np.zeros((n_symbols, n_horizons)),
+                "cvar_short": np.zeros((n_symbols, n_horizons)),
+                "p_tp_long": np.zeros((n_symbols, n_horizons)),
+                "p_sl_long": np.zeros((n_symbols, n_horizons)),
+                "p_tp_short": np.zeros((n_symbols, n_horizons)),
+                "p_sl_short": np.zeros((n_symbols, n_horizons)),
+            }
+            
+            t0 = time.perf_counter()
+            for i in range(n_symbols):
+                r = summarize_gbm_horizons_numpy(
+                    price_paths_batch[i],
+                    float(price_paths_batch[i, 0, 0]),  # s0
+                    float(leverages[i]),
+                    float(fee_roundtrips[i]),
+                    horizons_indices,  # 인덱스로 변환된 horizons
+                    1.0 - cvar_alpha
+                )
+                results["ev_long"][i] = r["ev_long"]
+                results["ev_short"][i] = r["ev_short"]
+                results["p_pos_long"][i] = r["win_long"]
+                results["p_pos_short"][i] = r["win_short"]
+                results["cvar_long"][i] = r["cvar_long"]
+                results["cvar_short"][i] = r["cvar_short"]
+            t1 = time.perf_counter()
+            logger.info(f"[VMAP] DEV_MODE NumPy batch evaluation: {n_symbols} symbols × {n_horizons} horizons in {(t1-t0)*1000:.2f}ms")
+            return results
+        
+        # JAX mode
         # Numpy → JAX 변환
         paths_jax = jnp.array(price_paths_batch)
         horizons_jax = jnp.array(horizons, dtype=jnp.int32)

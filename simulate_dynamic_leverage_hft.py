@@ -4,6 +4,7 @@
 # Dynamic Leverage in High Frequency Trading Simulation
 # ================================================================
 
+import bootstrap  # ensure JAX/XLA env is set for simulation scripts
 import sys
 import pandas as pd
 import numpy as np

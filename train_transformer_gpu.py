@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import bootstrap  # ensure JAX/XLA env is set for any GPU-accelerated workloads
 """
 GPU 학습 스크립트 for Final Transformer Edition
 - 180일 데이터

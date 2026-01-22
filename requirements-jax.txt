@@ -1,0 +1,17 @@
+# JAX Version Lock for Apple Metal GPU
+# ======================================
+# These versions are CRITICAL for stable operation.
+# DO NOT UPGRADE without testing memory behavior.
+#
+# Known Issues with other versions:
+# - JAX 0.4.22+: Ignores XLA_PYTHON_CLIENT_PREALLOCATE, causes 8GB memory preallocation
+# - JAX 0.9.0+: "UNIMPLEMENTED: default_memory_space is not supported" error
+# - jax-metal 0.0.6+: Requires JAX 0.4.22+, inherits memory issues
+#
+# Verified working combination (2026-01-22):
+jax==0.4.20
+jaxlib==0.4.20
+jax-metal==0.0.5
+numpy>=1.22,<2.0
+
+# Install: pip install -r requirements-jax.txt
