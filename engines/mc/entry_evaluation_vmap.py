@@ -12,7 +12,13 @@ Global Batching Entry Evaluation with JAX vmap
 
 from __future__ import annotations
 
-from engines.mc.jax_backend import ensure_jax, lazy_jit, jax, jnp, _JAX_OK, DEV_MODE
+from engines.mc import jax_backend as jax_backend
+ensure_jax = jax_backend.ensure_jax
+lazy_jit = jax_backend.lazy_jit
+_JAX_OK = lambda: getattr(jax_backend, '_JAX_OK', False)
+DEV_MODE = getattr(jax_backend, 'DEV_MODE', False)
+jax = jax_backend.jax
+jnp = jax_backend.jnp
 import numpy as np
 import time
 from typing import Dict, List, Any, Tuple
@@ -224,9 +230,14 @@ class GlobalBatchEvaluator:
         logger.info("[VMAP] Warming up JIT compilation...")
         
         # 더미 데이터로 워밍업
+        # Ensure JAX is initialized; if unavailable, fall back to CPU path without raising
         ensure_jax()
-        if not _JAX_OK:
-            raise RuntimeError("Cannot warm up GlobalBatchEvaluator: JAX not available")
+        if not getattr(jax_backend, '_JAX_OK', False):
+            logger.warning("[VMAP] JAX not available during warmup — falling back to CPU/NumPy path")
+            # Mark warmed up to avoid repeated attempts and let evaluate_batch use CPU fallback
+            self.jit_compute = None
+            self.warmed_up = True
+            return
 
         dummy_paths = jnp.ones((2, 100, 301))  # 2 symbols, 100 paths, 300 steps
         dummy_horizons = jnp.array([60, 180])
@@ -263,9 +274,14 @@ class GlobalBatchEvaluator:
         Returns:
             각 메트릭의 shape: (n_symbols, n_horizons)
         """
-        # 워밍업
+        # 워밍업 (ensure warmup attempted at least once)
         if not self.warmed_up:
-            self.warmup()
+            try:
+                self.warmup()
+            except Exception as e:
+                logger.warning(f"[VMAP] Warmup raised exception: {e}. Proceeding with CPU fallback.")
+                self.jit_compute = None
+                self.warmed_up = True
         
         # DEV_MODE: NumPy fallback (sequential)
         if DEV_MODE:
@@ -313,6 +329,52 @@ class GlobalBatchEvaluator:
             logger.info(f"[VMAP] DEV_MODE NumPy batch evaluation: {n_symbols} symbols × {n_horizons} horizons in {(t1-t0)*1000:.2f}ms")
             return results
         
+        # If JAX is not available or JIT wasn't created, fall back to CPU (NumPy) path
+        if not getattr(jax_backend, '_JAX_OK', False) or self.jit_compute is None:
+            logger.info("[VMAP] Using CPU fallback for batch evaluation (JAX unavailable)")
+            from engines.mc.jax_backend import summarize_gbm_horizons_numpy
+            n_symbols = len(leverages)
+            n_horizons = len(horizons)
+            n_steps = price_paths_batch.shape[2] - 1
+
+            horizons_arr = np.array(horizons, dtype=np.int32)
+            horizons_indices = np.clip(horizons_arr, 0, n_steps)
+
+            results = {
+                "ev_long": np.zeros((n_symbols, n_horizons)),
+                "ev_short": np.zeros((n_symbols, n_horizons)),
+                "p_pos_long": np.zeros((n_symbols, n_horizons)),
+                "p_pos_short": np.zeros((n_symbols, n_horizons)),
+                "cvar_long": np.zeros((n_symbols, n_horizons)),
+                "cvar_short": np.zeros((n_symbols, n_horizons)),
+                "p_tp_long": np.zeros((n_symbols, n_horizons)),
+                "p_sl_long": np.zeros((n_symbols, n_horizons)),
+                "p_tp_short": np.zeros((n_symbols, n_horizons)),
+                "p_sl_short": np.zeros((n_symbols, n_horizons)),
+            }
+            t0 = time.perf_counter()
+            for i in range(n_symbols):
+                try:
+                    r = summarize_gbm_horizons_numpy(
+                        price_paths_batch[i],
+                        float(price_paths_batch[i, 0, 0]),
+                        float(leverages[i]),
+                        float(fee_roundtrips[i]),
+                        horizons_indices,
+                        1.0 - cvar_alpha,
+                    )
+                    results["ev_long"][i] = r["ev_long"]
+                    results["ev_short"][i] = r["ev_short"]
+                    results["p_pos_long"][i] = r["win_long"]
+                    results["p_pos_short"][i] = r["win_short"]
+                    results["cvar_long"][i] = r["cvar_long"]
+                    results["cvar_short"][i] = r["cvar_short"]
+                except Exception as e:
+                    logger.warning(f"[VMAP] CPU fallback symbol {i} failed: {e}")
+            t1 = time.perf_counter()
+            logger.info(f"[VMAP] CPU batch evaluation: {n_symbols} symbols × {n_horizons} horizons in {(t1-t0)*1000:.2f}ms")
+            return results
+
         # JAX mode
         # Numpy → JAX 변환
         paths_jax = jnp.array(price_paths_batch)

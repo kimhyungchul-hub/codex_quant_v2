@@ -87,12 +87,48 @@ class CleanEntryEvaluator:
         fees = np.array([fee_roundtrip])
         tp_batch = np.array([tp_targets])  # (1, n_horizons)
         sl_batch = np.array([sl_targets])
-        
-        # GPU 평가
-        results = self.gpu_evaluator.evaluate_batch(
-            price_paths_batch, horizons, leverages, fees,
-            tp_batch, sl_batch, cvar_alpha
-        )
+        # Calls into GlobalBatchEvaluator which may raise if JAX not available
+        try:
+            results = self.gpu_evaluator.evaluate_batch(
+                price_paths_batch, horizons, leverages, fees,
+                tp_batch, sl_batch, cvar_alpha
+            )
+        except RuntimeError as e:
+            # Log and fallback to numpy-based evaluator to avoid bubbling exception
+            logger = logging.getLogger(__name__)
+            logger.warning(f"[ENTRY_EVAL_CLEAN] GPU evaluate failed: {e}. Falling back to CPU NumPy path.")
+            from engines.mc.jax_backend import summarize_gbm_horizons_numpy
+            # Attempt a best-effort CPU fallback using existing wrapper
+            n_symbols = price_paths_batch.shape[0]
+            n_horizons = len(horizons)
+            n_steps = price_paths_batch.shape[2] - 1
+            horizons_arr = np.array(horizons, dtype=np.int32)
+            horizons_indices = np.clip(horizons_arr, 0, n_steps)
+
+            results = {
+                "ev_long": np.zeros((n_symbols, n_horizons)),
+                "ev_short": np.zeros((n_symbols, n_horizons)),
+                "p_pos_long": np.zeros((n_symbols, n_horizons)),
+                "p_pos_short": np.zeros((n_symbols, n_horizons)),
+                "cvar_long": np.zeros((n_symbols, n_horizons)),
+                "cvar_short": np.zeros((n_symbols, n_horizons)),
+            }
+            for i in range(n_symbols):
+                r = summarize_gbm_horizons_numpy(
+                    price_paths_batch[i],
+                    float(price_paths_batch[i, 0, 0]),
+                    float(leverages[i]),
+                    float(fees[i]),
+                    horizons_indices,
+                    1.0 - cvar_alpha,
+                )
+                results["ev_long"][i] = r["ev_long"]
+                results["ev_short"][i] = r["ev_short"]
+                results["p_pos_long"][i] = r["win_long"]
+                results["p_pos_short"][i] = r["win_short"]
+                results["cvar_long"][i] = r["cvar_long"]
+                results["cvar_short"][i] = r["cvar_short"]
+            # continue to unpack below
         
         # 결과 언팩 (batch_size=1이므로 [0] 인덱스)
         return {
