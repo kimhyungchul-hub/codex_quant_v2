@@ -3180,7 +3180,7 @@ self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         print(f"[BATCH_TIMING] prep={(t_prep1-t_prep0):.3f}s n_paths={n_paths} max_steps={max_steps} step_sec={step_sec} dt={dt:.2e}", flush=True)
         
         # Ensure JAX is initialized before GPU operations
-        ensure_jax()
+        jax_backend.ensure_jax()
         from engines.mc.jax_backend import jax as jax_module, DEV_MODE as _DEV_MODE
         
         # ✅ DEV_MODE: NumPy sequential fallback
@@ -3293,7 +3293,7 @@ self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
             except Exception as e:
                 logger.warning(f"⚠️ [JAX_FALLBACK] Metal failed: {e}. Falling back to JAX-CPU (PARALLEL).")
-                ensure_jax()
+                jax_backend.ensure_jax()
                 from engines.mc.jax_backend import jax as jax_module
                 if jax_module is None:
                     raise RuntimeError("JAX is not available for CPU fallback") from e
