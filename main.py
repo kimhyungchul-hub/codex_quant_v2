@@ -20,6 +20,7 @@ import config
 from core.dashboard_server import DashboardServer
 from core.orchestrator import LiveOrchestrator, build_exchange, build_data_exchange
 from utils.helpers import normalize_symbol
+from engines.remote_engine_hub import create_engine_hub
 from engines import (
     alpha_features_methods,
     cvar_methods,
@@ -88,6 +89,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--mc-use-jax", dest="mc_use_jax", action="store_true", help="Force enable JAX in MC.")
     parser.add_argument("--mc-no-jax", dest="mc_use_jax", action="store_false", help="Disable JAX in MC.")
     parser.set_defaults(mc_use_jax=None)
+    parser.add_argument("--mc-process", dest="mc_process", action="store_true", help="Run MC engine in an isolated process (shared memory IPC).")
+    parser.add_argument("--no-mc-process", dest="mc_process", action="store_false", help="Run MC engine in-process.")
+    parser.set_defaults(mc_process=None)
     parser.add_argument(
         "--exec-mode",
         type=str,
@@ -247,12 +251,27 @@ async def main() -> None:
 
     # Create LiveOrchestrator with new mixin-based signature:
     # __init__(symbols, balance, leverage, exchange, hub, state_dir, **kwargs)
+    use_process_hub = os.environ.get("USE_PROCESS_ENGINE", "1").lower() in ("1", "true", "yes")
+    if args.mc_process is not None:
+        use_process_hub = bool(args.mc_process)
+
+    # CPU affinity optional; keep minimal parsing here to avoid platform errors.
+    affinity_env = os.environ.get("MC_ENGINE_CPU_AFFINITY", "")
+    affinity = None
+    if affinity_env:
+        try:
+            affinity = [int(x) for x in affinity_env.split(",") if x.strip()]
+        except Exception:
+            affinity = None
+
+    engine_hub = create_engine_hub(use_process=use_process_hub, cpu_affinity=affinity)
+
     orchestrator = LiveOrchestrator(
         symbols=symbols if symbols else config.SYMBOLS,
         balance=10000.0,  # Initial balance
         leverage=config.DEFAULT_LEVERAGE,
         exchange=exchange,
-        hub=None,  # Will be initialized inside orchestrator
+        hub=engine_hub,
         state_dir="state",
         data_exchange=data_exchange,  # Pass as kwarg
     )
@@ -304,6 +323,11 @@ async def main() -> None:
             await exchange.close()
             if data_exchange is not exchange:
                 await data_exchange.close()
+            try:
+                if hasattr(orchestrator, "hub") and hasattr(orchestrator.hub, "close"):
+                    orchestrator.hub.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

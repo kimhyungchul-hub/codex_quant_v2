@@ -4,6 +4,11 @@ import os
 from dataclasses import dataclass
 
 
+# Johnson SU shape parameters (skew/kurtosis) with env overrides
+JOHNSON_SU_GAMMA = float(os.environ.get("MC_JOHNSON_SU_GAMMA", "0.0"))
+JOHNSON_SU_DELTA = float(os.environ.get("MC_JOHNSON_SU_DELTA", "1.0"))
+
+
 @dataclass
 class MCParams:
     min_win: float

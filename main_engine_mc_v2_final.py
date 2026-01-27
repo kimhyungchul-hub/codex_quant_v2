@@ -24,12 +24,16 @@ import bootstrap
 from pathlib import Path
 import config
 from concurrent.futures import ThreadPoolExecutor
+from engines.mc.constants import DECIDE_BATCH_TIMEOUT_SEC as MC_DECIDE_BATCH_TIMEOUT_SEC
 
 # ============================================================================
 # GPU Thread Pool (prevents asyncio blocking during GPU operations)
 # ============================================================================
 # GPU 연산은 메인 asyncio 루프를 블로킹하므로 별도 스레드에서 실행
 GPU_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu_worker")
+
+# Timeout (seconds) for decide_batch GPU/remote calls. Centralized in engines.mc.constants
+DECIDE_BATCH_TIMEOUT_SEC = MC_DECIDE_BATCH_TIMEOUT_SEC
 
 # JAX platform 설정 - GPU 전용 모드 (CPU 폴백 없음)
 platform_env = os.environ.get("JAX_PLATFORMS", "").strip()
@@ -205,14 +209,24 @@ class LiveOrchestrator:
             print(f"[LiveOrchestrator] Using RemoteEngineHub @ {ENGINE_SERVER_URL}")
             self.hub = RemoteEngineHub(url=ENGINE_SERVER_URL, fallback_local=True)
         else:
-            print("[LiveOrchestrator] Using local EngineHub")
-            self.hub = EngineHub()
+            # 기본값: 프로세스 분리 허브를 사용하여 GIL 차단을 제거
+            use_process = os.environ.get("USE_PROCESS_ENGINE", "1").lower() in ("1", "true", "yes")
+            cpu_affinity = None
+            if os.environ.get("MC_ENGINE_CPU_AFFINITY"):
+                try:
+                    cpu_affinity = [int(x) for x in os.environ.get("MC_ENGINE_CPU_AFFINITY", "").split(",") if x.strip()]
+                except Exception:
+                    cpu_affinity = None
+            self.hub = create_engine_hub(use_remote=False, use_process=use_process, cpu_affinity=cpu_affinity)
+            print(f"[LiveOrchestrator] Using {'ProcessEngineHub' if use_process else 'EngineHub'}")
         self.exchange = exchange
         self._net_sem = asyncio.Semaphore(MAX_INFLIGHT_REQ)
         self._ob_sem = asyncio.Semaphore(ORDERBOOK_MAX_INFLIGHT_REQ)
         self._last_ok = {"tickers": 0, "ohlcv": {s: 0 for s in SYMBOLS}, "ob": {s: 0 for s in SYMBOLS}}
 
         self.clients = set()
+        # 마지막으로 전송된 full_update 메시지(문자열). 새로 연결된 클라이언트에 즉시 재전송 가능
+        self._last_broadcast_msg = None
         self.logs = deque(maxlen=300)
         self.anomalies = deque(maxlen=200)
         self._loss_streak = 0
@@ -324,7 +338,21 @@ class LiveOrchestrator:
         self._top_n_symbols: list[str] = []         # TOP N 종목 리스트
         self._last_ranking_ts = 0                   # 마지막 순위 갱신 시각
         self._kelly_allocations: dict[str, float] = {}  # sym -> allocation weight
+        
+        # ---- SoA (Structure of Arrays) Pre-allocation for Zero-Copy Batch Ingestion ----
+        # CRITICAL: 메모리 재할당 방지 & JAX Static Shape 유지
+        from engines.mc.constants import STATIC_MAX_SYMBOLS
+        self._batch_max_symbols = max(len(SYMBOLS), STATIC_MAX_SYMBOLS)  # JAX JIT stability
+        self._sym_to_idx = {s: i for i, s in enumerate(SYMBOLS)}  # O(1) lookup
+        # Pre-allocated numpy arrays (reused each cycle)
+        self._batch_prices = np.zeros(self._batch_max_symbols, dtype=np.float64)
+        self._batch_mus = np.zeros(self._batch_max_symbols, dtype=np.float64)
+        self._batch_sigmas = np.ones(self._batch_max_symbols, dtype=np.float64) * 0.2  # default vol
+        self._batch_leverages = np.ones(self._batch_max_symbols, dtype=np.float64) * DEFAULT_LEVERAGE
+        self._batch_ofi_scores = np.zeros(self._batch_max_symbols, dtype=np.float64)
+        self._batch_valid_mask = np.zeros(self._batch_max_symbols, dtype=bool)  # which slots are valid
         self._log(f"[INIT] Portfolio Management: TOP_N={TOP_N_SYMBOLS}, Kelly={USE_KELLY_ALLOCATION}, Opportunity={USE_CONTINUOUS_OPPORTUNITY}")
+        self._log(f"[INIT] SoA Batch Arrays: max_symbols={self._batch_max_symbols}, shape=({self._batch_max_symbols},)")
 
     def _log(self, text: str):
         ts = time.strftime("%H:%M:%S")
@@ -1676,6 +1704,105 @@ class LiveOrchestrator:
             "ev": None,
         }
 
+    def _build_batch_context_soa(self, ts: int) -> tuple[list[dict], np.ndarray]:
+        """
+        [SoA OPTIMIZATION] Structure of Arrays 방식으로 배치 컨텍스트 생성.
+        
+        Returns:
+            - ctx_list: 유효한 심볼의 컨텍스트 리스트 (기존 호환성 유지)
+            - valid_indices: 유효한 심볼의 인덱스 배열 (GPU 배열 인덱싱용)
+        
+        CRITICAL OPTIMIZATION:
+        - Pre-allocated 배열에 직접 값 할당 (메모리 재할당 없음)
+        - Dict 생성 최소화 (필수 필드만 포함)
+        - O(1) 심볼 인덱스 조회
+        """
+        # Reset valid mask and arrays
+        self._batch_valid_mask.fill(False)
+        
+        ctx_list = []
+        valid_indices = []
+        
+        for sym in SYMBOLS:
+            idx = self._sym_to_idx.get(sym)
+            if idx is None:
+                continue
+                
+            price = self.market[sym]["price"]
+            if price is None:
+                continue
+            
+            closes = list(self.ohlcv_buffer[sym])
+            candles = len(closes)
+            
+            # Compute mu/sigma directly into pre-allocated arrays
+            mu_bar, sigma_bar = self._compute_returns_and_vol(closes)
+            regime = self._infer_regime(closes)
+            
+            # Annualized μ/σ
+            mu_base, sigma = (0.0, 0.0)
+            if mu_bar is not None and sigma_bar is not None:
+                mu_base, sigma = self._annualize_mu_sigma(mu_bar, sigma_bar, bar_seconds=60.0)
+            
+            # Regime table blend
+            session = time_regime()
+            mu_tab, sig_tab = get_regime_mu_sigma(regime, session, symbol=sym)
+            if mu_tab is not None and sig_tab is not None:
+                w = 0.35
+                mu_base = float((1.0 - w) * float(mu_base) + w * float(mu_tab))
+                sigma = float(max(1e-6, (1.0 - w) * float(sigma) + w * float(sig_tab)))
+            
+            ofi_score = float(self._compute_ofi_score(sym))
+            
+            # Fill pre-allocated arrays (Zero-Copy style)
+            self._batch_prices[idx] = float(price)
+            self._batch_mus[idx] = float(mu_base)
+            self._batch_sigmas[idx] = float(max(sigma, 1e-6))
+            self._batch_ofi_scores[idx] = ofi_score
+            self._batch_valid_mask[idx] = True
+            
+            valid_indices.append(idx)
+            
+            # Build minimal ctx dict for backward compatibility
+            # (향후 완전 SoA 전환 시 제거 가능)
+            is_dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
+            ctx = {
+                "symbol": sym,
+                "price": float(price),
+                "bar_seconds": 60.0,
+                "closes": closes,
+                "candles": candles,
+                "direction": self._direction_bias(closes),
+                "regime": regime,
+                "ofi_score": ofi_score,
+                "liquidity_score": self._liquidity_score(sym),
+                "leverage": None,
+                "mu_base": float(mu_base),
+                "sigma": float(max(sigma, 0.0)),
+                "session": session,
+                "use_jax": not is_dev_mode,
+                "ev": None,
+                "_soa_idx": idx,  # SoA 배열 인덱스 참조
+            }
+            ctx_list.append(ctx)
+        
+        return ctx_list, np.array(valid_indices, dtype=np.int32)
+
+    def get_batch_arrays(self) -> dict:
+        """
+        [SoA API] Pre-allocated 배열들을 반환.
+        EngineHub.decide_batch_arrays()에서 사용.
+        """
+        return {
+            "prices": self._batch_prices,
+            "mus": self._batch_mus,
+            "sigmas": self._batch_sigmas,
+            "leverages": self._batch_leverages,
+            "ofi_scores": self._batch_ofi_scores,
+            "valid_mask": self._batch_valid_mask,
+            "max_symbols": self._batch_max_symbols,
+        }
+
     def _apply_decision(
         self,
         sym: str,
@@ -2417,6 +2544,25 @@ class LiveOrchestrator:
                 "last_msg_age": (ts - self._last_feed_ok_ms) if self._last_feed_ok_ms else None
             }
 
+            # Debug: announce broadcast attempt
+            try:
+                clients_now = len(self.clients)
+                # If no clients currently connected, wait briefly (non-blocking) for a short window
+                # to allow newly-connected dashboards to receive this update.
+                if clients_now == 0:
+                    wait_deadline = time.time() + 0.5  # seconds total to wait
+                    while time.time() < wait_deadline and len(self.clients) == 0:
+                        # yield control to event loop briefly without blocking
+                        try:
+                            await asyncio.sleep(0.05)
+                        except Exception:
+                            time.sleep(0.05)
+                            break
+                    clients_now = len(self.clients)
+                self._log(f"[BROADCAST] clients={clients_now} rows={len(rows)}")
+            except Exception:
+                pass
+
             payload = {
                 "type": "full_update",
                 "server_time": ts,
@@ -2445,6 +2591,39 @@ class LiveOrchestrator:
             }
 
             msg = json.dumps(payload, ensure_ascii=False)
+            # 캐시: 새로 연결되는 클라이언트에 즉시 전송하기 위해 마지막 페이로드 보관
+            try:
+                self._last_broadcast_msg = msg
+            except Exception:
+                self._last_broadcast_msg = None
+            # Debug: write last broadcast to a temp file for offline inspection (truncated legacy dump)
+            try:
+                with open('/tmp/last_broadcast.json', 'w', encoding='utf-8') as _f:
+                    _f.write(msg[:200000])
+            except Exception:
+                pass
+
+            # Write a compact diagnostics JSON (non-truncated) focused on rebalance fields
+            try:
+                diag = {
+                    "ts": int(time.time() * 1000),
+                    "market_diag": [
+                        {
+                            "symbol": r.get("symbol"),
+                            "rebalance_decision": r.get("rebalance_decision"),
+                            "rebalance_weight": r.get("rebalance_weight"),
+                            "rebalance_delta_ev": r.get("rebalance_delta_ev"),
+                            "rebalance_exec_cost": r.get("rebalance_exec_cost"),
+                            "rebalance_target_leverage": r.get("rebalance_target_leverage"),
+                            "rebalance_allow_trade": r.get("rebalance_allow_trade"),
+                        }
+                        for r in rows
+                    ],
+                }
+                with open('/tmp/last_broadcast_diag.json', 'w', encoding='utf-8') as _f:
+                    _f.write(json.dumps(diag, ensure_ascii=False))
+            except Exception:
+                pass
             dead = []
             for ws in list(self.clients):
                 try:
@@ -2453,6 +2632,10 @@ class LiveOrchestrator:
                     dead.append(ws)
             for ws in dead:
                 self.clients.discard(ws)
+            try:
+                self._log(f"[BROADCAST_DONE] sent rows={len(rows)} clients_now={len(self.clients)}")
+            except Exception:
+                pass
         except Exception as e:
             import traceback
             err_text = f"{e} {traceback.format_exc()}"
@@ -2467,187 +2650,264 @@ class LiveOrchestrator:
           3. Result Application: _apply_decision() per symbol (isolated exceptions)
         """
         while True:
-            rows = []
-            ts = now_ms()
-            self._decision_cycle = (self._decision_cycle + 1) % self._decision_log_every
-            log_this_cycle = (self._decision_cycle == 0)
+            try:
+                rows = []
+                ts = now_ms()
+                self._decision_cycle = (self._decision_cycle + 1) % self._decision_log_every
+                log_this_cycle = (self._decision_cycle == 0)
 
-            # ====== Stage 1: Context Collection ======
-            ctx_list = []
-            ctx_sym_map = {}  # sym -> ctx for later lookup
-
-            for sym in SYMBOLS:
+                # ====== Stage 1: Context Collection (SoA Optimized) ======
+                # [OPTIMIZATION] _build_batch_context_soa: Pre-allocated arrays + minimal dict creation
+                ctx_list = []
+                ctx_sym_map = {}  # sym -> ctx for later lookup
+                valid_indices = None
+                
                 try:
-                    ctx = self._build_decision_context(sym, ts)
-                    if ctx is None:
-                        # Price not ready
-                        candles = len(self.ohlcv_buffer[sym])
-                        rows.append(self._row(sym, None, ts, None, candles))
-                        continue
-                    ctx_list.append(ctx)
-                    ctx_sym_map[sym] = ctx
-                except Exception as e:
-                    self._log_err(f"[ERR] build_ctx {sym}: {e}")
-                    candles = len(self.ohlcv_buffer[sym])
-                    rows.append(self._row(sym, None, ts, None, candles))
+                    ctx_list, valid_indices = self._build_batch_context_soa(ts)
+                    # Cycle debug: log ctx_list size
+                    try:
+                        self._log(f"[CYCLE] ts={ts} ctx_count={len(ctx_list)} valid_indices_count={0 if valid_indices is None else len(valid_indices)}")
+                    except Exception:
+                        pass
+                    ctx_sym_map = {ctx["symbol"]: ctx for ctx in ctx_list}
 
-            # ====== Stage 2: Batch Decision Execution (GPU in separate thread) ======
-            batch_decisions = []
-            if ctx_list:
-                try:
-                    # GPU 연산을 별도 스레드에서 실행하여 asyncio 블로킹 방지
-                    loop = asyncio.get_event_loop()
-                    batch_decisions = await loop.run_in_executor(
-                        GPU_EXECUTOR, 
-                        self.hub.decide_batch, 
-                        ctx_list
-                    )
+                    # 유효하지 않은 심볼들은 빈 row로 채움
+                    valid_syms = set(ctx_sym_map.keys())
+                    for sym in SYMBOLS:
+                        if sym not in valid_syms:
+                            candles = len(self.ohlcv_buffer[sym])
+                            rows.append(self._row(sym, None, ts, None, candles))
                 except Exception as e:
                     import traceback
-                    self._log_err(f"[ERR] decide_batch: {e} {traceback.format_exc()}")
-                    self._note_runtime_error("decide_batch", str(e))
-                    # Fallback: create empty decisions
-                    batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_error"} for _ in ctx_list]
+                    self._log_err(f"[ERR] build_batch_ctx: {e} {traceback.format_exc()}")
+                    # Fallback: 개별 빌드 (기존 방식)
+                    for sym in SYMBOLS:
+                        try:
+                            ctx = self._build_decision_context(sym, ts)
+                            if ctx is None:
+                                candles = len(self.ohlcv_buffer[sym])
+                                rows.append(self._row(sym, None, ts, None, candles))
+                                continue
+                            ctx_list.append(ctx)
+                            ctx_sym_map[sym] = ctx
+                        except Exception as e2:
+                            self._log_err(f"[ERR] build_ctx {sym}: {e2}")
+                            candles = len(self.ohlcv_buffer[sym])
+                            rows.append(self._row(sym, None, ts, None, candles))
 
-            # ====== Stage 2.5: Portfolio Ranking & TOP N Selection + Kelly Allocation ======
-            if batch_decisions and USE_KELLY_ALLOCATION:
-                try:
-                    # 2.5.1 — 모든 심볼의 EV 수집 (EV 기반 Kelly 배분)
-                    sym_ev_map: dict[str, float] = {}
-                    
-                    for i, dec in enumerate(batch_decisions):
-                        sym = ctx_list[i]["symbol"]
-                        # decision dict에서 ev 직접 추출 (절대값 사용)
-                        ev_val = abs(float(dec.get("ev", 0.0) or 0.0))
-                        # ev_raw도 확인 (더 정확한 값일 수 있음)
-                        ev_raw = abs(float(dec.get("ev_raw", ev_val) or ev_val))
-                        sym_ev_map[sym] = max(ev_val, ev_raw)
-                    
-                    # 2.5.2 — EV 기준 순위 정렬 및 TOP N 선택
-                    sorted_syms = sorted(sym_ev_map.keys(), key=lambda s: sym_ev_map[s], reverse=True)
-                    self._symbol_scores = sym_ev_map.copy()
-                    self._symbol_ranks = {s: rank + 1 for rank, s in enumerate(sorted_syms)}
-                    self._top_n_symbols = sorted_syms[:TOP_N_SYMBOLS]
-                    
-                    # Always log TOP N selection (critical for debugging)
-                    top_info = [(s, f"{sym_ev_map[s]:.4f}") for s in self._top_n_symbols]
-                    self._log(f"[PORTFOLIO] TOP {TOP_N_SYMBOLS}: {top_info}")
-                    
-                    # 2.5.3 — Kelly 배분 계산 (EV 비례 배분)
-                    if self._top_n_symbols:
-                        import numpy as np
-                        n_top = len(self._top_n_symbols)
-                        
-                        # EV 기반 Kelly 배분 (EV가 높을수록 더 많은 자본 배분)
-                        evs = np.array([sym_ev_map[s] for s in self._top_n_symbols])
-                        self._log(f"[KELLY_DEBUG] EVs for TOP {n_top}: {dict(zip(self._top_n_symbols, evs.tolist()))}")
-                        
-                        # EV 비례 배분 (음수 EV는 0으로 처리)
-                        evs_positive = np.clip(evs, 0, None)
-                        total_ev = evs_positive.sum()
-                        
-                        if total_ev > 0:
-                            # EV 비례 배분 (더 높은 EV → 더 많은 자본)
-                            kelly_norm = evs_positive / total_ev
+                # ====== Stage 2: Batch Decision Execution (GPU in separate thread) ======
+                batch_decisions = []
+                if ctx_list:
+                    try:
+                        # Lightweight cycle log for debugging latency and ctx size
+                        try:
+                            self._log(f"[CYCLE] cycle={self._decision_cycle} ts={ts} ctx_count={len(ctx_list)} valid_indices={len(valid_indices) if valid_indices is not None else 'N/A'}")
+                        except Exception:
+                            pass
+                        # 우선 비동기 프로세스 허브가 있으면 polling 방식으로 사용
+                        if hasattr(self.hub, "decide_batch_async") and asyncio.iscoroutinefunction(getattr(self.hub, "decide_batch_async")):
+                            try:
+                                batch_decisions = await asyncio.wait_for(
+                                    self.hub.decide_batch_async(ctx_list, timeout=DECIDE_BATCH_TIMEOUT_SEC),
+                                    timeout=DECIDE_BATCH_TIMEOUT_SEC,
+                                )
+                            except asyncio.TimeoutError:
+                                self._log_err(f"[ERR] decide_batch: timeout after {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                self._note_runtime_error("decide_batch", f"timeout {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_timeout"} for _ in ctx_list]
                         else:
-                            # EV가 모두 0이거나 음수면 균등 배분
-                            kelly_norm = np.ones(n_top) / n_top
+                            # GPU 연산을 별도 스레드에서 실행하여 asyncio 블로킹 방지
+                            loop = asyncio.get_event_loop()
+                            try:
+                                batch_decisions = await asyncio.wait_for(
+                                    loop.run_in_executor(
+                                        GPU_EXECUTOR,
+                                        self.hub.decide_batch,
+                                        ctx_list,
+                                    ),
+                                    timeout=DECIDE_BATCH_TIMEOUT_SEC,
+                                )
+                            except asyncio.TimeoutError:
+                                self._log_err(f"[ERR] decide_batch: timeout after {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                self._note_runtime_error("decide_batch", f"timeout {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_timeout"} for _ in ctx_list]
+                    except Exception as e:
+                        import traceback
+                        self._log_err(f"[ERR] decide_batch: {e} {traceback.format_exc()}")
+                        self._note_runtime_error("decide_batch", str(e))
+                        # Fallback: create empty decisions
+                        batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_error"} for _ in ctx_list]
+
+                # ====== Stage 2.5: Portfolio Ranking & TOP N Selection + Kelly Allocation ======
+                if batch_decisions and USE_KELLY_ALLOCATION:
+                    try:
+                        # 2.5.1 — 모든 심볼의 EV 수집 (EV 기반 Kelly 배분)
+                        sym_ev_map: dict[str, float] = {}
                         
-                        self._kelly_allocations = {s: float(kelly_norm[i]) for i, s in enumerate(self._top_n_symbols)}
+                        for i, dec in enumerate(batch_decisions):
+                            sym = ctx_list[i]["symbol"]
+                            # decision dict에서 ev 직접 추출 (절대값 사용)
+                            ev_val = abs(float(dec.get("ev", 0.0) or 0.0))
+                            # ev_raw도 확인 (더 정확한 값일 수 있음)
+                            ev_raw = abs(float(dec.get("ev_raw", ev_val) or ev_val))
+                            sym_ev_map[sym] = max(ev_val, ev_raw)
                         
-                        # Always log Kelly allocations (critical for debugging)
-                        alloc_info = [(s, f"{self._kelly_allocations[s]:.2%}") for s in self._top_n_symbols]
-                        self._log(f"[KELLY] Allocations: {alloc_info}")
-                    
-                    # 2.5.4 — TOP N에 없는 심볼의 진입 차단 (action을 WAIT로 변경)
-                    for i, dec in enumerate(batch_decisions):
-                        sym = ctx_list[i]["symbol"]
-                        action = dec.get("action", "WAIT")
+                        # 2.5.2 — EV 기준 순위 정렬 및 TOP N 선택
+                        sorted_syms = sorted(sym_ev_map.keys(), key=lambda s: sym_ev_map[s], reverse=True)
+                        self._symbol_scores = sym_ev_map.copy()
+                        self._symbol_ranks = {s: rank + 1 for rank, s in enumerate(sorted_syms)}
+                        self._top_n_symbols = sorted_syms[:TOP_N_SYMBOLS]
                         
-                        if action in ("LONG", "SHORT") and sym not in self._top_n_symbols:
-                            # 현재 포지션이 없는 경우에만 차단 (기존 포지션 청산은 허용)
-                            pos = self.positions.get(sym, {})
-                            if pos.get("qty", 0) == 0:
-                                dec["action"] = "WAIT"
-                                dec["reason"] = f"NOT_IN_TOP_{TOP_N_SYMBOLS}"
-                                # Always log blocked symbols (critical for debugging)
-                                self._log(f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT (not in TOP {TOP_N_SYMBOLS})")
-                    
-                except Exception as e:
+                        # Always log TOP N selection (critical for debugging)
+                        top_info = [(s, f"{sym_ev_map[s]:.4f}") for s in self._top_n_symbols]
+                        self._log(f"[PORTFOLIO] TOP {TOP_N_SYMBOLS}: {top_info}")
+                        
+                        # 2.5.3 — Kelly 배분 계산 (EV 비례 배분)
+                        if self._top_n_symbols:
+                            import numpy as np
+                            n_top = len(self._top_n_symbols)
+                            
+                            # EV 기반 Kelly 배분 (EV가 높을수록 더 많은 자본 배분)
+                            evs = np.array([sym_ev_map[s] for s in self._top_n_symbols])
+                            self._log(f"[KELLY_DEBUG] EVs for TOP {n_top}: {dict(zip(self._top_n_symbols, evs.tolist()))}")
+                            
+                            # EV 비례 배분 (음수 EV는 0으로 처리)
+                            evs_positive = np.clip(evs, 0, None)
+                            total_ev = evs_positive.sum()
+                            
+                            if total_ev > 0:
+                                # EV 비례 배분 (더 높은 EV → 더 많은 자본)
+                                kelly_norm = evs_positive / total_ev
+                            else:
+                                # EV가 모두 0이거나 음수면 균등 배분
+                                kelly_norm = np.ones(n_top) / n_top
+                            
+                            self._kelly_allocations = {s: float(kelly_norm[i]) for i, s in enumerate(self._top_n_symbols)}
+                            
+                            # Always log Kelly allocations (critical for debugging)
+                            alloc_info = [(s, f"{self._kelly_allocations[s]:.2%}") for s in self._top_n_symbols]
+                            self._log(f"[KELLY] Allocations: {alloc_info}")
+                        
+                        # 2.5.4 — TOP N에 없는 심볼의 진입 차단 (action을 WAIT로 변경)
+                        for i, dec in enumerate(batch_decisions):
+                            sym = ctx_list[i]["symbol"]
+                            action = dec.get("action", "WAIT")
+                            
+                            if action in ("LONG", "SHORT") and sym not in self._top_n_symbols:
+                                # 현재 포지션이 없는 경우에만 차단 (기존 포지션 청산은 허용)
+                                pos = self.positions.get(sym, {})
+                                if pos.get("qty", 0) == 0:
+                                    dec["action"] = "WAIT"
+                                    dec["reason"] = f"NOT_IN_TOP_{TOP_N_SYMBOLS}"
+                                    # Always log blocked symbols (critical for debugging)
+                                    self._log(f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT (not in TOP {TOP_N_SYMBOLS})")
+                        
+                    except Exception as e:
                         import traceback
                         self._log_err(f"[ERR] portfolio_ranking: {e} {traceback.format_exc()}")
                         self._note_runtime_error("portfolio_ranking", str(e))
 
-            # ====== Stage 2.6: Continuous Opportunity Evaluation (Switching Cost) ======
-            if batch_decisions and USE_CONTINUOUS_OPPORTUNITY:
+                # ====== Stage 2.6: Continuous Opportunity Evaluation (Switching Cost) ======
+                if batch_decisions and USE_CONTINUOUS_OPPORTUNITY:
+                    try:
+                        # 현재 포지션 보유 심볼과 TOP N 비교
+                        current_positions = [s for s, p in self.positions.items() if p.get("qty", 0) != 0]
+                        
+                        for held_sym in current_positions:
+                            if held_sym in self._top_n_symbols:
+                                continue  # 이미 TOP N에 포함 → 유지
+                            
+                            # 가장 높은 EV를 가진 진입 후보와 비교
+                            best_candidate = self._top_n_symbols[0] if self._top_n_symbols else None
+                            if not best_candidate:
+                                continue
+                            
+                            held_ev = self._symbol_scores.get(held_sym, 0)
+                            cand_ev = self._symbol_scores.get(best_candidate, 0)
+                            
+                            # 거래 비용 추정 (현재 심볼 청산 + 새 심볼 진입)
+                            fee_rate = MAKER_FEE_RATE if USE_MAKER_ORDERS else TAKER_FEE_RATE
+                            switching_cost = fee_rate * 2 * SWITCHING_COST_MULT  # 왕복 + 마진
+                            
+                            # 교체 조건: 후보 EV > 보유 EV + 교체 비용
+                            if cand_ev > held_ev + switching_cost:
+                                if log_this_cycle:
+                                    self._log(f"[SWITCH] {held_sym}(ev={held_ev:.4f}) → {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
+                                # 청산 시그널 발생 (기존 포지션)
+                                for i, dec in enumerate(batch_decisions):
+                                    if ctx_list[i]["symbol"] == held_sym:
+                                        dec["action"] = "CLOSE"
+                                        dec["reason"] = f"SWITCH_TO_{best_candidate}"
+                                        break
+                            else:
+                                if log_this_cycle:
+                                    self._log(f"[HOLD] {held_sym}(ev={held_ev:.4f}) kept vs {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
+                                    
+                    except Exception as e:
+                        import traceback
+                        self._log_err(f"[ERR] opportunity_eval: {e} {traceback.format_exc()}")
+                        self._note_runtime_error("opportunity_eval", str(e))
+
+                # ====== Stage 3: Result Application (per-symbol isolation) ======
+                for i, decision in enumerate(batch_decisions):
+                    ctx = ctx_list[i]
+                    sym = ctx["symbol"]
+                    try:
+                        row = self._apply_decision(sym, decision, ctx, ts, log_this_cycle)
+                        rows.append(row)
+                    except Exception as e:
+                        import traceback
+                        self._log_err(f"[ERR] apply_decision {sym}: {e} {traceback.format_exc()}")
+                        self._note_runtime_error(f"apply_decision:{sym}", str(e))
+                        rows.append(self._row(sym, ctx.get("price"), ts, None, ctx.get("candles", 0)))
+
+                # ====== Stage 4: Spread Management & Broadcast (always execute) ======
                 try:
-                    # 현재 포지션 보유 심볼과 TOP N 비교
-                    current_positions = [s for s, p in self.positions.items() if p.get("qty", 0) != 0]
-                    
-                    for held_sym in current_positions:
-                        if held_sym in self._top_n_symbols:
-                            continue  # 이미 TOP N에 포함 → 유지
-                        
-                        # 가장 높은 EV를 가진 진입 후보와 비교
-                        best_candidate = self._top_n_symbols[0] if self._top_n_symbols else None
-                        if not best_candidate:
-                            continue
-                        
-                        held_ev = self._symbol_scores.get(held_sym, 0)
-                        cand_ev = self._symbol_scores.get(best_candidate, 0)
-                        
-                        # 거래 비용 추정 (현재 심볼 청산 + 새 심볼 진입)
-                        fee_rate = MAKER_FEE_RATE if USE_MAKER_ORDERS else TAKER_FEE_RATE
-                        switching_cost = fee_rate * 2 * SWITCHING_COST_MULT  # 왕복 + 마진
-                        
-                        # 교체 조건: 후보 EV > 보유 EV + 교체 비용
-                        if cand_ev > held_ev + switching_cost:
-                            if log_this_cycle:
-                                self._log(f"[SWITCH] {held_sym}(ev={held_ev:.4f}) → {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
-                            # 청산 시그널 발생 (기존 포지션)
-                            for i, dec in enumerate(batch_decisions):
-                                if ctx_list[i]["symbol"] == held_sym:
-                                    dec["action"] = "CLOSE"
-                                    dec["reason"] = f"SWITCH_TO_{best_candidate}"
-                                    break
-                        else:
-                            if log_this_cycle:
-                                self._log(f"[HOLD] {held_sym}(ev={held_ev:.4f}) kept vs {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
-                                
+                    if self.spread_enabled:
+                        self._manage_spreads(ts)
+                except Exception as e:
+                    self._log_err(f"[ERR] manage_spreads: {e}")
+                    self._note_runtime_error("manage_spreads", str(e))
+                
+                try:
+                        await self.broadcast(rows)
                 except Exception as e:
                     import traceback
-                    self._log_err(f"[ERR] opportunity_eval: {e} {traceback.format_exc()}")
-                    self._note_runtime_error("opportunity_eval", str(e))
+                    self._log_err(f"[ERR] broadcast: {e} {traceback.format_exc()}")
+                    self._note_runtime_error("broadcast", str(e))
 
-            # ====== Stage 3: Result Application (per-symbol isolation) ======
-            for i, decision in enumerate(batch_decisions):
-                ctx = ctx_list[i]
-                sym = ctx["symbol"]
+                    await asyncio.sleep(0.1)
+
+                # Cycle debug dump: record last cycle info for offline inspection
                 try:
-                    row = self._apply_decision(sym, decision, ctx, ts, log_this_cycle)
-                    rows.append(row)
-                except Exception as e:
-                    import traceback
-                    self._log_err(f"[ERR] apply_decision {sym}: {e} {traceback.format_exc()}")
-                    self._note_runtime_error(f"apply_decision:{sym}", str(e))
-                    rows.append(self._row(sym, ctx.get("price"), ts, None, ctx.get("candles", 0)))
+                    cycle_info = {
+                        "ts": ts,
+                        "ctx_count": len(ctx_list) if ctx_list is not None else 0,
+                        "batch_decisions": len(batch_decisions) if batch_decisions is not None else 0,
+                        "rows_sent": len(rows),
+                    }
+                    with open('/tmp/last_cycle.json', 'w', encoding='utf-8') as _cf:
+                        _cf.write(json.dumps(cycle_info))
+                except Exception:
+                    pass
 
-            # ====== Stage 4: Spread Management & Broadcast (always execute) ======
-            try:
-                if self.spread_enabled:
-                    self._manage_spreads(ts)
+                # If no contexts were built, throttle the loop to avoid tight spin.
+                if not ctx_list:
+                    await asyncio.sleep(0.2)
+
             except Exception as e:
-                self._log_err(f"[ERR] manage_spreads: {e}")
-                self._note_runtime_error("manage_spreads", str(e))
-            
-            try:
-                await self.broadcast(rows)
-            except Exception as e:
+                # Catch-all to prevent the decision loop from dying.
                 import traceback
-                self._log_err(f"[ERR] broadcast: {e} {traceback.format_exc()}")
-                self._note_runtime_error("broadcast", str(e))
-
-            await asyncio.sleep(0.1)
+                err_text = f"{e} {traceback.format_exc()}"
+                self._log_err(f"[ERR] decision_loop top-level: {err_text}")
+                self._note_runtime_error("decision_loop", str(e))
+                # Try to send a minimal update to keep dashboard alive
+                try:
+                    err_row = [self._row('SYSTEM', None, now_ms(), None, 0)]
+                    await self.broadcast(err_row)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
 
 
 async def index_handler(request):
@@ -2661,11 +2921,38 @@ async def ws_handler(request):
     orch: LiveOrchestrator = request.app["orchestrator"]
     orch.clients.add(ws)
     await ws.send_str(json.dumps({"type": "init", "msg": "connected"}, ensure_ascii=False))
+    try:
+        orch._log(f"[WS_CONNECT] client_id={id(ws)} clients_now={len(orch.clients)}")
+        # write a short client-connect snapshot for offline debugging
+        try:
+            with open('/tmp/ws_clients.json', 'w', encoding='utf-8') as _cf:
+                _cf.write(json.dumps({"ts": now_ms(), "clients": len(orch.clients)}, ensure_ascii=False))
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # If we have a cached last broadcast, send it immediately so UI lights update on connect
+    try:
+        if getattr(orch, "_last_broadcast_msg", None):
+            await ws.send_str(orch._last_broadcast_msg)
+            orch._log(f"[WS_CONNECT] sent cached full_update to client_id={id(ws)}")
+    except Exception:
+        pass
 
     async for _ in ws:
         pass
 
     orch.clients.discard(ws)
+    try:
+        orch._log(f"[WS_DISCONNECT] client_id={id(ws)} clients_now={len(orch.clients)}")
+        try:
+            with open('/tmp/ws_clients.json', 'w', encoding='utf-8') as _cf:
+                _cf.write(json.dumps({"ts": now_ms(), "clients": len(orch.clients)}, ensure_ascii=False))
+        except Exception:
+            pass
+    except Exception:
+        pass
     return ws
 
 
@@ -2674,16 +2961,17 @@ async def main():
         "enableRateLimit": True,
         "timeout": CCXT_TIMEOUT_MS,
     })
-    orchestrator = LiveOrchestrator(exchange)
+    # Create a lightweight stub orchestrator so the web server (WS) can accept
+    # connections immediately. The real LiveOrchestrator will be created in
+    # background and replace `app["orchestrator"]`.
+    from types import SimpleNamespace
+    orchestrator = SimpleNamespace()
+    orchestrator.clients = set()
 
     runner = None
     site = None
     try:
-        await orchestrator.init_exchange_settings()
-        # ✅ 서버 올리기 전에 OHLCV 먼저 채우기
-        await orchestrator.preload_all_ohlcv(limit=OHLCV_PRELOAD_LIMIT)
-        orchestrator._persist_state(force=True)
-
+        # Start the web server immediately so the dashboard can connect quickly.
         app = web.Application()
         app["orchestrator"] = orchestrator
         app.add_routes([web.get("/", index_handler), web.get("/ws", ws_handler)])
@@ -2693,13 +2981,48 @@ async def main():
         site = web.TCPSite(runner, "0.0.0.0", PORT)
         await site.start()
 
-        asyncio.create_task(orchestrator.fetch_prices_loop())
-        asyncio.create_task(orchestrator.fetch_ohlcv_loop())
-        asyncio.create_task(orchestrator.fetch_orderbook_loop())
-        asyncio.create_task(orchestrator.decision_loop())
-
         print(f"🚀 Dashboard: http://localhost:{PORT}")
         print(f"📄 Serving: {DASHBOARD_FILE.name}")
+
+        # Perform long-running initialization in background so server is responsive.
+        async def _background_init():
+            try:
+                # Instantiate the real orchestrator (this may spawn workers/processes)
+                # On macOS shared_memory/process workers can be unstable; prefer
+                # in-process EngineHub where possible to avoid startup failures.
+                os.environ["USE_PROCESS_ENGINE"] = os.environ.get("USE_PROCESS_ENGINE", "0")
+                real_orch = LiveOrchestrator(exchange)
+
+                # Transfer any connected WS clients from the stub to the real orchestrator
+                try:
+                    real_orch.clients = orchestrator.clients
+                except Exception:
+                    pass
+
+                # Replace the app reference so handlers use the real orchestrator
+                app["orchestrator"] = real_orch
+
+                # Perform heavy initialization (exchange settings, OHLCV preload)
+                await real_orch.init_exchange_settings()
+                await real_orch.preload_all_ohlcv(limit=OHLCV_PRELOAD_LIMIT)
+                real_orch._persist_state(force=True)
+
+                # Start periodic loops and decision pipeline on the real orchestrator
+                asyncio.create_task(real_orch.fetch_prices_loop())
+                asyncio.create_task(real_orch.fetch_ohlcv_loop())
+                asyncio.create_task(real_orch.fetch_orderbook_loop())
+                asyncio.create_task(real_orch.decision_loop())
+
+                print("✅ Background init completed: fetch/decision loops started")
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"[ERR] background_init: {e}\n{tb}")
+
+        # Schedule but don't await: server is responsive immediately
+        asyncio.create_task(_background_init())
+
+        # Keep running until cancelled
         await asyncio.Future()
     except OSError as e:
         print(f"[ERR] Failed to bind on port {PORT}: {e}")

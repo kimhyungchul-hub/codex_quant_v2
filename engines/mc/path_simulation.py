@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+# Implemented Antithetic Variates for variance reduction
 import logging
 import os
 import math
@@ -8,6 +9,8 @@ from typing import Dict, Sequence
 import numpy as np
 
 from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand, DEV_MODE
+from engines.mc.constants import EPSILON
+from engines.mc.params import JOHNSON_SU_GAMMA, JOHNSON_SU_DELTA
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +24,20 @@ def _simulate_paths_price_jax_core(
     n_steps: int,
     mode: str,
     df: float,
+    gamma: float,
+    delta: float,
     boot_jnp,
 ) -> "jnp.ndarray":  # type: ignore[name-defined]
     """JAX JIT-compiled GBM path generation core.
 
     Returns shape (n_paths, n_steps + 1) with paths[:,0] = s0.
+    `drift` must already reflect the chosen noise model (Gaussian uses Ito, heavy-tail/boot removes it).
     """
+    half_paths = n_paths // 2
+    has_odd_path = (n_paths % 2) == 1
+
+    mode_effective = mode
+    _sinh = lambda x: 0.5 * (jnp.exp(x) - jnp.exp(-x))  # type: ignore[attr-defined]
     if mode == "bootstrap" and boot_jnp is not None:
         br_size = int(boot_jnp.shape[0])
         if br_size >= 16:
@@ -34,16 +45,80 @@ def _simulate_paths_price_jax_core(
             idx = jrand.randint(k1, shape=(n_paths, n_steps), minval=0, maxval=br_size)  # type: ignore[attr-defined]
             z = boot_jnp[idx]
         else:
-            key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-            z = jrand.normal(k1, shape=(n_paths, n_steps))  # type: ignore[attr-defined]
-    elif mode == "student_t":
-        key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-        z = jrand.t(k1, df=df, shape=(n_paths, n_steps))  # type: ignore[attr-defined]
-        if df > 2:
-            z = z / jnp.sqrt(df / (df - 2.0))  # type: ignore[attr-defined]
+            mode_effective = "gaussian"
+    elif mode == "bootstrap":
+        mode_effective = "gaussian"
+
+    if mode_effective == "student_t":
+        noises = []
+        if half_paths > 0:
+            key, k_half = jrand.split(key)  # type: ignore[attr-defined]
+            z_half = jrand.t(k_half, df=df, shape=(half_paths, n_steps))  # type: ignore[attr-defined]
+            if df > 2:
+                z_half = z_half / jnp.sqrt(df / (df - 2.0))  # type: ignore[attr-defined]
+            noises.append(z_half)
+            noises.append(-z_half)
+        if has_odd_path:
+            key, k_extra = jrand.split(key)  # type: ignore[attr-defined]
+            z_extra = jrand.t(k_extra, df=df, shape=(1, n_steps))  # type: ignore[attr-defined]
+            if df > 2:
+                z_extra = z_extra / jnp.sqrt(df / (df - 2.0))  # type: ignore[attr-defined]
+            noises.append(z_extra)
+        if not noises:
+            z = jnp.zeros((0, n_steps), dtype=jnp.float32)  # type: ignore[attr-defined]
+        elif len(noises) == 1:
+            z = noises[0]
+        else:
+            z = jnp.concatenate(noises, axis=0)  # type: ignore[attr-defined]
+    elif mode_effective == "johnson_su":
+        noises = []
+        if half_paths > 0:
+            key, k_half = jrand.split(key)  # type: ignore[attr-defined]
+            z_half = jrand.normal(k_half, shape=(half_paths, n_steps))  # type: ignore[attr-defined]
+            js_half = _sinh((z_half - gamma) / delta)
+            noises.append(js_half)
+            js_half_neg = _sinh((-z_half - gamma) / delta)
+            noises.append(js_half_neg)
+        if has_odd_path:
+            key, k_extra = jrand.split(key)  # type: ignore[attr-defined]
+            z_extra = jrand.normal(k_extra, shape=(1, n_steps))  # type: ignore[attr-defined]
+            noises.append(_sinh((z_extra - gamma) / delta))
+        if not noises:
+            z = jnp.zeros((0, n_steps), dtype=jnp.float32)  # type: ignore[attr-defined]
+        elif len(noises) == 1:
+            z = noises[0]
+        else:
+            z = jnp.concatenate(noises, axis=0)  # type: ignore[attr-defined]
+        z_mean = jnp.mean(z)  # type: ignore[attr-defined]
+        z_std = jnp.std(z)  # type: ignore[attr-defined]
+        z_std = jnp.where(z_std < 1e-8, 1.0, z_std)  # type: ignore[attr-defined]
+        z = (z - z_mean) / z_std  # type: ignore[attr-defined]
+    elif mode_effective == "gaussian":
+        noises = []
+        if half_paths > 0:
+            key, k_half = jrand.split(key)  # type: ignore[attr-defined]
+            z_half = jrand.normal(k_half, shape=(half_paths, n_steps))  # type: ignore[attr-defined]
+            noises.append(z_half)
+            noises.append(-z_half)
+        if has_odd_path:
+            key, k_extra = jrand.split(key)  # type: ignore[attr-defined]
+            noises.append(jrand.normal(k_extra, shape=(1, n_steps)))  # type: ignore[attr-defined]
+        if not noises:
+            z = jnp.zeros((0, n_steps), dtype=jnp.float32)  # type: ignore[attr-defined]
+        elif len(noises) == 1:
+            z = noises[0]
+        else:
+            z = jnp.concatenate(noises, axis=0)  # type: ignore[attr-defined]
     else:
-        key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-        z = jrand.normal(k1, shape=(n_paths, n_steps))  # type: ignore[attr-defined]
+        # Bootstrap with sufficient history: use empirical distribution as-is
+        z = z.astype(jnp.float32)  # type: ignore[attr-defined]
+        logret = jnp.cumsum(drift + diffusion * z, axis=1)  # type: ignore[attr-defined]
+        prices_1 = s0 * jnp.exp(logret)  # type: ignore[attr-defined]
+        paths = jnp.concatenate(  # type: ignore[attr-defined]
+            [jnp.full((n_paths, 1), s0, dtype=jnp.float32), prices_1],  # type: ignore[attr-defined]
+            axis=1,
+        )
+        return paths
 
     z = z.astype(jnp.float32)  # type: ignore[attr-defined]
     logret = jnp.cumsum(drift + diffusion * z, axis=1)  # type: ignore[attr-defined]
@@ -62,12 +137,12 @@ if _JAX_OK and jax is not None:
     )
     
     # ✅ GLOBAL BATCHING: Multi-symbol path generation
-    # in_axes: (key, s0, drift, diffusion, n_paths, n_steps, mode, df, boot_jnp)
+    # in_axes: (key, s0, drift, diffusion, n_paths, n_steps, mode, df, gamma, delta, boot_jnp)
     # vmap over (key, s0, drift, diffusion). 
-    # n_paths, n_steps, mode, df, boot_jnp are shared (static or single array).
+    # n_paths, n_steps, mode, df, gamma, delta, boot_jnp are shared (static or single array).
     _simulate_paths_price_batch_jax = jax.vmap(
         _simulate_paths_price_jax_core_jit,
-        in_axes=(0, 0, 0, 0, None, None, None, None, None)
+        in_axes=(0, 0, 0, 0, None, None, None, None, None, None, None)
     )
 
 else:  # pragma: no cover
@@ -86,22 +161,31 @@ class MonteCarloPathSimulationMixin:
         n_steps: int,
         dt: float,
         return_jax: bool = False,
+        return_stats: bool = False,
     ) -> np.ndarray | jnp.ndarray:
         """
         1초 단위 가격 경로를 생성한다 (JAX JIT 최적화 버전).
         - 반환 shape: (n_paths, n_steps+1)
           paths[:,0] = s0 (t=0), paths[:,t] = price at t seconds
+        - tail mode: gaussian | student_t | bootstrap | johnson_su
+        - return_stats=True 시 control variate 기반 평균(cv_mean) 포함
         """
         n_paths_i = int(max(1, int(n_paths)))
         n_steps_i = int(max(1, int(n_steps)))
-
-        drift = (float(mu) - 0.5 * float(sigma) * float(sigma)) * float(dt)
-        diffusion = float(sigma) * math.sqrt(float(dt))
-
         mode = str(getattr(self, "_tail_mode", self.default_tail_mode))
         df = float(getattr(self, "_student_t_df", self.default_student_t_df))
+        gamma = float(getattr(self, "_johnson_gamma", JOHNSON_SU_GAMMA))
+        delta = float(max(getattr(self, "_johnson_delta", JOHNSON_SU_DELTA), 1e-6))
         br = getattr(self, "_bootstrap_returns", None)
+        self._johnson_gamma = gamma
+        self._johnson_delta = delta
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
+        # Mode-aware drift: Gaussian keeps Ito correction, heavy-tail/boot removes it to avoid EV bias
+        if mode in ("student_t", "bootstrap", "johnson_su"):
+            drift = float(mu) * float(dt)
+        else:
+            drift = (float(mu) - 0.5 * float(sigma) * float(sigma)) * float(dt)
+        diffusion = float(sigma) * math.sqrt(float(dt))
 
         if use_jax and _simulate_paths_price_jax_core_jit is not None:
             try:
@@ -110,27 +194,99 @@ class MonteCarloPathSimulationMixin:
                 
                 # JIT 컴파일된 핵심 함수 호출
                 paths_jnp = _simulate_paths_price_jax_core_jit(
-                    key, s0, drift, diffusion, n_paths_i, n_steps_i, mode, df, boot_jnp
+                    key, s0, drift, diffusion, n_paths_i, n_steps_i, mode, df, gamma, delta, boot_jnp
                 )
                 
-                if return_jax:
+                if return_jax and not return_stats:
                     return paths_jnp
 
-                # JAX 배열을 NumPy로 변환
+                # JAX 배열을 NumPy로 변환 (control variates/검증용)
                 paths = np.asarray(jax.device_get(paths_jnp), dtype=np.float64)  # type: ignore[attr-defined]
+                stats = None
+                if return_stats:
+                    stats = self._control_variate_price_stats(paths, drift, diffusion)
+                    if return_jax:
+                        return paths_jnp, stats
+                elif return_jax:
+                    return paths_jnp
+
+                # Optional verification: check empirical log drift vs target when requested
+                if os.environ.get("MC_VERIFY_DRIFT"):
+                    horizon = max(n_steps_i, 1) * float(dt)
+                    empirical_log_mu = float(
+                        np.mean(np.log(paths[:, -1] / float(s0)))
+                    ) / horizon
+                    target_log_mu = float(mu) if mode in ("student_t", "bootstrap", "johnson_su") else (
+                        float(mu) - 0.5 * float(sigma) * float(sigma)
+                    )
+                    logger.debug(
+                        f"[MC] drift check mode={mode} empirical={empirical_log_mu:.6f} target={target_log_mu:.6f}"
+                    )
+                if return_stats:
+                    return paths, stats
                 return paths
             except Exception:
                 use_jax = False
 
         # Fallback to NumPy implementation
         rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
-        z = self._sample_increments_np(rng, (n_paths_i, n_steps_i), mode=mode, df=df, bootstrap_returns=br)
+        half_paths = n_paths_i // 2
+        has_odd_path = (n_paths_i % 2) == 1
+        br_size = int(br.shape[0]) if br is not None else 0
+        bootstrap_ready = mode == "bootstrap" and br is not None and br_size >= 16
+
+        if bootstrap_ready:
+            z = self._sample_increments_np(
+                rng,
+                (n_paths_i, n_steps_i),
+                mode=mode,
+                df=df,
+                bootstrap_returns=br,
+            )
+        else:
+            noises = []
+            if half_paths > 0:
+                z_half = self._sample_increments_np(
+                    rng,
+                    (half_paths, n_steps_i),
+                    mode=mode,
+                    df=df,
+                    bootstrap_returns=br,
+                )
+                noises.append(z_half)
+                noises.append(-z_half)
+            if has_odd_path:
+                noises.append(
+                    self._sample_increments_np(
+                        rng,
+                        (1, n_steps_i),
+                        mode=mode,
+                        df=df,
+                        bootstrap_returns=br,
+                    )
+                )
+            z = noises[0] if len(noises) == 1 else np.concatenate(noises, axis=0)
+
         logret = np.cumsum(drift + diffusion * z, axis=1)
         prices_1 = float(s0) * np.exp(logret)
 
         paths = np.empty((n_paths_i, n_steps_i + 1), dtype=np.float64)
         paths[:, 0] = float(s0)
         paths[:, 1:] = prices_1
+
+        if return_stats:
+            stats = self._control_variate_price_stats(paths, drift, diffusion)
+            return paths, stats
+
+        if os.environ.get("MC_VERIFY_DRIFT"):
+            horizon = max(n_steps_i, 1) * float(dt)
+            empirical_log_mu = float(np.mean(np.log(paths[:, -1] / float(s0)))) / horizon
+            target_log_mu = float(mu) if mode in ("student_t", "bootstrap", "johnson_su") else (
+                float(mu) - 0.5 * float(sigma) * float(sigma)
+            )
+            logger.debug(
+                f"[MC] drift check mode={mode} empirical={empirical_log_mu:.6f} target={target_log_mu:.6f}"
+            )
         return paths
 
 
@@ -153,12 +309,15 @@ class MonteCarloPathSimulationMixin:
         n_paths_i = int(max(1, int(n_paths)))
         n_steps_i = int(max(1, int(n_steps)))
         
-        drifts = (mus - 0.5 * sigmas * sigmas) * float(dt)
-        diffusions = sigmas * math.sqrt(float(dt))
-        
         mode = str(getattr(self, "_tail_mode", self.default_tail_mode))
         df = float(getattr(self, "_student_t_df", self.default_student_t_df))
         br = getattr(self, "_bootstrap_returns", None)
+
+        if mode in ("student_t", "bootstrap", "johnson_su"):
+            drifts = mus * float(dt)
+        else:
+            drifts = (mus - 0.5 * sigmas * sigmas) * float(dt)
+        diffusions = sigmas * math.sqrt(float(dt))
         
         # ✅ DEV_MODE: JAX 완전 비활성화
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK and not DEV_MODE
@@ -214,6 +373,14 @@ class MonteCarloPathSimulationMixin:
             elif mode == "student_t" and df > 0:
                 # Student-t distribution
                 innovations = rng.standard_t(df, size=(n_paths_i, n_steps_i))
+            elif mode == "johnson_su":
+                innovations = self._sample_increments_np(
+                    rng,
+                    (n_paths_i, n_steps_i),
+                    mode=mode,
+                    df=df,
+                    bootstrap_returns=br,
+                )
             else:
                 # Normal distribution
                 innovations = rng.standard_normal(size=(n_paths_i, n_steps_i))
@@ -241,9 +408,11 @@ class MonteCarloPathSimulationMixin:
         horizons: Sequence[int],
         dt: float,
         fee_roundtrip: float,
+        return_stats: bool = False,
     ) -> Dict[int, np.ndarray]:
         """
         horizon별 net_pnl paths 반환 (JAX Metal 호환성 수정: 명시적 디바이스 지정 제거)
+        return_stats=True 시 control variate 기반 평균(cv_mean) 제공
         """
         # ✅ Step A: MC 입력이 진짜 0인지 확인
         if not hasattr(self, "_sim_input_logged"):
@@ -254,12 +423,18 @@ class MonteCarloPathSimulationMixin:
             )
         
         max_steps = int(max(horizons))
-        drift = (mu - 0.5 * sigma * sigma) * dt
-        diffusion = sigma * math.sqrt(dt)
-
         mode = str(getattr(self, "_tail_mode", self.default_tail_mode))
         df = float(getattr(self, "_student_t_df", self.default_student_t_df))
+        gamma = float(getattr(self, "_johnson_gamma", JOHNSON_SU_GAMMA))
+        delta = float(max(getattr(self, "_johnson_delta", JOHNSON_SU_DELTA), 1e-6))
         br = getattr(self, "_bootstrap_returns", None)
+        self._johnson_gamma = gamma
+        self._johnson_delta = delta
+        if mode in ("student_t", "bootstrap", "johnson_su"):
+            drift = (mu) * dt
+        else:
+            drift = (mu - 0.5 * sigma * sigma) * dt
+        diffusion = sigma * math.sqrt(dt)
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
 
         prices: np.ndarray
@@ -271,6 +446,8 @@ class MonteCarloPathSimulationMixin:
                     (int(n_paths), int(max_steps)),
                     mode=mode,
                     df=df,
+                    gamma=gamma,
+                    delta=delta,
                     bootstrap_returns=br,
                 )
 
@@ -278,7 +455,16 @@ class MonteCarloPathSimulationMixin:
                     use_jax = False
                 else:
                     z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
-                    logret = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
+                    drift_f = jnp.asarray(drift, dtype=jnp.float32)  # type: ignore[attr-defined]
+                    diffusion_f = jnp.asarray(diffusion, dtype=jnp.float32)  # type: ignore[attr-defined]
+                    increments = drift_f + diffusion_f * z_j  # type: ignore[attr-defined]
+                    def _row_cumsum(row):
+                        def _scan(carry, x):
+                            nxt = carry + x
+                            return nxt, nxt
+                        _, out = jax.lax.scan(_scan, 0.0, row)  # type: ignore[attr-defined]
+                        return out
+                    logret = jax.vmap(_row_cumsum)(increments)  # type: ignore[attr-defined]
                     prices_jnp = float(s0) * jnp.exp(logret)  # type: ignore[attr-defined]
                     prices = np.asarray(jax.device_get(prices_jnp), dtype=np.float64)  # type: ignore[attr-defined]
             except Exception as e:
@@ -298,10 +484,60 @@ class MonteCarloPathSimulationMixin:
             prices = s0 * np.exp(logret)
 
         out = {}
+        stats = {} if return_stats else None
+        z_hat = None
+        control = None
+        if return_stats and diffusion > EPSILON:
+            try:
+                z_hat = self._infer_standardized_noise(prices, drift, diffusion)
+                control = np.sum(z_hat, axis=1)
+            except Exception:
+                z_hat = None
+                control = None
         for h in horizons:
             idx = int(h) - 1
             tp = prices[:, idx]
             gross = direction * (tp - s0) / s0 * float(leverage)
             net = gross - fee_roundtrip
             out[int(h)] = net.astype(np.float64)
+            if return_stats:
+                raw_mean = float(np.mean(net))
+                if z_hat is None or control is None:
+                    stats[int(h)] = {"raw_mean": raw_mean, "cv_mean": raw_mean, "c_opt": 0.0}
+                else:
+                    cv_mean, c_opt = self._control_variate_mean(net, control)
+                    stats[int(h)] = {"raw_mean": raw_mean, "cv_mean": cv_mean, "c_opt": c_opt}
+        if return_stats:
+            return out, stats
         return out
+
+    def _infer_standardized_noise(self, prices: np.ndarray, drift: float, diffusion: float) -> np.ndarray:
+        prices_np = np.asarray(prices, dtype=np.float64)
+        if prices_np.shape[1] < 2 or diffusion <= EPSILON:
+            return np.zeros_like(prices_np[:, :-1], dtype=np.float64)
+        log_prices = np.log(np.clip(prices_np, EPSILON, None))
+        log_returns = np.diff(log_prices, axis=1)
+        return (log_returns - drift) / diffusion
+
+    def _control_variate_mean(self, values: np.ndarray, control: np.ndarray, expected_control: float = 0.0) -> tuple[float, float]:
+        v = np.asarray(values, dtype=np.float64)
+        c = np.asarray(control, dtype=np.float64)
+        v_mean = float(np.mean(v))
+        c_mean = float(np.mean(c))
+        var_c = float(np.mean((c - c_mean) ** 2))
+        if var_c < EPSILON:
+            return v_mean, 0.0
+        cov = float(np.mean((v - v_mean) * (c - c_mean)))
+        c_opt = cov / var_c
+        adj_mean = float(np.mean(v - c_opt * (c - expected_control)))
+        return adj_mean, c_opt
+
+    def _control_variate_price_stats(self, prices: np.ndarray, drift: float, diffusion: float) -> Dict[str, float]:
+        prices_np = np.asarray(prices, dtype=np.float64)
+        raw_mean = float(np.mean(prices_np[:, -1]))
+        if diffusion <= EPSILON:
+            return {"raw_mean": raw_mean, "cv_mean": raw_mean, "c_opt": 0.0}
+        z_hat = self._infer_standardized_noise(prices_np, drift, diffusion)
+        control = np.sum(z_hat, axis=1)
+        cv_mean, c_opt = self._control_variate_mean(prices_np[:, -1], control)
+        return {"raw_mean": raw_mean, "cv_mean": cv_mean, "c_opt": c_opt}

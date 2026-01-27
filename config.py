@@ -8,6 +8,12 @@ BASE_DIR = Path(__file__).resolve().parent
 # Load local `.env` first (developer convenience).
 _load_env_file(str(BASE_DIR / ".env"))
 
+# bybit api
+API_KEY = "cITWygtNEBO1zxHgXH"
+API_SECRET = "AKnWtmPRF59YU5FhNMPjwcSQZHd05cpaYY6R5"
+# 환경변수로 자동 주입 (기존 코드 호환)
+os.environ["BYBIT_API_KEY"] = API_KEY
+os.environ["BYBIT_API_SECRET"] = API_SECRET
 # Load runtime overrides early so all config values can be controlled from state/bybit.env.
 # NOTE: `state/bybit.env.example` is a template (often with testnet defaults). We only load it when no
 # real env file exists (to avoid accidentally enabling testnet when the project is configured via `.env`).
@@ -41,8 +47,13 @@ DEBUG_MU_SIGMA = _env_bool("DEBUG_MU_SIGMA", False)
 DEBUG_TPSL_META = _env_bool("DEBUG_TPSL_META", False)
 DEBUG_ROW = _env_bool("DEBUG_ROW", False)
 DECISION_LOG_EVERY = _env_int("DECISION_LOG_EVERY", 10)
-MC_N_PATHS_LIVE = _env_int("MC_N_PATHS_LIVE", 16384)
-MC_N_PATHS_EXIT = _env_int("MC_N_PATHS_EXIT", 4096)
+
+# ✅ DEV_MODE에서는 n_paths를 줄여서 빠른 피드백 제공
+_DEV_MODE = _env_bool("DEV_MODE", False)
+_DEFAULT_N_PATHS_LIVE = 1024 if _DEV_MODE else 16384
+_DEFAULT_N_PATHS_EXIT = 512 if _DEV_MODE else 4096
+MC_N_PATHS_LIVE = _env_int("MC_N_PATHS_LIVE", _DEFAULT_N_PATHS_LIVE)
+MC_N_PATHS_EXIT = _env_int("MC_N_PATHS_EXIT", _DEFAULT_N_PATHS_EXIT)
 
 SYMBOLS = _env_symbols([
     "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "BNB/USDT:USDT",

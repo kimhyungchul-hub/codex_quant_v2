@@ -156,6 +156,10 @@
               <th data-k="kelly">KELLY</th>
               <th data-k="pos_roe">ROE%</th>
               <th data-k="pos_leverage">LEV</th>
+              <th data-k="rebalance">REBAL</th>
+              <th data-k="delta_ev">ΔEV</th>
+              <th data-k="exec_cost">COST</th>
+              <th data-k="wgt">WGT</th>
             </tr>
           </thead>
           <tbody id="mktBody"></tbody>
@@ -522,7 +526,7 @@
       if(!cached){
         const tr = document.createElement('tr');
         const cells = [];
-        for(let i=0;i<10;i++){  // 10열로 변경
+        for(let i=0;i<14;i++){  // 확장: 14열 (rebalance 컬럼 포함)
           const td = document.createElement('td');
           cells.push(td);
           tr.appendChild(td);
@@ -578,6 +582,26 @@
       
       c[9].className='mono'; 
       c[9].textContent = (r.pos_leverage===null?'-':(isNum(r.pos_leverage)?r.pos_leverage:r.pos_leverage));
+
+      // Rebalance decision badge
+      c[10].className = '';
+      const reb = r.rebalance_decision || null;
+      if(reb===null){ c[10].innerHTML = '<span class="pill muted">-</span>'; }
+      else if(reb==='HOLD'){ c[10].innerHTML = '<span class="pill wait">HOLD</span>'; }
+      else if(reb==='SWITCH'){ c[10].innerHTML = '<span class="pill">SWITCH</span>'; }
+      else { c[10].innerHTML = `<span class="pill muted">${reb}</span>`; }
+
+      // ΔEV (show as percentage if number)
+      c[11].className = 'mono';
+      c[11].textContent = (r.rebalance_delta_ev===null||r.rebalance_delta_ev===undefined)?'-':(isNum(r.rebalance_delta_ev)?(Number(r.rebalance_delta_ev)*100).toFixed(2):r.rebalance_delta_ev);
+
+      // Exec cost (bps) display
+      c[12].className = 'mono';
+      c[12].textContent = (r.rebalance_exec_cost===null||r.rebalance_exec_cost===undefined)?'-':(isNum(r.rebalance_exec_cost)?f2(r.rebalance_exec_cost*100):r.rebalance_exec_cost);
+
+      // Joint weight (fraction of leverage allocated)
+      c[13].className = 'mono';
+      c[13].textContent = (r.rebalance_weight===null||r.rebalance_weight===undefined)?'-':(isNum(r.rebalance_weight)?(Number(r.rebalance_weight)).toFixed(4):r.rebalance_weight);
 
       frag.appendChild(tr);
     });

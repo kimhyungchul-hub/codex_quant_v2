@@ -50,20 +50,24 @@ class NAPVEngineJAX:
         self.config = config or NAPVConfig()
         # Lazily initialize JAX and compile kernels on first use
         jax_backend.ensure_jax()
-        
-        # DEV_MODE: NumPy fallback
-        if jax_backend.DEV_MODE:
-            print("[NAPV_JAX] DEV_MODE enabled, using NumPy fallback")
+        # DEV_MODE or JAX not available: use NumPy fallback
+        if getattr(jax_backend, 'DEV_MODE', False) or not getattr(jax_backend, '_JAX_OK', False) or jax_backend.jax is None:
+            print("[NAPV_JAX] JAX unavailable or DEV_MODE; using NumPy fallback")
             self.device = "cpu"
             self._use_numpy = True
             return
-        
-        if jax_backend.jax is None:
-            raise RuntimeError("JAX not available for NAPVEngineJAX")
 
+        # JAX is available: initialize device and jit kernels
         self._use_numpy = False
-        self.device = jax_backend.jax.devices()[0]
-        print(f"[NAPV_JAX] Initialized on device: {self.device}")
+        try:
+            self.device = jax_backend.jax.devices()[0]
+            print(f"[NAPV_JAX] Initialized on device: {self.device}")
+        except Exception:
+            # If device query fails, fallback to NumPy
+            print("[NAPV_JAX] Device query failed; falling back to NumPy")
+            self.device = "cpu"
+            self._use_numpy = True
+            return
 
         # JIT-compile core functions using jax backend
         self._napv_single_jit = jax_backend.jax.jit(self._napv_single_core)

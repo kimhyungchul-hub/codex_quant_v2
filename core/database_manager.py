@@ -17,15 +17,18 @@ Author: codex_quant
 Date: 2026-01-19
 """
 
+import asyncio
 import sqlite3
 import json
 import time
 import logging
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Callable, Coroutine
 from datetime import datetime
 from threading import Lock
 from pathlib import Path
 from enum import Enum
+
+import aiosqlite
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,9 @@ class DatabaseManager:
     def __init__(self, db_path: str = "state/bot_data.db"):
         self.db_path = db_path
         self.lock = Lock()
+        self._async_conn: Optional[aiosqlite.Connection] = None
+        self._async_lock = asyncio.Lock()
+        self._pending_tasks: set[asyncio.Task] = set()
         
         # DB 디렉토리 생성
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -61,15 +67,76 @@ class DatabaseManager:
         self._initialize_db()
         logger.info(f"DatabaseManager initialized: {db_path}")
 
+    def _apply_pragmas_sync(self, conn: sqlite3.Connection) -> None:
+        """공통 PRAGMA 설정을 동기 연결에 적용합니다 (HFT: synchronous=NORMAL 고정)."""
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")  # HFT throughput 우선 정책: 전원 차단 리스크 감수
+        conn.execute("PRAGMA foreign_keys = ON;")
+
     def _get_connection(self) -> sqlite3.Connection:
         """DB 연결을 생성하고 최적화 설정을 적용합니다."""
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row  # dict-like access
         # WAL 모드: 읽기/쓰기 동시성 향상 및 속도 최적화
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.execute("PRAGMA foreign_keys = ON;")
+        self._apply_pragmas_sync(conn)
         return conn
+
+    async def _apply_pragmas_async(self, conn: aiosqlite.Connection) -> None:
+        await conn.execute("PRAGMA journal_mode=WAL;")
+        await conn.execute("PRAGMA synchronous = NORMAL;")
+        await conn.execute("PRAGMA foreign_keys = ON;")
+
+    async def _get_async_connection(self) -> aiosqlite.Connection:
+        """공유 aiosqlite 연결을 반환합니다 (lazy init)."""
+        if self._async_conn is None:
+            async with self._async_lock:
+                if self._async_conn is None:
+                    conn = await aiosqlite.connect(self.db_path)
+                    conn.row_factory = aiosqlite.Row
+                    await self._apply_pragmas_async(conn)
+                    self._async_conn = conn
+        return self._async_conn
+
+    async def _execute_async(self, query: str, params: Tuple | List | Dict | None = None) -> None:
+        params = params or ()
+        conn = await self._get_async_connection()
+        async with self._async_lock:
+            await conn.execute(query, params)
+            await conn.commit()
+
+    def _cleanup_task(self, task: asyncio.Task, label: str) -> None:
+        self._pending_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error("Async DB task failed (%s): %s", label, exc)
+
+    def _schedule_async_write(
+        self,
+        coro: Coroutine[Any, Any, Any] | asyncio.Future,
+        fallback: Optional[Callable[[], None]],
+        label: str,
+    ):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            if fallback:
+                try:
+                    fallback()
+                except Exception as e:
+                    logger.error("Sync fallback failed for %s: %s", label, e)
+            return None
+
+        task = loop.create_task(coro)
+        self._pending_tasks.add(task)
+        task.add_done_callback(lambda t: self._cleanup_task(t, label))
+        return task
+
+    async def close_async(self) -> None:
+        if self._async_conn is not None:
+            await self._async_conn.close()
+            self._async_conn = None
 
     def _initialize_db(self):
         """필요한 테이블들을 생성합니다."""
@@ -340,6 +407,95 @@ class DatabaseManager:
             conn.commit()
             logger.info("Database tables initialized successfully")
 
+    # 내부적으로 동기/비동기 공용으로 사용할 파라미터 빌더
+    def _prepare_trade_params(self, trade_data: Dict[str, Any], mode: TradingMode) -> Tuple:
+        target = trade_data.get("target_price") or trade_data.get("price", 0)
+        fill = trade_data.get("fill_price") or trade_data.get("price", 0)
+        slippage_bps = 0
+        if target and target > 0:
+            slippage_bps = (fill - target) / target * 10000
+
+        return (
+            trade_data.get("symbol"),
+            trade_data.get("side"),
+            trade_data.get("action", "OPEN"),
+            target,
+            fill,
+            float(trade_data.get("qty", 0)),
+            float(trade_data.get("notional", 0)),
+            slippage_bps,
+            trade_data.get("slippage_est_bps"),
+            float(trade_data.get("fee", 0)),
+            trade_data.get("fee_rate"),
+            mode.value,
+            trade_data.get("pos_source"),
+            trade_data.get("exec_type"),
+            trade_data.get("order_id", ""),
+            trade_data.get("timestamp_ms", int(time.time() * 1000)),
+            trade_data.get("entry_group"),
+            trade_data.get("entry_rank"),
+            trade_data.get("entry_reason"),
+            trade_data.get("entry_ev"),
+            trade_data.get("entry_kelly"),
+            trade_data.get("entry_confidence"),
+            trade_data.get("realized_pnl"),
+            trade_data.get("roe"),
+            trade_data.get("hold_duration_sec"),
+            json.dumps(trade_data),
+        )
+
+    def _prepare_equity_params(self, equity_data: Dict[str, Any], mode: TradingMode) -> Tuple:
+        return (
+            equity_data.get("timestamp_ms", int(time.time() * 1000)),
+            mode.value,
+            equity_data.get("pos_source"),
+            equity_data.get("total_equity"),
+            equity_data.get("wallet_balance"),
+            equity_data.get("available_balance"),
+            equity_data.get("unrealized_pnl"),
+            equity_data.get("position_count"),
+            equity_data.get("total_notional"),
+            equity_data.get("total_margin"),
+            equity_data.get("margin_ratio"),
+            equity_data.get("total_leverage"),
+        )
+
+    def _prepare_position_params(self, symbol: str, pos_data: Dict[str, Any], mode: TradingMode) -> Tuple:
+        return (
+            symbol,
+            mode.value,
+            pos_data.get("pos_source"),
+            pos_data.get("side"),
+            pos_data.get("size") or pos_data.get("quantity"),
+            pos_data.get("entry_price"),
+            pos_data.get("current") or pos_data.get("price"),
+            pos_data.get("leverage"),
+            pos_data.get("margin"),
+            pos_data.get("notional"),
+            pos_data.get("cap_frac"),
+            pos_data.get("unrealized_pnl") or pos_data.get("pnl"),
+            pos_data.get("roe"),
+            pos_data.get("max_roe"),
+            pos_data.get("time") or pos_data.get("entry_time_ms"),
+            int(time.time() * 1000),
+            pos_data.get("age_sec"),
+            pos_data.get("entry_group"),
+            pos_data.get("entry_rank"),
+            pos_data.get("entry_order"),
+            pos_data.get("entry_t_star"),
+            pos_data.get("reason") or pos_data.get("entry_reason"),
+            pos_data.get("policy_horizon_sec"),
+            pos_data.get("policy_flip_streak"),
+            pos_data.get("policy_hold_bad"),
+            pos_data.get("policy_last_eval_ms"),
+            pos_data.get("policy_mu_annual"),
+            pos_data.get("policy_sigma_annual"),
+            json.dumps(pos_data),
+        )
+
+    def _prepare_state_params(self, key: str, data: Any) -> Tuple:
+        return (key, json.dumps(data), int(time.time() * 1000))
+
     # ═══════════════════════════════════════════════════════════════════════
     # 거래 기록 메서드 (Trade Tape)
     # ═══════════════════════════════════════════════════════════════════════
@@ -353,13 +509,7 @@ class DatabaseManager:
         - Live: target_price는 주문가, fill_price는 거래소에서 받은 실제 체결가
         """
         with self.lock, self._get_connection() as conn:
-            # 슬리피지 계산
-            target = trade_data.get('target_price') or trade_data.get('price', 0)
-            fill = trade_data.get('fill_price') or trade_data.get('price', 0)
-            slippage_bps = 0
-            if target and target > 0:
-                slippage_bps = (fill - target) / target * 10000
-            
+            params = self._prepare_trade_params(trade_data, mode)
             conn.execute("""
                 INSERT INTO trades (
                     symbol, side, action, target_price, fill_price, qty, notional,
@@ -368,35 +518,27 @@ class DatabaseManager:
                     entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
                     realized_pnl, roe, hold_duration_sec, raw_data
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                trade_data.get('symbol'),
-                trade_data.get('side'),
-                trade_data.get('action', 'OPEN'),
-                target,
-                fill,
-                float(trade_data.get('qty', 0)),
-                float(trade_data.get('notional', 0)),
-                slippage_bps,
-                trade_data.get('slippage_est_bps'),
-                float(trade_data.get('fee', 0)),
-                trade_data.get('fee_rate'),
-                mode.value,
-                trade_data.get('exec_type'),
-                trade_data.get('pos_source'),
-                trade_data.get('order_id', ''),
-                trade_data.get('timestamp_ms', int(time.time() * 1000)),
-                trade_data.get('entry_group'),
-                trade_data.get('entry_rank'),
-                trade_data.get('entry_reason'),
-                trade_data.get('entry_ev'),
-                trade_data.get('entry_kelly'),
-                trade_data.get('entry_confidence'),
-                trade_data.get('realized_pnl'),
-                trade_data.get('roe'),
-                trade_data.get('hold_duration_sec'),
-                json.dumps(trade_data)
-            ))
+            """, params)
             conn.commit()
+
+    async def log_trade_async(self, trade_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER) -> None:
+        params = self._prepare_trade_params(trade_data, mode)
+        await self._execute_async(
+            """
+            INSERT INTO trades (
+                symbol, side, action, target_price, fill_price, qty, notional,
+                slippage_bps, slippage_est_bps, fee, fee_rate,
+                trading_mode, pos_source, exec_type, order_id, timestamp_ms,
+                entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
+                realized_pnl, roe, hold_duration_sec, raw_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+
+    def log_trade_background(self, trade_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER):
+        coro = self.log_trade_async(trade_data, mode=mode)
+        return self._schedule_async_write(coro, lambda: self.log_trade(trade_data, mode=mode), "log_trade")
 
     def get_recent_trades(self, limit: int = 100, mode: Optional[TradingMode] = None,
                           symbol: Optional[str] = None) -> List[Dict]:
@@ -427,6 +569,7 @@ class DatabaseManager:
     def log_equity(self, equity_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER):
         """현재 자산 상태를 시계열로 기록합니다."""
         with self.lock, self._get_connection() as conn:
+            params = self._prepare_equity_params(equity_data, mode)
             conn.execute("""
                 INSERT OR REPLACE INTO equity_history (
                     timestamp_ms, trading_mode, pos_source,
@@ -434,21 +577,26 @@ class DatabaseManager:
                     position_count, total_notional, total_margin,
                     margin_ratio, total_leverage
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                equity_data.get('timestamp_ms', int(time.time() * 1000)),
-                mode.value,
-                equity_data.get('pos_source'),
-                equity_data.get('total_equity'),
-                equity_data.get('wallet_balance'),
-                equity_data.get('available_balance'),
-                equity_data.get('unrealized_pnl'),
-                equity_data.get('position_count'),
-                equity_data.get('total_notional'),
-                equity_data.get('total_margin'),
-                equity_data.get('margin_ratio'),
-                equity_data.get('total_leverage'),
-            ))
+            """, params)
             conn.commit()
+
+    async def log_equity_async(self, equity_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER) -> None:
+        params = self._prepare_equity_params(equity_data, mode)
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO equity_history (
+                timestamp_ms, trading_mode, pos_source,
+                total_equity, wallet_balance, available_balance, unrealized_pnl,
+                position_count, total_notional, total_margin,
+                margin_ratio, total_leverage
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+
+    def log_equity_background(self, equity_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER):
+        coro = self.log_equity_async(equity_data, mode=mode)
+        return self._schedule_async_write(coro, lambda: self.log_equity(equity_data, mode=mode), "log_equity")
 
     def get_equity_history(self, limit: int = 1000, mode: Optional[TradingMode] = None,
                            since_ms: Optional[int] = None) -> List[Dict]:
@@ -478,6 +626,7 @@ class DatabaseManager:
     def save_position(self, symbol: str, pos_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER):
         """포지션을 저장합니다 (upsert)."""
         with self.lock, self._get_connection() as conn:
+            params = self._prepare_position_params(symbol, pos_data, mode)
             conn.execute("""
                 INSERT OR REPLACE INTO positions (
                     symbol, trading_mode, pos_source, side, size, entry_price, current_price, leverage,
@@ -488,38 +637,29 @@ class DatabaseManager:
                     policy_last_eval_ms, policy_mu_annual, policy_sigma_annual,
                     raw_data
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol,
-                mode.value,
-                pos_data.get('pos_source'),
-                pos_data.get('side'),
-                pos_data.get('size') or pos_data.get('quantity'),
-                pos_data.get('entry_price'),
-                pos_data.get('current') or pos_data.get('price'),
-                pos_data.get('leverage'),
-                pos_data.get('margin'),
-                pos_data.get('notional'),
-                pos_data.get('cap_frac'),
-                pos_data.get('unrealized_pnl') or pos_data.get('pnl'),
-                pos_data.get('roe'),
-                pos_data.get('max_roe'),
-                pos_data.get('time') or pos_data.get('entry_time_ms'),
-                int(time.time() * 1000),
-                pos_data.get('age_sec'),
-                pos_data.get('entry_group'),
-                pos_data.get('entry_rank'),
-                pos_data.get('entry_order'),
-                pos_data.get('entry_t_star'),
-                pos_data.get('reason') or pos_data.get('entry_reason'),
-                pos_data.get('policy_horizon_sec'),
-                pos_data.get('policy_flip_streak'),
-                pos_data.get('policy_hold_bad'),
-                pos_data.get('policy_last_eval_ms'),
-                pos_data.get('policy_mu_annual'),
-                pos_data.get('policy_sigma_annual'),
-                json.dumps(pos_data)
-            ))
+            """, params)
             conn.commit()
+
+    async def save_position_async(self, symbol: str, pos_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER) -> None:
+        params = self._prepare_position_params(symbol, pos_data, mode)
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO positions (
+                symbol, trading_mode, pos_source, side, size, entry_price, current_price, leverage,
+                margin, notional, cap_frac, unrealized_pnl, roe, max_roe,
+                entry_time_ms, last_update_ms, age_sec,
+                entry_group, entry_rank, entry_order, entry_t_star, entry_reason,
+                policy_horizon_sec, policy_flip_streak, policy_hold_bad,
+                policy_last_eval_ms, policy_mu_annual, policy_sigma_annual,
+                raw_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+
+    def save_position_background(self, symbol: str, pos_data: Dict[str, Any], mode: TradingMode = TradingMode.PAPER):
+        coro = self.save_position_async(symbol, pos_data, mode=mode)
+        return self._schedule_async_write(coro, lambda: self.save_position(symbol, pos_data, mode=mode), "save_position")
 
     def delete_position(self, symbol: str):
         """포지션을 삭제합니다."""
@@ -660,11 +800,29 @@ class DatabaseManager:
     def save_state(self, key: str, data: Any):
         """복잡한 객체를 JSON으로 저장합니다."""
         with self.lock, self._get_connection() as conn:
-            conn.execute("""
+            params = self._prepare_state_params(key, data)
+            conn.execute(
+                """
                 INSERT OR REPLACE INTO bot_state (key, value, updated_at_ms)
                 VALUES (?, ?, ?)
-            """, (key, json.dumps(data), int(time.time() * 1000)))
+            """,
+                params,
+            )
             conn.commit()
+
+    async def save_state_async(self, key: str, data: Any) -> None:
+        params = self._prepare_state_params(key, data)
+        await self._execute_async(
+            """
+            INSERT OR REPLACE INTO bot_state (key, value, updated_at_ms)
+            VALUES (?, ?, ?)
+            """,
+            params,
+        )
+
+    def save_state_background(self, key: str, data: Any):
+        coro = self.save_state_async(key, data)
+        return self._schedule_async_write(coro, lambda: self.save_state(key, data), "save_state")
 
     def load_state(self, key: str, default: Any = None) -> Any:
         """저장된 상태를 불러옵니다."""

@@ -8,7 +8,7 @@ import random
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import ccxt.async_support as ccxt
 import numpy as np
@@ -120,6 +120,15 @@ class LiveOrchestrator:
         self._decision_cache: Dict[str, Dict[str, Any]] = {}
         self._decision_rr_index: int = 0
         self._decide_cycle_ms: Optional[int] = None
+
+        # Portfolio-level rebalancing config
+        self.rebalance_top_n = int(_env_int("PORTFOLIO_TOP_N", 4))
+        self.rebalance_cost_mult = float(_env_float("PORTFOLIO_SWITCH_COST_MULT", 1.2))
+        self.rebalance_kelly_cap = float(_env_float("PORTFOLIO_KELLY_CAP", 5.0))
+        self.portfolio_joint_interval_sec = float(_env_float("PORTFOLIO_JOINT_INTERVAL_SEC", 15.0))
+        self._rebalance_last_decision: Dict[str, str] = {}
+        self._last_portfolio_joint_ts: float = 0.0
+        self._last_portfolio_report: Optional[Dict[str, Any]] = None
 
         # Back-compat state used by dashboard/aux modules
         self._group_info: Dict[str, Any] = {}
@@ -567,7 +576,7 @@ class LiveOrchestrator:
                 mode = TradingMode.LIVE if self.is_live_mode else TradingMode.PAPER
                 trade_with_mode = dict(trade)
                 trade_with_mode["trading_mode"] = self.trading_mode
-                self.db.log_trade(trade_with_mode, mode=mode)
+                self.db.log_trade_background(trade_with_mode, mode=mode)
             except Exception as e:
                 self._log_err(f"[ERR] DB log_trade: {e}")
 
@@ -1509,13 +1518,13 @@ class LiveOrchestrator:
                 mode = TradingMode.LIVE if self.is_live_mode else TradingMode.PAPER
                 
                 # Balance 저장
-                self.db.save_state("balance", self.balance)
-                self.db.save_state("trading_mode", self.trading_mode)
+                self.db.save_state_background("balance", self.balance)
+                self.db.save_state_background("trading_mode", self.trading_mode)
                 
                 # Positions 저장
                 for sym, pos in self.positions.items():
                     if isinstance(pos, dict):
-                        self.db.save_position(sym, pos, mode=mode)
+                        self.db.save_position_background(sym, pos, mode=mode)
                 
                 # 최신 equity 기록
                 if self._equity_history:
@@ -1526,7 +1535,7 @@ class LiveOrchestrator:
                             "total_equity": latest.get("equity", self.balance),
                             "wallet_balance": self.balance,
                         }
-                        self.db.log_equity(equity_data, mode=mode)
+                        self.db.log_equity_background(equity_data, mode=mode)
             except Exception as e:
                 self._log_err(f"[ERR] persist state (DB): {e}")
 
@@ -1596,6 +1605,183 @@ class LiveOrchestrator:
             if d.get("_engine") in ("mc_barrier", "mc_engine", "mc"):
                 return d.get("meta", {}) or {}
         return decision.get("meta", {}) or {}
+
+    def _decision_metrics(self, decision: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        mc_meta = self._extract_mc_meta(decision)
+        ev = _safe_float(decision.get("ev", mc_meta.get("ev", 0.0)) if decision else 0.0, 0.0)
+        exec_cost = _safe_float(
+            mc_meta.get("execution_cost", mc_meta.get("fee_roundtrip_fee_mix", 0.0)),
+            0.0,
+        )
+        kelly = _safe_float(mc_meta.get("kelly", 0.0), 0.0)
+        ev_adj = float(ev) - float(self.rebalance_cost_mult) * float(exec_cost)
+        # Debug: surface potentially-missing MC outputs
+        try:
+            if float(ev) == 0.0:
+                self._log(f"[METRICS] ev==0 exec_cost={exec_cost:.6f} kelly={kelly:.6f} meta_keys={list(mc_meta.keys())[:8]}")
+        except Exception:
+            pass
+        return {"ev": ev, "exec_cost": exec_cost, "kelly": kelly, "ev_adj": ev_adj, "meta": mc_meta}
+
+    def _run_portfolio_joint_sync(self, symbols: List[str], ai_scores: Dict[str, float]) -> Optional[Dict[str, Any]]:
+        if not symbols:
+            return None
+
+        try:
+            from engines.mc.portfolio_joint_sim import PortfolioJointSimEngine, PortfolioConfig
+            from engines.mc.config import config as mc_config
+        except Exception as e:  # pragma: no cover - defensive import guard
+            self._log_err(f"[PORTFOLIO_JOINT] import failed: {e}")
+            return None
+
+        ohlcv_map = {}
+        for sym in symbols:
+            candles = self.data.ohlcv_buffer.get(sym, [])
+            if candles:
+                try:
+                    ohlcv_map[sym] = [
+                        (
+                            float(c.get("open")),
+                            float(c.get("high")),
+                            float(c.get("low")),
+                            float(c.get("close")),
+                            float(c.get("volume")),
+                        )
+                        for c in candles
+                    ]
+                except Exception:
+                    continue
+
+        if not ohlcv_map:
+            return None
+
+        cfg = PortfolioConfig(
+            days=int(getattr(mc_config, "portfolio_days", 3)),
+            simulations=int(getattr(mc_config, "portfolio_simulations", 12000)),
+            batch_size=int(getattr(mc_config, "portfolio_batch_size", 4000)),
+            block_size=int(getattr(mc_config, "portfolio_block_size", 12)),
+            min_history=int(getattr(mc_config, "portfolio_min_history", 180)),
+            drift_k=float(getattr(mc_config, "portfolio_drift_k", 0.35)),
+            score_clip=float(getattr(mc_config, "portfolio_score_clip", 1.0)),
+            tilt_strength=float(getattr(mc_config, "portfolio_tilt_strength", 0.6)),
+            use_jumps=bool(getattr(mc_config, "portfolio_use_jumps", True)),
+            p_jump_market=float(getattr(mc_config, "portfolio_p_jump_market", 0.005)),
+            p_jump_idio=float(getattr(mc_config, "portfolio_p_jump_idio", 0.007)),
+            target_leverage=float(getattr(mc_config, "portfolio_target_leverage", 10.0)),
+            individual_cap=float(getattr(mc_config, "portfolio_individual_cap", 3.0)),
+            risk_aversion=float(getattr(mc_config, "portfolio_risk_aversion", 0.5)),
+            var_alpha=float(getattr(mc_config, "portfolio_var_alpha", 0.05)),
+            leverage=float(self.max_leverage),
+            seed=None,
+        )
+
+        try:
+            # Debug: report input sizes
+            try:
+                self._log(f"[PORTFOLIO_JOINT] building ohlcv_map entries={len(ohlcv_map)} ai_scores={list(ai_scores.keys())[:8]} cfg_target_lev={cfg.target_leverage}")
+            except Exception:
+                pass
+
+            engine = PortfolioJointSimEngine(ohlcv_map, ai_scores, cfg)
+            weights, report = engine.build_portfolio(symbols)
+            report = dict(report)
+            report["weights"] = weights
+            report["target_leverage"] = float(cfg.target_leverage)
+            try:
+                self._log(f"[PORTFOLIO_JOINT] report E[PnL]={report.get('expected_portfolio_pnl', 0.0):.6f} cvar={report.get('cvar', 0.0):.6f}")
+            except Exception:
+                pass
+            return report
+        except Exception as e:  # pragma: no cover - runtime guard
+            import traceback
+
+            self._log_err(f"[PORTFOLIO_JOINT] run failed: {e}")
+            try:
+                self._log_err(traceback.format_exc())
+            except Exception:
+                pass
+            return None
+
+    async def _maybe_portfolio_joint(self, symbols: List[str], ai_scores: Dict[str, float]) -> Optional[Dict[str, Any]]:
+        now = time.time()
+        if (now - float(self._last_portfolio_joint_ts)) < float(self.portfolio_joint_interval_sec):
+            self._log(f"[PORTFOLIO_JOINT] skipping; last_run={self._last_portfolio_joint_ts} interval={self.portfolio_joint_interval_sec}")
+            return self._last_portfolio_report
+        report = await asyncio.to_thread(self._run_portfolio_joint_sync, symbols, ai_scores)
+        if report:
+            self._last_portfolio_joint_ts = now
+            self._last_portfolio_report = report
+            self._log(
+                f"[PORTFOLIO_JOINT] E[PnL]={report.get('expected_portfolio_pnl', 0.0):.6f} "
+                f"CVaR={report.get('cvar', 0.0):.6f} weights={report.get('weights', {})}"
+            )
+        else:
+            self._log("[PORTFOLIO_JOINT] report is None or empty")
+        return report
+
+    def _build_rebalance_plan(
+        self,
+        *,
+        decision_map: Dict[str, Dict[str, Any]],
+        metrics_map: Dict[str, Dict[str, Any]],
+        joint_report: Optional[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not metrics_map:
+            return {}
+
+        entries = [(sym, m.get("ev_adj", 0.0)) for sym, m in metrics_map.items()]
+        entries.sort(key=lambda x: float(x[1]), reverse=True)
+
+        top_syms = [sym for sym, ev_adj in entries if ev_adj > 0][: int(self.rebalance_top_n)]
+        plan: Dict[str, Dict[str, Any]] = {}
+        joint_weights = (joint_report or {}).get("weights") or {}
+        total_lev = float((joint_report or {}).get("target_leverage", 0.0) or (joint_report or {}).get("total_leverage_allocated", 0.0) or 0.0)
+
+        for sym, metrics in metrics_map.items():
+            ev_adj = float(metrics.get("ev_adj", 0.0))
+            exec_cost = float(metrics.get("exec_cost", 0.0))
+            kelly = float(metrics.get("kelly", 0.0))
+            allowed = bool(sym in top_syms and ev_adj > 0)
+            target_leverage = min(max(kelly, 0.0), float(self.rebalance_kelly_cap)) if allowed else None
+            cap_frac = None
+            if allowed and sym in joint_weights and total_lev > 0:
+                cap_frac = max(0.0, min(1.0, float(joint_weights[sym]) / float(total_lev)))
+
+            plan[sym] = {
+                "allow_trade": allowed,
+                "ev_adj": ev_adj,
+                "exec_cost": exec_cost,
+                "target_leverage": target_leverage,
+                "target_cap_frac": cap_frac,
+            }
+
+        # cost-aware HOLD logging for symbols we choose not to rotate out
+        best_ev_adj = entries[0][1] if entries else 0.0
+        for sym, metrics in metrics_map.items():
+            if sym in top_syms:
+                self._rebalance_last_decision[sym] = "SWITCH"
+                continue
+            if sym in self.positions:
+                delta_ev = float(best_ev_adj) - float(metrics.get("ev_adj", 0.0))
+                threshold = float(self.rebalance_cost_mult) * float(metrics.get("exec_cost", 0.0))
+                if delta_ev <= threshold:
+                    prev = self._rebalance_last_decision.get(sym)
+                    if prev != "HOLD":
+                        self._log(
+                            f"Rebalance Decision: HOLD {sym} (ΔEV={delta_ev:.6f} <= cost={threshold:.6f})"
+                        )
+                    self._rebalance_last_decision[sym] = "HOLD"
+                    plan.setdefault(sym, {})["allow_trade"] = False
+                else:
+                    self._rebalance_last_decision[sym] = "SWITCH"
+
+        # cache last plan for dashboard access
+        try:
+            self._last_rebalance_plan = plan
+        except Exception:
+            pass
+
+        return plan
 
     def _row(self, sym: str, price: Any, ts: int, decision: Optional[Dict[str, Any]], candles: int, ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         status = "WAIT"
@@ -1799,6 +1985,14 @@ class LiveOrchestrator:
             # extra
             "pmaker": self.pmaker.status_dict() if getattr(self, "pmaker", None) is not None else None,
             "details": (decision.get("details", []) if (decision and bool(getattr(config, "DASHBOARD_INCLUDE_DETAILS", False))) else []),
+            # Rebalance diagnostics (last joint-run decisions)
+            "rebalance_decision": self._rebalance_last_decision.get(sym) if hasattr(self, "_rebalance_last_decision") else None,
+            "rebalance_weight": (self._last_portfolio_report.get("weights", {}).get(sym) if (hasattr(self, "_last_portfolio_report") and self._last_portfolio_report) else None),
+            # Detailed rebalance diagnostics
+            "rebalance_delta_ev": (self._last_rebalance_plan.get(sym, {}).get("ev_adj") if (hasattr(self, "_last_rebalance_plan") and self._last_rebalance_plan) else None),
+            "rebalance_exec_cost": (self._last_rebalance_plan.get(sym, {}).get("exec_cost") if (hasattr(self, "_last_rebalance_plan") and self._last_rebalance_plan) else None),
+            "rebalance_target_leverage": (self._last_rebalance_plan.get(sym, {}).get("target_leverage") if (hasattr(self, "_last_rebalance_plan") and self._last_rebalance_plan) else None),
+            "rebalance_allow_trade": (self._last_rebalance_plan.get(sym, {}).get("allow_trade") if (hasattr(self, "_last_rebalance_plan") and self._last_rebalance_plan) else None),
         }
 
     def _snapshot_inputs(
@@ -2206,13 +2400,42 @@ class LiveOrchestrator:
                     decisions.append(d)
             decide_ms = int((time.time() - t0) * 1000)
 
+            # Build decision maps for portfolio-aware gating
+            decision_map: Dict[str, Dict[str, Any]] = {}
+            metrics_map: Dict[str, Dict[str, Any]] = {}
+            ai_scores: Dict[str, float] = {}
+
+            for i, sym in enumerate(ctx_syms):
+                decision = decisions[i] if i < len(decisions) else None
+                decision_map[sym] = decision
+                metrics = self._decision_metrics(decision)
+                metrics_map[sym] = metrics
+                # Debug: log per-symbol metrics that look suspicious
+                try:
+                    ev = float(metrics.get("ev", 0.0) or 0.0)
+                    kelly = float(metrics.get("kelly", 0.0) or 0.0)
+                    exec_cost = float(metrics.get("exec_cost", 0.0) or 0.0)
+                    if ev == 0.0:
+                        self._log(f"[DECIDE] {sym} ev=0 kelly={kelly:.6f} exec_cost={exec_cost:.6f} decision_mc_reason={decision.get('reason') if isinstance(decision, dict) else None}")
+                except Exception:
+                    pass
+                if math.isfinite(metrics.get("ev", 0.0)):
+                    ai_scores[sym] = float(metrics.get("ev", 0.0))
+
+            joint_report = await self._maybe_portfolio_joint(list(ai_scores.keys()), ai_scores)
+            rebalance_plan = self._build_rebalance_plan(
+                decision_map=decision_map,
+                metrics_map=metrics_map,
+                joint_report=joint_report,
+            )
+
             # Map back decisions to symbols and apply
             for i, sym in enumerate(ctx_syms):
                 ts_ms = int(ctx_meta.get(sym, {}).get("ts_ms") or now_ms())
                 best_bid = ctx_meta.get(sym, {}).get("best_bid")
                 best_ask = ctx_meta.get(sym, {}).get("best_ask")
                 mark_price = ctx_meta.get(sym, {}).get("mark_price")
-                decision = decisions[i] if i < len(decisions) else None
+                decision = decision_map.get(sym)
 
                 self._decision_cache[sym] = {"decision": decision, "ctx": ctx_list[i], "ts": int(ts_ms), "decide_ms": int(decide_ms)}
 
@@ -2223,8 +2446,19 @@ class LiveOrchestrator:
                         cand = [d for d in details if isinstance(d, dict)]
                         if cand:
                             best_detail = max(cand, key=lambda d: float(d.get("ev", 0.0) or 0.0))
-                    decision_reason = str(decision.get("reason", "") or "") if isinstance(decision, dict) else ""
+                    plan = rebalance_plan.get(sym, {})
                     desired_action = str(decision.get("action", "WAIT") if isinstance(decision, dict) else "WAIT")
+                    if not plan.get("allow_trade", True):
+                        desired_action = "WAIT"
+                    if best_detail is not None:
+                        best_detail = dict(best_detail)
+                    if plan.get("target_leverage") is not None:
+                        best_detail = best_detail or {}
+                        best_detail["optimal_leverage"] = float(plan.get("target_leverage"))
+                    if plan.get("target_cap_frac") is not None:
+                        best_detail = best_detail or {}
+                        best_detail["optimal_size"] = float(plan.get("target_cap_frac"))
+                    decision_reason = str(decision.get("reason", "") or "") if isinstance(decision, dict) else ""
                     self._paper_trade_step(
                         sym=sym,
                         desired_action=desired_action,
@@ -2332,8 +2566,8 @@ async def build_exchange() -> ccxt.Exchange:
     if bool(getattr(config, "ENABLE_LIVE_ORDERS", False)):
         ex_cfg.update(
             {
-                "apiKey": os.environ.get("BYBIT_API_KEY", ""),
-                "secret": os.environ.get("BYBIT_API_SECRET", ""),
+                "apiKey": getattr(config, "API_KEY", ""),
+                "secret": getattr(config, "API_SECRET", ""),
             }
         )
     exchange = ccxt.bybit(ex_cfg)

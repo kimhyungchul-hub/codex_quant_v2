@@ -176,7 +176,8 @@ class MonteCarloEntryEvaluationMixin:
             if self._tail_mode == "bootstrap" and closes is not None and len(closes) >= 64:
                 x = np.asarray(closes, dtype=np.float64)
                 rets = np.diff(np.log(np.maximum(x, 1e-12)))
-                self._bootstrap_returns = rets[-512:].astype(np.float64) if rets.size >= 32 else None
+                from engines.mc.constants import BOOTSTRAP_HISTORY_LEN, BOOTSTRAP_MIN_SAMPLES
+                self._bootstrap_returns = rets[-BOOTSTRAP_HISTORY_LEN:].astype(np.float64) if rets.size >= BOOTSTRAP_MIN_SAMPLES else None
             else:
                 self._bootstrap_returns = None
         regime_ctx = str(ctx.get("regime", "chop"))
@@ -1421,6 +1422,15 @@ class MonteCarloEntryEvaluationMixin:
             print(
                 f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}"
             )
+
+# Always-on short summary for troubleshooting (helps when MC_VERBOSE_PRINT is False)
+try:
+    el_len = len(evs_long) if ("evs_long" in locals() and hasattr(evs_long, '__len__')) else 0
+    es_len = len(evs_short) if ("evs_short" in locals() and hasattr(evs_short, '__len__')) else 0
+except Exception:
+    el_len = 0
+    es_len = 0
+print(f"[EV_SUMMARY] {symbol} n_paths={n_paths} ev_mix_long={policy_ev_mix_long:.8f} ev_mix_short={policy_ev_mix_short:.8f} evs_long_len={el_len} evs_short_len={es_len}")
             logger.info(f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}")
         
         # ✅ 모든 심볼의 policy_ev_mix가 음수인 경우 검증 (LINK 제외)
@@ -1529,6 +1539,19 @@ class MonteCarloEntryEvaluationMixin:
                     out.append(float("nan"))
             return np.asarray(out, dtype=np.float64)
 
+        def _ensure_len(arr: np.ndarray, target_len: int, fill: float = 0.0) -> np.ndarray:
+            """Patched: Static warmup shape and empty array defense."""
+            a = np.asarray(arr, dtype=np.float64)
+            if a.size == 0:
+                return np.full(target_len, fill, dtype=np.float64)
+            if a.size < target_len:
+                out = np.full(target_len, fill, dtype=np.float64)
+                out[: a.size] = a
+                return out
+            if a.size > target_len:
+                return a[:target_len]
+            return a
+
         # risk stats from exit-policy rollforward (per horizon)
         var_long_h = _metric_arr(per_h_long, "var_exit_policy")
         var_short_h = _metric_arr(per_h_short, "var_exit_policy")
@@ -1538,8 +1561,8 @@ class MonteCarloEntryEvaluationMixin:
         dd_min_short_h = _metric_arr(per_h_short, "dd_min_exit_policy")
 
         # CVaR arrays are already net-of-entry-cost (see append above)
-        cvar_long_h = np.asarray(cvars_long, dtype=np.float64)
-        cvar_short_h = np.asarray(cvars_short, dtype=np.float64)
+        cvar_long_h = _ensure_len(cvars_long, n_pol, 0.0)
+        cvar_short_h = _ensure_len(cvars_short, n_pol, 0.0)
 
         # Profit/Cost ratio uses total execution cost (entry+exit) in ROE units.
         cost_total_roe = float(cost_entry_roe) + float(cost_exit_roe)
@@ -3075,10 +3098,11 @@ class MonteCarloEntryEvaluationMixin:
         }
         return res
     # ✅ Fixed batch size for JAX JIT stability (Static Batching)
-    JAX_STATIC_BATCH_SIZE = 32
+    # CRITICAL: constants.py에서 중앙 관리됨
+    from engines.mc.constants import JAX_STATIC_BATCH_SIZE
 
     def evaluate_entry_metrics_batch(
-self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         GLOBAL BATCHING: 여러 심볼에 대해 병렬로 Monte Carlo 평가를 수행한다.
         - tasks: List of {ctx, params, seed}
@@ -3163,8 +3187,9 @@ self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         max_steps = int(math.ceil(max_h_sec / float(step_sec))) if max_h_sec > 0 else 0
         
         # Horizons summary inputs (seconds)
+        from engines.mc.constants import HORIZON_SUMMARY_DEFAULT
         h_cols: list[int] = []
-        for h in [60, 300, 600, 1800, 3600]:
+        for h in HORIZON_SUMMARY_DEFAULT:
             h_cols.append(min(int(h), int(max_h_sec)))
         # Convert sec horizons to step indices
         h_indices = np.array(

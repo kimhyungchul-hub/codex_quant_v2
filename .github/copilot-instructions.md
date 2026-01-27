@@ -82,6 +82,46 @@
 
 **영향 파일:** `engines/mc/entry_evaluation.py`, `engines/mc/entry_evaluation_vmap.py`, `engines/mc/jax_backend.py`
 
+### 5. 중앙 집중식 상수 관리 (Constants Management) - NEW!
+**원칙:** 모든 하드코딩된 수치 상수는 `engines/mc/constants.py`에서 중앙 관리합니다.
+
+**금지 사항:**
+- ❌ 개별 파일에서 직접 하드코딩 (예: `STATIC_MAX_PATHS = 16384`)
+- ❌ 중복 정의 (여러 파일에서 같은 상수 재정의)
+
+**필수 사항:**
+- ✅ 모든 상수는 `engines/mc/constants.py`에서 정의
+- ✅ 다른 파일에서는 `from engines.mc.constants import STATIC_MAX_PATHS` 형태로 import
+- ✅ 상수 변경 시 `constants.py` 파일만 수정
+
+**주요 상수 목록:**
+```python
+from engines.mc.constants import (
+    STATIC_MAX_SYMBOLS,      # JAX Static Shape: 최대 심볼 수 (32)
+    STATIC_MAX_PATHS,        # JAX Static Shape: 최대 경로 수 (16384)
+    STATIC_MAX_STEPS,        # JAX Static Shape: 최대 스텝 수 (3600)
+    JAX_STATIC_BATCH_SIZE,   # 배치 크기 (STATIC_MAX_SYMBOLS와 동일)
+    STATIC_HORIZONS,         # 고정 horizon 목록 [60, 300, 600, 1800, 3600]
+    MC_N_PATHS_LIVE,         # 라이브 진입 평가 경로 수
+    MC_N_PATHS_EXIT,         # Exit policy 평가 경로 수
+    BOOTSTRAP_MIN_SAMPLES,   # Bootstrap 최소 샘플 수 (64)
+    BOOTSTRAP_HISTORY_LEN,   # Bootstrap 히스토리 길이 (512)
+    SECONDS_PER_YEAR,        # 연간 초 (31536000)
+    EPSILON,                 # 0 나누기 방지 최소값 (1e-12)
+)
+
+    DEFAULT_IMPACT_CONSTANT, # Square-Root Market Impact 계수 (default=0.75)
+```
+
+**적용 파일:**
+- `engines/mc/constants.py` - 중앙 정의 (Source of Truth)
+- `engines/mc/entry_evaluation_vmap.py` - STATIC_* 상수 import
+- `engines/mc/entry_evaluation.py` - JAX_STATIC_BATCH_SIZE, BOOTSTRAP_* import
+- `engines/mc/monte_carlo_engine.py` - STATIC_* 상수 import
+- `main_engine_mc_v2_final.py` - STATIC_MAX_SYMBOLS import
+
+**영향 파일:** `engines/mc/entry_evaluation.py`, `engines/mc/entry_evaluation_vmap.py`, `engines/mc/jax_backend.py`
+
 ## 📂 프로젝트 핵심 구조 (CODE_MAP)
 - `core/orchestrator/`: 믹스인 기반 오케스트레이터 (Data, Risk, Decision 분리)
 - `core/data_manager.py`: 시장 데이터 관리
@@ -121,3 +161,38 @@
 - WebSocket `full_update` 메시지 정상 전송 (2초 주기)
 
 **참조 이슈:** Dashboard에 데이터가 표시되지 않는 문제 (WebSocket 연결은 성공하나 `market` 배열 비어있음)
+
+### [2026-01-22] 3가지 핵심 병렬화 개선 및 중앙 집중식 상수 관리
+**문제:**
+1. **Data Ingestion 병목**: `decision_loop`에서 개별 심볼마다 Dict 생성 → 메모리 재할당 및 for 루프 오버헤드
+2. **Barrier Logic 누락**: `compute_horizon_metrics_jax`가 만기 가격만 체크 → 중간 경로 TP/SL 도달 케이스 약 40% 누락
+3. **JIT 재컴파일**: 심볼 수 변동 시 JAX JIT 재컴파일로 장중 렉 발생
+4. **하드코딩 난립**: STATIC_MAX_PATHS 등 상수가 여러 파일에 중복 정의
+
+**해결책:**
+1. **SoA (Structure of Arrays) 구조** (`main_engine_mc_v2_final.py`):
+   - Pre-allocated numpy 배열 추가: `_batch_prices`, `_batch_mus`, `_batch_sigmas` 등
+   - `_build_batch_context_soa()`: Dict 생성 최소화, 배열에 직접 값 할당
+   - 효과: 메모리 재할당 방지, O(1) 인덱스 조회
+
+2. **Barrier Logic** (`engines/mc/entry_evaluation_vmap.py`):
+   - `compute_horizon_metrics_jax()` 완전 재작성
+   - `jnp.max/min`으로 경로 내 고가/저가 산출 후 First Passage 체크
+   - 효과: TP 도달 케이스 43.6% → 83.2% (약 40% 증가)
+
+3. **Static Shape Warmup** (`engines/mc/constants.py`, `monte_carlo_engine.py`):
+   - `STATIC_MAX_SYMBOLS=32`, `STATIC_MAX_PATHS=16384`, `STATIC_MAX_STEPS=3600`
+   - `MonteCarloEngine.__init__()`: 최대 크기로 워밍업
+   - 효과: 장중 shape 변경 시 JIT 재컴파일 방지
+
+4. **중앙 집중식 상수 관리** (`engines/mc/constants.py`):
+   - 모든 하드코딩 상수를 `constants.py`로 집중
+   - 다른 파일은 `from engines.mc.constants import *` 형태로 import
+   - 효과: 단일 수정 지점, 중복 제거, 유지보수성 향상
+
+**영향 파일:**
+- `engines/mc/constants.py` - 중앙 상수 정의 (신규 확장)
+- `main_engine_mc_v2_final.py` - SoA 배열 + STATIC_MAX_SYMBOLS import
+- `engines/mc/entry_evaluation_vmap.py` - Barrier Logic + constants import
+- `engines/mc/entry_evaluation.py` - JAX_STATIC_BATCH_SIZE, BOOTSTRAP_* constants import
+- `engines/mc/monte_carlo_engine.py` - STATIC_* constants import + warmup

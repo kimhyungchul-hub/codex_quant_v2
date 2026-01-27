@@ -207,3 +207,29 @@ class MonteCarloEngine(
         self.ALPHA_DELAY_DECAY_TAU_SEC = float(os.getenv("ALPHA_DELAY_DECAY_TAU_SEC", "30.0"))
         self.PMAKER_ENTRY_DELAY_SHIFT = os.getenv("PMAKER_ENTRY_DELAY_SHIFT", "1") == "1"
         self.PMAKER_STRICT = bool(os.getenv("PMAKER_STRICT", "0") == "1")
+
+        # ============================================================================
+        # [STATIC SHAPE WARMUP] JAX JIT 재컴파일 방지
+        # ============================================================================
+        # CRITICAL: 봇 시작 시 최대 크기로 워밍업하여 장중 렉 방지
+        try:
+            from engines.mc.entry_evaluation_vmap import GlobalBatchEvaluator
+            from engines.mc.constants import (
+                STATIC_MAX_SYMBOLS,
+                STATIC_MAX_PATHS,
+                STATIC_MAX_STEPS,
+            )
+            self._global_batch_evaluator = GlobalBatchEvaluator(
+                dt=self.dt,
+                max_symbols=STATIC_MAX_SYMBOLS
+            )
+            # 최대 크기로 워밍업 (장중 shape 변경 시 재컴파일 방지)
+            logger.info(f"[MC_ENGINE] Starting Static Shape warmup: ({STATIC_MAX_SYMBOLS}, {STATIC_MAX_PATHS}, {STATIC_MAX_STEPS})")
+            self._global_batch_evaluator.warmup(
+                n_symbols=STATIC_MAX_SYMBOLS,
+                n_paths=STATIC_MAX_PATHS,
+                n_steps=STATIC_MAX_STEPS
+            )
+        except Exception as e:
+            logger.warning(f"[MC_ENGINE] GlobalBatchEvaluator warmup failed: {e}")
+            self._global_batch_evaluator = None

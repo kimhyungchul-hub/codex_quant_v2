@@ -10,12 +10,47 @@ logger = logging.getLogger(__name__)
 # ✅ DEV_MODE: NumPy 전용 모드 (JAX 완전 비활성화)
 DEV_MODE = os.environ.get("DEV_MODE", "").lower() in ("1", "true", "yes")
 
+
+def _configure_jax_env() -> None:
+    """Ensure JAX memory envs are sane before importing JAX.
+
+    - Logs current values for allocator/preallocate/mem_fraction.
+    - Removes platform allocator to allow BFC pool.
+    - Sets default MEM_FRACTION=0.65 if unset.
+    """
+
+    preallocate = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE")
+    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR")
+    mem_fraction = os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION")
+
+    logger.info(
+        "🔧 [JAX_ENV] PREALLOCATE=%s, ALLOCATOR=%s, MEM_FRACTION=%s",
+        preallocate or "unset",
+        allocator or "unset",
+        mem_fraction or "unset",
+    )
+
+    if allocator and allocator.lower() == "platform":
+        logger.warning(
+            "⚠️  [JAX_ENV] Removing XLA_PYTHON_CLIENT_ALLOCATOR=platform to use BFC pool"
+        )
+        os.environ.pop("XLA_PYTHON_CLIENT_ALLOCATOR", None)
+        allocator = None
+
+    if not mem_fraction:
+        os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.65"
+        logger.info("🔧 [JAX_ENV] Defaulted XLA_PYTHON_CLIENT_MEM_FRACTION to 0.65")
+
+
+_configure_jax_env()
+
 # Lazy JAX initialization to avoid importing/initializing JAX at module import time.
 _JAX_OK = False
 jax: Any = None
 jnp: Any = None
 jrand: Any = None
 lax: Any = None
+_JAX_WARMED = False
 
 
 def ensure_jax() -> None:
@@ -40,8 +75,6 @@ def ensure_jax() -> None:
     if jax is not None:
         return
     try:
-        import os as _os_module
-        # Avoid forcing platform env vars here; rely on external bootstrap to set envs.
         import jax as _jax_module  # type: ignore
         import jax.numpy as _jnp_module  # type: ignore
         from jax import random as _jrand_module  # type: ignore
@@ -66,12 +99,60 @@ def ensure_jax() -> None:
         gpu_devices = [d for d in devices if getattr(d, 'platform', None) and str(d.platform).lower() != 'cpu']
         if not gpu_devices:
             logger.warning("⚠️  [JAX] No non-CPU devices found; GPU-only expectation not met")
+
+        _warmup_bfc_allocator()
     except ImportError as e:
         logger.warning(f"⚠️  [JAX] Not available: {e}")
         _JAX_OK = False
     except Exception as e:
         logger.warning(f"⚠️  [JAX] Initialization error: {e}")
-        _JAX_OK = False
+        # If the error appears to be related to a missing/unsupported Metal backend,
+        # attempt a CPU-only fallback by forcing JAX to use the CPU platform.
+        err_text = str(e).lower()
+        if "metal" in err_text or "unknown backend" in err_text:
+            try:
+                logger.info("🔧 [JAX] Attempting CPU fallback (JAX_PLATFORM_NAME=cpu)")
+                os.environ["JAX_PLATFORM_NAME"] = "cpu"
+                # Clear any partially loaded jax module and retry import
+                import importlib, sys
+                for m in ("jax", "jax.numpy", "jax.random", "jax.lax"):
+                    if m in sys.modules:
+                        del sys.modules[m]
+                import jax as _jax_module  # type: ignore
+                import jax.numpy as _jnp_module  # type: ignore
+                from jax import random as _jrand_module  # type: ignore
+                from jax import lax as _lax_module  # type: ignore
+
+                jax = _jax_module
+                jnp = _jnp_module
+                jrand = _jrand_module
+                lax = _lax_module
+                _JAX_OK = True
+                devices = jax.devices()
+                logger.info(f"✅ [JAX-CPU] Fallback succeeded, devices={devices}")
+                _warmup_bfc_allocator()
+            except Exception as e2:
+                logger.warning(f"⚠️  [JAX] CPU fallback failed: {e2}")
+                _JAX_OK = False
+        else:
+            _JAX_OK = False
+
+
+def _warmup_bfc_allocator() -> None:
+    """Pre-warm BFC allocator with a tiny allocation to avoid first-use jitter."""
+
+    global _JAX_WARMED
+
+    if _JAX_WARMED or DEV_MODE or not _JAX_OK or jax is None or jnp is None:
+        return
+
+    try:
+        arr = jnp.zeros((1024, 1024), dtype=jnp.float32)
+        _ = jax.block_until_ready(arr)
+        _JAX_WARMED = True
+        logger.info("✅ [JAX] BFC allocator pre-warmed (1024x1024 zeros)")
+    except Exception as e:
+        logger.warning(f"⚠️  [JAX] Warmup failed: {e}")
 
 
 def lazy_jit(static_argnames=()):
@@ -308,9 +389,8 @@ def _jax_mc_device() -> Optional[Any]:
         return None
 
 
-# NOTE: Do NOT auto-initialize JAX at module import time here.
-# Auto-initialization caused JAX to be loaded before environment variables
-# (XLA_PYTHON_CLIENT_*) could be applied in some entrypoints, leading to
-# undesired Metal memory reservation. Call `ensure_jax()` explicitly
-# from application entrypoints (for example from `main_engine_mc_v2_final.py`)
-# after environment variables are set.
+# NOTE: env configuration happens at module import; JAX is initialized below to
+# avoid None-state pitfalls in downstream exception handlers. Ensure any
+# external overrides are set before importing this module.
+
+ensure_jax()

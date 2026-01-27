@@ -57,6 +57,9 @@ class MonteCarloFirstPassageMixin:
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
 
         prices_np: np.ndarray
+        bridge_tp_np: Optional[np.ndarray] = None
+        bridge_sl_np: Optional[np.ndarray] = None
+        log_prices_j = None
         if use_jax:
             # ✅ GPU 우선: default backend (GPU/Metal) 사용
             force_cpu_dev = _jax_mc_device()
@@ -76,7 +79,8 @@ class MonteCarloFirstPassageMixin:
                     else:
                         z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
                         logret_j = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
-                        prices_j = float(s0) * jnp.exp(direction * logret_j)  # type: ignore[attr-defined]
+                        log_prices_j = direction * logret_j + math.log(s0)
+                        prices_j = jnp.exp(log_prices_j)  # type: ignore[attr-defined]
                         prices_np = np.asarray(jax.device_get(prices_j), dtype=np.float64)  # type: ignore[attr-defined]
                 else:
                     # CPU로 강제된 경우만 CPU 사용 (env JAX_MC_DEVICE=cpu)
@@ -94,7 +98,8 @@ class MonteCarloFirstPassageMixin:
                         else:
                             z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
                             logret_j = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
-                            prices_j = float(s0) * jnp.exp(direction * logret_j)  # type: ignore[attr-defined]
+                            log_prices_j = direction * logret_j + math.log(s0)
+                            prices_j = jnp.exp(log_prices_j)  # type: ignore[attr-defined]
                             prices_np = np.asarray(jax.device_get(prices_j), dtype=np.float64)  # type: ignore[attr-defined]
             except Exception:
                 # Any JAX/XLA backend failure -> fall back to NumPy path simulation
@@ -114,8 +119,71 @@ class MonteCarloFirstPassageMixin:
             tp_level = s0 * (1.0 + tp_pct)
             sl_level = s0 * (1.0 - sl_pct)
 
-        hit_tp = prices_np >= tp_level
-        hit_sl = prices_np <= sl_level
+        # Brownian Bridge 보정: intra-step 배리어 터치 확률을 보완
+        sigma_sq_dt = sigma * sigma * dt
+        if sigma_sq_dt > 0.0:
+            if use_jax and log_prices_j is not None:
+                log_prices_full_j = jnp.concatenate(  # type: ignore[attr-defined]
+                    (
+                        jnp.full((n_paths, 1), math.log(s0), dtype=log_prices_j.dtype),  # type: ignore[attr-defined]
+                        log_prices_j,
+                    ),
+                    axis=1,
+                )
+                prev_j = log_prices_full_j[:, :-1]
+                nxt_j = log_prices_full_j[:, 1:]
+
+                log_tp_j = jnp.array(math.log(tp_level), dtype=log_prices_j.dtype)  # type: ignore[attr-defined]
+                below_tp_j = (prev_j < log_tp_j) & (nxt_j < log_tp_j)
+                sigma_sq_dt_j = jnp.array(sigma_sq_dt, dtype=log_prices_j.dtype)  # type: ignore[attr-defined]
+                prob_tp_j = jnp.where(
+                    below_tp_j,
+                    jnp.exp(-2.0 * (log_tp_j - prev_j) * (log_tp_j - nxt_j) / sigma_sq_dt_j),  # type: ignore[attr-defined]
+                    0.0,
+                )
+                key, key_tp = jrand.split(key)  # type: ignore[attr-defined]
+                bridge_tp_np = np.asarray(
+                    jax.device_get(jrand.uniform(key_tp, prob_tp_j.shape) < prob_tp_j), dtype=bool  # type: ignore[attr-defined]
+                )
+
+                log_sl_j = jnp.array(math.log(sl_level), dtype=log_prices_j.dtype)  # type: ignore[attr-defined]
+                above_sl_j = (prev_j > log_sl_j) & (nxt_j > log_sl_j)
+                prob_sl_j = jnp.where(
+                    above_sl_j,
+                    jnp.exp(-2.0 * (prev_j - log_sl_j) * (nxt_j - log_sl_j) / sigma_sq_dt_j),  # type: ignore[attr-defined]
+                    0.0,
+                )
+                key, key_sl = jrand.split(key)  # type: ignore[attr-defined]
+                bridge_sl_np = np.asarray(
+                    jax.device_get(jrand.uniform(key_sl, prob_sl_j.shape) < prob_sl_j), dtype=bool  # type: ignore[attr-defined]
+                )
+
+            if bridge_tp_np is None or bridge_sl_np is None:
+                log_prices = np.log(prices_np)
+                log_prices_full = np.concatenate(
+                    (np.full((n_paths, 1), math.log(s0), dtype=np.float64), log_prices), axis=1
+                )
+
+                prev = log_prices_full[:, :-1]
+                nxt = log_prices_full[:, 1:]
+
+                log_tp = math.log(tp_level)
+                below_tp = (prev < log_tp) & (nxt < log_tp)
+                prob_tp = np.zeros_like(prev, dtype=np.float64)
+                prob_tp[below_tp] = np.exp(-2.0 * (log_tp - prev[below_tp]) * (log_tp - nxt[below_tp]) / sigma_sq_dt)
+                bridge_tp_np = rng.random(prob_tp.shape) < prob_tp
+
+                log_sl = math.log(sl_level)
+                above_sl = (prev > log_sl) & (nxt > log_sl)
+                prob_sl = np.zeros_like(prev, dtype=np.float64)
+                prob_sl[above_sl] = np.exp(-2.0 * (prev[above_sl] - log_sl) * (nxt[above_sl] - log_sl) / sigma_sq_dt)
+                bridge_sl_np = rng.random(prob_sl.shape) < prob_sl
+
+            hit_tp = (prices_np >= tp_level) | bridge_tp_np
+            hit_sl = (prices_np <= sl_level) | bridge_sl_np
+        else:
+            hit_tp = prices_np >= tp_level
+            hit_sl = prices_np <= sl_level
 
         tp_hit_idx = np.where(hit_tp.any(axis=1), hit_tp.argmax(axis=1) + 1, max_steps + 1)
         sl_hit_idx = np.where(hit_sl.any(axis=1), hit_sl.argmax(axis=1) + 1, max_steps + 1)

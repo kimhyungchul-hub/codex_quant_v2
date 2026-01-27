@@ -63,7 +63,7 @@ class DecisionMixin:
         liquidity = self._liquidity_score(orderbook)
         
         # 레짐
-        regime = self._infer_regime(closes)
+        regime = self._infer_regime(closes, symbol=sym)
         
         # 방향성
         direction = self._direction_bias(closes)

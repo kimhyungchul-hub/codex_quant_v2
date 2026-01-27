@@ -138,7 +138,8 @@ DD_STOP_ROE = -0.02  # -2% 미실현 손실 시 강제 청산
 - **권장하지 않음** — 프로덕션 환경에서는 false 사용
 
 **Change Log (selected):**
-- 2026-01-22: Exit Policy 기본값 변경 — `SKIP_EXIT_POLICY=false`를 기본값으로 설정하여 모든 청산 로직이 MC 시뮬레이션에 반영되도록 함 (`engines/mc/entry_evaluation.py`).
+ - 2026-01-24: JAX 환경 자동 구성 및 BFC 프리워밍 추가 — `engines/mc/jax_backend.py`가 모듈 import 시점에 JAX 관련 환경을 점검하고(`XLA_PYTHON_CLIENT_ALLOCATOR`가 `platform`일 경우 제거), `XLA_PYTHON_CLIENT_MEM_FRACTION`이 설정되지 않은 경우 기본값 `0.65`로 설정하도록 변경되었습니다. 또한 JAX 초기화 직후 BFC allocator를 프리워밍하는 더미 연산을 수행하여 첫 사용 시 latency jitter를 줄입니다. (engines/mc/jax_backend.py)
+ - 2026-01-22: Exit Policy 기본값 변경 — `SKIP_EXIT_POLICY=false`를 기본값으로 설정하여 모든 청산 로직이 MC 시뮬레이션에 반영되도록 함 (`engines/mc/entry_evaluation.py`).
 - 2026-01-22: Portfolio Management 통합 — TOP N 선택 + Kelly 배분 + Switching Cost 평가 추가 (`main_engine_mc_v2_final.py`).
 - 2026-01-21: JAX/XLA bootstrap 추가 — 프로세스 시작 시 메모리 선점 방지 및 컴파일 캐시 중앙화 (`bootstrap.py`, `config.py`, `main.py`, `main_engine_mc_v2_final.py`, `mc_plus.py`, `mc_engine.py`, `server.py`, `train_transformer_gpu.py`, `train_transformer_gpu.sh`, `check_system.py`, `tools/jax_cache_probe.py`).
 - 2026-01-21: decision_loop 3단계 파이프라인 리팩터링 — 컨텍스트 생성(`_build_decision_context`), 배치 의사결정, 결과 적용(`_apply_decision`) 분리 및 개별 심볼 예외 격리 (`main_engine_mc_v2_final.py`).
@@ -157,13 +158,17 @@ After auditing the codebase and stabilizing JAX initialization, we recommend sta
    - If you prefer a single canonical file named `main.py`, rename `main_engine_mc_v2_final.py` to `main.py` and keep a thin shim that calls it (this preserves backwards compatibility while centralizing runtime behavior).
 
 - **Operational notes (must follow):**
-   1. Always execute `bootstrap.py` (or source `.venv/bin/activate` that exports the same envs) before any process that may import JAX. Environment keys: `XLA_PYTHON_CLIENT_PREALLOCATE=false`, `XLA_PYTHON_CLIENT_ALLOCATOR=platform`, `XLA_PYTHON_CLIENT_MEM_FRACTION=0.25`, `JAX_METAL_CACHE_SIZE=0`, `JAX_COMPILATION_CACHE_DIR=<repo>/.jax_cache`.
-   2. The repository now provides `engines/mc/jax_backend.py` which performs lazy JAX initialization via `ensure_jax()` and a `lazy_jit()` decorator; prefer using these utilities in new JAX modules to avoid import-time initialization.
+   1. Always execute `bootstrap.py` (or source `.venv/bin/activate` that exports the same envs) before any process that may import JAX. Recommended keys: `XLA_PYTHON_CLIENT_PREALLOCATE=false`, `JAX_METAL_CACHE_SIZE=0`, `JAX_COMPILATION_CACHE_DIR=<repo>/.jax_cache`. Note: `engines/mc/jax_backend.py` will automatically remove `XLA_PYTHON_CLIENT_ALLOCATOR=platform` (to prefer the BFC allocator) and will default `XLA_PYTHON_CLIENT_MEM_FRACTION` to `0.65` if unset; if you have a site-wide policy to enforce a different fraction, set it explicitly in the environment before importing Python modules.
+   2. The repository provides `engines/mc/jax_backend.py` which handles JAX initialization. It now:
+      - configures JAX envs at module import (removes `platform` allocator, defaults MEM_FRACTION to `0.65` when unset),
+      - calls `ensure_jax()` at import to avoid `None`-state pitfalls in exception handlers,
+      - performs a BFC allocator pre-warm (`jnp.zeros((1024,1024), dtype=jnp.float32)`) to reduce first-call latency jitter.
+      Prefer importing `ensure_jax()` and `_JAX_OK` from this module when writing GPU kernels, and continue to use `DEV_MODE=true` for CPU-only development.
    3. CI runners and container entrypoints should source `bootstrap.py` or ensure the envs are set before Python loads project modules (e.g., `python -m bootstrap && python main_engine_mc_v2_final.py` or `source .venv/bin/activate && python main_engine_mc_v2_final.py`).
 
 Below we document the exact changes made to support this recommendation (for maintainers):
 
-- Added `engines/mc/jax_backend.py` — lazy JAX loader (`ensure_jax`) and `lazy_jit` decorator.
+ - Added `engines/mc/jax_backend.py` — JAX init helper. Provides `ensure_jax`, `lazy_jit`, automatic environment configuration (allocator/mem_fraction), and BFC pre-warm on import.
 - Converted major JAX-using modules to lazy-init patterns (examples): `engines/mc/entry_evaluation_vmap.py`, `engines/mc/exit_policy_jax.py`, `engines/mc/probability_jax.py`, `core/napv_engine_jax.py`, `engines/mc/portfolio_joint_sim.py`, `engines/mc/leverage_optimizer_jax.py`, `mc_engine.py`, `mc_plus.py`, `engines/cvar_methods.py`.
 - Updated `main_engine_mc_v2_final.py` runs during testing and verified dashboard binding at `:9999` and JAX device initialization logs.
 
@@ -523,6 +528,25 @@ JAX vmap 배치 평가.
 | `MonteCarloExecutionCostsMixin` | 실행 비용 | 수수료/슬리피지 |
 | `MonteCarloExecutionMixMixin` | 메이커/테이커 믹스 | 생존율 반영 |
 
+#### `ExecutionCostModel` (신규)
+
+`engines/mc/execution_costs.py`에 `ExecutionCostModel` 클래스가 추가되어 동적 시장 충격 모델을 구현합니다.
+
+| 항목 | 설명 | 한글 |
+|------|------|------|
+| `ExecutionCostModel` | Square-Root Market Impact 기반 비용 모델 | 주문규모/변동성/ADV 기반 비용 계산 (JAX 호환)
+
+요약:
+- 수식: Impact Cost (%) = σ * (Order Size / Daily Volume)^0.5 * Constant
+- 메서드: `calculate_cost(order_size, price, sigma, adv=None, base_spread=0.001)`
+   - `adv` 제공 시 square-root impact 적용
+   - `adv` 미제공 시 tiered spread fallback (order_size 기반 1x/2x/3x)
+- JAX 벡터화 지원: `jnp` 사용 및 `_JAX_OK` 체크, JAX 미사용 시 NumPy fallback
+
+관련 상수:
+- `engines/mc/constants.py`에 `DEFAULT_IMPACT_CONSTANT` (기본 0.75) 추가
+
+
 ---
 
 ### `engines/mc/tail_sampling.py` / `engines/mc/signal_features.py`
@@ -638,6 +662,17 @@ GBM 경로 시뮬레이션.
 - `_simulate_paths_price_jax_core` — JAX JIT 컴파일된 GBM 코어
 - `_simulate_paths_price_batch_jax` — vmap 적용 배치 버전
 
+**주의 (2026-01-24 업데이트)**:
+- Mode-aware drift 처리가 도입되었습니다. `mode`가 `student_t` 또는 `bootstrap`인 경우
+   이토 보정항(`-0.5 * sigma^2`)을 제거하고 순수 `mu * dt`를 적용합니다 (Gaussian 모드만
+   종전대로 Ito 보정 유지). 이는 팻테일 분포와 Bootstrap 샘플링에서 기대값(EV) 편향을
+   방지하기 위한 수학적 수정입니다.
+- 디버그/검증: `MC_VERIFY_DRIFT=1` 환경변수로 시뮬레이션 후 경험적 로그수익률과 타깃
+   드리프트를 비교하는 검증 로그가 활성화됩니다.
+- 테스트 스크립트: `scripts/mc_drift_test.py`를 통해 NumPy 및 JAX(JIT) 모드에서
+   `normal` vs `student_t` 드리프트 무결성 검증이 가능합니다. JAX 모드는 `MC_USE_JAX=1`
+   환경변수로 활성화합니다.
+
 ---
 
 ### `engines/mc/exit_policy.py` — `MonteCarloExitPolicyMixin`
@@ -667,6 +702,10 @@ First-passage time 계산.
 | `mc_first_passage_tp_sl` | `(s0, tp_pct, sl_pct, mu, sigma, dt, max_steps, n_paths, cvar_alpha=0.05, timeout_mode="flat", seed=None, side="LONG") -> Dict` | TP/SL first-passage 시뮬레이션 | event_p_tp, event_p_sl, event_ev_r 등 |
 
 **반환 키**: `event_p_tp`, `event_p_sl`, `event_p_timeout`, `event_ev_r`, `event_cvar_r`, `event_t_median`, `event_t_mean`
+
+**최근 변경 (Brownian Bridge 보정):**
+- 2026-01-22: `mc_first_passage_tp_sl`에 Brownian Bridge 기반 intra-step 배리어 터치 보정이 추가되었습니다. NumPy fallback과 JAX 경로 모두에서 확률적 보정을 계산하여 discrete-time 검사의 과소평가 문제를 완화합니다. 관련 테스트 스크립트는 `tests/test_first_passage_bb_compare.py`, `tests/test_first_passage_debug.py`, `tests/test_first_passage_jax_compare.py`, `tests/test_first_passage_outliers.py`에 추가되어 있습니다.
+
 
 ---
 

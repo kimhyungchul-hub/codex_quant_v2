@@ -15,12 +15,17 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from regime import MarketRegimeDetector
+
 if TYPE_CHECKING:
     pass
 
 
 class MarketDataMixin:
     """시장 데이터 계산 믹스인"""
+
+    _regime_detectors: Dict[str, MarketRegimeDetector]
+    _regime_meta: Dict[str, Dict[str, Any]]
 
     def _compute_returns_and_vol(
         self, 
@@ -78,29 +83,41 @@ class MarketDataMixin:
         return 2.0 * up_ratio - 1.0  # -1 ~ 1 변환
 
     def _infer_regime(
-        self, 
-        closes: List[float], 
+        self,
+        closes: List[float],
+        symbol: Optional[str] = None,
         threshold_low: float = 0.005,
-        threshold_high: float = 0.02
+        threshold_high: float = 0.02,
     ) -> str:
-        """
-        변동성 기반 시장 레짐 추정.
-        
+        """온라인 GMM 기반 레짐 추정 (폴백: 단순 변동성 분류).
+
         Args:
             closes: 종가 리스트
-            threshold_low: 낮은 변동성 임계값
-            threshold_high: 높은 변동성 임계값
-            
+            symbol: 심볼(없으면 공용 디텍터 사용)
+            threshold_low: 폴백용 낮은 변동성 임계값
+            threshold_high: 폴백용 높은 변동성 임계값
+
         Returns:
-            "LOW_VOL", "MED_VOL", "HIGH_VOL" 중 하나
+            레짐 라벨 문자열
         """
-        _, sigma = self._compute_returns_and_vol(closes, lookback=20)
-        
-        if sigma < threshold_low:
-            return "LOW_VOL"
-        elif sigma > threshold_high:
-            return "HIGH_VOL"
-        else:
+        if not closes or len(closes) < 2:
+            return "-"
+
+        detector = self._get_regime_detector(symbol)
+        try:
+            meta = detector.detect_regime(closes, assume_returns=False)
+            if symbol:
+                self._regime_meta[symbol] = meta
+            else:
+                self._regime_meta["__default__"] = meta
+            return meta.get("regime", "-")
+        except Exception:
+            # 폴백: 기존 변동성 기반 분류 유지
+            _, sigma = self._compute_returns_and_vol(closes, lookback=20)
+            if sigma < threshold_low:
+                return "LOW_VOL"
+            if sigma > threshold_high:
+                return "HIGH_VOL"
             return "MED_VOL"
 
     def _compute_ofi_score(
@@ -211,3 +228,23 @@ class MarketDataMixin:
         ann_sigma = sigma * math.sqrt(periods_per_year)
         
         return ann_mu, ann_sigma
+
+    # --------- helpers ---------
+    def _get_regime_detector(self, symbol: Optional[str]) -> MarketRegimeDetector:
+        """심볼별(또는 공용) 레짐 디텍터를 반환/초기화."""
+        if not hasattr(self, "_regime_detectors"):
+            self._regime_detectors = {}
+        if not hasattr(self, "_regime_meta"):
+            self._regime_meta = {}
+
+        key = symbol or "__default__"
+        detector = self._regime_detectors.get(key)
+        if detector is None:
+            detector = MarketRegimeDetector(
+                n_states=getattr(self, "REGIME_N_STATES", 3),
+                window=getattr(self, "REGIME_WINDOW", 256),
+                alpha=getattr(self, "REGIME_ALPHA", 0.05),
+                use_jax=getattr(self, "REGIME_USE_JAX", True),
+            )
+            self._regime_detectors[key] = detector
+        return detector

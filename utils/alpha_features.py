@@ -2,6 +2,234 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 
+def calculate_order_flow_imbalance(
+    prices: np.ndarray,
+    volumes: np.ndarray,
+    window: int = 50,
+    use_jax: bool = False,
+    eps: float = 1e-8,
+    return_components: bool = False,
+):
+    """
+    Bulk Volume Classification 기반 Order Flow Imbalance 계산.
+
+    Args:
+        prices: 1D 가격 시계열
+        volumes: 1D 거래량 시계열 (prices와 길이 동일 가정)
+        window: 계산에 사용할 최근 샘플 개수 (시간/체결 버킷 대용)
+        use_jax: True 시 jax.numpy 사용 (호환 모드)
+        eps: 0 나누기 방지 상수
+        return_components: True 시 (imbalance, v_buy, v_sell) 반환
+
+    Returns:
+        불균형 지표 스칼라 (|V_buy - V_sell| / (V_buy + V_sell))
+    """
+
+    xp = np  # default numpy backend
+    jax_backend = False
+
+    if use_jax:
+        try:
+            import jax.numpy as jnp  # type: ignore
+
+            xp = jnp
+            jax_backend = True
+        except Exception:
+            xp = np
+            jax_backend = False
+
+    prices_arr = xp.asarray(prices, dtype=xp.float64)
+    volumes_arr = xp.asarray(volumes, dtype=xp.float64)
+
+    if prices_arr.size < 2 or volumes_arr.size == 0:
+        zero = xp.asarray(0.0) if jax_backend else 0.0
+        return (zero, zero, zero) if return_components else zero
+
+    n = int(xp.minimum(prices_arr.size, volumes_arr.size))
+    prices_arr = prices_arr[-n:]
+    volumes_arr = volumes_arr[-n:]
+
+    delta_p = xp.diff(prices_arr)
+    if delta_p.size == 0:
+        zero = xp.asarray(0.0) if jax_backend else 0.0
+        return (zero, zero, zero) if return_components else zero
+
+    window = max(1, int(window))
+    delta_p = delta_p[-window:]
+    vol_window = volumes_arr[-delta_p.shape[0]:]
+
+    buy_mask = xp.where(delta_p > 0, 1.0, 0.0)
+    sell_mask = xp.where(delta_p < 0, 1.0, 0.0)
+    neutral_mask = xp.where(delta_p == 0, 1.0, 0.0)
+
+    buy_vol = vol_window * (buy_mask + 0.5 * neutral_mask)
+    sell_vol = vol_window * (sell_mask + 0.5 * neutral_mask)
+
+    v_buy = xp.sum(buy_vol)
+    v_sell = xp.sum(sell_vol)
+
+    denom = v_buy + v_sell + eps
+    imbalance = xp.abs(v_buy - v_sell) / denom
+
+    if return_components:
+        if jax_backend:
+            return imbalance, v_buy, v_sell
+        return float(imbalance), float(v_buy), float(v_sell)
+
+    if jax_backend:
+        return imbalance
+    return float(imbalance)
+
+
+def calculate_vpin(
+    prices: np.ndarray,
+    volumes: np.ndarray,
+    bucket_size: Optional[float] = None,
+    bucket_count_hint: int = 50,
+    vpin_window: Optional[int] = None,
+    use_jax: bool = False,
+    eps: float = 1e-8,
+    return_components: bool = False,
+):
+    """
+    VPIN (Volume-Synchronized PIN) 계산.
+
+    - Bulk Volume Classification(BVC): ΔP 기준 확률적 분류
+      V_buy = V * Φ(ΔP/σ), V_sell = V - V_buy
+    - Volume Bucket: 누적 거래량이 bucket_size에 도달할 때마다 버킷 완성
+    - VPIN = (최근 N개 버킷 OI 합) / (N * bucket_size)
+
+    Args:
+        prices: 가격 시계열
+        volumes: 거래량 시계열 (prices와 동일 길이)
+        bucket_size: 볼륨 버킷 크기. None이면 총 거래량을 bucket_count_hint로 나눈 값 사용
+        bucket_count_hint: bucket_size 자동 산출 시 분모 (기본 50)
+        vpin_window: VPIN 계산에 사용할 최근 버킷 수. None이면 bucket_count_hint 사용
+        use_jax: True 시 jax.numpy 사용 (JIT 미필요, 호환 모드)
+        eps: 0 나누기 방지 상수
+        return_components: True 시 (vpin, oi_list, bucket_size) 반환
+    """
+
+    xp = np
+    jax_backend = False
+
+    if use_jax:
+        try:
+            import jax.numpy as jnp  # type: ignore
+
+            xp = jnp
+            jax_backend = True
+        except Exception:
+            xp = np
+            jax_backend = False
+
+    prices_arr = xp.asarray(prices, dtype=xp.float64)
+    volumes_arr = xp.asarray(volumes, dtype=xp.float64)
+
+    if prices_arr.size < 2 or volumes_arr.size == 0:
+        zero = xp.asarray(0.0) if jax_backend else 0.0
+        empty = [] if not jax_backend else ()
+        return (zero, empty, zero) if return_components else zero
+
+    n = int(xp.minimum(prices_arr.size, volumes_arr.size))
+    prices_arr = prices_arr[-n:]
+    volumes_arr = volumes_arr[-n:]
+
+    # ΔP와 σ 추정
+    delta_p = xp.diff(prices_arr)
+    if delta_p.size == 0:
+        zero = xp.asarray(0.0) if jax_backend else 0.0
+        empty = [] if not jax_backend else ()
+        return (zero, empty, zero) if return_components else zero
+
+    sigma = xp.std(delta_p) + eps
+
+    # 표준정규 CDF Φ(x) = 0.5 * (1 + erf(x / sqrt(2)))
+    def _phi(x):
+        if jax_backend:
+            return 0.5 * (1.0 + xp.erf(x / xp.sqrt(2.0)))
+        try:
+            from scipy.special import erf as sp_erf  # type: ignore
+
+            erf_fn = sp_erf
+        except Exception:
+            import math
+
+            erf_fn = np.vectorize(math.erf)
+        return 0.5 * (1.0 + erf_fn(x / np.sqrt(2.0)))
+
+    buy_prob = _phi(delta_p / sigma)
+    vol_effective = volumes_arr[1:][: buy_prob.shape[0]]
+
+    # bucket_size 자동 산출: 총 거래량 / bucket_count_hint
+    if bucket_size is None:
+        total_vol = xp.sum(vol_effective)
+        bucket_size = float(total_vol) / max(bucket_count_hint, 1)
+        bucket_size = max(bucket_size, eps)
+
+    bucket_size_scalar = float(bucket_size)
+    window = vpin_window if vpin_window is not None else bucket_count_hint
+    window = max(1, int(window))
+
+    bucket_oi: List[float] = []
+    acc_vol = 0.0
+    acc_buy = 0.0
+    acc_sell = 0.0
+
+    for v, pb in zip(vol_effective.tolist(), buy_prob.tolist()):
+        # 실수 값으로 변환 (jax일 경우 Python float)
+        v = float(v)
+        pb = float(pb)
+        buy_v = v * pb
+        sell_v = v - buy_v
+
+        remaining = bucket_size_scalar - acc_vol
+        # 현 거래량으로 여러 버킷을 채울 수 있는 경우 while로 처리
+        while v > 0:
+            if v <= remaining + eps:
+                acc_vol += v
+                acc_buy += buy_v
+                acc_sell += sell_v
+                remaining -= v
+                v = 0.0
+            else:
+                # 버킷을 채우고 잔량 carry
+                fill_ratio = remaining / v
+                acc_vol += remaining
+                acc_buy += buy_v * fill_ratio
+                acc_sell += sell_v * fill_ratio
+                # 버킷 종료
+                bucket_oi.append(abs(acc_buy - acc_sell))
+                # 잔여 거래량/볼륨을 다음 버킷에 carry
+                v -= remaining
+                buy_v -= buy_v * fill_ratio
+                sell_v -= sell_v * fill_ratio
+                acc_vol = 0.0
+                acc_buy = 0.0
+                acc_sell = 0.0
+                remaining = bucket_size_scalar
+
+            if acc_vol >= bucket_size_scalar - eps:
+                bucket_oi.append(abs(acc_buy - acc_sell))
+                acc_vol = 0.0
+                acc_buy = 0.0
+                acc_sell = 0.0
+                remaining = bucket_size_scalar
+
+    # VPIN: 최근 window 버킷 기준
+    if len(bucket_oi) == 0:
+        vpin = xp.asarray(0.0) if jax_backend else 0.0
+    else:
+        recent = bucket_oi[-window:]
+        vpin = sum(recent) / (len(recent) * bucket_size_scalar + eps)
+        if jax_backend:
+            vpin = xp.asarray(vpin)
+
+    if return_components:
+        return vpin, bucket_oi[-window:], bucket_size_scalar
+    return vpin
+
+
 def safe_z(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     m = np.nanmean(x)
     s = np.nanstd(x)
