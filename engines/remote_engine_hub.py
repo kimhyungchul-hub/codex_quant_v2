@@ -194,7 +194,7 @@ class ProcessEngineHub:
         env_copy = {
             k: v
             for k, v in os.environ.items()
-            if k.startswith("XLA_") or k in {"MC_VERBOSE_PRINT", "MC_TAIL_MODE", "MC_USE_JAX", "JAX_PLATFORMS", "JAX_PLATFORM_NAME"}
+            if k in {"MC_VERBOSE_PRINT", "MC_TAIL_MODE"}
         }
 
         self._proc = MCEngineWorker(

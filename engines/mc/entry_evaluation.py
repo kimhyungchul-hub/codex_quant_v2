@@ -1423,15 +1423,15 @@ class MonteCarloEntryEvaluationMixin:
                 f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}"
             )
 
-# Always-on short summary for troubleshooting (helps when MC_VERBOSE_PRINT is False)
-try:
-    el_len = len(evs_long) if ("evs_long" in locals() and hasattr(evs_long, '__len__')) else 0
-    es_len = len(evs_short) if ("evs_short" in locals() and hasattr(evs_short, '__len__')) else 0
-except Exception:
-    el_len = 0
-    es_len = 0
-print(f"[EV_SUMMARY] {symbol} n_paths={n_paths} ev_mix_long={policy_ev_mix_long:.8f} ev_mix_short={policy_ev_mix_short:.8f} evs_long_len={el_len} evs_short_len={es_len}")
-            logger.info(f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}")
+        # Always-on short summary for troubleshooting (helps when MC_VERBOSE_PRINT is False)
+        try:
+            el_len = len(evs_long) if ("evs_long" in locals() and hasattr(evs_long, '__len__')) else 0
+            es_len = len(evs_short) if ("evs_short" in locals() and hasattr(evs_short, '__len__')) else 0
+        except Exception:
+            el_len = 0
+            es_len = 0
+        print(f"[EV_SUMMARY] {symbol} n_paths={n_paths} ev_mix_long={policy_ev_mix_long:.8f} ev_mix_short={policy_ev_mix_short:.8f} evs_long_len={el_len} evs_short_len={es_len}")
+        logger.info(f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}")
         
         # ✅ 모든 심볼의 policy_ev_mix가 음수인 경우 검증 (LINK 제외)
         if not symbol.startswith("LINK") and policy_ev_mix_long < 0 and policy_ev_mix_short < 0:

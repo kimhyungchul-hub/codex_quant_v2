@@ -479,10 +479,6 @@ async def runtime_post_handler(request):
             orch.mc_n_paths_exit = int(max(200, min(200000, v)))
             if hasattr(orch, "_apply_mc_runtime_to_engines"):
                 orch._apply_mc_runtime_to_engines()
-    if "mc_use_jax" in body:
-        v = _b(body.get("mc_use_jax"))
-        if v is not None:
-            orch.mc_use_jax = bool(v)
     if "mc_tail_mode" in body:
         v = str(body.get("mc_tail_mode") or "").strip().lower()
         if v in ("gaussian", "student_t", "bootstrap"):

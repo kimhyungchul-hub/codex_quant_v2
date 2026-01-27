@@ -1,15 +1,12 @@
-# mc_plus.py 전체를 이 코드로 덮어쓰세요.
+# mc_plus.py - PyTorch-first with NumPy fallback
 
-import bootstrap  # ensure JAX/XLA env is set before jax imports
+import bootstrap  # ensure environment vars are set
 
 import numpy as np
-import pandas as pd
 from typing import Dict, List, Tuple
 
-from engines.mc.jax_backend import ensure_jax, lazy_jit
-
-# Use lazy_jit to avoid JAX initialization at module import time
-from typing import Dict, List, Tuple
+# Import PyTorch-first backend
+from engines.mc.jax_backend import _TORCH_OK, torch, to_torch, to_numpy, get_device
 
 class KalmanFilter1D:
     def __init__(self, R=0.01, Q=1e-5):
@@ -42,23 +39,57 @@ class OUProcess:
 
 class LSMModel:
     @staticmethod
-    @lazy_jit()
     def calculate_values(paths, entry_price, direction, leverage, discount=0.9999):
-        # paths shape: (sims, steps)
-        import engines.mc.jax_backend as _jb
-        _jb.ensure_jax()
-        jnp = _jb.jnp
-        current_price = jnp.mean(paths[:, 0])
+        """
+        Least Squares Monte Carlo valuation.
+        Uses PyTorch for GPU acceleration when available, NumPy fallback otherwise.
+        """
+        # Try PyTorch first
+        if _TORCH_OK:
+            try:
+                device = get_device()
+                
+                # Convert to PyTorch tensor
+                if not isinstance(paths, torch.Tensor):
+                    paths_tensor = to_torch(paths, device=device)
+                else:
+                    paths_tensor = paths
+                
+                current_price = torch.mean(paths_tensor[:, 0])
+                exercise_value = (current_price - entry_price) / entry_price * direction * leverage
+                
+                future_prices = paths_tensor[:, 1:]
+                future_pnl = (future_prices - entry_price) / entry_price * direction * leverage
+                
+                n_steps = future_pnl.shape[1]
+                discount_factors = torch.pow(
+                    torch.tensor(discount, device=device, dtype=torch.float32),
+                    torch.arange(1, n_steps + 1, device=device, dtype=torch.float32)
+                )
+                discounted_pnl = future_pnl * discount_factors[None, :]
+                
+                continuation_value = torch.mean(torch.sum(discounted_pnl, dim=1))
+                
+                # Return as Python floats
+                return float(exercise_value.cpu()), float(continuation_value.cpu())
+            
+            except Exception:
+                # Fall through to NumPy
+                pass
+        
+        # NumPy fallback
+        paths_np = np.asarray(paths)
+        current_price = np.mean(paths_np[:, 0])
         exercise_value = (current_price - entry_price) / entry_price * direction * leverage
         
-        future_prices = paths[:, 1:]
+        future_prices = paths_np[:, 1:]
         future_pnl = (future_prices - entry_price) / entry_price * direction * leverage
-
+        
         n_steps = future_pnl.shape[1]
-        discount_factors = jnp.power(discount, jnp.arange(1, n_steps + 1))
+        discount_factors = np.power(discount, np.arange(1, n_steps + 1))
         discounted_pnl = future_pnl * discount_factors[None, :]
-
-        continuation_value = jnp.mean(jnp.sum(discounted_pnl, axis=1))
+        
+        continuation_value = np.mean(np.sum(discounted_pnl, axis=1))
         return exercise_value, continuation_value
 
 class LeverageOptimizer:
@@ -96,21 +127,20 @@ class QuantDecisionEngine:
         pnl_pct = (current_price - position['entry_price']) / position['entry_price'] * position['direction'] * position['leverage']
         if pnl_pct < -0.015: return "CLOSE", f"🛑 Stop Loss (-1.5%)"
         
-        # 2. 최소 보유 시간 (스캘핑이므로 3분으로 단축)
+        # 2. 최소 보유 시간 (3분)
         import time
-        if time.time() - position['entry_time'] < 180: # 3분
-             if pnl_pct > -0.005: # 큰 손실 아니면 좀 더 지켜봄
+        if time.time() - position['entry_time'] < 180:
+             if pnl_pct > -0.005:
                  return "HOLD", "⏳ Min Hold (3m)"
 
-        # 3. [수정] LSMC Horizon 동기화 (15분 예측)
-        # 기존: 48시간 -> 수정: 15분 (1분봉 기준 15개)
+        # 3. LSMC 평가 (15분 horizon)
         mc_paths = mc_engine.generate_raw_paths(
             symbol=symbol,
             current_price=current_price,
             mu=market_data['predicted_mu'],
             sigma=market_data['volatility'],
-            n_steps=15,    # [변경] 15 steps (15분)
-            dt=1/525600,   # [변경] 1분 단위 (1년=525600분)
+            n_steps=15,
+            dt=1/525600,
             n_paths=5000
         )
         
@@ -118,14 +148,11 @@ class QuantDecisionEngine:
             mc_paths, position['entry_price'], position['direction'], position['leverage']
         )
         
-        # 판결 로직 (Scalping에 맞게 민감도 조절)
+        # 판결
         score_close = 0
-        
-        # 미래가치보다 현재가치가 더 크면 (즉, 고점 찍고 내려갈 것 같으면)
-        if exercise_val > continue_val * 1.01: # 1% 더 버는 것보다 지금 파는게 낫다
+        if exercise_val > continue_val * 1.01:
             score_close += 50
             
-        # OU 과열 (Z-Score > 2.5)
         z_score = self.ou.get_z_score(np.array(historical_prices))
         if abs(z_score) > 2.5:
             score_close += 30

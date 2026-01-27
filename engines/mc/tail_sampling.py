@@ -4,7 +4,8 @@ from typing import Optional
 
 import numpy as np
 
-from engines.mc.jax_backend import jnp, jrand
+# Import PyTorch-first backend
+from engines.mc.jax_backend import _TORCH_OK, torch, to_torch, to_numpy, get_device
 from engines.mc.params import JOHNSON_SU_GAMMA, JOHNSON_SU_DELTA
 
 
@@ -20,6 +21,7 @@ class MonteCarloTailSamplingMixin:
         gamma: Optional[float] = None,
         delta: Optional[float] = None,
     ):
+        """NumPy-based sampling (CPU fallback)."""
         gamma_val = float(JOHNSON_SU_GAMMA if gamma is None else gamma)
         delta_val = float(JOHNSON_SU_DELTA if delta is None else delta)
         delta_val = float(max(delta_val, 1e-6))
@@ -41,9 +43,8 @@ class MonteCarloTailSamplingMixin:
             return (x - x_mean) / x_std
         return rng.standard_normal(size=shape).astype(np.float64)
 
-    def _sample_increments_jax(
+    def _sample_increments_torch(
         self,
-        key,
         shape,
         *,
         mode: str,
@@ -51,35 +52,41 @@ class MonteCarloTailSamplingMixin:
         bootstrap_returns: Optional[np.ndarray],
         gamma: Optional[float] = None,
         delta: Optional[float] = None,
+        device=None,
     ):
-        if jrand is None:
-            return key, None
+        """PyTorch-based sampling (GPU accelerated)."""
+        if not _TORCH_OK:
+            return None
+        
+        if device is None:
+            device = get_device()
+        
         gamma_val = float(JOHNSON_SU_GAMMA if gamma is None else gamma)
         delta_val = float(JOHNSON_SU_DELTA if delta is None else delta)
         delta_val = float(max(delta_val, 1e-6))
-        def _sinh(x):
-            return 0.5 * (jnp.exp(x) - jnp.exp(-x))  # type: ignore[attr-defined]
-        if mode == "bootstrap" and bootstrap_returns is not None:
-            # ✅ 해결: boot를 무조건 jnp.asarray로 정규화하고 shape[0]을 Python int로 변환
-            br = jnp.asarray(bootstrap_returns, dtype=jnp.float32)  # type: ignore[attr-defined]
-            br_size = int(br.shape[0])  # Python int로 변환 (tracer 방지)
-            if br_size >= 16:
-                key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-                idx = jrand.randint(k1, shape=shape, minval=0, maxval=br_size)  # type: ignore[attr-defined]
-                return key, br[idx]
+        
+        if mode == "bootstrap" and bootstrap_returns is not None and bootstrap_returns.size >= 16:
+            br_tensor = to_torch(bootstrap_returns, device=device)
+            n = br_tensor.shape[0]
+            idx = torch.randint(0, n, shape, device=device, dtype=torch.long)
+            return br_tensor[idx]
+        
         if mode == "student_t":
-            key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-            z = jrand.t(k1, df=df, shape=shape)  # type: ignore[attr-defined]
+            # Student-t distribution
+            dist = torch.distributions.StudentT(df=df)
+            z = dist.sample(shape).to(device)
             if df > 2:
-                z = z / jnp.sqrt(df / (df - 2.0))  # type: ignore[attr-defined]
-            return key, z
+                scale = torch.sqrt(torch.tensor(df / (df - 2.0), device=device))
+                z = z / scale
+            return z
+        
         if mode == "johnson_su":
-            key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-            z = jrand.normal(k1, shape=shape)  # type: ignore[attr-defined]
-            x = _sinh((z - gamma_val) / delta_val)
-            x_mean = jnp.mean(x)  # type: ignore[attr-defined]
-            x_std = jnp.std(x)  # type: ignore[attr-defined]
-            x_std = jnp.where(x_std < 1e-8, 1.0, x_std)  # type: ignore[attr-defined]
-            return key, (x - x_mean) / x_std  # type: ignore[attr-defined]
-        key, k1 = jrand.split(key)  # type: ignore[attr-defined]
-        return key, jrand.normal(k1, shape=shape)  # type: ignore[attr-defined]
+            z = torch.randn(shape, device=device)
+            x = torch.sinh((z - gamma_val) / delta_val)
+            x_mean = torch.mean(x)
+            x_std = torch.std(x)
+            x_std = torch.where(x_std < 1e-8, torch.tensor(1.0, device=device), x_std)
+            return (x - x_mean) / x_std
+        
+        # Gaussian (default)
+        return torch.randn(shape, device=device)

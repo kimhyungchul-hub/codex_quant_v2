@@ -5,224 +5,23 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from engines.cvar_methods import _cvar_jnp
 
-# Defer importing jax until first use to guarantee environment variables
-# (XLA_PYTHON_CLIENT_PREALLOCATE, ALLOCATOR, MEM_FRACTION) are set.
-jax = None
-jnp = None
-lax = None
-random = None
-_JAX_OK = False
+def _cvar_empirical(pnl: np.ndarray, alpha: float = 0.05) -> float:
+    x = np.sort(np.asarray(pnl, dtype=np.float64))
+    k = max(1, int(alpha * len(x)))
+    return float(x[:k].mean())
 
 
-def ensure_jax():
-    """Lazily import jax and related symbols. Safe to call multiple times."""
-    global jax, jnp, lax, random, _JAX_OK
-    if jax is not None:
-        return
-    try:
-        import jax as _jax  # type: ignore
-        import jax.numpy as _jnp  # type: ignore
-        from jax import lax as _lax  # type: ignore
-        from jax import random as _random  # type: ignore
-        jax = _jax
-        jnp = _jnp
-        lax = _lax
-        random = _random
-        _JAX_OK = True
-    except Exception:
-        jax = None
-        jnp = None
-        lax = None
-        random = None
-        _JAX_OK = False
-
-
-def _sample_noise(key, shape, dist: str = "gaussian", df: float = 6.0, boot=None):
-    ensure_jax()
-    if jnp is None or random is None:  # pragma: no cover
-        raise RuntimeError("JAX is not available")
+def _sample_noise(shape, dist: str = "gaussian", df: float = 6.0, boot=None):
     if dist == "bootstrap" and boot is not None:
-        boot_jnp = jnp.asarray(boot, dtype=jnp.float32)  # type: ignore[attr-defined]
-        boot_size = int(boot_jnp.shape[0])
-        if boot_size > 16:
-            idx = random.randint(key, shape, 0, boot_size)  # type: ignore[attr-defined]
-            return boot_jnp[idx]
+        boot_np = np.asarray(boot, dtype=np.float32)
+        return np.random.choice(boot_np, size=shape)
     if dist == "student_t":
-        k1, k2 = random.split(key)  # type: ignore[attr-defined]
-        z = random.normal(k1, shape)  # type: ignore[attr-defined]
-        u = 2.0 * random.gamma(k2, df / 2.0, shape)  # type: ignore[attr-defined]
-        return z / jnp.sqrt(u / df)  # type: ignore[attr-defined]
-    return random.normal(key, shape)  # type: ignore[attr-defined]
+        return np.random.standard_t(df, size=shape)
+    return np.random.standard_normal(size=shape)
 
 
-def _mc_first_passage_tp_sl_jax_core(
-    key,
-    s0: float,
-    tp_pct: float,
-    sl_pct: float,
-    drift: float,
-    vol: float,
-    max_steps: int,
-    n_paths: int,
-    dist: str,
-    df: float,
-    boot_jnp,
-    cvar_alpha: float,
-):
-    ensure_jax()
-    if jnp is None or lax is None:  # pragma: no cover
-        raise RuntimeError("JAX is not available")
-    eps = _sample_noise(key, (n_paths, max_steps), dist=dist, df=df, boot=boot_jnp)
-
-    log_inc = drift + vol * eps
-    tp_price = s0 * (1.0 + tp_pct)
-    sl_price = s0 * (1.0 - sl_pct)
-
-    alive = jnp.ones(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    hit_tp = jnp.zeros(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    hit_sl = jnp.zeros(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    t_hit = -jnp.ones(n_paths, dtype=jnp.int32)  # type: ignore[attr-defined]
-    logp = jnp.zeros(n_paths)  # type: ignore[attr-defined]
-
-    def step(carry, t):
-        logp, alive, hit_tp, hit_sl, t_hit = carry
-        logp2 = logp + log_inc[:, t]
-        price = s0 * jnp.exp(logp2)  # type: ignore[attr-defined]
-        tp_now = alive & (price >= tp_price)
-        sl_now = alive & (price <= sl_price)
-        hit = tp_now | sl_now
-        t_hit = jnp.where(hit & (t_hit < 0), t, t_hit)  # type: ignore[attr-defined]
-        hit_tp = hit_tp | tp_now
-        hit_sl = hit_sl | sl_now
-        alive = alive & (~hit)
-        return (logp2, alive, hit_tp, hit_sl, t_hit), None
-
-    (logp, alive, hit_tp, hit_sl, t_hit), _ = lax.scan(  # type: ignore[attr-defined]
-        step,
-        (logp, alive, hit_tp, hit_sl, t_hit),
-        jnp.arange(max_steps),  # type: ignore[attr-defined]
-    )
-
-    p_tp = jnp.mean(hit_tp)  # type: ignore[attr-defined]
-    p_sl = jnp.mean(hit_sl)  # type: ignore[attr-defined]
-    p_to = jnp.mean(alive)  # type: ignore[attr-defined]
-
-    r_tp = tp_pct / sl_pct
-    r = jnp.where(hit_tp, r_tp, jnp.where(hit_sl, -1.0, 0.0))  # type: ignore[attr-defined]
-
-    ev_r = jnp.mean(r)  # type: ignore[attr-defined]
-    cvar_r = _cvar_jnp(r, cvar_alpha)
-
-    t_vals = jnp.where(t_hit >= 0, t_hit.astype(jnp.float32), jnp.nan)  # type: ignore[attr-defined]
-
-    return p_tp, p_sl, p_to, ev_r, cvar_r, t_vals
-
-
-_mc_first_passage_tp_sl_jax_core_jit = None
-
-
-def _maybe_compile_jit_wrappers():
-    """Compile JIT wrappers on first real JAX use."""
-    global _mc_first_passage_tp_sl_jax_core_jit, _JAX_OK
-    if _mc_first_passage_tp_sl_jax_core_jit is not None:
-        return
-    ensure_jax()
-    if not _JAX_OK:
-        _mc_first_passage_tp_sl_jax_core_jit = None
-        return
-    try:
-        _mc_first_passage_tp_sl_jax_core_jit = jax.jit(
-            _mc_first_passage_tp_sl_jax_core, static_argnames=("dist", "max_steps", "n_paths")
-        )
-    except Exception:
-        _mc_first_passage_tp_sl_jax_core_jit = None
-
-
-def _generate_and_check_paths_jax_core(
-    key,
-    s0: float,
-    tp_pct: float,
-    sl_pct: float,
-    drift: float,
-    vol: float,
-    max_steps: int,
-    n_paths: int,
-    dist: str,
-    df: float,
-    boot_jnp,
-    cvar_alpha: float,
-):
-    ensure_jax()
-    if jnp is None or lax is None:  # pragma: no cover
-        raise RuntimeError("JAX is not available")
-    eps = _sample_noise(key, (n_paths, max_steps), dist=dist, df=df, boot=boot_jnp)
-
-    log_inc = drift + vol * eps
-    tp_price = s0 * (1.0 + tp_pct)
-    sl_price = s0 * (1.0 - sl_pct)
-
-    alive = jnp.ones(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    hit_tp = jnp.zeros(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    hit_sl = jnp.zeros(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    t_hit = -jnp.ones(n_paths, dtype=jnp.int32)  # type: ignore[attr-defined]
-    logp = jnp.zeros(n_paths)  # type: ignore[attr-defined]
-
-    def step(carry, t):
-        logp, alive, hit_tp, hit_sl, t_hit = carry
-        logp2 = logp + log_inc[:, t]
-        price = s0 * jnp.exp(logp2)  # type: ignore[attr-defined]
-        tp_now = alive & (price >= tp_price)
-        sl_now = alive & (price <= sl_price)
-        hit = tp_now | sl_now
-        t_hit = jnp.where(hit & (t_hit < 0), t, t_hit)  # type: ignore[attr-defined]
-        hit_tp = hit_tp | tp_now
-        hit_sl = hit_sl | sl_now
-        alive = alive & (~hit)
-        return (logp2, alive, hit_tp, hit_sl, t_hit), None
-
-    (logp, alive, hit_tp, hit_sl, t_hit), _ = lax.scan(  # type: ignore[attr-defined]
-        step,
-        (logp, alive, hit_tp, hit_sl, t_hit),
-        jnp.arange(max_steps),  # type: ignore[attr-defined]
-    )
-
-    p_tp = jnp.mean(hit_tp)  # type: ignore[attr-defined]
-    p_sl = jnp.mean(hit_sl)  # type: ignore[attr-defined]
-    p_to = jnp.mean(alive)  # type: ignore[attr-defined]
-
-    r_tp = tp_pct / sl_pct
-    r = jnp.where(hit_tp, r_tp, jnp.where(hit_sl, -1.0, 0.0))  # type: ignore[attr-defined]
-
-    ev_r = jnp.mean(r)  # type: ignore[attr-defined]
-    cvar_r = _cvar_jnp(r, cvar_alpha)
-
-    t_vals = jnp.where(t_hit >= 0, t_hit.astype(jnp.float32), jnp.nan)  # type: ignore[attr-defined]
-
-    return p_tp, p_sl, p_to, ev_r, cvar_r, t_vals
-
-
-_generate_and_check_paths_jax_core_jit = None
-
-
-def _maybe_compile_generate_jit():
-    global _generate_and_check_paths_jax_core_jit, _JAX_OK
-    if _generate_and_check_paths_jax_core_jit is not None:
-        return
-    ensure_jax()
-    if not _JAX_OK:
-        _generate_and_check_paths_jax_core_jit = None
-        return
-    try:
-        _generate_and_check_paths_jax_core_jit = jax.jit(
-            _generate_and_check_paths_jax_core, static_argnames=("dist", "max_steps", "n_paths")
-        )
-    except Exception:
-        _generate_and_check_paths_jax_core_jit = None
-
-
-def mc_first_passage_tp_sl_jax(
+def mc_first_passage_tp_sl_numpy(
     s0: float,
     tp_pct: float,
     sl_pct: float,
@@ -237,74 +36,76 @@ def mc_first_passage_tp_sl_jax(
     boot_rets: np.ndarray | None = None,
     cvar_alpha: float = 0.05,
 ) -> Dict[str, Any]:
-    ensure_jax()
-    if jax is None or jnp is None or random is None or tp_pct <= 0 or sl_pct <= 0 or sigma <= 0:
+    if tp_pct <= 0 or sl_pct <= 0 or sigma <= 0:
         return {}
 
+    np.random.seed(seed & 0xFFFFFFFF)
     drift = (mu - 0.5 * sigma * sigma) * dt
     vol = sigma * math.sqrt(dt)
 
-    key = random.PRNGKey(seed & 0xFFFFFFFF)  # type: ignore[attr-defined]
-    boot_jnp = None if boot_rets is None else jnp.asarray(boot_rets, dtype=jnp.float32)  # type: ignore[attr-defined]
+    eps = _sample_noise((n_paths, max_steps), dist=dist, df=df, boot=boot_rets)
+    log_inc = drift + vol * eps
+    log_paths = np.cumsum(log_inc, axis=1)
+    prices = s0 * np.exp(log_paths)
 
-    # Ensure JIT wrapper is compiled lazily
-    _maybe_compile_jit_wrappers()
-    if _mc_first_passage_tp_sl_jax_core_jit is not None:
-        p_tp, p_sl, p_to, ev_r, cvar_r, t_vals = _mc_first_passage_tp_sl_jax_core_jit(
-            key, s0, tp_pct, sl_pct, drift, vol, max_steps, n_paths, dist, df, boot_jnp, cvar_alpha
-        )
-    else:
-        p_tp, p_sl, p_to, ev_r, cvar_r, t_vals = _mc_first_passage_tp_sl_jax_core(
-            key, s0, tp_pct, sl_pct, drift, vol, max_steps, n_paths, dist, df, boot_jnp, cvar_alpha
-        )
+    tp_price = s0 * (1.0 + tp_pct)
+    sl_price = s0 * (1.0 - sl_pct)
 
-    p_tp_f = float(p_tp)
-    p_sl_f = float(p_sl)
-    p_to_f = float(p_to)
-    prob_sum = p_tp_f + p_sl_f + p_to_f
-    if abs(prob_sum - 1.0) > 1e-3 and prob_sum > 0:
-        p_tp_f /= prob_sum
-        p_sl_f /= prob_sum
-        p_to_f = max(0.0, 1.0 - p_tp_f - p_sl_f)
+    hit_tp = np.any(prices >= tp_price, axis=1)
+    hit_sl = np.any(prices <= sl_price, axis=1)
+    
+    # First hit logic
+    t_hit = np.full(n_paths, -1, dtype=np.int32)
+    for t in range(max_steps):
+        # Already hit check
+        active = t_hit < 0
+        tp_now = active & (prices[:, t] >= tp_price)
+        sl_now = active & (prices[:, t] <= sl_price)
+        hit = tp_now | sl_now
+        t_hit[hit] = t
 
-    t_median_raw = jnp.nanmedian(t_vals)  # type: ignore[attr-defined]
-    t_mean_raw = jnp.nanmean(t_vals)  # type: ignore[attr-defined]
-    t_median = float(np.asarray(t_median_raw).item())
-    t_mean = float(np.asarray(t_mean_raw).item())
-    if not math.isfinite(t_median):
-        t_median = None
-    if not math.isfinite(t_mean):
-        t_mean = None
+    p_tp = np.mean(hit_tp)
+    p_sl = np.mean(hit_sl)
+    p_to = 1.0 - np.mean(hit_tp | hit_sl)
 
-    ev_r_host = float(np.asarray(ev_r).item())
-    cvar_r_host = float(np.asarray(cvar_r).item())
+    r_tp = tp_pct / sl_pct
+    # ROE-like ratio calculation consistent with legacy code
+    r = np.zeros(n_paths)
+    r[hit_tp] = r_tp
+    r[hit_sl & ~hit_tp] = -1.0
+    
+    ev_r = np.mean(r)
+    cvar_r = _cvar_empirical(r, cvar_alpha)
+
+    t_vals = t_hit[t_hit >= 0].astype(np.float32)
+    t_median = float(np.median(t_vals)) if t_vals.size > 0 else None
+    t_mean = float(np.mean(t_vals)) if t_vals.size > 0 else None
 
     return {
-        "event_p_tp": p_tp_f,
-        "event_p_sl": p_sl_f,
-        "event_p_timeout": p_to_f,
-        "event_ev_r": ev_r_host,
-        "event_cvar_r": cvar_r_host,
+        "event_p_tp": float(p_tp),
+        "event_p_sl": float(p_sl),
+        "event_p_timeout": float(p_to),
+        "event_ev_r": float(ev_r),
+        "event_cvar_r": float(cvar_r),
         "event_t_median": t_median,
         "event_t_mean": t_mean,
     }
 
+# Shim to match legacy naming if needed, though most call mc_first_passage_tp_sl_jax
+def mc_first_passage_tp_sl_jax(*args, **kwargs):
+    return mc_first_passage_tp_sl_numpy(*args, **kwargs)
 
 _ENGINE = None
-
 
 def _get_engine():
     global _ENGINE
     if _ENGINE is None:
         from engines.mc.monte_carlo_engine import MonteCarloEngine
-
         _ENGINE = MonteCarloEngine()
     return _ENGINE
 
-
 def simulate_paths_price(*args, **kwargs):
     return _get_engine().simulate_paths_price(*args, **kwargs)
-
 
 def simulate_paths_netpnl(*args, **kwargs):
     return _get_engine().simulate_paths_netpnl(*args, **kwargs)

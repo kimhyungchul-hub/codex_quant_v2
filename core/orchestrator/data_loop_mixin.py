@@ -46,7 +46,7 @@ class DataLoopMixin:
         
         try:
             # Bybit의 경우 한 번에 모든 티커 가져오기
-            tickers = await self._ccxt_call(self.exchange.fetch_tickers, self.symbols)
+            tickers = await self._ccxt_call("fetch_tickers", self.exchange.fetch_tickers, self.symbols)
             
             for sym in self.symbols:
                 ticker = tickers.get(sym)
@@ -58,7 +58,7 @@ class DataLoopMixin:
             # 개별 심볼 시도
             for sym in self.symbols:
                 try:
-                    ticker = await self._ccxt_call(self.exchange.fetch_ticker, sym)
+                    ticker = await self._ccxt_call("fetch_ticker", self.exchange.fetch_ticker, sym)
                     if ticker:
                         price = ticker.get("last") or ticker.get("close")
                         if price:
@@ -103,6 +103,7 @@ class DataLoopMixin:
         """
         try:
             ohlcv = await self._ccxt_call(
+                "fetch_ohlcv",
                 self.exchange.fetch_ohlcv, 
                 sym, 
                 timeframe, 
@@ -202,6 +203,7 @@ class DataLoopMixin:
         """
         try:
             ob = await self._ccxt_call(
+                "fetch_order_book",
                 self.exchange.fetch_order_book, 
                 sym, 
                 limit=depth

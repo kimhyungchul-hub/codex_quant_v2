@@ -1,93 +1,20 @@
 # engines/mc_engine.py
-import bootstrap  # ensure JAX/XLA env is set before jax imports
+import bootstrap  # ensure environment vars are set before any imports
 import math
 import time
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-# JAX platform 설정 - GPU 전용 모드 (CPU 폴백 없음)
-# 반드시 JAX import보다 먼저 실행됩니다. GPU가 없으면 초기화에서 실패합니다.
-platform_env = os.environ.get("JAX_PLATFORMS", "").strip()
-if platform_env.lower() == "metal":
-    os.environ.pop("JAX_PLATFORMS", None)
-platform_name_env = os.environ.get("JAX_PLATFORM_NAME", "").strip()
-if platform_name_env.lower() == "metal":
-    os.environ.pop("JAX_PLATFORM_NAME", None)
-
 import numpy as np
 from engines.base import BaseEngine
 from regime import adjust_mu_sigma
-
-from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # NOTE:
 # - meta에 멀티호라이즌(예: 60s/180s) 보조 필드를 넣어
 #   상위 오케스트레이터에서 mid_boost/필터를 더 세밀하게 적용할 수 있게 한다.
 
-# optional JAX acceleration - lazy import to avoid premature GPU memory allocation
-jax = None
-jnp = None
-random = None
-lax = None
-jrand = None
-_JAX_OK = False
 
-
-def ensure_jax():
-    """Lazily import jax and related symbols. Call before using JAX APIs."""
-    global jax, jnp, random, lax, jrand, _JAX_OK
-    if jax is not None:
-        return
-    try:
-        import jax as _jax  # type: ignore
-        import jax.numpy as _jnp  # type: ignore
-        from jax import random as _random  # type: ignore
-        from jax import lax as _lax  # type: ignore
-        jax = _jax
-        jnp = _jnp
-        random = _random
-        lax = _lax
-        jrand = _random
-        _JAX_OK = True
-    except Exception:
-        jax = None
-        jnp = None
-        random = None
-        lax = None
-        jrand = None
-        _JAX_OK = False
-def _jax_mc_device():
-    """Return a device to run MC kernels on.
-    On Apple Metal backend, some ops/paths may crash with:
-      UNIMPLEMENTED: default_memory_space is not supported.
-    We keep using JAX, but run these kernels on CPU by default.
-    Override with env JAX_MC_DEVICE=default to force default backend.
-    """
-    ensure_jax()
-    if jax is None:
-        return None
-    try:
-        pref = os.environ.get("JAX_MC_DEVICE", "").strip().lower()
-        if pref in ("default", "metal", "gpu"):
-            return None
-
-        # auto: if default backend is metal, prefer cpu for stability
-        backend = None
-        try:
-            devs = jax.devices()
-            if devs:
-                backend = getattr(devs[0], "platform", None)
-        except Exception:
-            backend = None
-
-        if pref in ("cpu",) or (backend and str(backend).lower() == "metal"):
-            devs = jax.devices("cpu")
-            if devs:
-                return devs[0]
-    except Exception:
-        return None
-    return None
 
 
 # -----------------------------
@@ -131,125 +58,7 @@ def cvar_ensemble(pnl: Sequence[float], alpha: float = 0.05) -> float:
     return float(0.60 * b + 0.25 * a + 0.15 * c)
 
 
-# -----------------------------
-# JAX helpers (optional)
-# -----------------------------
 
-
-def _cvar_jnp(x: "jnp.ndarray", alpha: float) -> "jnp.ndarray":  # type: ignore[name-defined]
-    xs = jnp.sort(x)  # type: ignore[attr-defined]
-    k = jnp.asarray(xs.shape[0] * alpha, dtype=jnp.int32)  # type: ignore[attr-defined]
-    k = jnp.maximum(1, k)  # type: ignore[attr-defined]
-    return jnp.mean(xs[:k])  # type: ignore[attr-defined]
-
-
-def _sample_noise(key, shape, dist="gaussian", df=6.0, boot=None):
-    if dist == "bootstrap" and boot is not None and boot.size > 16:
-        idx = random.randint(key, shape, 0, boot.shape[0])  # type: ignore[attr-defined]
-        return boot[idx]
-    if dist == "student_t":
-        k1, k2 = random.split(key)  # type: ignore[attr-defined]
-        z = random.normal(k1, shape)  # type: ignore[attr-defined]
-        u = 2.0 * random.gamma(k2, df / 2.0, shape)  # type: ignore[attr-defined]
-        return z / jnp.sqrt(u / df)  # type: ignore[attr-defined]
-    return random.normal(key, shape)  # type: ignore[attr-defined]
-
-
-def mc_first_passage_tp_sl_jax(
-    s0: float,
-    tp_pct: float,
-    sl_pct: float,
-    mu: float,
-    sigma: float,
-    dt: float,
-    max_steps: int,
-    n_paths: int,
-    seed: int,
-    dist: str = "gaussian",
-    df: float = 6.0,
-    boot_rets: np.ndarray | None = None,
-    cvar_alpha: float = 0.05,
-) -> Dict[str, Any]:
-    """
-    JAX 가속 first-passage MC (TP/SL/timeout)
-    """
-    if jax is None or tp_pct <= 0 or sl_pct <= 0 or sigma <= 0:
-        return {}
-
-    drift = (mu - 0.5 * sigma * sigma) * dt
-    vol = sigma * math.sqrt(dt)
-
-    key = random.PRNGKey(seed & 0xFFFFFFFF)  # type: ignore[attr-defined]
-    eps = _sample_noise(
-        key,
-        (n_paths, max_steps),
-        dist=dist,
-        df=df,
-        boot=None if boot_rets is None else jnp.asarray(boot_rets),  # type: ignore[attr-defined]
-    )
-
-    log_inc = drift + vol * eps
-    tp_price = s0 * (1.0 + tp_pct)
-    sl_price = s0 * (1.0 - sl_pct)
-
-    alive = jnp.ones(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    hit_tp = jnp.zeros(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    hit_sl = jnp.zeros(n_paths, dtype=bool)  # type: ignore[attr-defined]
-    t_hit = -jnp.ones(n_paths, dtype=jnp.int32)  # type: ignore[attr-defined]
-    logp = jnp.zeros(n_paths)  # type: ignore[attr-defined]
-
-    def step(carry, t):
-        logp, alive, hit_tp, hit_sl, t_hit = carry
-        logp2 = logp + log_inc[:, t]
-        price = s0 * jnp.exp(logp2)  # type: ignore[attr-defined]
-        tp_now = alive & (price >= tp_price)
-        sl_now = alive & (price <= sl_price)
-        hit = tp_now | sl_now
-        t_hit = jnp.where(hit & (t_hit < 0), t, t_hit)  # type: ignore[attr-defined]
-        hit_tp = hit_tp | tp_now
-        hit_sl = hit_sl | sl_now
-        alive = alive & (~hit)
-        return (logp2, alive, hit_tp, hit_sl, t_hit), None
-
-    (logp, alive, hit_tp, hit_sl, t_hit), _ = lax.scan(  # type: ignore[attr-defined]
-        step,
-        (logp, alive, hit_tp, hit_sl, t_hit),
-        jnp.arange(max_steps),  # type: ignore[attr-defined]
-    )
-
-    p_tp = jnp.mean(hit_tp)  # type: ignore[attr-defined]
-    p_sl = jnp.mean(hit_sl)  # type: ignore[attr-defined]
-    p_to = jnp.mean(alive)  # type: ignore[attr-defined]
-
-    r_tp = tp_pct / sl_pct
-    r = jnp.where(hit_tp, r_tp, jnp.where(hit_sl, -1.0, 0.0))  # type: ignore[attr-defined]
-
-    ev_r = jnp.mean(r)  # type: ignore[attr-defined]
-    cvar_r = _cvar_jnp(r, cvar_alpha)
-
-    t_vals = jnp.where(t_hit >= 0, t_hit.astype(jnp.float32), jnp.nan)  # type: ignore[attr-defined]
-
-    p_tp_f = float(p_tp)
-    p_sl_f = float(p_sl)
-    p_to_f = float(p_to)
-    prob_sum = p_tp_f + p_sl_f + p_to_f
-    if abs(prob_sum - 1.0) > 1e-3 and prob_sum > 0:
-        p_tp_f /= prob_sum
-        p_sl_f /= prob_sum
-        p_to_f = max(0.0, 1.0 - p_tp_f - p_sl_f)
-
-    t_median = float(jnp.nanmedian(t_vals))  # type: ignore[attr-defined]
-    t_mean = float(jnp.nanmean(t_vals))  # type: ignore[attr-defined]
-
-    return {
-        "event_p_tp": p_tp_f,
-        "event_p_sl": p_sl_f,
-        "event_p_timeout": p_to_f,
-        "event_ev_r": float(ev_r),
-        "event_cvar_r": float(cvar_r),
-        "event_t_median": t_median if math.isfinite(t_median) else None,
-        "event_t_mean": t_mean if math.isfinite(t_mean) else None,
-    }
 
 
 # -----------------------------

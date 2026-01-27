@@ -1,0 +1,38 @@
+model_list:
+  - model_name: codestral-22b
+    litellm_params:
+      model: openai/models--mlx-community--Codestral-22B-v0.1-4bit
+      api_base: http://localhost:8080/v1 # 로컬 서버 주소 (예: mlx-lm server)
+      api_key: "not-needed"
+
+  - model_name: deepseek-coder-lite
+    litellm_params:
+      model: openai/models--mlx-community--DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx
+      api_base: http://localhost:8080/v1
+      api_key: "not-needed"
+
+  - model_name: qwen-coder-14b
+    litellm_params:
+      model: openai/models--mlx-community--Qwen2.5-Coder-14B-Instruct-4bit
+      api_base: http://localhost:8080/v1
+      api_key: "not-needed"
+
+  - model_name: qwen-coder-7b
+    litellm_params:
+      model: openai/models--mlx-community--Qwen2.5-Coder-7B-Instruct-4bit
+      api_base: http://localhost:8080/v1
+      api_key: "not-needed"
+
+  - model_name: local-quant
+    litellm_params:
+      model: "openai/nightmedia/Qwen3-14B-Claude-4.5-Opus-High-Reasoning-Distill-qx86-hi-mlx" # 검증을 피하기 위한 임의의 명칭
+      api_base: "http://localhost:8080/v1"
+      api_key: "not-needed"
+      custom_llm_provider: "openai" # 중요: 외부 라이브러리 대신 표준 OpenAI API 규격 사용 강제
+
+litellm_settings:
+  - drop_params: True
+  - set_verbose: True
+  - ignore_errors: True
+  - suppress_model_name_error: True
+  - allowed_openai_params: ["thinking", "reasoning_effort", "Reasoning"]

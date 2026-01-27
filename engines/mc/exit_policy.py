@@ -15,18 +15,11 @@ from engines.mc.config import config
 
 logger = logging.getLogger(__name__)
 
-try:
-    from engines.mc.exit_policy_jax import (
-        simulate_exit_policy_rollforward_jax,
-        simulate_exit_policy_rollforward_batched_vmap_jax,
-        simulate_exit_policy_multi_symbol_jax
-    )
-    from engines.mc.probability_jax import _approx_p_pos_and_ev_hold_numpy
-except ImportError as e:
-    logger.warning(f"[JAX_IMPORT_FAIL] Failed to import exit_policy_jax: {e}")
-    simulate_exit_policy_rollforward_jax = None
-    simulate_exit_policy_rollforward_batched_vmap_jax = None
-    simulate_exit_policy_multi_symbol_jax = None
+# JAX removed - all functions use NumPy backend
+simulate_exit_policy_rollforward_jax = None
+simulate_exit_policy_rollforward_batched_vmap_jax = None
+simulate_exit_policy_multi_symbol_jax = None
+
 
 
 class MonteCarloExitPolicyMixin:

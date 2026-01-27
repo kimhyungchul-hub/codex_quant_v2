@@ -106,7 +106,6 @@ class LiveOrchestrator:
         # MC runtime tuning (ctx/instance overrides)
         self.mc_n_paths_live = int(_env_int("MC_N_PATHS_LIVE", int(getattr(config, "MC_N_PATHS_LIVE", 10000))))
         self.mc_n_paths_exit = int(_env_int("MC_N_PATHS_EXIT", int(getattr(config, "MC_N_PATHS_EXIT", 512))))
-        self.mc_use_jax = _env_bool("MC_USE_JAX", True)
         self.mc_tail_mode = str(os.environ.get("MC_TAIL_MODE", "student_t")).strip().lower() or "student_t"
         self.mc_student_t_df = float(_env_float("MC_STUDENT_T_DF", 6.0))
         self._last_trade_event_by_sym: Dict[str, str] = {}
@@ -444,7 +443,6 @@ class LiveOrchestrator:
             "paper_exit_policy_only": bool(self.paper_exit_policy_only),
             "mc_n_paths_live": int(self.mc_n_paths_live),
             "mc_n_paths_exit": int(self.mc_n_paths_exit),
-            "mc_use_jax": bool(self.mc_use_jax),
             "mc_tail_mode": str(self.mc_tail_mode),
             "mc_student_t_df": float(self.mc_student_t_df),
             "exec_mode": str(os.environ.get("EXEC_MODE", config.EXEC_MODE)).strip().lower(),
@@ -2177,7 +2175,6 @@ class LiveOrchestrator:
             "leverage": float(self.leverage),
             "max_leverage": float(self.max_leverage),
             "n_paths": int(self.mc_n_paths_live),
-            "use_jax": bool(self.mc_use_jax),
             "tail_mode": str(self.mc_tail_mode),
             "student_t_df": float(self.mc_student_t_df),
         }
