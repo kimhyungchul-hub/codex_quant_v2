@@ -32,7 +32,7 @@
 | `PORT` | 대시보드 서버 포트 (기본: 9999) | — |
 | `SYMBOLS` | 거래 대상 심볼 리스트 (기본 18개) | — |
 | `MC_N_PATHS_LIVE` | 라이브 MC 시뮬레이션 경로 수 (기본: 16384) | — |
-| `MC_N_PATHS_EXIT` | Exit policy MC 경로 수 (기본: 2048) | — |
+| `MC_N_PATHS_EXIT` | Exit policy MC 경로 수 (기본: 16384) | — |
 | `ENABLE_LIVE_ORDERS` | 실거래 주문 활성화 여부 | True=실거래, False=페이퍼 |
 | `MAX_LEVERAGE` | 최대 허용 레버리지 (기본: 100) | — |
 | `DEFAULT_LEVERAGE` | 기본 레버리지 (기본: 5) | — |
@@ -68,8 +68,8 @@
 |-------|------|------|
 | 1 | Context Collection | `_build_decision_context()`로 심볼별 ctx 수집 |
 | 2 | Batch Decision | `hub.decide_batch(ctx_list)`로 MC 엔진 배치 평가 |
-| **2.5** | **Portfolio Ranking** | EV 기준 순위 정렬 → TOP N 선택 → Kelly 배분 계산 |
-| **2.6** | **Switching Cost Eval** | 기존 포지션 vs TOP N 비교, 교체 비용 분석 |
+| **2.5** | **Portfolio Ranking** | UnifiedScore 기준 순위 정렬 → TOP N 선택 → Kelly 배분 계산 |
+| **2.6** | **Switching Eval** | 보유 UnifiedScore vs 신규 UnifiedScore 비교, 교체 판단 |
 | 3 | Result Application | `_apply_decision()`으로 진입/청산 실행 |
 
 **포트폴리오 관리 관련 상수:**
@@ -80,7 +80,7 @@
 | `USE_CONTINUOUS_OPPORTUNITY` | true | 연속 기회 평가 활성화 |
 | `SWITCHING_COST_MULT` | 2.0 | 교체 비용 배수 |
 
-**Kelly 배분 공식:**
+**Kelly 배분 공식 (UnifiedScore 기반):**
 ```
 f_i = μ_i / σ_i²  (개별 Kelly 비중)
 f_normalized = f_i / Σf_i  (정규화)
@@ -88,7 +88,7 @@ f_normalized = f_i / Σf_i  (정규화)
 
 **교체 조건:**
 ```
-EV_new > EV_held + (fee_rate × 2 × SWITCHING_COST_MULT)
+UnifiedScore_new > UnifiedScore_hold
 ```
 
 #### 몬테카를로 시뮬레이션 청산 로직 (Exit Policy)
@@ -138,6 +138,8 @@ DD_STOP_ROE = -0.02  # -2% 미실현 손실 시 강제 청산
 - **권장하지 않음** — 프로덕션 환경에서는 false 사용
 
 **Change Log (selected):**
+- 2026-01-27: UnifiedScore(마진율 기반 NAPV) 도입 및 랭킹/교체/대시보드 기준 통일 — 단일 점수로 결정/랭킹/교체 수행, UI 컬럼 및 Top-4 정렬을 UnifiedScore 기준으로 변경 (`core/economic_brain.py`, `engines/mc/entry_evaluation.py`, `engines/mc/decision.py`, `main_engine_mc_v2_final.py`, `core/orchestrator.py`, `dashboard_v2.html`, `engines/engine_hub.py`).
+- 2026-01-27: Exit policy 경로 수 기본값을 16384로 상향, TP/SL 경로별 우선 판정 로직 유지 명시 (`engines/mc/config.py`, `docs/CODE_MAP_v2.md`, `engines/exit_policy_methods.py`, `engines/mc/exit_policy_torch.py`).
 - 2026-01-27: PyTorch 기반 MC Exit Policy 배치 경로/TP·SL 경로별 반영 및 n_paths 기본값 복원 — torch 배치 exit policy 추가, TP/SL 경로 히트 반영, `MC_N_PATHS_LIVE=16384`, `MC_N_PATHS_EXIT=2048` 문서 갱신 (`engines/mc/exit_policy_torch.py`, `engines/mc/exit_policy.py`, `engines/exit_policy_methods.py`, `engines/mc/path_simulation.py`, `engines/mc/entry_evaluation.py`, `engines/mc/config.py`, `docs/CODE_MAP_v2.md`).
  - 2026-01-24: JAX 환경 자동 구성 및 BFC 프리워밍 추가 — `engines/mc/jax_backend.py`가 모듈 import 시점에 JAX 관련 환경을 점검하고(`XLA_PYTHON_CLIENT_ALLOCATOR`가 `platform`일 경우 제거), `XLA_PYTHON_CLIENT_MEM_FRACTION`이 설정되지 않은 경우 기본값 `0.65`로 설정하도록 변경되었습니다. 또한 JAX 초기화 직후 BFC allocator를 프리워밍하는 더미 연산을 수행하여 첫 사용 시 latency jitter를 줄입니다. (engines/mc/jax_backend.py)
  - 2026-01-22: Exit Policy 기본값 변경 — `SKIP_EXIT_POLICY=false`를 기본값으로 설정하여 모든 청산 로직이 MC 시뮬레이션에 반영되도록 함 (`engines/mc/entry_evaluation.py`).
@@ -995,6 +997,7 @@ MC 리스크 헬퍼.
 ## 변경 로그
 | 날짜 | 내용 | 파일 |
 |------|------|------|
+| 2026-01-27 | UnifiedScore 도입 및 랭킹/교체/대시보드 기준 통일 | `core/economic_brain.py`, `engines/mc/entry_evaluation.py`, `engines/mc/decision.py`, `main_engine_mc_v2_final.py`, `core/orchestrator.py`, `dashboard_v2.html`, `engines/engine_hub.py` |
 | 2026-01-21 | 개발 모드 `DEV_MODE=true` 일 때 JAX 비활성화하여 NumPy 경로 사용 — JAX 컴파일 시간 제거 | `main_engine_mc_v2_final.py` |
 | 2026-01-19 | CODE_MAP_v2 core/engines 상세 함수/클래스 보강 | `docs/CODE_MAP_v2.md` |
 | 2026-01-19 | CODE_MAP_v2에 core/engines/루트 모듈 및 문서/스크립트/테스트 보강 | `docs/CODE_MAP_v2.md` |

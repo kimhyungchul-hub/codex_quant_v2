@@ -334,6 +334,7 @@ class LiveOrchestrator:
         self.opportunity_checker = ContinuousOpportunityChecker(self)
         self.napv_engine = get_napv_engine()
         self._symbol_scores: dict[str, float] = {}  # sym -> score (EV or NAPV)
+        self._symbol_hold_scores: dict[str, float] = {}  # sym -> score for current side (hold)
         self._symbol_ranks: dict[str, int] = {}     # sym -> rank (1=best)
         self._top_n_symbols: list[str] = []         # TOP N 종목 리스트
         self._last_ranking_ts = 0                   # 마지막 순위 갱신 시각
@@ -1753,6 +1754,15 @@ class LiveOrchestrator:
                 sigma = float(max(1e-6, (1.0 - w) * float(sigma) + w * float(sig_tab)))
             
             ofi_score = float(self._compute_ofi_score(sym))
+            pos = self.positions.get(sym, {})
+            pos_qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
+            pos_side_val = 0
+            if pos_qty != 0.0:
+                side = str(pos.get("side", "")).upper()
+                if side == "LONG":
+                    pos_side_val = 1
+                elif side == "SHORT":
+                    pos_side_val = -1
             
             # Fill pre-allocated arrays (Zero-Copy style)
             self._batch_prices[idx] = float(price)
@@ -1782,6 +1792,8 @@ class LiveOrchestrator:
                 "session": session,
                 "use_jax": not is_dev_mode,
                 "ev": None,
+                "position_side": pos_side_val,
+                "has_position": bool(pos_qty != 0.0),
                 "_soa_idx": idx,  # SoA 배열 인덱스 참조
             }
             ctx_list.append(ctx)
@@ -2741,45 +2753,46 @@ class LiveOrchestrator:
                 # ====== Stage 2.5: Portfolio Ranking & TOP N Selection + Kelly Allocation ======
                 if batch_decisions and USE_KELLY_ALLOCATION:
                     try:
-                        # 2.5.1 — 모든 심볼의 EV 수집 (EV 기반 Kelly 배분)
-                        sym_ev_map: dict[str, float] = {}
+                        # 2.5.1 — 모든 심볼의 UnifiedScore 수집
+                        sym_score_map: dict[str, float] = {}
+                        sym_hold_map: dict[str, float] = {}
                         
                         for i, dec in enumerate(batch_decisions):
                             sym = ctx_list[i]["symbol"]
-                            # decision dict에서 ev 직접 추출 (절대값 사용)
-                            ev_val = abs(float(dec.get("ev", 0.0) or 0.0))
-                            # ev_raw도 확인 (더 정확한 값일 수 있음)
-                            ev_raw = abs(float(dec.get("ev_raw", ev_val) or ev_val))
-                            sym_ev_map[sym] = max(ev_val, ev_raw)
+                            score_val = float(dec.get("unified_score", dec.get("ev", 0.0)) or 0.0)
+                            sym_score_map[sym] = score_val
+                            hold_val = dec.get("unified_score_hold")
+                            if hold_val is None:
+                                hold_val = score_val
+                            sym_hold_map[sym] = float(hold_val)
                         
-                        # 2.5.2 — EV 기준 순위 정렬 및 TOP N 선택
-                        sorted_syms = sorted(sym_ev_map.keys(), key=lambda s: sym_ev_map[s], reverse=True)
-                        self._symbol_scores = sym_ev_map.copy()
+                        # 2.5.2 — UnifiedScore 기준 순위 정렬 및 TOP N 선택
+                        sorted_syms = sorted(sym_score_map.keys(), key=lambda s: sym_score_map[s], reverse=True)
+                        self._symbol_scores = sym_score_map.copy()
+                        self._symbol_hold_scores = sym_hold_map.copy()
                         self._symbol_ranks = {s: rank + 1 for rank, s in enumerate(sorted_syms)}
                         self._top_n_symbols = sorted_syms[:TOP_N_SYMBOLS]
                         
                         # Always log TOP N selection (critical for debugging)
-                        top_info = [(s, f"{sym_ev_map[s]:.4f}") for s in self._top_n_symbols]
+                        top_info = [(s, f"{sym_score_map[s]:.4f}") for s in self._top_n_symbols]
                         self._log(f"[PORTFOLIO] TOP {TOP_N_SYMBOLS}: {top_info}")
                         
-                        # 2.5.3 — Kelly 배분 계산 (EV 비례 배분)
+                        # 2.5.3 — Kelly 배분 계산 (UnifiedScore 비례 배분)
                         if self._top_n_symbols:
                             import numpy as np
                             n_top = len(self._top_n_symbols)
                             
-                            # EV 기반 Kelly 배분 (EV가 높을수록 더 많은 자본 배분)
-                            evs = np.array([sym_ev_map[s] for s in self._top_n_symbols])
-                            self._log(f"[KELLY_DEBUG] EVs for TOP {n_top}: {dict(zip(self._top_n_symbols, evs.tolist()))}")
+                            scores = np.array([sym_score_map[s] for s in self._top_n_symbols])
+                            self._log(f"[KELLY_DEBUG] Scores for TOP {n_top}: {dict(zip(self._top_n_symbols, scores.tolist()))}")
                             
-                            # EV 비례 배분 (음수 EV는 0으로 처리)
-                            evs_positive = np.clip(evs, 0, None)
-                            total_ev = evs_positive.sum()
+                            # UnifiedScore 비례 배분 (음수는 0으로 처리)
+                            scores_positive = np.clip(scores, 0, None)
+                            total_score = scores_positive.sum()
                             
-                            if total_ev > 0:
-                                # EV 비례 배분 (더 높은 EV → 더 많은 자본)
-                                kelly_norm = evs_positive / total_ev
+                            if total_score > 0:
+                                kelly_norm = scores_positive / total_score
                             else:
-                                # EV가 모두 0이거나 음수면 균등 배분
+                                # 점수가 모두 0이거나 음수면 균등 배분
                                 kelly_norm = np.ones(n_top) / n_top
                             
                             self._kelly_allocations = {s: float(kelly_norm[i]) for i, s in enumerate(self._top_n_symbols)}
@@ -2822,17 +2835,13 @@ class LiveOrchestrator:
                             if not best_candidate:
                                 continue
                             
-                            held_ev = self._symbol_scores.get(held_sym, 0)
-                            cand_ev = self._symbol_scores.get(best_candidate, 0)
+                            held_score = self._symbol_hold_scores.get(held_sym, self._symbol_scores.get(held_sym, 0.0))
+                            cand_score = self._symbol_scores.get(best_candidate, 0.0)
                             
-                            # 거래 비용 추정 (현재 심볼 청산 + 새 심볼 진입)
-                            fee_rate = MAKER_FEE_RATE if USE_MAKER_ORDERS else TAKER_FEE_RATE
-                            switching_cost = fee_rate * 2 * SWITCHING_COST_MULT  # 왕복 + 마진
-                            
-                            # 교체 조건: 후보 EV > 보유 EV + 교체 비용
-                            if cand_ev > held_ev + switching_cost:
+                            # 교체 조건: UnifiedScore(New) > UnifiedScore(Hold)
+                            if cand_score > held_score:
                                 if log_this_cycle:
-                                    self._log(f"[SWITCH] {held_sym}(ev={held_ev:.4f}) → {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
+                                    self._log(f"[SWITCH] {held_sym}(hold={held_score:.4f}) → {best_candidate}(new={cand_score:.4f})")
                                 # 청산 시그널 발생 (기존 포지션)
                                 for i, dec in enumerate(batch_decisions):
                                     if ctx_list[i]["symbol"] == held_sym:
@@ -2841,7 +2850,7 @@ class LiveOrchestrator:
                                         break
                             else:
                                 if log_this_cycle:
-                                    self._log(f"[HOLD] {held_sym}(ev={held_ev:.4f}) kept vs {best_candidate}(ev={cand_ev:.4f}) cost={switching_cost:.4f}")
+                                    self._log(f"[HOLD] {held_sym}(hold={held_score:.4f}) kept vs {best_candidate}(new={cand_score:.4f})")
                                     
                     except Exception as e:
                         import traceback

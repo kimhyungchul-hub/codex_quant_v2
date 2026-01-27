@@ -48,6 +48,11 @@ class DashboardMixin:
             "ev_score_p": 0.0,
             "napv_p": 0.0,
             "evp": 0.0,
+            "unified_score": 0.0,
+            "unified_score_long": 0.0,
+            "unified_score_short": 0.0,
+            "unified_score_hold": 0.0,
+            "unified_t_star": 0.0,
             "rank": 0,
             "hold_mean_sec": 0.0,
             "optimal_horizon_sec": 0.0,
@@ -68,6 +73,11 @@ class DashboardMixin:
             row["ev_score_p"] = decision.get("ev_score_p", 0.0)
             row["napv_p"] = decision.get("napv_p", 0.0)
             row["evp"] = decision.get("evp", 0.0)
+            row["unified_score"] = decision.get("unified_score", decision.get("ev", 0.0))
+            row["unified_score_long"] = decision.get("unified_score_long", 0.0)
+            row["unified_score_short"] = decision.get("unified_score_short", 0.0)
+            row["unified_score_hold"] = decision.get("unified_score_hold", 0.0)
+            row["unified_t_star"] = decision.get("unified_t_star", 0.0)
             row["rank"] = decision.get("rank", 0)
             row["hold_mean_sec"] = decision.get("hold_mean_sec", 0.0)
             row["optimal_horizon_sec"] = decision.get("optimal_horizon_sec", 0.0)

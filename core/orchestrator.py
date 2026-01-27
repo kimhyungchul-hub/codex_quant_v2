@@ -1815,6 +1815,18 @@ class LiveOrchestrator:
         kelly = _safe_float(mc_meta.get("kelly", meta.get("kelly", 0.0)), 0.0)
         regime = (ctx or {}).get("regime") or meta.get("regime") or "-"
 
+        unified_score = _opt_float(decision.get("unified_score") if decision else None)
+        if unified_score is None:
+            unified_score = _opt_float(mc_meta.get("unified_score", meta.get("unified_score")))
+        if unified_score is None:
+            unified_score = float(ev)
+        unified_score_long = _opt_float(mc_meta.get("unified_score_long", meta.get("unified_score_long")))
+        unified_score_short = _opt_float(mc_meta.get("unified_score_short", meta.get("unified_score_short")))
+        unified_score_hold = _opt_float(decision.get("unified_score_hold") if decision else None)
+        if unified_score_hold is None:
+            unified_score_hold = _opt_float(mc_meta.get("unified_score_hold", meta.get("unified_score_hold")))
+        unified_t_star = _opt_float(mc_meta.get("unified_t_star", meta.get("unified_t_star")))
+
         def _opt_float(val):
             if val is None:
                 return None
@@ -1905,6 +1917,11 @@ class LiveOrchestrator:
             "mc": reason,
             "ev": ev,
             "ev_raw": ev_raw,
+            "unified_score": unified_score,
+            "unified_score_long": unified_score_long,
+            "unified_score_short": unified_score_short,
+            "unified_score_hold": unified_score_hold,
+            "unified_t_star": unified_t_star,
             "mc_win_rate": mc_win_rate,
             "mc_cvar": mc_cvar,
             "kelly": kelly,
@@ -2130,6 +2147,15 @@ class LiveOrchestrator:
         regime = self._infer_regime(closes)
         ofi = self._compute_ofi_score(sym)
         liq = self._liquidity_score(sym)
+        pos = (self.positions or {}).get(sym) or {}
+        pos_qty = float(pos.get("size", pos.get("quantity", pos.get("qty", 0.0))) or 0.0)
+        pos_side_val = 0
+        if pos_qty != 0.0:
+            side = str(pos.get("side", "")).upper()
+            if side == "LONG":
+                pos_side_val = 1
+            elif side == "SHORT":
+                pos_side_val = -1
         
         # ✅ FIX: mu_base와 sigma 계산 추가
         mu_sim, sigma_sim = self._compute_returns_and_vol(closes)
@@ -2177,6 +2203,8 @@ class LiveOrchestrator:
             "n_paths": int(self.mc_n_paths_live),
             "tail_mode": str(self.mc_tail_mode),
             "student_t_df": float(self.mc_student_t_df),
+            "position_side": pos_side_val,
+            "has_position": bool(pos_qty != 0.0),
         }
         # PMaker: provide survival model for mu_alpha boost (paper-mode training updates sym_fill_mean).
         try:

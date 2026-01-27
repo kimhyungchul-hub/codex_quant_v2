@@ -32,7 +32,7 @@ def get_env_int(name: str, default: int) -> int:
 class MCConfig:
     # --- Performance & Simulation ---
     n_paths_live: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_LIVE", 16384))
-    n_paths_exit: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_EXIT", 2048))
+    n_paths_exit: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_EXIT", 16384))
     verbose_print: bool = field(default_factory=lambda: get_env_bool("MC_VERBOSE_PRINT", False))
     jax_device: str = field(default_factory=lambda: os.environ.get("JAX_MC_DEVICE", "").strip().lower())
     
@@ -99,6 +99,9 @@ class MCConfig:
     # Minimum LONG-vs-SHORT edge required to take a directional trade when both sides look viable.
     # Units: ROE (e.g., 0.0002 = 2 bps). A small positive default reduces noisy direction flips in chop.
     policy_min_ev_gap: float = field(default_factory=lambda: get_env_float("POLICY_MIN_EV_GAP", 0.0002))
+    # Unified Psi score parameters
+    unified_risk_lambda: float = field(default_factory=lambda: get_env_float("UNIFIED_RISK_LAMBDA", 1.0))
+    unified_rho: float = field(default_factory=lambda: get_env_float("UNIFIED_RHO", 0.0))
 
     # --- Neighbor / Consensus Logic ---
     policy_neighbor_bonus_w: float = field(default_factory=lambda: get_env_float("POLICY_NEIGHBOR_BONUS_W", 0.25))

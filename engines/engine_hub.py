@@ -213,6 +213,28 @@ class EngineHub:
             "details": results,
         }
 
+        # Surface unified score on the top-level (if present in engine results)
+        try:
+            unified_src = None
+            for r in results:
+                if isinstance(r, dict) and r.get("unified_score") is not None:
+                    unified_src = r
+                    break
+            if unified_src is None:
+                for r in results:
+                    meta_r = r.get("meta") if isinstance(r, dict) else None
+                    if isinstance(meta_r, dict) and meta_r.get("unified_score") is not None:
+                        unified_src = meta_r
+                        break
+            if unified_src is not None:
+                final["unified_score"] = float(unified_src.get("unified_score"))
+                final["unified_score_long"] = unified_src.get("unified_score_long")
+                final["unified_score_short"] = unified_src.get("unified_score_short")
+                final["unified_score_hold"] = unified_src.get("unified_score_hold")
+                final["unified_t_star"] = unified_src.get("unified_t_star")
+        except Exception:
+            pass
+
         # 🔥 최종 경계에서 무조건 sanitize
         if MC_VERBOSE_PRINT:
             print(

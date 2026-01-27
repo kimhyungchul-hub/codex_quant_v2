@@ -26,7 +26,9 @@ class EconomicBrain:
     Notes:
       - `rho` is used both as a hurdle (subtract) and as a discount rate (exp(-rho t)).
       - Costs are subtracted once from the total integrated value (not time-weighted).
-      - `yield_rate` must be a *signed* return-rate series (per-second), so directionality works via `side * ev_rate`.
+      - `yield_rate` must be a *signed instant return-rate series* (per-second, marginal rate),
+        not cumulative-to-horizon values. If you have cumulative EV/CVaR vectors, convert to
+        marginal rates before calling.
     """
 
     def __init__(
@@ -83,6 +85,55 @@ class EconomicBrain:
 
         best_idx = int(np.argmax(net_curve))
         return float(net_curve[best_idx]), float(h[best_idx])
+
+    def calculate_unified_score(
+        self,
+        *,
+        horizons_sec: np.ndarray,
+        cumulative_ev: np.ndarray,
+        cumulative_cvar: np.ndarray,
+        cost: float,
+        rho: float,
+        lambda_param: float,
+    ) -> tuple[float, float]:
+        """
+        Unified Psi score based on marginal utility flow.
+
+        Inputs:
+          - cumulative_ev/cumulative_cvar: cumulative (to-horizon) EV/CVaR vectors.
+          - cost: one-time transaction cost (ROE units, leverage-adjusted).
+
+        Returns:
+          - (best_score, t_star)
+        """
+        if horizons_sec is None or cumulative_ev is None or cumulative_cvar is None:
+            return 0.0, 0.0
+        h = np.asarray(horizons_sec, dtype=float)
+        ev = np.asarray(cumulative_ev, dtype=float)
+        cv = np.asarray(cumulative_cvar, dtype=float)
+        if h.ndim != 1 or ev.ndim != 1 or cv.ndim != 1:
+            return 0.0, 0.0
+        n = min(h.size, ev.size, cv.size)
+        if n < 2:
+            return 0.0, 0.0
+        h = h[:n]
+        ev = ev[:n]
+        cv = cv[:n]
+
+        dt = np.diff(h, prepend=0.0)
+        safe_dt = np.where(dt > 0.0, dt, 1.0)
+        marginal_ev = np.diff(ev, prepend=0.0) / safe_dt
+        marginal_cvar = np.diff(cv, prepend=0.0) / safe_dt
+
+        utility_rate = marginal_ev - float(lambda_param) * np.abs(marginal_cvar)
+        discount = np.exp(-float(rho) * h)
+        gross_napv = np.cumsum((utility_rate - float(rho)) * discount * dt)
+
+        denom = np.where(h > 0.0, h, 1.0)
+        psi_score = (gross_napv - float(cost)) / denom
+
+        best_idx = int(np.argmax(psi_score))
+        return float(psi_score[best_idx]), float(h[best_idx])
 
     def evaluate_4way(
         self,
@@ -149,4 +200,3 @@ class EconomicBrain:
             winning = results["CASH"]
 
         return best_action, float(winning)
-

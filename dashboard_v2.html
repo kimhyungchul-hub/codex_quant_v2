@@ -151,8 +151,8 @@
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
               <th data-k="filters">FILTERS</th>
-              <th data-k="ev_score">EV_SCORE</th>
-              <th data-k="evp">EV%</th>
+              <th data-k="unified_score">UNIFIED</th>
+              <th data-k="scorep">SCORE%</th>
               <th data-k="kelly">KELLY</th>
               <th data-k="pos_roe">ROE%</th>
               <th data-k="pos_leverage">LEV</th>
@@ -431,7 +431,18 @@
 
     const data = (rows||[]).map(x=>{
       const sym = normSym(x.symbol);
-      const evp = (x.ev||0)*100;
+      const unified_score = (function(){
+        if(x.unified_score!==undefined && x.unified_score!==null) return Number(x.unified_score);
+        if(x.meta && x.meta.unified_score!==undefined && x.meta.unified_score!==null) return Number(x.meta.unified_score);
+        if(Array.isArray(x.details)){
+          for(const d of x.details){
+            if(d && d.meta && d.meta.unified_score!==undefined) return Number(d.meta.unified_score);
+          }
+        }
+        if(x.ev!==undefined && x.ev!==null) return Number(x.ev);
+        return 0;
+      })();
+      const scorep = unified_score * 100;
       const confp = (x.conf||0)*100;
       const mc_win = (x.mc_win_rate||0)*100;
       const pos_roe = (x.pos_roe||0)*100;
@@ -459,11 +470,6 @@
         }
       }
       
-      // 디버깅: filter_states 추출 로그 (모든 심볼)
-      if(!filter_states){
-        console.warn(`[FILTER_MISSING] ${sym}: filter_states not found. x.filter_states=${x.filter_states}, x.meta.filter_states=${x.meta?.filter_states}, x.details.length=${x.details?.length}`);
-      }
-
       return {
         raw:x,
         symbol:sym,
@@ -472,22 +478,9 @@
         regime: x.regime || '-',
         action_type: action_type || '-',
         filter_states: filter_states,  // ✅ 필터 상태 추가
-        evp,
+        unified_score,
+        scorep,
         confp,
-        ev_score: (function(){
-          if(x.policy_ev_score_long!==undefined && x.policy_ev_score_long!==null) return Number(x.policy_ev_score_long);
-          if(x.policy_ev_score_short!==undefined && x.policy_ev_score_short!==null) return Number(x.policy_ev_score_short);
-          if(x.ev!==undefined && x.ev!==null) return Number(x.ev);
-          if(Array.isArray(x.details)){
-            for(const d of x.details){
-              if(d && d.meta){
-                if(d.meta.policy_ev_score_long!==undefined) return Number(d.meta.policy_ev_score_long);
-                if(d.meta.policy_ev_score_short!==undefined) return Number(d.meta.policy_ev_score_short);
-              }
-            }
-          }
-          return 0;
-        })(),
         kelly: x.kelly ?? x.kelly_frac ?? null,
         pos_roe,
         pos_leverage: x.pos_leverage ?? null,
@@ -498,8 +491,8 @@
       return hay.includes(q);
     });
 
-    // compute ranking by evp (or ev_score if evp is zero)
-    data.forEach((d)=>{ d._score_for_rank = (isNum(d.evp) && d.evp!==0) ? d.evp : (isNum(d.ev_score)? d.ev_score*100 : 0); });
+    // compute ranking by unified score
+    data.forEach((d)=>{ d._score_for_rank = isNum(d.unified_score) ? d.unified_score : 0; });
 
     data.sort((a,b)=>{
       const va = a[sortKey], vb = b[sortKey];
@@ -551,7 +544,7 @@
       // Top-4 표시: rank 1~4는 굵게 표시
       const isTop4 = (r.rank!==null && r.rank!==undefined && r.rank <= 4);
 
-      // column mapping: rank, symbol, price, status, filters, ev_score, ev%, kelly, roe%, lev
+      // column mapping: rank, symbol, price, status, filters, unified, score%, kelly, roe%, lev
       c[0].className = 'mono'; 
       c[0].innerHTML = isTop4 ? `<b style="color:var(--accent)">${r.rank}</b>` : (r.rank!==null && r.rank!==undefined ? String(r.rank) : '-');
       
@@ -569,10 +562,10 @@
       c[4].innerHTML = renderFilterLights(r.filter_states);
       
       c[5].className = 'mono'; 
-      c[5].textContent = (isNum(r.ev_score) ? (Number(r.ev_score)*100).toFixed(2) : '-');
+      c[5].textContent = (isNum(r.unified_score) ? (Number(r.unified_score)*100).toFixed(2) : '-');
       
-      c[6].className = `mono ${(r.evp>=0)?'up':'down'}`; 
-      c[6].textContent = (r.evp===null||r.evp===undefined)?'-':(isNum(r.evp)?r.evp.toFixed(2):r.evp);
+      c[6].className = `mono ${(r.scorep>=0)?'up':'down'}`; 
+      c[6].textContent = (r.scorep===null||r.scorep===undefined)?'-':(isNum(r.scorep)?r.scorep.toFixed(2):r.scorep);
       
       c[7].className = 'mono'; 
       c[7].textContent = (r.kelly===null?'-':(isNum(r.kelly)?f2(r.kelly):r.kelly));
@@ -854,22 +847,23 @@
     
     const data = (rows||[]).map(x=>{
       const sym = normSym(x.symbol);
-      const evp = (x.ev||0)*100;
+      const unified = (x.unified_score!==undefined && x.unified_score!==null) ? Number(x.unified_score) :
+                      (x.meta && x.meta.unified_score!==undefined && x.meta.unified_score!==null) ? Number(x.meta.unified_score) :
+                      (x.ev!==undefined && x.ev!==null ? Number(x.ev) : 0);
+      const scorep = unified * 100;
       return {
         raw:x,
         symbol:sym,
-        ev_score: (x.policy_ev_score_long!==undefined && x.policy_ev_score_long!==null) ? Number(x.policy_ev_score_long) : 
-                  (x.policy_ev_score_short!==undefined && x.policy_ev_score_short!==null) ? Number(x.policy_ev_score_short) :
-                  (x.ev!==undefined && x.ev!==null ? Number(x.ev) : 0),
-        evp: evp,
+        unified_score: unified,
+        scorep: scorep,
         price: x.price ?? null,
         status: x.status || 'WAIT',
         regime: x.regime || '-',
       };
     });
     
-    // EV score 기준 정렬
-    const byScore = data.slice().sort((a,b)=> (b.ev_score||0) - (a.ev_score||0));
+    // Unified score 기준 정렬
+    const byScore = data.slice().sort((a,b)=> (b.unified_score||0) - (a.unified_score||0));
     const top = byScore.slice(0,4);
     
     out.innerHTML = '';
@@ -892,7 +886,7 @@
         </div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:4px">자본 배분: <b style="color:var(--accent)">${pct}%</b></div>
         <div style="display:flex;gap:12px;font-size:12px">
-          <div><span style="color:var(--muted)">EV:</span> <b class="${(t.evp>=0)?'up':'down'}">${t.evp.toFixed(2)}%</b></div>
+          <div><span style="color:var(--muted)">Score:</span> <b class="${(t.scorep>=0)?'up':'down'}">${t.scorep.toFixed(2)}%</b></div>
           <div><span style="color:var(--muted)">Status:</span> <span class="pill ${statusCls}" style="font-size:10px;padding:2px 6px">${t.status}</span></div>
         </div>
         <div style="margin-top:4px;font-size:11px;color:var(--muted)">Regime: ${t.regime}</div>

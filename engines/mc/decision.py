@@ -12,6 +12,7 @@ import numpy as np
 from engines.mc.constants import MC_VERBOSE_PRINT
 from engines.mc_risk import kelly_with_cvar
 from utils.helpers import now_ms
+from core.economic_brain import EconomicBrain
 
 # ✅ GPU-Accelerated Leverage Optimization
 try:
@@ -23,6 +24,39 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _LAST_LOG_MS: dict[tuple[str, str], int] = {}
+_UNIFIED_BRAIN = EconomicBrain()
+
+
+def _calc_unified_score(
+    horizons: list[int] | list[float],
+    cumulative_ev: list[float],
+    cumulative_cvar: list[float],
+    *,
+    cost: float,
+    rho: float,
+    lambda_param: float,
+) -> tuple[float, float]:
+    try:
+        return _UNIFIED_BRAIN.calculate_unified_score(
+            horizons_sec=np.asarray(horizons, dtype=float),
+            cumulative_ev=np.asarray(cumulative_ev, dtype=float),
+            cumulative_cvar=np.asarray(cumulative_cvar, dtype=float),
+            cost=float(cost),
+            rho=float(rho),
+            lambda_param=float(lambda_param),
+        )
+    except Exception:
+        return 0.0, 0.0
+
+
+def _get_vector(metrics: Dict[str, Any], key: str) -> list[float]:
+    v = metrics.get(key)
+    if isinstance(v, (list, tuple, np.ndarray)):
+        try:
+            return [float(x) for x in v]
+        except Exception:
+            return []
+    return []
 
 
 def _throttled_log(symbol: str, key: str, interval_ms: int) -> bool:
@@ -72,33 +106,7 @@ class MonteCarloDecisionMixin:
         optimal_size = 0.0
         best_net_ev = None
         
-        # ============================================================
-        # Funnel Structure Entry Filter Logic
-        # ✅ Step 0: NAPV (Net Added Present Value) Filter
-        # ============================================================
         action = "WAIT"
-        filter_reason = None
-        
-        # ✅ 개별 필터 상태 추적 (신호등 표시용)
-        filter_states = {
-            "napv": True,      # 통과 = True (녹색), 실패 = False (빨간색)
-            "ev": True,
-            "winrate": True,
-            "cvar": True,
-            "event_cvar": True,
-            "direction": True,
-        }
-        
-        use_napv_filter = config.funnel_use_napv_filter
-        napv_val = float(ctx.get("napv", 0.0))
-        napv_threshold = config.funnel_napv_threshold
-        group = ctx.get("group", "OTHER")
-        
-        if use_napv_filter:
-            if napv_val < napv_threshold:
-                filter_states["napv"] = False
-                filter_reason = f"NAPV_FILTER: napv={napv_val:.6f} < threshold={napv_threshold:.6f} (group={group})"
-                logger.info(f"[FUNNEL_FILTER] {symbol} | {filter_reason}")
         
         try:
             # 1. 기초 Pass
@@ -236,90 +244,97 @@ class MonteCarloDecisionMixin:
                     metrics["policy_ev_score_short"] = sS
         except Exception:
             pass
-        best_h = int(metrics.get("best_h", 300))
-        best_desc = f"{best_h}s"
         win_value = float(metrics.get("win", 0.0) or 0.0)
-        cvar_value = float(metrics.get("cvar", 0.0) or 0.0)
-        policy_ev_mix = float(metrics.get("policy_ev_mix", 0.0) or 0.0)
-        direction_policy = int(metrics.get("direction", 0) or 0)
-        
-        # ✅ 모든 필터 상태를 항상 계산 (NAPV 이후)
-        regime = str(regime_ctx).upper() if regime_ctx else "CHOP"
-        if regime not in ["BULL", "BEAR", "CHOP", "VOLATILE"]: regime = "CHOP"
-        
-        ev_for_filter = policy_ev_mix if policy_ev_mix != 0.0 else float(metrics.get("ev", 0.0))
-        win_rate_f = float(metrics.get("policy_p_pos_mix", metrics.get("win", 0.0)) or 0.0)
-        cvar1 = float(metrics.get("cvar1", metrics.get("cvar", 0.0)) or 0.0)
-        event_cvar_r = metrics.get("event_cvar_r")
-        
-        win_floors = {"BULL": config.funnel_win_floor_bull, "BEAR": config.funnel_win_floor_bear, "CHOP": config.funnel_win_floor_chop, "VOLATILE": config.funnel_win_floor_volatile}
-        cvar_floors = {"BULL": config.funnel_cvar_floor_bull, "BEAR": config.funnel_cvar_floor_bear, "CHOP": config.funnel_cvar_floor_chop, "VOLATILE": config.funnel_cvar_floor_volatile}
-        event_cvar_floors = {"BULL": config.funnel_event_cvar_floor_bull, "BEAR": config.funnel_event_cvar_floor_bear, "CHOP": config.funnel_event_cvar_floor_chop, "VOLATILE": config.funnel_event_cvar_floor_volatile}
-        
-        win_floor = win_floors.get(regime, 0.0) if config.funnel_use_winrate_filter else 0.0
-        cvar_floor = cvar_floors.get(regime, -0.10)
-        event_cvar_floor = event_cvar_floors.get(regime, -1.0)
-        
-        # 모든 필터 개별 체크 (신호등 표시용)
-        if ev_for_filter <= 0.0:
-            filter_states["ev"] = False
-        if win_rate_f < win_floor:
-            filter_states["winrate"] = False
-        if cvar1 < cvar_floor:
-            filter_states["cvar"] = False
-        if event_cvar_r is not None and event_cvar_r < event_cvar_floor:
-            filter_states["event_cvar"] = False
-        if direction_policy == 0:
-            filter_states["direction"] = False
-        
-        # score_only_mode에서는 필터 무시하고 early return
-        if config.score_only_mode and not filter_reason:
-            target_action = "LONG" if direction_policy == 1 else "SHORT" if direction_policy == -1 else "WAIT"
-            metrics["filter_states"] = filter_states
-            return {
-                "action": target_action, "ev": policy_ev_mix, "ev_raw": float(metrics.get("ev_raw", policy_ev_mix)),
-                "confidence": win_value, "reason": f"SCORE({best_desc}) {regime_ctx} EV {policy_ev_mix*100:.2f}%",
-                "meta": metrics, "size_frac": smoothed_size, "optimal_leverage": optimal_leverage, "optimal_size": smoothed_size,
-                "filter_states": filter_states,
-            }
-        
-        # 첫 번째 실패한 필터를 filter_reason으로 설정 (NAPV 이후)
-        if not filter_reason:
-            if not filter_states["ev"]:
-                filter_reason = f"EV_FILTER: ev={ev_for_filter:.6f} <= 0.0"
-            elif not filter_states["winrate"]:
-                filter_reason = f"WINRATE_FILTER: win={win_rate_f:.4f} < {win_floor:.4f}"
-            elif not filter_states["cvar"]:
-                filter_reason = f"CVAR_FILTER: cvar1={cvar1:.4f}"
-            elif not filter_states["event_cvar"]:
-                filter_reason = f"EVENT_FILTER: {event_cvar_r:.4f}"
-            elif not filter_states["direction"]:
-                filter_reason = "DIRECTION_ZERO"
-            
-            if not filter_reason:
-                if direction_policy == 1: action = "LONG"
-                elif direction_policy == -1: action = "SHORT"
-        
-        if filter_reason and MC_VERBOSE_PRINT:
-            logger.info(f"[FUNNEL_FILTER] {symbol} | {filter_reason}")
 
-        ev_value = policy_ev_mix if policy_ev_mix != 0.0 else float(metrics.get("ev", 0.0))
-        
-        # meta에도 filter_states 추가 (접근 편의성)
-        metrics["filter_states"] = filter_states
+        horizons_long = _get_vector(metrics, "horizon_seq_long")
+        horizons_short = _get_vector(metrics, "horizon_seq_short")
+        ev_long = _get_vector(metrics, "ev_by_horizon_long")
+        ev_short = _get_vector(metrics, "ev_by_horizon_short")
+        cvar_long = _get_vector(metrics, "cvar_by_horizon_long")
+        cvar_short = _get_vector(metrics, "cvar_by_horizon_short")
+
+        lev_val = float(ctx_final.get("leverage") or 1.0)
+        cost_base = float(metrics.get("fee_roundtrip_total", metrics.get("execution_cost", 0.0)) or 0.0)
+        cost_roe = float(cost_base * lev_val)
+        rho_val = float(ctx_final.get("rho", config.unified_rho))
+        lambda_val = float(ctx_final.get("unified_lambda", config.unified_risk_lambda))
+
+        # Convert net cumulative vectors to gross for marginal extraction
+        ev_long_gross = [v + cost_roe for v in ev_long]
+        ev_short_gross = [v + cost_roe for v in ev_short]
+        cvar_long_gross = [v + cost_roe for v in cvar_long]
+        cvar_short_gross = [v + cost_roe for v in cvar_short]
+
+        score_long, t_long = _calc_unified_score(
+            horizons_long, ev_long_gross, cvar_long_gross,
+            cost=cost_roe, rho=rho_val, lambda_param=lambda_val,
+        ) if horizons_long and ev_long_gross and cvar_long_gross else (0.0, 0.0)
+        score_short, t_short = _calc_unified_score(
+            horizons_short, ev_short_gross, cvar_short_gross,
+            cost=cost_roe, rho=rho_val, lambda_param=lambda_val,
+        ) if horizons_short and ev_short_gross and cvar_short_gross else (0.0, 0.0)
+
+        if score_long >= score_short:
+            best_score = float(score_long)
+            best_dir = 1
+            best_t = float(t_long)
+        else:
+            best_score = float(score_short)
+            best_dir = -1
+            best_t = float(t_short)
+
+        hold_score = None
+        pos_side = int(ctx_final.get("position_side", 0) or 0)
+        if pos_side == 1:
+            hold_score = float(score_long)
+        elif pos_side == -1:
+            hold_score = float(score_short)
+
+        if config.score_only_mode:
+            if best_dir == 1:
+                action = "LONG"
+            elif best_dir == -1:
+                action = "SHORT"
+            else:
+                action = "WAIT"
+        else:
+            if best_score > 0:
+                action = "LONG" if best_dir == 1 else "SHORT"
+            else:
+                action = "WAIT"
+
+        best_desc = f"{int(best_t)}s" if best_t > 0 else f"{int(metrics.get('best_h', 300))}s"
+        reason = f"UNIFIED({best_desc}) score {best_score*100:.2f}%"
+
+        metrics["unified_score"] = float(best_score)
+        metrics["unified_score_long"] = float(score_long)
+        metrics["unified_score_short"] = float(score_short)
+        metrics["unified_t_star"] = float(best_t)
+        metrics["unified_t_star_long"] = float(t_long)
+        metrics["unified_t_star_short"] = float(t_short)
+        metrics["unified_lambda"] = float(lambda_val)
+        metrics["unified_rho"] = float(rho_val)
+        metrics["unified_cost_roe"] = float(cost_roe)
+        metrics["unified_direction"] = int(best_dir)
+        if best_t > 0:
+            metrics["best_h"] = int(best_t)
+        metrics["best_horizon_steps"] = int(best_t) if best_t > 0 else int(metrics.get("best_h", 300))
 
         res = {
-            "action": action, 
-            "ev": ev_value,
-            "ev_raw": float(metrics.get("ev_raw", ev_value)),
-            "confidence": win_rate_f if 'win_rate_f' in locals() else win_rate,
-            "reason": f"MC({best_desc}) {regime_ctx} EV {ev_value*100:.2f}%" if not filter_reason else f"FILTERED: {filter_reason}",
-            "meta": metrics, 
-            "size_frac": smoothed_size, 
-            "optimal_leverage": optimal_leverage, 
+            "action": action,
+            "ev": best_score,
+            "ev_raw": best_score,
+            "confidence": win_value,
+            "reason": reason,
+            "meta": metrics,
+            "size_frac": smoothed_size,
+            "optimal_leverage": optimal_leverage,
             "optimal_size": smoothed_size,
             "boost": boost_val,
-            "filter_states": filter_states,  # ✅ 개별 필터 상태 추가
+            "unified_score": float(best_score),
+            "unified_score_long": float(score_long),
+            "unified_score_short": float(score_short),
+            "unified_score_hold": hold_score,
         }
         if MC_VERBOSE_PRINT:
             logger.info(f"[DECIDE_FINAL] {symbol} | action={res['action']} ev={res['ev']:.6f} reason={res['reason']}")
@@ -358,13 +373,6 @@ class MonteCarloDecisionMixin:
             regime = str(ctx.get("regime", "chop"))
             params = self._get_params(regime, ctx)
             seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)
-            
-            # Simplified NAPV filter check for batching
-            napv_val = float(ctx.get("napv", 0.0))
-            napv_threshold = config.funnel_napv_threshold
-            if config.funnel_use_napv_filter and napv_val < napv_threshold:
-                continue # Skip evaluation for this symbol
-                
             tasks.append({"ctx": ctx, "params": params, "seed": seed})
             
         if not tasks:
@@ -388,92 +396,55 @@ class MonteCarloDecisionMixin:
             sym = ctx.get("symbol")
             if sym in results_map:
                 metrics = results_map[sym]
-                
-                policy_score = float(metrics.get("score", 0.0))
-                if math.isnan(policy_score): policy_score = 0.0
-                
+
+                policy_score = float(metrics.get("unified_score", metrics.get("score", 0.0)) or 0.0)
+                if math.isnan(policy_score):
+                    policy_score = 0.0
+
+                score_long = float(metrics.get("unified_score_long", metrics.get("policy_ev_score_long", 0.0)) or 0.0)
+                score_short = float(metrics.get("unified_score_short", metrics.get("policy_ev_score_short", 0.0)) or 0.0)
+
                 direction = 0
-                if policy_score > 1e-9: direction = 1
-                elif policy_score < -1e-9: direction = -1
-                
+                if score_long > score_short:
+                    direction = 1
+                elif score_short > score_long:
+                    direction = -1
+                elif policy_score > 0:
+                    direction = 1
+                elif policy_score < 0:
+                    direction = -1
+
                 metric_copy = metrics.copy()
-                # Explicitly set fields for dashboard
                 metric_copy["score"] = policy_score
-                metric_copy["ev"] = metrics.get("ev", policy_score)
-                metric_copy["confidence"] = metrics.get("win_prob", 0.0)
+                metric_copy["ev"] = policy_score
+                metric_copy["confidence"] = metrics.get("win", metrics.get("win_prob", 0.0))
                 metric_copy["mc_win_rate"] = metrics.get("win_prob", 0.0)
                 metric_copy["mc_cvar"] = metrics.get("cvar", 0.0)
                 metric_copy["best_h"] = int(metrics.get("best_h", 300))
-                
-                # Standard Filtering Logic for Batch
+                metric_copy["unified_score"] = policy_score
+                metric_copy["unified_score_long"] = float(score_long)
+                metric_copy["unified_score_short"] = float(score_short)
+
+                pos_side = int(ctx.get("position_side", 0) or 0)
+                if pos_side == 1:
+                    metric_copy["unified_score_hold"] = float(score_long)
+                elif pos_side == -1:
+                    metric_copy["unified_score_hold"] = float(score_short)
+
                 target_action = "WAIT"
-                filter_reason = None
-                
-                # ✅ 개별 필터 상태 추적 (신호등 표시용)
-                filter_states = {
-                    "napv": True,      # 통과 = True, 차단 = False
-                    "ev": True,
-                    "winrate": True,
-                    "cvar": True,
-                    "event_cvar": True,
-                    "direction": True,
-                }
-                
-                # Get metrics for filtering - use positive EV for both Long/Short
-                ev_val = float(metrics.get("ev", 0.0))
-                win_rate_f = float(metrics.get("win_prob", 0.0))
-                cvar1 = float(metrics.get("cvar", 0.0))
-                
-                # 모든 필터 상태 계산
-                regime = str(ctx.get("regime", "CHOP")).upper()
-                if regime not in ["BULL", "BEAR", "CHOP", "VOLATILE"]: regime = "CHOP"
-                
-                win_floors = {"BULL": config.funnel_win_floor_bull, "BEAR": config.funnel_win_floor_bear, "CHOP": config.funnel_win_floor_chop, "VOLATILE": config.funnel_win_floor_volatile}
-                cvar_floors = {"BULL": config.funnel_cvar_floor_bull, "BEAR": config.funnel_cvar_floor_bear, "CHOP": config.funnel_cvar_floor_chop, "VOLATILE": config.funnel_cvar_floor_volatile}
-                
-                win_floor = win_floors.get(regime, 0.0) if config.funnel_use_winrate_filter else 0.0
-                cvar_floor = cvar_floors.get(regime, -0.10)
-                
-                # 모든 필터 개별 체크
-                if ev_val <= 0.0:
-                    filter_states["ev"] = False
-                if win_rate_f < win_floor:
-                    filter_states["winrate"] = False
-                if cvar1 < cvar_floor:
-                    filter_states["cvar"] = False
-                if direction == 0:
-                    filter_states["direction"] = False
-                
-                # Apply filters if not in score_only_mode
-                if not config.score_only_mode:
-                    # 첫 번째 실패한 필터를 filter_reason으로 설정
-                    if not filter_states["ev"]:
-                        filter_reason = f"EV_FILTER: ev={ev_val:.6f}"
-                    elif not filter_states["winrate"]:
-                        filter_reason = f"WINRATE_FILTER: win={win_rate_f:.4f} < {win_floor:.4f}"
-                    elif not filter_states["cvar"]:
-                        filter_reason = f"CVAR_FILTER: cvar1={cvar1:.4f}"
-                    elif not filter_states["direction"]:
-                        filter_reason = "DIRECTION_ZERO"
-                        
-                    if not filter_reason:
-                        if direction == 1: target_action = "LONG"
-                        elif direction == -1: target_action = "SHORT"
+                if config.score_only_mode:
+                    if direction == 1:
+                        target_action = "LONG"
+                    elif direction == -1:
+                        target_action = "SHORT"
                 else:
-                    # Score only mode: simply follow the direction
-                    if direction == 1: target_action = "LONG"
-                    elif direction == -1: target_action = "SHORT"
-                    else: target_action = "WAIT"
-                    filter_reason = None
+                    if policy_score > 0:
+                        target_action = "LONG" if direction == 1 else "SHORT"
 
                 metric_copy["action"] = target_action
-                metric_copy["status"] = target_action # Sync status with action for dashboard
-                metric_copy["filter_states"] = filter_states  # ✅ 개별 필터 상태 추가
-                if filter_reason:
-                    metric_copy["reason"] = f"FILTERED: {filter_reason}"
-                else:
-                    best_h = int(metrics.get("best_h", 3600))
-                    metric_copy["reason"] = f"BATCH({best_h}s) {ctx.get('regime','chop')} EV {ev_val*100:.2f}%"
+                metric_copy["status"] = target_action
+                best_h = int(metrics.get("best_h", 3600))
+                metric_copy["reason"] = f"UNIFIED({best_h}s) {ctx.get('regime','chop')} score {policy_score*100:.2f}%"
                 
                 # Compatibility with LiveOrchestrator._paper_trade_step
                 meta = metrics.get("meta", {})
@@ -486,14 +457,8 @@ class MonteCarloDecisionMixin:
 
                 final_decisions.append(metric_copy)
             else:
-                # NAPV 필터로 걸러진 경우
-                filter_states = {
-                    "napv": False, "ev": True, "winrate": True,
-                    "cvar": True, "event_cvar": True, "direction": True,
-                }
                 final_decisions.append({
-                    "ok": False, "reason": "FILTERED", "action": "WAIT", "score": 0.0,
-                    "filter_states": filter_states,
+                    "ok": False, "reason": "NO_METRICS", "action": "WAIT", "score": 0.0,
                 })
         print(f"[DECIDE_BATCH] END symbols={num_symbols} elapsed={(time.time()*1000 - ts_ms):.0f}ms")
         return final_decisions

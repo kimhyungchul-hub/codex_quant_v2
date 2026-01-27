@@ -62,6 +62,39 @@ def _summary_to_numpy(res: Any) -> Any:
     return res
 
 
+def _calc_unified_score_from_cumulative(
+    horizons_sec: Sequence[float],
+    cumulative_ev: Sequence[float],
+    cumulative_cvar: Sequence[float],
+    *,
+    cost: float,
+    rho: float,
+    lambda_param: float,
+) -> tuple[float, float]:
+    h = np.asarray(horizons_sec, dtype=float)
+    ev = np.asarray(cumulative_ev, dtype=float)
+    cv = np.asarray(cumulative_cvar, dtype=float)
+    if h.ndim != 1 or ev.ndim != 1 or cv.ndim != 1:
+        return 0.0, 0.0
+    n = min(h.size, ev.size, cv.size)
+    if n < 2:
+        return 0.0, 0.0
+    h = h[:n]
+    ev = ev[:n]
+    cv = cv[:n]
+    dt = np.diff(h, prepend=0.0)
+    safe_dt = np.where(dt > 0.0, dt, 1.0)
+    marginal_ev = np.diff(ev, prepend=0.0) / safe_dt
+    marginal_cvar = np.diff(cv, prepend=0.0) / safe_dt
+    utility_rate = marginal_ev - float(lambda_param) * np.abs(marginal_cvar)
+    discount = np.exp(-float(rho) * h)
+    gross_napv = np.cumsum((utility_rate - float(rho)) * discount * dt)
+    denom = np.where(h > 0.0, h, 1.0)
+    psi_score = (gross_napv - float(cost)) / denom
+    best_idx = int(np.argmax(psi_score))
+    return float(psi_score[best_idx]), float(h[best_idx])
+
+
 class MonteCarloEntryEvaluationMixin:
     def _get_execution_costs(self, ctx: Dict[str, Any], params: Optional[MCParams] = None) -> Dict[str, float]:
         """
@@ -3021,10 +3054,15 @@ class MonteCarloEntryEvaluationMixin:
             "event_t_median": event_metrics.get("event_t_median"),
             "event_t_mean": event_metrics.get("event_t_mean"),
             "ev_by_horizon": [float(x) for x in ev_list] if (ev_list is not None and len(ev_list) > 0) else [],
+            "cvar_by_horizon": [float(x) for x in cvar_list] if (cvar_list is not None and len(cvar_list) > 0) else [],
+            "ev_vector": [float(x) for x in ev_list] if (ev_list is not None and len(ev_list) > 0) else [],
+            "cvar_vector": [float(x) for x in cvar_list] if (cvar_list is not None and len(cvar_list) > 0) else [],
             # Directional EV curves for Score_A (vector: LONG/SHORT).
             # These are hold-to-horizon EVs (net ROE) for each side.
             "ev_by_horizon_long": [float(x) for x in (dbg_L[0] if (isinstance(dbg_L, (list, tuple)) and len(dbg_L) > 0 and len(dbg_L[0]) > 0) else [])] if "dbg_L" in locals() else [],
             "ev_by_horizon_short": [float(x) for x in (dbg_S[0] if (isinstance(dbg_S, (list, tuple)) and len(dbg_S) > 0 and len(dbg_S[0]) > 0) else [])] if "dbg_S" in locals() else [],
+            "cvar_by_horizon_long": [float(x) for x in (dbg_L[2] if (isinstance(dbg_L, (list, tuple)) and len(dbg_L) > 2 and len(dbg_L[2]) > 0) else [])] if "dbg_L" in locals() else [],
+            "cvar_by_horizon_short": [float(x) for x in (dbg_S[2] if (isinstance(dbg_S, (list, tuple)) and len(dbg_S) > 2 and len(dbg_S[2]) > 0) else [])] if "dbg_S" in locals() else [],
             "horizon_seq": [int(h) for h in h_list] if (h_list is not None and len(h_list) > 0) else [],
             "horizon_seq_long": [int(h) for h in (dbg_L[3] if (isinstance(dbg_L, (list, tuple)) and len(dbg_L) > 3 and len(dbg_L[3]) > 0) else [])] if "dbg_L" in locals() else [],
             "horizon_seq_short": [int(h) for h in (dbg_S[3] if (isinstance(dbg_S, (list, tuple)) and len(dbg_S) > 3 and len(dbg_S[3]) > 0) else [])] if "dbg_S" in locals() else [],
@@ -3049,6 +3087,11 @@ class MonteCarloEntryEvaluationMixin:
                 "ev_by_horizon",
                 "ev_by_horizon_long",
                 "ev_by_horizon_short",
+                "cvar_by_horizon",
+                "cvar_by_horizon_long",
+                "cvar_by_horizon_short",
+                "ev_vector",
+                "cvar_vector",
             )
         }
         meta_detail = {k: v for k, v in meta.items() if k not in meta_core}
@@ -3372,23 +3415,52 @@ class MonteCarloEntryEvaluationMixin:
                         best_ev_short = ev
                         best_h_short = h_val
 
-            # Determine Policy Score (Signed EV)
-            if best_ev_long > best_ev_short:
-                policy_ev_mix = float(best_ev_long)
-                direction_best = 1
-                best_h = int(best_h_long)
-            else:
-                policy_ev_mix = float(best_ev_short)
-                direction_best = -1
-                best_h = int(best_h_short)
+            # Unified score (Psi) from cumulative EV/CVaR vectors
+            ev_long_vec = np.asarray(summary_cpu["ev_long"][i], dtype=np.float64)
+            ev_short_vec = np.asarray(summary_cpu["ev_short"][i], dtype=np.float64)
+            cvar_long_vec = np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64)
+            cvar_short_vec = np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64)
 
-            if best_ev_long < 0 and best_ev_short < 0:
-                policy_ev_mix = float(max(best_ev_long, best_ev_short))
-                best_h = int(best_h_long if best_ev_long > best_ev_short else best_h_short)
+            lev_val = float(leverages_jax[i])
+            cost_base = float(fees_jax[i])
+            cost_roe = float(cost_base * lev_val)
+            rho_val = float(tasks[i]["ctx"].get("rho", config.unified_rho))
+            lambda_val = float(tasks[i]["ctx"].get("unified_lambda", config.unified_risk_lambda))
+
+            # Convert net cumulative vectors to gross (remove one-time cost)
+            ev_long_gross = ev_long_vec + cost_roe
+            ev_short_gross = ev_short_vec + cost_roe
+            cvar_long_gross = cvar_long_vec + cost_roe
+            cvar_short_gross = cvar_short_vec + cost_roe
+
+            score_long, t_long = _calc_unified_score_from_cumulative(
+                h_list, ev_long_gross, cvar_long_gross,
+                cost=cost_roe, rho=rho_val, lambda_param=lambda_val,
+            )
+            score_short, t_short = _calc_unified_score_from_cumulative(
+                h_list, ev_short_gross, cvar_short_gross,
+                cost=cost_roe, rho=rho_val, lambda_param=lambda_val,
+            )
+
+            if score_long >= score_short:
+                policy_ev_mix = float(score_long)
+                direction_best = 1
+                best_h = int(t_long) if t_long > 0 else int(best_h_long)
+            else:
+                policy_ev_mix = float(score_short)
+                direction_best = -1
+                best_h = int(t_short) if t_short > 0 else int(best_h_short)
+
+            ev_vec = ev_long_vec if direction_best == 1 else ev_short_vec
+            cvar_vec = cvar_long_vec if direction_best == 1 else cvar_short_vec
 
             # [Sizing] Kelly calculation similar to sequential path
-            win_val = float(summary_cpu["win_long"][i].max())  # Optimistic Win Rate
-            cvar_val = float(summary_cpu["cvar_long"][i].mean())
+            if direction_best == 1:
+                win_val = float(summary_cpu["win_long"][i].max())
+                cvar_val = float(np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64).mean())
+            else:
+                win_val = float(summary_cpu["win_short"][i].max())
+                cvar_val = float(np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64).mean())
             sigma_val = float(sigmas[i])
 
             variance_proxy = float(sigma_val * sigma_val)
@@ -3421,6 +3493,15 @@ class MonteCarloEntryEvaluationMixin:
                 "direction": int(direction_best),
                 "kelly": float(kelly),
                 "size_frac": float(size_frac),
+                "unified_score": float(policy_ev_mix),
+                "unified_score_long": float(score_long),
+                "unified_score_short": float(score_short),
+                "unified_t_star": float(best_h),
+                "unified_t_star_long": float(t_long),
+                "unified_t_star_short": float(t_short),
+                "ev_vector": [float(x) for x in ev_vec.tolist()],
+                "cvar_vector": [float(x) for x in cvar_vec.tolist()],
+                "horizon_seq": [int(h) for h in h_list],
                 "meta": {
                     "can_enter": bool(policy_ev_mix > 0.0001),
                     "ev": float(policy_ev_mix),
@@ -3431,6 +3512,25 @@ class MonteCarloEntryEvaluationMixin:
                     "direction": int(direction_best),
                     "kelly": float(kelly),
                     "size_frac": float(size_frac),
+                    "unified_score": float(policy_ev_mix),
+                    "unified_score_long": float(score_long),
+                    "unified_score_short": float(score_short),
+                    "unified_t_star": float(best_h),
+                    "unified_t_star_long": float(t_long),
+                    "unified_t_star_short": float(t_short),
+                    "unified_lambda": float(lambda_val),
+                    "unified_rho": float(rho_val),
+                    "execution_cost": float(cost_base),
+                    "fee_roundtrip_total": float(cost_base),
+                    "leverage": float(lev_val),
+                    "ev_vector": [float(x) for x in ev_vec.tolist()],
+                    "cvar_vector": [float(x) for x in cvar_vec.tolist()],
+                    "horizon_seq": [int(h) for h in h_list],
+                    "ev_by_horizon_long": [float(x) for x in ev_long_vec.tolist()],
+                    "ev_by_horizon_short": [float(x) for x in ev_short_vec.tolist()],
+                    "cvar_by_horizon_long": [float(x) for x in cvar_long_vec.tolist()],
+                    "cvar_by_horizon_short": [float(x) for x in cvar_short_vec.tolist()],
+                    "horizon_seq": [int(h) for h in h_list],
                     "policy_ev_score_long": float(best_ev_long),
                     "policy_ev_score_short": float(best_ev_short),
                     "policy_best_h_long": int(best_h_long),
