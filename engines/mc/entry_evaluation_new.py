@@ -10,6 +10,7 @@ import numpy as np
 
 from engines.cvar_methods import cvar_ensemble
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
+from engines.mc import jax_backend
 from engines.mc.jax_backend import (
     _JAX_OK,
     jax,
@@ -695,7 +696,7 @@ class MonteCarloEntryEvaluationMixin:
         )
         
         # Bring only final small results back to CPU
-        res_summary_cpu = jax.device_get(res_summary)
+        res_summary_cpu = {k: jax_backend.to_numpy(v) for k, v in res_summary.items()}
         
         ev_L_arr = res_summary_cpu["ev_long"]
         win_L_arr = res_summary_cpu["win_long"]
@@ -3329,7 +3330,7 @@ class MonteCarloEntryEvaluationMixin:
         summary_results = summarize_gbm_horizons_multi_symbol_jax(
             price_paths_batch, s0s, leverages, fees * leverages, h_indices, 0.05
         )
-        summary_cpu = jax.device_get(summary_results)
+        summary_cpu = {k: jax_backend.to_numpy(v) for k, v in summary_results.items()}
         t1_sum = time.perf_counter()
         
         # ✅ GLOBAL BATCH EXIT POLICY

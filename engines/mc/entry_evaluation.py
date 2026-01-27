@@ -11,6 +11,7 @@ import numpy as np
 from engines.cvar_methods import cvar_ensemble
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
 from engines.mc import jax_backend as jax_backend
+from engines.mc.jax_backend import summarize_gbm_horizons_multi_symbol_jax
 from engines.mc.params import MCParams
 from engines.mc.config import config
 from engines.simulation_methods import mc_first_passage_tp_sl_jax
@@ -48,19 +49,17 @@ def _throttled_log(symbol: str, key: str, interval_ms: int) -> bool:
         return True
 
 
-# Removed _env_bool helper
-        if v is None:
-            return bool(default)
-        v = str(v).strip().lower()
-        if not v:
-            return bool(default)
-        if v in ("1", "true", "yes", "y", "on"):
-            return True
-        if v in ("0", "false", "no", "n", "off"):
-            return False
-        return bool(default)
-    except Exception:
-        return bool(default)
+def _summary_to_numpy(res: Any) -> Any:
+    """Convert torch-backed summary dict to numpy arrays."""
+    if isinstance(res, dict):
+        out: dict[str, Any] = {}
+        for k, v in res.items():
+            try:
+                out[k] = jax_backend.to_numpy(v)
+            except Exception:
+                out[k] = v
+        return out
+    return res
 
 
 class MonteCarloEntryEvaluationMixin:
@@ -753,7 +752,7 @@ class MonteCarloEntryEvaluationMixin:
             dtype=np.int32,
         )
         
-        # Calculate all stats on GPU (with CPU/NumPy fallback)
+        # Calculate stats (PyTorch/NumPy backend)
         try:
             res_summary = jax_backend.summarize_gbm_horizons_jax(
                 price_paths=price_paths,
@@ -761,48 +760,20 @@ class MonteCarloEntryEvaluationMixin:
                 leverage=lev_f,
                 fee_rt_total_roe=fee_rt_total_roe_f,
                 horizons_indices=h_indices,
-                alpha=params.cvar_alpha
+                alpha=params.cvar_alpha,
             )
-            # DEV_MODE returns NumPy directly, JAX needs device_get
-            from engines.mc.jax_backend import DEV_MODE as _DEV_MODE
-            if _DEV_MODE:
-                res_summary_cpu = res_summary  # Already NumPy
-            else:
-                # ensure jax is initialized on-demand and use module jax
-                jax_backend.ensure_jax()
-                if jax_backend.jax is None:
-                    raise RuntimeError("JAX unavailable for device_get")
-                res_summary_cpu = jax_backend.jax.device_get(res_summary)
+            res_summary_cpu = _summary_to_numpy(res_summary)
         except Exception as e:
-            logger.warning(f"⚠️ [JAX_FALLBACK] evaluate_entry_metrics failed: {e}. Falling back to JAX-CPU.")
-            # Re-ensure JAX is properly initialized before using jax.devices()
-            jax_backend.ensure_jax()
-            from engines.mc.jax_backend import jax as jax_module, DEV_MODE as _DEV_MODE
-            
-            # DEV_MODE: use NumPy fallback directly
-            if _DEV_MODE:
-                from engines.mc.jax_backend import summarize_gbm_horizons_numpy
-                res_summary_cpu = summarize_gbm_horizons_numpy(
-                    np.asarray(price_paths),
-                    s0_f, lev_f, fee_rt_total_roe_f,
-                    h_indices, params.cvar_alpha
-                )
-            elif jax_module is None:
-                raise RuntimeError("JAX is not available for CPU fallback") from e
-            else:
-                cpu_dev = jax_module.devices("cpu")[0]
-                with jax_module.default_device(cpu_dev):
-                    # We need to make sure price_paths is on CPU if it was on GPU
-                    cpu_paths = jax_module.device_put(price_paths, cpu_dev)
-                    res_summary = jax_backend.summarize_gbm_horizons_jax(
-                        price_paths=cpu_paths,
-                        s0=s0_f,
-                        leverage=lev_f,
-                        fee_rt_total_roe=fee_rt_total_roe_f,
-                        horizons_indices=h_indices,
-                        alpha=params.cvar_alpha
-                    )
-                    res_summary_cpu = jax_module.device_get(res_summary)
+            logger.warning(f"⚠️ [MC_FALLBACK] summarize_gbm_horizons failed: {e}. Falling back to NumPy.")
+            from engines.mc.jax_backend import summarize_gbm_horizons_numpy
+            res_summary_cpu = summarize_gbm_horizons_numpy(
+                np.asarray(jax_backend.to_numpy(price_paths)),
+                s0_f,
+                lev_f,
+                fee_rt_total_roe_f,
+                h_indices,
+                params.cvar_alpha,
+            )
         
         ev_L_arr = res_summary_cpu["ev_long"]
         win_L_arr = res_summary_cpu["win_long"]
@@ -3201,147 +3172,44 @@ class MonteCarloEntryEvaluationMixin:
 
         price_paths_batch = None
         t_sim0 = time.perf_counter()
-        
+
         print(f"[BATCH_TIMING] prep={(t_prep1-t_prep0):.3f}s n_paths={n_paths} max_steps={max_steps} step_sec={step_sec} dt={dt:.2e}", flush=True)
-        
-        # Ensure JAX is initialized before GPU operations
-        jax_backend.ensure_jax()
-        from engines.mc.jax_backend import jax as jax_module, DEV_MODE as _DEV_MODE
-        
-        # ✅ DEV_MODE: NumPy sequential fallback
-        if _DEV_MODE:
-            print("[BATCH_TIMING] DEV_MODE: Using NumPy sequential fallback...", flush=True)
-            from engines.mc.jax_backend import summarize_gbm_horizons_numpy
-            
-            # Sequential path simulation (NumPy)
+
+        use_torch = bool(getattr(jax_backend, "_TORCH_OK", False)) and (not bool(getattr(jax_backend, "DEV_MODE", False)))
+
+        if use_torch:
+            print("[BATCH_TIMING] Torch batch path simulation...", flush=True)
             price_paths_batch = self.simulate_paths_price_batch(
                 seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
-                n_paths=n_paths, n_steps=max_steps, dt=dt
+                n_paths=n_paths, n_steps=max_steps, dt=dt, return_torch=True
             )
             t_sim1 = time.perf_counter()
-            print(f"[BATCH_TIMING] simulate_paths_price_batch (NumPy) done t={(t_sim1-t_sim0):.3f}s", flush=True)
-            
-            # Sequential summary (NumPy)
             t_sum0 = time.perf_counter()
-            summary_cpu = {
-                "ev_long": [], "win_long": [], "cvar_long": [],
-                "ev_short": [], "win_short": [], "cvar_short": []
-            }
-            for i in range(num_symbols):
-                r = summarize_gbm_horizons_numpy(
-                    np.asarray(price_paths_batch[i]),
-                    float(s0s_jax[i]), float(leverages_jax[i]), float(fees_jax[i] * leverages_jax[i]),
-                    h_indices, 0.05
-                )
-                for k in summary_cpu:
-                    summary_cpu[k].append(r[k])
-            for k in summary_cpu:
-                summary_cpu[k] = np.array(summary_cpu[k])
+            summary_results = summarize_gbm_horizons_multi_symbol_jax(
+                price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
+            )
+            summary_cpu = _summary_to_numpy(summary_results)
             t_sum1 = time.perf_counter()
-            print(f"[BATCH_TIMING] summarize_gbm_horizons (NumPy) done t={(t_sum1-t_sum0):.3f}s", flush=True)
+            print(f"[BATCH_TIMING] torch sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
         else:
-            if jax_module is None:
-                raise RuntimeError("JAX is not available for batch evaluation")
-            
-            try:
-                print("[BATCH_TIMING] Starting simulate_paths_price_batch (implicit device)...", flush=True)
-                price_paths_batch = self.simulate_paths_price_batch(
-                    seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
-                    n_paths=n_paths, n_steps=max_steps, dt=dt
-                )
-                print("[BATCH_TIMING] simulate_paths_price_batch returned, blocking...", flush=True)
-                jax_module.block_until_ready(price_paths_batch)
-                print(f"[BATCH_TIMING] simulate_paths_price_batch done t={(time.perf_counter()-t_sim0):.3f}s", flush=True)
-
-                t_sim1 = time.perf_counter()
-                t_sum0 = time.perf_counter()
-                use_cpu_summary = str(os.environ.get("MC_SUMMARY_CPU", "")).lower() in ("1", "true", "yes")
-                try:
-                    if not use_cpu_summary:
-                        devs = jax_module.devices()
-                        if devs and str(getattr(devs[0], "platform", "")).upper() == "METAL":
-                            use_cpu_summary = True
-                except Exception:
-                    pass
-
-                if use_cpu_summary:
-                    print(f"[BATCH_TIMING] Using CPU summary path (Metal detected)", flush=True)
-                    t_xfer_start = time.perf_counter()
-                    price_paths_cpu = np.asarray(jax_module.device_get(price_paths_batch), dtype=np.float64)
-                    print(f"[BATCH_TIMING] device_get done t={(time.perf_counter()-t_xfer_start):.3f}s shape={price_paths_cpu.shape}", flush=True)
-                    
-                    s0s_cpu = np.asarray(s0s_jax, dtype=np.float64)
-                    lev_cpu = np.asarray(leverages_jax, dtype=np.float64)
-                    # Fee는 leverage와 독립 - 명목금액 기준 수수료이므로 ROE에서는 leverage 곱하지 않음
-                    fee_cpu = np.asarray(fees_jax, dtype=np.float64)
-
-                    t_calc_start = time.perf_counter()
-                    # h_indices is array of step indices, select those columns
-                    # price_paths_cpu shape: (n_symbols, n_paths, n_steps+1)
-                    # We want: (n_symbols, n_paths, len(h_indices))
-                    tp = price_paths_cpu[:, :, h_indices]  # This works if h_indices is 1D array
-                    print(f"[BATCH_TIMING] tp extraction done shape={tp.shape}", flush=True)
-                    
-                    denom = np.maximum(1e-12, s0s_cpu[:, None, None])
-                    gross = (tp - s0s_cpu[:, None, None]) / denom
-
-                    net_long = gross * lev_cpu[:, None, None] - fee_cpu[:, None, None]
-                    net_short = -gross * lev_cpu[:, None, None] - fee_cpu[:, None, None]
-
-                    ev_long = net_long.mean(axis=1)
-                    win_long = (net_long > 0).mean(axis=1)
-                    ev_short = net_short.mean(axis=1)
-                    win_short = (net_short > 0).mean(axis=1)
-
-                    k = max(1, int(0.05 * n_paths))
-                    part_long = np.partition(net_long, kth=k - 1, axis=1)
-                    part_short = np.partition(net_short, kth=k - 1, axis=1)
-                    cvar_long = part_long[:, :k, :].mean(axis=1)
-                    cvar_short = part_short[:, :k, :].mean(axis=1)
-
-                    summary_cpu = {
-                        "ev_long": ev_long,
-                        "win_long": win_long,
-                        "cvar_long": cvar_long,
-                        "ev_short": ev_short,
-                        "win_short": win_short,
-                        "cvar_short": cvar_short,
-                    }
-                    t_sum1 = time.perf_counter()
-                    print(f"[BATCH_TIMING] CPU summary done t={(t_sum1-t_calc_start):.3f}s", flush=True)
-                else:
-                    summary_results = summarize_gbm_horizons_multi_symbol_jax(
-                        price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
-                    )
-                    jax_module.block_until_ready(summary_results)
-                    t_sum1 = time.perf_counter()
-
-            except Exception as e:
-                logger.warning(f"⚠️ [JAX_FALLBACK] Metal failed: {e}. Falling back to JAX-CPU (PARALLEL).")
-                jax_backend.ensure_jax()
-                from engines.mc.jax_backend import jax as jax_module
-                if jax_module is None:
-                    raise RuntimeError("JAX is not available for CPU fallback") from e
-                cpu_dev = jax_module.devices("cpu")[0]
-                with jax_module.default_device(cpu_dev):
-                    price_paths_batch = self.simulate_paths_price_batch(
-                        seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
-                        n_paths=n_paths, n_steps=max_steps, dt=dt
-                    )
-                    jax_module.block_until_ready(price_paths_batch)
-                    t_sim1 = time.perf_counter()
-                    t_sum0 = time.perf_counter()
-                    summary_results = summarize_gbm_horizons_multi_symbol_jax(
-                        price_paths_batch, s0s_jax, leverages_jax, fees_jax * leverages_jax, h_indices, 0.05
-                    )
-                    jax_module.block_until_ready(summary_results)
-                    t_sum1 = time.perf_counter()
-
-            t_xfer0 = time.perf_counter()
-            if "summary_cpu" not in locals():
-                summary_cpu = jax_module.device_get(summary_results)
-            t_xfer1 = time.perf_counter()
-            print(f"[BATCH_TIMING] device_get done t={(t_xfer1-t_xfer0):.3f}s shape={price_paths_batch.shape}", flush=True)
+            print("[BATCH_TIMING] NumPy batch fallback...", flush=True)
+            from engines.mc.torch_backend import summarize_gbm_horizons_multi_symbol_numpy
+            price_paths_batch = self.simulate_paths_price_batch(
+                seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
+                n_paths=n_paths, n_steps=max_steps, dt=dt, return_torch=False
+            )
+            t_sim1 = time.perf_counter()
+            t_sum0 = time.perf_counter()
+            summary_cpu = summarize_gbm_horizons_multi_symbol_numpy(
+                np.asarray(price_paths_batch),
+                np.asarray(s0s_jax, dtype=np.float64),
+                np.asarray(leverages_jax, dtype=np.float64),
+                np.asarray(fees_jax * leverages_jax, dtype=np.float64),
+                h_indices,
+                0.05,
+            )
+            t_sum1 = time.perf_counter()
+            print(f"[BATCH_TIMING] numpy sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
         
         # ✅ GLOBAL BATCH EXIT POLICY (can be skipped with SKIP_EXIT_POLICY=true)
         t_exit_prep0 = time.perf_counter()
@@ -3464,11 +3332,8 @@ class MonteCarloEntryEvaluationMixin:
             try:
                 exit_policy_results = self.compute_exit_policy_metrics_multi_symbol(exit_policy_args)
             except Exception as e:
-                logger.warning(f"⚠️ [METAL_FAILURE] Exit Policy failed: {e}. Falling back to JAX-CPU.")
-                # Use CPU device to force JAX-CPU execution
-                cpu_dev = jax_module.devices("cpu")[0]
-                with jax_module.default_device(cpu_dev):
-                    exit_policy_results = self.compute_exit_policy_metrics_multi_symbol(exit_policy_args)
+                logger.warning(f"⚠️ [EXIT_POLICY_FALLBACK] Exit Policy failed: {e}. Falling back to sequential.")
+                exit_policy_results = [self.compute_exit_policy_metrics_batched(**args) for args in exit_policy_args]
 
             t_exit1 = time.perf_counter()
         

@@ -10,15 +10,20 @@ import numpy as np
 from engines.cvar_methods import cvar_ensemble
 from engines.exit_policy_methods import simulate_exit_policy_rollforward
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
-from engines.mc.jax_backend import _JAX_OK, ensure_jax, jax, jnp
+from engines.mc.torch_backend import _TORCH_OK, to_numpy
 from engines.mc.config import config
 
 logger = logging.getLogger(__name__)
 
-# JAX removed - all functions use NumPy backend
-simulate_exit_policy_rollforward_jax = None
-simulate_exit_policy_rollforward_batched_vmap_jax = None
-simulate_exit_policy_multi_symbol_jax = None
+# PyTorch exit-policy backends (JAX replacement)
+try:
+    from engines.mc.exit_policy_torch import (
+        simulate_exit_policy_rollforward_batched_vmap_torch as simulate_exit_policy_rollforward_batched_vmap_jax,
+        simulate_exit_policy_multi_symbol_torch as simulate_exit_policy_multi_symbol_jax,
+    )
+except Exception:  # pragma: no cover
+    simulate_exit_policy_rollforward_batched_vmap_jax = None
+    simulate_exit_policy_multi_symbol_jax = None
 
 
 
@@ -149,7 +154,7 @@ class MonteCarloExitPolicyMixin:
         paths = None
         if price_paths is not None:
             try:
-                arr = np.asarray(price_paths, dtype=np.float32)
+                arr = np.asarray(to_numpy(price_paths), dtype=np.float32)
                 if arr.ndim != 2:
                     logger.warning(
                         f"[HORIZON_SLICING] {symbol} | price_paths ndim={arr.ndim} (expected 2), ignoring provided paths"
@@ -241,18 +246,13 @@ class MonteCarloExitPolicyMixin:
         else:
             sl_target_roe = float(sl_r_price) * float(leverage)
 
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK and simulate_exit_policy_rollforward_jax is not None
-        
-        if use_jax:
-            try:
-                # Ensure JAX is initialized before converting arrays / calling JAX functions
-                ensure_jax()
-                if not _JAX_OK:
-                    raise RuntimeError("JAX not available after ensure_jax")
+        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
 
-                # JAX version
-                res_jax = simulate_exit_policy_rollforward_jax(
-                    price_paths=jnp.asarray(pp, dtype=jnp.float32),
+        if use_torch:
+            try:
+                min_hold_sec_val = int(max(self.MIN_HOLD_SEC_DIRECTIONAL, int(h * config.policy_min_hold_frac)))
+                res_batch = simulate_exit_policy_rollforward_batched_vmap_jax(
+                    price_paths=np.asarray(pp, dtype=np.float32),
                     s0=float(price),
                     mu_ps=float(mu_ps),
                     sigma_ps=float(sigma_ps),
@@ -260,12 +260,14 @@ class MonteCarloExitPolicyMixin:
                     fee_roundtrip=float(fee_roundtrip),
                     exec_oneway=float(exec_oneway),
                     impact_cost=float(impact_cost),
-                    step_sec=int(step_sec),
                     decision_dt_sec=int(decision_dt_sec),
-                    horizon_sec=int(h_eff),
-                    min_hold_sec=int(max(self.MIN_HOLD_SEC_DIRECTIONAL, int(h * config.policy_min_hold_frac))),
-                    flip_confirm_ticks=int(self.FLIP_CONFIRM_TICKS),
-                    hold_bad_ticks=int(self.POLICY_HOLD_BAD_TICKS),
+                    step_sec=int(step_sec),
+                    max_horizon_sec=int(h_eff),
+                    side_now_batch=np.array([int(direction)], dtype=np.int32),
+                    horizon_sec_batch=np.array([int(h_eff)], dtype=np.int32),
+                    min_hold_sec_batch=np.array([int(min_hold_sec_val)], dtype=np.int32),
+                    tp_target_roe_batch=np.array([float(tp_target_roe)], dtype=np.float32),
+                    sl_target_roe_batch=np.array([float(sl_target_roe)], dtype=np.float32),
                     p_pos_floor_enter=float(p_pos_floor_enter if p_pos_floor_enter is not None else self.POLICY_P_POS_ENTER_BY_REGIME.get(regime, 0.52)),
                     p_pos_floor_hold=float(p_pos_floor_hold if p_pos_floor_hold is not None else self.POLICY_P_POS_HOLD_BY_REGIME.get(regime, 0.50)),
                     p_sl_enter_ceiling=float(p_sl_enter_ceiling if p_sl_enter_ceiling is not None else self.POLICY_P_SL_ENTER_MAX_BY_REGIME.get(regime, 0.20)),
@@ -275,37 +277,46 @@ class MonteCarloExitPolicyMixin:
                     p_tp_floor_hold=float(p_tp_floor_hold if p_tp_floor_hold is not None else self.POLICY_P_TP_HOLD_MIN_BY_REGIME.get(regime, 0.12)),
                     score_margin=float(self.SCORE_MARGIN_DEFAULT),
                     soft_floor=float(self.POLICY_VALUE_SOFT_FLOOR_AFTER_COST),
-                    side_now=int(direction),
                     enable_dd_stop=bool(enable_dd_stop),
-                    dd_stop_roe=float(dd_stop_roe_eff),
+                    dd_stop_roe_batch=np.array([float(dd_stop_roe_eff)], dtype=np.float32),
+                    flip_confirm_ticks=int(self.FLIP_CONFIRM_TICKS),
+                    hold_bad_ticks=int(self.POLICY_HOLD_BAD_TICKS),
                     fee_exit_only_override=float(fee_exit_only_override if fee_exit_only_override is not None else -1.0),
-                    tp_target_roe=float(tp_target_roe),
-                    sl_target_roe=float(sl_target_roe),
+                    cvar_alpha=float(cvar_alpha),
                 )
-                
-                # Convert JAX results to NumPy-friendly format
+
+                res_batch_cpu = {k: to_numpy(v) for k, v in res_batch.items()}
                 res = {
-                    "p_pos_exit": float(res_jax["p_pos_exit"]),
-                    "ev_exit": float(res_jax["ev_exit"]),
-                    "exit_t_mean_sec": float(res_jax["exit_t_mean_sec"]),
-                    "net_out": np.asarray(jax.device_get(res_jax["net_out"]), dtype=np.float64),
-                    "exit_t": np.asarray(jax.device_get(res_jax["exit_t"]), dtype=np.int64),
-                    "ok": True
+                    "p_pos_exit": float(res_batch_cpu["p_pos_exit"][0]),
+                    "ev_exit": float(res_batch_cpu["ev_exit"][0]),
+                    "exit_t_mean_sec": float(res_batch_cpu["exit_t_mean_sec"][0]),
+                    "net_out": np.asarray(res_batch_cpu.get("net_out", [np.zeros((0,), dtype=np.float64)])[0], dtype=np.float64),
+                    "exit_t": np.asarray(res_batch_cpu.get("exit_t", [np.zeros((0,), dtype=np.int64)])[0], dtype=np.int64),
+                    "ok": True,
+                    "p_tp": float(res_batch_cpu.get("p_tp", [0.0])[0]),
+                    "p_sl": float(res_batch_cpu.get("p_sl", [0.0])[0]),
+                    "p_other": float(res_batch_cpu.get("p_other", [0.0])[0]),
                 }
-                # Reason counts from idx
-                reason_idxs = np.asarray(jax.device_get(res_jax["reason_idx"]), dtype=np.int32)
-                reason_map = {0: "time_stop", 1: "psl_emergency", 2: "score_flip", 3: "hold_bad", 4: "unrealized_dd"}
+                reason_idxs = np.asarray(res_batch_cpu["reason_idx"][0], dtype=np.int32)
+                reason_map = {
+                    0: "time_stop",
+                    1: "psl_emergency",
+                    2: "score_flip",
+                    3: "hold_bad",
+                    4: "unrealized_dd",
+                    5: "tp_hit",
+                    6: "sl_hit",
+                }
                 counts = {}
                 for idx in reason_idxs:
                     r = reason_map.get(int(idx), "unknown")
                     counts[r] = counts.get(r, 0) + 1
                 res["exit_reason_counts"] = counts
-                
             except Exception as e:
-                logger.warning(f"[JAX_ROLLFORWARD] Failed: {e}, falling back to CPU")
-                use_jax = False
+                logger.warning(f"[TORCH_ROLLFORWARD] Failed: {e}, falling back to CPU")
+                use_torch = False
 
-        if not use_jax:
+        if not use_torch:
             res = simulate_exit_policy_rollforward(
                 price_paths=pp,
                 s0=float(price),
@@ -520,7 +531,7 @@ class MonteCarloExitPolicyMixin:
         regime: str,
         batch_directions: np.ndarray,
         batch_horizons: np.ndarray,
-        price_paths: jnp.ndarray,
+        price_paths: np.ndarray,
         cvar_alpha: float = 0.05,
         tp_target_roe_batch: Optional[np.ndarray] = None,
         sl_target_roe_batch: Optional[np.ndarray] = None,
@@ -530,7 +541,7 @@ class MonteCarloExitPolicyMixin:
         """
         Computes exit policy metrics for a batch of (direction, horizon) combinations using JAX vmap.
         """
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
+        use_jax = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
         
         if not use_jax:
             # Fallback to sequential CPU processing
@@ -587,11 +598,11 @@ class MonteCarloExitPolicyMixin:
                 decision_dt_sec=int(decision_dt_sec),
                 step_sec=int(step_sec),
                 max_horizon_sec=int(max_horizon_sec),
-                side_now_batch=jnp.array(batch_directions, dtype=jnp.int32),
-                horizon_sec_batch=jnp.array(horizon_sec_batch, dtype=jnp.int32),
-                min_hold_sec_batch=jnp.array(min_hold_sec_batch, dtype=jnp.int32),
-                tp_target_roe_batch=jnp.array(tp_target_roe_batch, dtype=jnp.float32),
-                sl_target_roe_batch=jnp.array(sl_target_roe_batch, dtype=jnp.float32),
+                side_now_batch=np.array(batch_directions, dtype=np.int32),
+                horizon_sec_batch=np.array(horizon_sec_batch, dtype=np.int32),
+                min_hold_sec_batch=np.array(min_hold_sec_batch, dtype=np.int32),
+                tp_target_roe_batch=np.array(tp_target_roe_batch, dtype=np.float32),
+                sl_target_roe_batch=np.array(sl_target_roe_batch, dtype=np.float32),
                 p_pos_floor_enter=float(self.POLICY_P_POS_ENTER_BY_REGIME.get(regime, 0.52)),
                 p_pos_floor_hold=float(self.POLICY_P_POS_HOLD_BY_REGIME.get(regime, 0.50)),
                 p_sl_enter_ceiling=float(self.POLICY_P_SL_ENTER_MAX_BY_REGIME.get(regime, 0.20)),
@@ -602,7 +613,7 @@ class MonteCarloExitPolicyMixin:
                 score_margin=float(self.SCORE_MARGIN_DEFAULT),
                 soft_floor=float(self.POLICY_VALUE_SOFT_FLOOR_AFTER_COST),
                 enable_dd_stop=bool(enable_dd_stop),
-                dd_stop_roe_batch=jnp.array(dd_stop_roe_batch, dtype=jnp.float32),
+                dd_stop_roe_batch=np.array(dd_stop_roe_batch, dtype=np.float32),
                 flip_confirm_ticks=int(self.FLIP_CONFIRM_TICKS),
                 hold_bad_ticks=int(self.POLICY_HOLD_BAD_TICKS),
                 cvar_alpha=float(cvar_alpha),
@@ -610,16 +621,27 @@ class MonteCarloExitPolicyMixin:
 
             # Unpack results
             results = []
-            reason_map = {0: "time_stop", 1: "psl_emergency", 2: "score_flip", 3: "hold_bad", 4: "unrealized_dd"}
-            
-            # Combine device_get for all result components to minimize transfers
-            res_jax_batch_cpu = jax.device_get(res_jax_batch)
-            
+            reason_map = {
+                0: "time_stop",
+                1: "psl_emergency",
+                2: "score_flip",
+                3: "hold_bad",
+                4: "unrealized_dd",
+                5: "tp_hit",
+                6: "sl_hit",
+            }
+
+            # Convert torch -> numpy once
+            res_jax_batch_cpu = {k: to_numpy(v) for k, v in res_jax_batch.items()}
+
             p_pos_exit_arr = res_jax_batch_cpu["p_pos_exit"]
             ev_exit_arr = res_jax_batch_cpu["ev_exit"]
             exit_t_mean_arr = res_jax_batch_cpu["exit_t_mean_sec"]
             reason_idx_arr = res_jax_batch_cpu["reason_idx"]
             cvar_exit_arr = res_jax_batch_cpu["cvar_exit"]
+            p_tp_arr = res_jax_batch_cpu.get("p_tp")
+            p_sl_arr = res_jax_batch_cpu.get("p_sl")
+            p_other_arr = res_jax_batch_cpu.get("p_other")
 
             for i in range(len(batch_directions)):
                 res = {
@@ -631,6 +653,12 @@ class MonteCarloExitPolicyMixin:
                     "exit_reason_counts": {},
                     "meta": {"policy_horizon_eff_sec": int(batch_horizons[i])}
                 }
+                if p_tp_arr is not None:
+                    res["p_tp"] = float(p_tp_arr[i])
+                if p_sl_arr is not None:
+                    res["p_sl"] = float(p_sl_arr[i])
+                if p_other_arr is not None:
+                    res["p_other"] = float(p_other_arr[i])
                 
                 # Simple reason count estimate
                 counts = {}
@@ -705,7 +733,7 @@ class MonteCarloExitPolicyMixin:
         - symbols_args: 각 심볼별 compute_exit_policy_metrics_batched에 필요한 인자 리스트
         - 반환: 각 심볼별 결과 리스트의 리스트
         """
-        if not _JAX_OK or simulate_exit_policy_multi_symbol_jax is None:
+        if not _TORCH_OK or simulate_exit_policy_multi_symbol_jax is None:
             # Fallback (sequential)
             return [self.compute_exit_policy_metrics_batched(**args) for args in symbols_args]
 
@@ -774,53 +802,42 @@ class MonteCarloExitPolicyMixin:
             # Need to ensure they have the same n_steps
             n_paths_v = symbols_args[0]["price_paths"].shape[0]
             max_horizon_steps_overall = int(math.ceil(float(max_horizon_pts_overall) / float(step_sec)))
-            price_paths_b = jnp.zeros((num_symbols, n_paths_v, max_horizon_steps_overall + 1), dtype=jnp.float32)
+            price_paths_b = np.zeros((num_symbols, n_paths_v, max_horizon_steps_overall + 1), dtype=np.float32)
             for i, args in enumerate(symbols_args):
-                p_paths = args["price_paths"]
-                cur_steps = p_paths.shape[1]
+                p_paths_np = to_numpy(args["price_paths"])
+                cur_steps = p_paths_np.shape[1]
                 steps_to_copy = min(cur_steps, max_horizon_steps_overall + 1)
                 # Pad/slice price_paths to global max_horizon_steps
-                price_paths_b = price_paths_b.at[i, :, :steps_to_copy].set(p_paths[:, :steps_to_copy])
+                price_paths_b[i, :, :steps_to_copy] = np.asarray(p_paths_np[:, :steps_to_copy], dtype=np.float32)
 
-            # JAX Multi-Symbol Kernel Call
-            from engines.mc.jax_backend import _jax_mc_device
-            force_dev = _jax_mc_device()
-            
-            if force_dev:
-                with jax.default_device(force_dev):
-                    res_jax_multi = simulate_exit_policy_multi_symbol_jax(
-                        price_paths_b,
-                        s0_v, mu_ps_v, sigma_ps_v, leverage_v, fee_rt_v, exec_ow_v, impact_v,
-                        decision_dt_sec, step_sec, max_horizon_pts_overall,
-                        side_now_b, horizon_sec_b, min_hold_b, tp_target_b, sl_target_b,
-                        p_pos_floor_enter_v, p_pos_floor_hold_v,
-                        p_sl_enter_ceiling_v, p_sl_hold_ceiling_v, p_sl_emergency_v,
-                        p_tp_floor_enter_v, p_tp_floor_hold_v,
-                        score_margin_v, soft_floor_v,
-                        True, dd_stop_b,
-                        int(self.FLIP_CONFIRM_TICKS), int(self.POLICY_HOLD_BAD_TICKS),
-                        -1.0, float(symbols_args[0].get("cvar_alpha", 0.05))
-                    )
-            else:
-                res_jax_multi = simulate_exit_policy_multi_symbol_jax(
-                    price_paths_b,
-                    s0_v, mu_ps_v, sigma_ps_v, leverage_v, fee_rt_v, exec_ow_v, impact_v,
-                    decision_dt_sec, step_sec, max_horizon_pts_overall,
-                    side_now_b, horizon_sec_b, min_hold_b, tp_target_b, sl_target_b,
-                    p_pos_floor_enter_v, p_pos_floor_hold_v,
-                    p_sl_enter_ceiling_v, p_sl_hold_ceiling_v, p_sl_emergency_v,
-                    p_tp_floor_enter_v, p_tp_floor_hold_v,
-                    score_margin_v, soft_floor_v,
-                    True, dd_stop_b,
-                    int(self.FLIP_CONFIRM_TICKS), int(self.POLICY_HOLD_BAD_TICKS),
-                    -1.0, float(symbols_args[0].get("cvar_alpha", 0.05))
-                )
+            # Torch multi-symbol kernel call
+            res_jax_multi = simulate_exit_policy_multi_symbol_jax(
+                price_paths_b,
+                s0_v, mu_ps_v, sigma_ps_v, leverage_v, fee_rt_v, exec_ow_v, impact_v,
+                decision_dt_sec, step_sec, max_horizon_pts_overall,
+                side_now_b, horizon_sec_b, min_hold_b, tp_target_b, sl_target_b,
+                p_pos_floor_enter_v, p_pos_floor_hold_v,
+                p_sl_enter_ceiling_v, p_sl_hold_ceiling_v, p_sl_emergency_v,
+                p_tp_floor_enter_v, p_tp_floor_hold_v,
+                score_margin_v, soft_floor_v,
+                True, dd_stop_b,
+                int(self.FLIP_CONFIRM_TICKS), int(self.POLICY_HOLD_BAD_TICKS),
+                -1.0, float(symbols_args[0].get("cvar_alpha", 0.05))
+            )
             
             # Transfer all results in one go
-            res_cpu_multi = jax.device_get(res_jax_multi)
+            res_cpu_multi = {k: to_numpy(v) for k, v in res_jax_multi.items()}
             
             final_results = []
-            reason_map = {0: "time_stop", 1: "psl_emergency", 2: "score_flip", 3: "hold_bad", 4: "unrealized_dd"}
+            reason_map = {
+                0: "time_stop",
+                1: "psl_emergency",
+                2: "score_flip",
+                3: "hold_bad",
+                4: "unrealized_dd",
+                5: "tp_hit",
+                6: "sl_hit",
+            }
             
             for i in range(num_symbols):
                 bs = batch_sizes[i]
@@ -841,6 +858,12 @@ class MonteCarloExitPolicyMixin:
                         "exit_reason_counts": counts,
                         "meta": {"policy_horizon_eff_sec": int(symbols_args[i]["batch_horizons"][j])}
                     }
+                    if "p_tp" in res_cpu_multi:
+                        res["p_tp"] = float(res_cpu_multi["p_tp"][i, j])
+                    if "p_sl" in res_cpu_multi:
+                        res["p_sl"] = float(res_cpu_multi["p_sl"][i, j])
+                    if "p_other" in res_cpu_multi:
+                        res["p_other"] = float(res_cpu_multi["p_other"][i, j])
                     sym_res.append(res)
                 final_results.append(sym_res)
             return final_results

@@ -32,7 +32,7 @@
 | `PORT` | 대시보드 서버 포트 (기본: 9999) | — |
 | `SYMBOLS` | 거래 대상 심볼 리스트 (기본 18개) | — |
 | `MC_N_PATHS_LIVE` | 라이브 MC 시뮬레이션 경로 수 (기본: 16384) | — |
-| `MC_N_PATHS_EXIT` | Exit policy MC 경로 수 (기본: 512) | — |
+| `MC_N_PATHS_EXIT` | Exit policy MC 경로 수 (기본: 2048) | — |
 | `ENABLE_LIVE_ORDERS` | 실거래 주문 활성화 여부 | True=실거래, False=페이퍼 |
 | `MAX_LEVERAGE` | 최대 허용 레버리지 (기본: 100) | — |
 | `DEFAULT_LEVERAGE` | 기본 레버리지 (기본: 5) | — |
@@ -138,6 +138,7 @@ DD_STOP_ROE = -0.02  # -2% 미실현 손실 시 강제 청산
 - **권장하지 않음** — 프로덕션 환경에서는 false 사용
 
 **Change Log (selected):**
+- 2026-01-27: PyTorch 기반 MC Exit Policy 배치 경로/TP·SL 경로별 반영 및 n_paths 기본값 복원 — torch 배치 exit policy 추가, TP/SL 경로 히트 반영, `MC_N_PATHS_LIVE=16384`, `MC_N_PATHS_EXIT=2048` 문서 갱신 (`engines/mc/exit_policy_torch.py`, `engines/mc/exit_policy.py`, `engines/exit_policy_methods.py`, `engines/mc/path_simulation.py`, `engines/mc/entry_evaluation.py`, `engines/mc/config.py`, `docs/CODE_MAP_v2.md`).
  - 2026-01-24: JAX 환경 자동 구성 및 BFC 프리워밍 추가 — `engines/mc/jax_backend.py`가 모듈 import 시점에 JAX 관련 환경을 점검하고(`XLA_PYTHON_CLIENT_ALLOCATOR`가 `platform`일 경우 제거), `XLA_PYTHON_CLIENT_MEM_FRACTION`이 설정되지 않은 경우 기본값 `0.65`로 설정하도록 변경되었습니다. 또한 JAX 초기화 직후 BFC allocator를 프리워밍하는 더미 연산을 수행하여 첫 사용 시 latency jitter를 줄입니다. (engines/mc/jax_backend.py)
  - 2026-01-22: Exit Policy 기본값 변경 — `SKIP_EXIT_POLICY=false`를 기본값으로 설정하여 모든 청산 로직이 MC 시뮬레이션에 반영되도록 함 (`engines/mc/entry_evaluation.py`).
 - 2026-01-22: Portfolio Management 통합 — TOP N 선택 + Kelly 배분 + Switching Cost 평가 추가 (`main_engine_mc_v2_final.py`).

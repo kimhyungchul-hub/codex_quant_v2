@@ -8,7 +8,8 @@ from typing import Dict, Sequence
 
 import numpy as np
 
-from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand, DEV_MODE
+from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand
+from engines.mc.torch_backend import _TORCH_OK, torch, DEV_MODE, get_torch_device, to_numpy
 from engines.mc.constants import EPSILON
 from engines.mc.params import JOHNSON_SU_GAMMA, JOHNSON_SU_DELTA
 
@@ -161,6 +162,7 @@ class MonteCarloPathSimulationMixin:
         n_steps: int,
         dt: float,
         return_jax: bool = False,
+        return_torch: bool = False,
         return_stats: bool = False,
     ) -> np.ndarray | jnp.ndarray:
         """
@@ -179,6 +181,8 @@ class MonteCarloPathSimulationMixin:
         br = getattr(self, "_bootstrap_returns", None)
         self._johnson_gamma = gamma
         self._johnson_delta = delta
+        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and not DEV_MODE
+        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and not DEV_MODE
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
         # Mode-aware drift: Gaussian keeps Ito correction, heavy-tail/boot removes it to avoid EV bias
         if mode in ("student_t", "bootstrap", "johnson_su"):
@@ -186,6 +190,87 @@ class MonteCarloPathSimulationMixin:
         else:
             drift = (float(mu) - 0.5 * float(sigma) * float(sigma)) * float(dt)
         diffusion = float(sigma) * math.sqrt(float(dt))
+
+        if use_torch:
+            try:
+                device = get_torch_device()
+                if device is None:
+                    raise RuntimeError("torch device unavailable")
+
+                z = None
+                br_size = int(br.shape[0]) if br is not None else 0
+                bootstrap_ready = mode == "bootstrap" and br is not None and br_size >= 16
+                half_paths = n_paths_i // 2
+                has_odd_path = (n_paths_i % 2) == 1
+
+                if bootstrap_ready:
+                    torch.manual_seed(int(seed) & 0xFFFFFFFF)
+                    z = self._sample_increments_torch(
+                        (n_paths_i, n_steps_i),
+                        mode=mode,
+                        df=df,
+                        bootstrap_returns=br,
+                        gamma=gamma,
+                        delta=delta,
+                        device=device,
+                    )
+                else:
+                    noises = []
+                    if half_paths > 0:
+                        torch.manual_seed(int(seed) & 0xFFFFFFFF)
+                        z_half = self._sample_increments_torch(
+                            (half_paths, n_steps_i),
+                            mode=mode,
+                            df=df,
+                            bootstrap_returns=br,
+                            gamma=gamma,
+                            delta=delta,
+                            device=device,
+                        )
+                        if z_half is not None:
+                            noises.append(z_half)
+                            noises.append(-z_half)
+                    if has_odd_path:
+                        torch.manual_seed((int(seed) + 1) & 0xFFFFFFFF)
+                        z_extra = self._sample_increments_torch(
+                            (1, n_steps_i),
+                            mode=mode,
+                            df=df,
+                            bootstrap_returns=br,
+                            gamma=gamma,
+                            delta=delta,
+                            device=device,
+                        )
+                        if z_extra is not None:
+                            noises.append(z_extra)
+                    if noises:
+                        z = noises[0] if len(noises) == 1 else torch.cat(noises, dim=0)
+
+                if z is None:
+                    raise RuntimeError("torch sampling unavailable")
+
+                logret = torch.cumsum(float(drift) + float(diffusion) * z, dim=1)
+                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                if clip_val > 0:
+                    logret = torch.clamp(logret, -clip_val, clip_val)
+                prices_1 = float(s0) * torch.exp(logret)
+                s0_col = torch.full((n_paths_i, 1), float(s0), device=prices_1.device, dtype=prices_1.dtype)
+                paths_t = torch.cat([s0_col, prices_1], dim=1)
+
+                if return_torch or return_jax:
+                    if return_stats:
+                        stats = self._control_variate_price_stats(to_numpy(paths_t), drift, diffusion)
+                        return paths_t, stats
+                    return paths_t
+
+                paths = to_numpy(paths_t).astype(np.float64)
+                if return_stats:
+                    stats = self._control_variate_price_stats(paths, drift, diffusion)
+                    return paths, stats
+                return paths
+            except Exception as e:
+                logger.warning(f"[MC] Torch path simulation failed, falling back to NumPy: {e}")
+                use_torch = False
 
         if use_jax and _simulate_paths_price_jax_core_jit is not None:
             try:
@@ -197,7 +282,7 @@ class MonteCarloPathSimulationMixin:
                     key, s0, drift, diffusion, n_paths_i, n_steps_i, mode, df, gamma, delta, boot_jnp
                 )
                 
-                if return_jax and not return_stats:
+                if (return_jax or return_torch) and not return_stats:
                     return paths_jnp
 
                 # JAX 배열을 NumPy로 변환 (control variates/검증용)
@@ -205,9 +290,9 @@ class MonteCarloPathSimulationMixin:
                 stats = None
                 if return_stats:
                     stats = self._control_variate_price_stats(paths, drift, diffusion)
-                    if return_jax:
+                    if return_jax or return_torch:
                         return paths_jnp, stats
-                elif return_jax:
+                elif return_jax or return_torch:
                     return paths_jnp
 
                 # Optional verification: check empirical log drift vs target when requested
@@ -300,6 +385,7 @@ class MonteCarloPathSimulationMixin:
         n_paths: int,
         n_steps: int,
         dt: float,
+        return_torch: bool = False,
     ) -> jnp.ndarray:
         """
         GLOBAL BATCHING: 여러 심볼의 가격 경로를 한 번에 생성한다.
@@ -318,9 +404,90 @@ class MonteCarloPathSimulationMixin:
         else:
             drifts = (mus - 0.5 * sigmas * sigmas) * float(dt)
         diffusions = sigmas * math.sqrt(float(dt))
-        
+
+        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and not DEV_MODE
         # ✅ DEV_MODE: JAX 완전 비활성화
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK and not DEV_MODE
+
+        if use_torch:
+            try:
+                device = get_torch_device()
+                if device is None:
+                    raise RuntimeError("torch device unavailable")
+
+                s0s_np = np.asarray(s0s, dtype=np.float32)
+                drifts_np = np.asarray(drifts, dtype=np.float32)
+                diff_np = np.asarray(diffusions, dtype=np.float32)
+
+                br = getattr(self, "_bootstrap_returns", None)
+                bootstrap_ready = mode == "bootstrap" and br is not None and int(br.shape[0]) >= 16
+
+                z_list = []
+                for i in range(num_symbols):
+                    seed_i = int(seeds[i]) & 0xFFFFFFFF
+                    if bootstrap_ready:
+                        torch.manual_seed(seed_i)
+                        z_i = self._sample_increments_torch(
+                            (n_paths_i, n_steps_i),
+                            mode=mode,
+                            df=df,
+                            bootstrap_returns=br,
+                            gamma=None,
+                            delta=None,
+                            device=device,
+                        )
+                    else:
+                        half_paths = n_paths_i // 2
+                        has_odd = (n_paths_i % 2) == 1
+                        noises = []
+                        if half_paths > 0:
+                            torch.manual_seed(seed_i)
+                            z_half = self._sample_increments_torch(
+                                (half_paths, n_steps_i),
+                                mode=mode,
+                                df=df,
+                                bootstrap_returns=br,
+                                gamma=None,
+                                delta=None,
+                                device=device,
+                            )
+                            if z_half is not None:
+                                noises.append(z_half)
+                                noises.append(-z_half)
+                        if has_odd:
+                            torch.manual_seed((seed_i + 1) & 0xFFFFFFFF)
+                            z_extra = self._sample_increments_torch(
+                                (1, n_steps_i),
+                                mode=mode,
+                                df=df,
+                                bootstrap_returns=br,
+                                gamma=None,
+                                delta=None,
+                                device=device,
+                            )
+                            if z_extra is not None:
+                                noises.append(z_extra)
+                        z_i = noises[0] if len(noises) == 1 else torch.cat(noises, dim=0)
+                    if z_i is None:
+                        raise RuntimeError("torch sampling unavailable")
+                    z_list.append(z_i)
+
+                z = torch.stack(z_list, dim=0)
+                drifts_t = torch.tensor(drifts_np, device=device).view(num_symbols, 1, 1)
+                diff_t = torch.tensor(diff_np, device=device).view(num_symbols, 1, 1)
+                logret = torch.cumsum(drifts_t + diff_t * z, dim=2)
+                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                if clip_val > 0:
+                    logret = torch.clamp(logret, -clip_val, clip_val)
+                s0s_t = torch.tensor(s0s_np, device=device).view(num_symbols, 1, 1)
+                prices_1 = s0s_t * torch.exp(logret)
+                paths_t = torch.cat([s0s_t.expand(num_symbols, n_paths_i, 1), prices_1], dim=2)
+                if return_torch:
+                    return paths_t
+                return to_numpy(paths_t)
+            except Exception as e:
+                logger.warning(f"[MC] Torch batch path simulation failed, falling back to NumPy: {e}")
+                use_torch = False
         
         if use_jax and _simulate_paths_price_batch_jax is not None:
             try:
@@ -438,7 +605,34 @@ class MonteCarloPathSimulationMixin:
         use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
 
         prices: np.ndarray
-        if use_jax:
+        if use_torch:
+            try:
+                device = get_torch_device()
+                if device is None:
+                    raise RuntimeError("torch device unavailable")
+                torch.manual_seed(int(seed) & 0xFFFFFFFF)
+                z = self._sample_increments_torch(
+                    (int(n_paths), int(max_steps)),
+                    mode=mode,
+                    df=df,
+                    bootstrap_returns=br,
+                    gamma=gamma,
+                    delta=delta,
+                    device=device,
+                )
+                if z is None:
+                    raise RuntimeError("torch sampling unavailable")
+                logret = torch.cumsum(float(drift) + float(diffusion) * z, dim=1)
+                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                if clip_val > 0:
+                    logret = torch.clamp(logret, -clip_val, clip_val)
+                prices_t = float(s0) * torch.exp(logret)
+                prices = to_numpy(prices_t).astype(np.float64)
+            except Exception as e:
+                logger.warning(f"[MC] Torch path simulation failed, falling back to NumPy: {e}")
+                use_torch = False
+
+        if use_jax and not use_torch:
             try:
                 key = jrand.PRNGKey(int(seed) & 0xFFFFFFFF)  # type: ignore[attr-defined]
                 key, z_j = self._sample_increments_jax(

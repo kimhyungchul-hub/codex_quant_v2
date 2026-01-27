@@ -241,6 +241,31 @@ class GlobalBatchEvaluator:
                 
         return results
 
+    def warmup(self, n_symbols: int, n_paths: int, n_steps: int) -> None:
+        """Warmup allocator with capped sizes to avoid huge allocations."""
+        if not self.torch_ok:
+            return
+        try:
+            # Cap warmup sizes to keep memory bounded
+            cap_symbols = int(max(1, min(n_symbols, 8)))
+            cap_paths = int(max(1, min(n_paths, 2048)))
+            cap_steps = int(max(1, min(n_steps, 256)))
+            dummy_paths = torch.zeros(
+                (cap_symbols, cap_paths, cap_steps + 1),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            horizons = [min(1, cap_steps), min(5, cap_steps), min(30, cap_steps)]
+            leverages = np.ones((cap_symbols,), dtype=np.float32)
+            fees = np.zeros((cap_symbols,), dtype=np.float32)
+            tp_targets = np.zeros((cap_symbols, len(horizons)), dtype=np.float32)
+            sl_targets = np.zeros((cap_symbols, len(horizons)), dtype=np.float32)
+            _ = self.evaluate_batch(
+                dummy_paths, horizons, leverages, fees, tp_targets, sl_targets, cvar_alpha=0.95
+            )
+        except Exception as e:
+            logger.warning(f"[VMAP_TORCH] Warmup failed: {e}")
+
 
 # ============================================================================
 # 레거시 호환성을 위한 래퍼 함수들

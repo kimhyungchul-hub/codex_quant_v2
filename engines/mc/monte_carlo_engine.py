@@ -75,7 +75,7 @@ class MonteCarloEngine(
     POLICY_MULTI_HORIZONS_SEC = (60, 300, 600, 1800, 3600)
     SCORE_MARGIN_DEFAULT = 0.0001
     POLICY_VALUE_SOFT_FLOOR_AFTER_COST = -0.0005
-    N_PATHS_EXIT_POLICY = int(os.environ.get("MC_N_PATHS_EXIT", "2048"))
+    N_PATHS_EXIT_POLICY = int(getattr(config, "n_paths_exit", 2048))
 
     TP_R_BY_H = {15: 0.0002, 30: 0.0003, 60: 0.0005, 120: 0.0008, 180: 0.0012, 300: 0.0015, 600: 0.0030, 1800: 0.0050, 3600: 0.0080}
     SL_R_FIXED = 0.0020

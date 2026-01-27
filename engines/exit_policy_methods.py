@@ -138,6 +138,8 @@ def simulate_exit_policy_rollforward(
     logret = np.log(np.maximum(prices / s0_f, 1e-12))
 
     realized = float(side_now) * float(leverage) * logret
+    # ROE for TP/SL checks (simple return)
+    roe_simple = float(side_now) * float(leverage) * ((prices / s0_f) - 1.0)
 
     flip_streak = np.zeros((n_paths,), dtype=np.int64)
     hold_bad = np.zeros((n_paths,), dtype=np.int64)
@@ -151,6 +153,21 @@ def simulate_exit_policy_rollforward(
     for t in range(0, H, dt_dec):
         age = int(t)
         tau = float(max(0, H - t))
+
+        # ✅ TP/SL per-path hit check (priority exit)
+        tp_hit = (~decided) & (roe_simple[:, t] >= float(tp_target_roe))
+        sl_hit = (~decided) & (~tp_hit) & (roe_simple[:, t] <= -float(sl_target_roe))
+        if np.any(tp_hit):
+            exit_t[tp_hit] = age
+            exit_reason[tp_hit] = "tp_hit"
+            decided[tp_hit] = True
+        if np.any(sl_hit):
+            exit_t[sl_hit] = age
+            exit_reason[sl_hit] = "sl_hit"
+            decided[sl_hit] = True
+
+        if np.all(decided):
+            break
 
         if meta_provider is not None:
             try:
@@ -272,8 +289,8 @@ def simulate_exit_policy_rollforward(
     for r in exit_reason.tolist():
         counts[str(r)] = counts.get(str(r), 0) + 1
 
-    is_tp = net_out > 0.0
-    is_sl = net_out < 0.0
+    is_tp = exit_reason == "tp_hit"
+    is_sl = exit_reason == "sl_hit"
     is_other = ~(is_tp | is_sl)
     n_total = int(n_paths)
     n_tp = int(np.sum(is_tp))
