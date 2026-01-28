@@ -86,6 +86,8 @@ UnifiedScore = max_T Score(a, L, T)
 - 2026-01-28: 대시보드 테이블 재편 (UnifiedScore 중심)
   - 시장/신호 테이블 컬럼을 Ψ 체계로 변경 (Ψ, Ψ_HOLD, T*)
   - 트레이드 테이프에 Exit 키워드 표시
+- 2026-01-28: _row fallback 보강
+  - `unified_score_hold`, `unified_t_star`를 `mc_meta`에서 복원
 
 ## 청산(Exit) 로직 업데이트
 ### 1) MC Exit-Policy (시뮬레이션 기준)

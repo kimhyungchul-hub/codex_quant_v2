@@ -704,6 +704,17 @@ class LiveOrchestrator:
             except Exception:
                 return None
 
+        unified_score = _opt_float(decision.get("unified_score") if decision else None)
+        if unified_score is None:
+            unified_score = _opt_float(meta.get("unified_score"))
+        unified_score_hold = _opt_float(decision.get("unified_score_hold") if decision else None)
+        if unified_score_hold is None:
+            unified_score_hold = _opt_float(meta.get("unified_score_hold"))
+        if unified_score_hold is None:
+            unified_score_hold = _opt_float(mc_meta.get("unified_score_hold") if mc_meta else None)
+        unified_t_star = _opt_float(meta.get("unified_t_star"))
+        if unified_t_star is None:
+            unified_t_star = _opt_float(mc_meta.get("unified_t_star") if mc_meta else None)
         event_p_tp = _opt_float(meta.get("event_p_tp"))
         event_p_timeout = _opt_float(meta.get("event_p_timeout"))
         event_t_median = _opt_float(meta.get("event_t_median"))
@@ -711,6 +722,7 @@ class LiveOrchestrator:
         event_cvar_r = _opt_float(meta.get("event_cvar_r"))
         event_ev_pct = _opt_float(meta.get("event_ev_pct"))
         event_cvar_pct = _opt_float(meta.get("event_cvar_pct"))
+        event_unified_score = _opt_float(meta.get("event_unified_score"))
         horizon_weights = meta.get("horizon_weights")
         ev_by_h = meta.get("ev_by_horizon")
         win_by_h = meta.get("win_by_horizon")
@@ -729,6 +741,9 @@ class LiveOrchestrator:
             "regime": regime,
             "mode": mode,
             "action_type": action_type,
+            "unified_score": unified_score if unified_score is not None else ev,
+            "unified_score_hold": unified_score_hold,
+            "unified_t_star": unified_t_star,
             "candles": candles,
             "event_p_tp": event_p_tp,
             "event_p_timeout": event_p_timeout,
@@ -737,6 +752,7 @@ class LiveOrchestrator:
             "event_cvar_r": event_cvar_r,
             "event_ev_pct": event_ev_pct,
             "event_cvar_pct": event_cvar_pct,
+            "event_unified_score": event_unified_score,
             "horizon_weights": horizon_weights,
             "ev_by_horizon": ev_by_h,
             "win_by_horizon": win_by_h,
