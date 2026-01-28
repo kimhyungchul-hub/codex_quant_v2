@@ -119,8 +119,9 @@ class MonteCarloExecutionCostsMixin:
         lev_term = 1.0 + 0.1 * math.log(1.0 + abs(leverage))
         adv_k = 1.0 + 0.6 * min(2.0, max(0.0, ofi_z_abs))
         slip = base * vol_term * liq_term * lev_term * adv_k
-        slip_mult = float(os.environ.get("SLIPPAGE_MULT", "0.3"))
-        slip_cap = float(os.environ.get("SLIPPAGE_CAP", "0.0003"))
+        from engines.mc.config import config as mc_config
+        slip_mult = float(getattr(mc_config, "slippage_mult", 0.3))
+        slip_cap = float(getattr(mc_config, "slippage_cap", 0.0003))
         slip = max(0.0, float(slip) * slip_mult)
         if slip_cap > 0:
             slip = min(slip, slip_cap)
@@ -132,7 +133,8 @@ class MonteCarloExecutionCostsMixin:
         - 기본: 유동성↑, 스프레드↓, OFI extreme↓일수록 maker 성공 확률↑
         - 너무 과도한 낙관을 막기 위해 [0.05, 0.95]로 클립
         """
-        fixed = os.environ.get("P_MAKER_FIXED")
+        from engines.mc.config import config as mc_config
+        fixed = getattr(mc_config, "p_maker_fixed", None)
         if fixed is not None and str(fixed).strip() != "":
             try:
                 return float(np.clip(float(fixed), 0.0, 1.0))

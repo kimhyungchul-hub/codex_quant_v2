@@ -14,11 +14,11 @@ from engines.mc_risk import kelly_with_cvar
 from utils.helpers import now_ms
 from core.economic_brain import EconomicBrain
 
-# ✅ GPU-Accelerated Leverage Optimization
+# ✅ GPU-Accelerated Leverage Optimization (PyTorch)
 try:
-    from engines.mc.leverage_optimizer_jax import find_optimal_leverage
+    from engines.mc.leverage_optimizer_torch import find_optimal_leverage
     USE_GPU_LEVERAGE_OPT = True
-except ImportError:
+except Exception:
     USE_GPU_LEVERAGE_OPT = False
 
 logger = logging.getLogger(__name__)
@@ -354,9 +354,11 @@ class MonteCarloDecisionMixin:
         return res
 
     def _get_params(self, regime: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        use_torch_default = str(os.environ.get("MC_USE_TORCH", "1")).strip().lower() in ("1", "true", "yes", "on")
         params = {
             "n_paths": int(ctx.get("n_paths", config.n_paths_live)),
-            "use_jax": bool(ctx.get("use_jax", True)),
+            "use_torch": bool(ctx.get("use_torch", ctx.get("use_jax", use_torch_default))),
+            "use_jax": False,
             "tail_mode": str(ctx.get("tail_mode", "student_t")),
             "student_t_df": float(ctx.get("student_t_df", 3.0)),
         }
@@ -390,11 +392,57 @@ class MonteCarloDecisionMixin:
         if not tasks:
             return [{"ok": False, "reason": "ALL_FILTERED"} for _ in ctx_list]
             
-        # 2. Call Batch Evaluation (The Global JAX Vmap!)
+        # 2. Call Batch Evaluation (Multi-fidelity optional)
         import time
         t_eval_start = time.perf_counter()
         print(f"[DECIDE_BATCH] evaluate_entry_metrics_batch START num_tasks={len(tasks)}")
-        batch_metrics = self.evaluate_entry_metrics_batch(tasks)
+
+        mf_enabled = str(os.environ.get("MC_MULTI_FIDELITY_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        if mf_enabled:
+            n_paths_stage1 = int(os.environ.get("MC_N_PATHS_STAGE1", max(512, int(config.n_paths_live // 4))))
+            n_paths_stage2 = int(os.environ.get("MC_N_PATHS_STAGE2", int(config.n_paths_live)))
+            mf_topk = int(os.environ.get("MC_MULTI_FIDELITY_TOPK", 8))
+            mf_score_min = float(os.environ.get("MC_MULTI_FIDELITY_SCORE_MIN", 0.0))
+
+            stage1_metrics = self.evaluate_entry_metrics_batch(tasks, n_paths_override=n_paths_stage1)
+            for m in stage1_metrics:
+                try:
+                    m_meta = m.get("meta", {})
+                    m_meta["mf_stage"] = 1
+                    m_meta["mf_n_paths"] = int(n_paths_stage1)
+                    m["meta"] = m_meta
+                except Exception:
+                    pass
+
+            # Select candidates for stage2
+            scored = []
+            for i, m in enumerate(stage1_metrics):
+                score_val = float(m.get("unified_score", m.get("ev", 0.0)) or 0.0)
+                if score_val >= mf_score_min:
+                    scored.append((i, score_val))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            if mf_topk > 0:
+                scored = scored[: mf_topk]
+            idxs_stage2 = [i for i, _ in scored]
+
+            if idxs_stage2:
+                tasks_stage2 = [tasks[i] for i in idxs_stage2]
+                stage2_metrics = self.evaluate_entry_metrics_batch(tasks_stage2, n_paths_override=n_paths_stage2)
+                for j, i in enumerate(idxs_stage2):
+                    m2 = stage2_metrics[j]
+                    try:
+                        m_meta = m2.get("meta", {})
+                        m_meta["mf_stage"] = 2
+                        m_meta["mf_n_paths"] = int(n_paths_stage2)
+                        m2["meta"] = m_meta
+                    except Exception:
+                        pass
+                    stage1_metrics[i] = m2
+
+            batch_metrics = stage1_metrics
+        else:
+            batch_metrics = self.evaluate_entry_metrics_batch(tasks)
+
         t_eval_end = time.perf_counter()
         print(f"[DECIDE_BATCH] evaluate_entry_metrics_batch END elapsed={(t_eval_end-t_eval_start):.3f}s")
         

@@ -5,8 +5,10 @@ from dataclasses import dataclass
 
 
 # Johnson SU shape parameters (skew/kurtosis) with env overrides
-JOHNSON_SU_GAMMA = float(os.environ.get("MC_JOHNSON_SU_GAMMA", "0.0"))
-JOHNSON_SU_DELTA = float(os.environ.get("MC_JOHNSON_SU_DELTA", "1.0"))
+from engines.mc.config import config as mc_config
+
+JOHNSON_SU_GAMMA = float(getattr(mc_config, "johnson_su_gamma", 0.0))
+JOHNSON_SU_DELTA = float(getattr(mc_config, "johnson_su_delta", 1.0))
 
 
 @dataclass

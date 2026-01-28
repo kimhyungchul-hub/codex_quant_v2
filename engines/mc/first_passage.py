@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from engines.cvar_methods import cvar_ensemble
-from engines.mc.jax_backend import _JAX_OK, _jax_mc_device, jax, jnp, jrand
+from engines.mc.torch_backend import _TORCH_OK, torch, get_torch_device, to_numpy
 
 
 class MonteCarloFirstPassageMixin:
@@ -24,6 +24,7 @@ class MonteCarloFirstPassageMixin:
         timeout_mode: str = "flat",
         seed: Optional[int] = None,
         side: str = "LONG",
+        dist_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         tp_pct = float(tp_pct)
         sl_pct = float(sl_pct)
@@ -51,62 +52,37 @@ class MonteCarloFirstPassageMixin:
         drift = direction * (mu - 0.5 * sigma * sigma) * dt
         diffusion = sigma * math.sqrt(dt)
 
-        mode = str(getattr(self, "_tail_mode", self.default_tail_mode))
+        mode = str(dist_override or getattr(self, "_tail_mode", self.default_tail_mode))
         df = float(getattr(self, "_student_t_df", self.default_student_t_df))
         br = getattr(self, "_bootstrap_returns", None)
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK
 
         prices_np: np.ndarray
         bridge_tp_np: Optional[np.ndarray] = None
         bridge_sl_np: Optional[np.ndarray] = None
-        log_prices_j = None
-        if use_jax:
-            # ✅ GPU 우선: default backend (GPU/Metal) 사용
-            force_cpu_dev = _jax_mc_device()
+        if use_torch:
             try:
-                if force_cpu_dev is None:
-                    # GPU/Metal default backend 사용
-                    key = jrand.PRNGKey(int(seed or 0) & 0xFFFFFFFF)  # type: ignore[attr-defined]
-                    key, z_j = self._sample_increments_jax(
-                        key,
-                        (int(n_paths), int(max_steps)),
-                        mode=mode,
-                        df=df,
-                        bootstrap_returns=br,
-                    )
-                    if z_j is None:
-                        use_jax = False
-                    else:
-                        z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
-                        logret_j = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
-                        log_prices_j = direction * logret_j + math.log(s0)
-                        prices_j = jnp.exp(log_prices_j)  # type: ignore[attr-defined]
-                        prices_np = np.asarray(jax.device_get(prices_j), dtype=np.float64)  # type: ignore[attr-defined]
-                else:
-                    # CPU로 강제된 경우만 CPU 사용 (env JAX_MC_DEVICE=cpu)
-                    with jax.default_device(force_cpu_dev):  # type: ignore[attr-defined]
-                        key = jrand.PRNGKey(int(seed or 0) & 0xFFFFFFFF)  # type: ignore[attr-defined]
-                        key, z_j = self._sample_increments_jax(
-                            key,
-                            (int(n_paths), int(max_steps)),
-                            mode=mode,
-                            df=df,
-                            bootstrap_returns=br,
-                        )
-                        if z_j is None:
-                            use_jax = False
-                        else:
-                            z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
-                            logret_j = jnp.cumsum((drift + diffusion * z_j), axis=1)  # type: ignore[attr-defined]
-                            log_prices_j = direction * logret_j + math.log(s0)
-                            prices_j = jnp.exp(log_prices_j)  # type: ignore[attr-defined]
-                            prices_np = np.asarray(jax.device_get(prices_j), dtype=np.float64)  # type: ignore[attr-defined]
+                device = get_torch_device()
+                if device is None:
+                    raise RuntimeError("torch device unavailable")
+                torch.manual_seed(int(seed or 0) & 0xFFFFFFFF)
+                z_t = self._sample_increments_torch(
+                    (int(n_paths), int(max_steps)),
+                    mode=mode,
+                    df=df,
+                    bootstrap_returns=br,
+                    device=device,
+                )
+                if z_t is None:
+                    raise RuntimeError("torch sampling unavailable")
+                logret_t = torch.cumsum((float(drift) + float(diffusion) * z_t), dim=1)
+                log_prices_t = float(direction) * logret_t + math.log(float(s0))
+                prices_t = torch.exp(log_prices_t)
+                prices_np = to_numpy(prices_t).astype(np.float64)
             except Exception:
-                # Any JAX/XLA backend failure -> fall back to NumPy path simulation
-                use_jax = False
+                use_torch = False
 
-
-        if not use_jax:
+        if not use_torch:
             z = self._sample_increments_np(rng, (n_paths, max_steps), mode=mode, df=df, bootstrap_returns=br)
             steps = drift + diffusion * z
             log_prices = np.cumsum(steps, axis=1) + math.log(s0)
@@ -122,42 +98,6 @@ class MonteCarloFirstPassageMixin:
         # Brownian Bridge 보정: intra-step 배리어 터치 확률을 보완
         sigma_sq_dt = sigma * sigma * dt
         if sigma_sq_dt > 0.0:
-            if use_jax and log_prices_j is not None:
-                log_prices_full_j = jnp.concatenate(  # type: ignore[attr-defined]
-                    (
-                        jnp.full((n_paths, 1), math.log(s0), dtype=log_prices_j.dtype),  # type: ignore[attr-defined]
-                        log_prices_j,
-                    ),
-                    axis=1,
-                )
-                prev_j = log_prices_full_j[:, :-1]
-                nxt_j = log_prices_full_j[:, 1:]
-
-                log_tp_j = jnp.array(math.log(tp_level), dtype=log_prices_j.dtype)  # type: ignore[attr-defined]
-                below_tp_j = (prev_j < log_tp_j) & (nxt_j < log_tp_j)
-                sigma_sq_dt_j = jnp.array(sigma_sq_dt, dtype=log_prices_j.dtype)  # type: ignore[attr-defined]
-                prob_tp_j = jnp.where(
-                    below_tp_j,
-                    jnp.exp(-2.0 * (log_tp_j - prev_j) * (log_tp_j - nxt_j) / sigma_sq_dt_j),  # type: ignore[attr-defined]
-                    0.0,
-                )
-                key, key_tp = jrand.split(key)  # type: ignore[attr-defined]
-                bridge_tp_np = np.asarray(
-                    jax.device_get(jrand.uniform(key_tp, prob_tp_j.shape) < prob_tp_j), dtype=bool  # type: ignore[attr-defined]
-                )
-
-                log_sl_j = jnp.array(math.log(sl_level), dtype=log_prices_j.dtype)  # type: ignore[attr-defined]
-                above_sl_j = (prev_j > log_sl_j) & (nxt_j > log_sl_j)
-                prob_sl_j = jnp.where(
-                    above_sl_j,
-                    jnp.exp(-2.0 * (prev_j - log_sl_j) * (nxt_j - log_sl_j) / sigma_sq_dt_j),  # type: ignore[attr-defined]
-                    0.0,
-                )
-                key, key_sl = jrand.split(key)  # type: ignore[attr-defined]
-                bridge_sl_np = np.asarray(
-                    jax.device_get(jrand.uniform(key_sl, prob_sl_j.shape) < prob_sl_j), dtype=bool  # type: ignore[attr-defined]
-                )
-
             if bridge_tp_np is None or bridge_sl_np is None:
                 log_prices = np.log(prices_np)
                 log_prices_full = np.concatenate(

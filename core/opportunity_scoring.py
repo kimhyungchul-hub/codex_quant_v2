@@ -197,7 +197,11 @@ def extract_ev_by_horizon_from_meta(mc_meta: Dict) -> Optional[Dict[int, float]]
 
     # Priority 4: individual policy_ev_h_{horizon} keys
     ev_dict = {}
-    common_horizons = [300, 600, 1200, 1800, 3600]  # Common MC horizons
+    try:
+        from engines.mc.constants import STATIC_HORIZONS
+        common_horizons = [int(h) for h in STATIC_HORIZONS] if STATIC_HORIZONS else [300, 600, 1200, 1800, 3600]
+    except Exception:
+        common_horizons = [300, 600, 1200, 1800, 3600]  # Common MC horizons
     
     for h in common_horizons:
         key = f"policy_ev_h_{h}"

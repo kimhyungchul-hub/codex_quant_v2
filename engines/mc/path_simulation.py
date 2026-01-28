@@ -2,12 +2,13 @@ from __future__ import annotations
 
 # Implemented Antithetic Variates for variance reduction
 import logging
-import os
 import math
+import os
 from typing import Dict, Sequence
 
 import numpy as np
 
+from engines.mc.config import config as mc_config
 from engines.mc.jax_backend import _JAX_OK, jax, jnp, jrand
 from engines.mc.torch_backend import _TORCH_OK, torch, DEV_MODE, get_torch_device, to_numpy
 from engines.mc.constants import EPSILON
@@ -181,9 +182,9 @@ class MonteCarloPathSimulationMixin:
         br = getattr(self, "_bootstrap_returns", None)
         self._johnson_gamma = gamma
         self._johnson_delta = delta
-        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and not DEV_MODE
-        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and not DEV_MODE
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK and not DEV_MODE
+        use_antithetic = str(os.environ.get("MC_USE_ANTITHETIC", "1")).strip().lower() in ("1", "true", "yes", "on")
+        use_jax = False
         # Mode-aware drift: Gaussian keeps Ito correction, heavy-tail/boot removes it to avoid EV bias
         if mode in ("student_t", "bootstrap", "johnson_su"):
             drift = float(mu) * float(dt)
@@ -203,7 +204,7 @@ class MonteCarloPathSimulationMixin:
                 half_paths = n_paths_i // 2
                 has_odd_path = (n_paths_i % 2) == 1
 
-                if bootstrap_ready:
+                if bootstrap_ready or not use_antithetic:
                     torch.manual_seed(int(seed) & 0xFFFFFFFF)
                     z = self._sample_increments_torch(
                         (n_paths_i, n_steps_i),
@@ -250,7 +251,7 @@ class MonteCarloPathSimulationMixin:
                     raise RuntimeError("torch sampling unavailable")
 
                 logret = torch.cumsum(float(drift) + float(diffusion) * z, dim=1)
-                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                clip_val = float(getattr(mc_config, "logret_clip", 12.0))
                 if clip_val > 0:
                     logret = torch.clamp(logret, -clip_val, clip_val)
                 prices_1 = float(s0) * torch.exp(logret)
@@ -296,7 +297,7 @@ class MonteCarloPathSimulationMixin:
                     return paths_jnp
 
                 # Optional verification: check empirical log drift vs target when requested
-                if os.environ.get("MC_VERIFY_DRIFT"):
+                if bool(getattr(mc_config, "verify_drift", False)):
                     horizon = max(n_steps_i, 1) * float(dt)
                     empirical_log_mu = float(
                         np.mean(np.log(paths[:, -1] / float(s0)))
@@ -363,7 +364,7 @@ class MonteCarloPathSimulationMixin:
             stats = self._control_variate_price_stats(paths, drift, diffusion)
             return paths, stats
 
-        if os.environ.get("MC_VERIFY_DRIFT"):
+        if bool(getattr(mc_config, "verify_drift", False)):
             horizon = max(n_steps_i, 1) * float(dt)
             empirical_log_mu = float(np.mean(np.log(paths[:, -1] / float(s0)))) / horizon
             target_log_mu = float(mu) if mode in ("student_t", "bootstrap", "johnson_su") else (
@@ -405,9 +406,9 @@ class MonteCarloPathSimulationMixin:
             drifts = (mus - 0.5 * sigmas * sigmas) * float(dt)
         diffusions = sigmas * math.sqrt(float(dt))
 
-        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and not DEV_MODE
-        # ✅ DEV_MODE: JAX 완전 비활성화
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK and not DEV_MODE
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK and not DEV_MODE
+        use_antithetic = str(os.environ.get("MC_USE_ANTITHETIC", "1")).strip().lower() in ("1", "true", "yes", "on")
+        use_jax = False
 
         if use_torch:
             try:
@@ -425,7 +426,7 @@ class MonteCarloPathSimulationMixin:
                 z_list = []
                 for i in range(num_symbols):
                     seed_i = int(seeds[i]) & 0xFFFFFFFF
-                    if bootstrap_ready:
+                    if bootstrap_ready or not use_antithetic:
                         torch.manual_seed(seed_i)
                         z_i = self._sample_increments_torch(
                             (n_paths_i, n_steps_i),
@@ -476,7 +477,7 @@ class MonteCarloPathSimulationMixin:
                 drifts_t = torch.tensor(drifts_np, device=device).view(num_symbols, 1, 1)
                 diff_t = torch.tensor(diff_np, device=device).view(num_symbols, 1, 1)
                 logret = torch.cumsum(drifts_t + diff_t * z, dim=2)
-                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                clip_val = float(getattr(mc_config, "logret_clip", 12.0))
                 if clip_val > 0:
                     logret = torch.clamp(logret, -clip_val, clip_val)
                 s0s_t = torch.tensor(s0s_np, device=device).view(num_symbols, 1, 1)
@@ -509,7 +510,7 @@ class MonteCarloPathSimulationMixin:
 
                 # CPU pre-cumsum (Metal mhlo.pad 회피) + GPU exp
                 logret_np = np.cumsum(drifts_np + diffusions_np * z_np, axis=2, dtype=np.float64)
-                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                clip_val = float(getattr(mc_config, "logret_clip", 12.0))
                 if not np.isfinite(logret_np).all() or np.any(np.abs(logret_np) > clip_val):
                     logger.warning(
                         "[MC] logret overflow/NaN detected in batch; applying clip "
@@ -528,29 +529,66 @@ class MonteCarloPathSimulationMixin:
                 logger.warning(f"[MC] JAX batch path simulation failed, falling back to NumPy: {e}")
                 use_jax = False
         
-        # NumPy fallback for DEV_MODE or when JAX is unavailable
+        # NumPy fallback
         paths_all = np.empty((num_symbols, n_paths_i, n_steps_i + 1), dtype=np.float64)
         for i in range(num_symbols):
             rng = np.random.default_rng(int(seeds[i]) & 0xFFFFFFFF)
             
             if mode == "bootstrap" and br is not None and len(br) > 0:
-                # Bootstrap sampling
+                # Bootstrap sampling (no antithetic)
                 idxs = rng.integers(0, len(br), size=(n_paths_i, n_steps_i))
                 innovations = br[idxs]
-            elif mode == "student_t" and df > 0:
-                # Student-t distribution
-                innovations = rng.standard_t(df, size=(n_paths_i, n_steps_i))
-            elif mode == "johnson_su":
-                innovations = self._sample_increments_np(
-                    rng,
-                    (n_paths_i, n_steps_i),
-                    mode=mode,
-                    df=df,
-                    bootstrap_returns=br,
-                )
             else:
-                # Normal distribution
-                innovations = rng.standard_normal(size=(n_paths_i, n_steps_i))
+                # Antithetic variates for variance reduction (non-bootstrap only)
+                if use_antithetic and n_paths_i > 1:
+                    half_paths = n_paths_i // 2
+                    has_odd = (n_paths_i % 2) == 1
+                    noises = []
+                    if half_paths > 0:
+                        if mode == "student_t" and df > 0:
+                            z_half = rng.standard_t(df, size=(half_paths, n_steps_i))
+                        elif mode == "johnson_su":
+                            z_half = self._sample_increments_np(
+                                rng,
+                                (half_paths, n_steps_i),
+                                mode=mode,
+                                df=df,
+                                bootstrap_returns=br,
+                            )
+                        else:
+                            z_half = rng.standard_normal(size=(half_paths, n_steps_i))
+                        noises.append(z_half)
+                        noises.append(-z_half)
+                    if has_odd:
+                        if mode == "student_t" and df > 0:
+                            z_extra = rng.standard_t(df, size=(1, n_steps_i))
+                        elif mode == "johnson_su":
+                            z_extra = self._sample_increments_np(
+                                rng,
+                                (1, n_steps_i),
+                                mode=mode,
+                                df=df,
+                                bootstrap_returns=br,
+                            )
+                        else:
+                            z_extra = rng.standard_normal(size=(1, n_steps_i))
+                        noises.append(z_extra)
+                    innovations = np.concatenate(noises, axis=0) if noises else rng.standard_normal(size=(n_paths_i, n_steps_i))
+                    if innovations.shape[0] > n_paths_i:
+                        innovations = innovations[:n_paths_i]
+                else:
+                    if mode == "student_t" and df > 0:
+                        innovations = rng.standard_t(df, size=(n_paths_i, n_steps_i))
+                    elif mode == "johnson_su":
+                        innovations = self._sample_increments_np(
+                            rng,
+                            (n_paths_i, n_steps_i),
+                            mode=mode,
+                            df=df,
+                            bootstrap_returns=br,
+                        )
+                    else:
+                        innovations = rng.standard_normal(size=(n_paths_i, n_steps_i))
             
             # GBM path construction
             log_returns = drifts[i] + diffusions[i] * innovations
@@ -602,7 +640,8 @@ class MonteCarloPathSimulationMixin:
         else:
             drift = (mu - 0.5 * sigma * sigma) * dt
         diffusion = sigma * math.sqrt(dt)
-        use_jax = bool(getattr(self, "_use_jax", True)) and _JAX_OK
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK
+        use_jax = False
 
         prices: np.ndarray
         if use_torch:
@@ -623,7 +662,7 @@ class MonteCarloPathSimulationMixin:
                 if z is None:
                     raise RuntimeError("torch sampling unavailable")
                 logret = torch.cumsum(float(drift) + float(diffusion) * z, dim=1)
-                clip_val = float(os.environ.get("MC_LOGRET_CLIP", "12.0"))
+                clip_val = float(getattr(mc_config, "logret_clip", 12.0))
                 if clip_val > 0:
                     logret = torch.clamp(logret, -clip_val, clip_val)
                 prices_t = float(s0) * torch.exp(logret)
@@ -632,48 +671,49 @@ class MonteCarloPathSimulationMixin:
                 logger.warning(f"[MC] Torch path simulation failed, falling back to NumPy: {e}")
                 use_torch = False
 
-        if use_jax and not use_torch:
-            try:
-                key = jrand.PRNGKey(int(seed) & 0xFFFFFFFF)  # type: ignore[attr-defined]
-                key, z_j = self._sample_increments_jax(
-                    key,
+        if not use_jax:
+            rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+            use_antithetic = str(os.environ.get("MC_USE_ANTITHETIC", "1")).strip().lower() in ("1", "true", "yes", "on")
+            if use_antithetic and int(n_paths) > 1:
+                half_paths = int(n_paths) // 2
+                has_odd = (int(n_paths) % 2) == 1
+                noises = []
+                if half_paths > 0:
+                    z_half = self._sample_increments_np(
+                        rng,
+                        (half_paths, int(max_steps)),
+                        mode=mode,
+                        df=df,
+                        bootstrap_returns=br,
+                    )
+                    noises.append(z_half)
+                    noises.append(-z_half)
+                if has_odd:
+                    z_extra = self._sample_increments_np(
+                        rng,
+                        (1, int(max_steps)),
+                        mode=mode,
+                        df=df,
+                        bootstrap_returns=br,
+                    )
+                    noises.append(z_extra)
+                z = np.concatenate(noises, axis=0) if noises else self._sample_increments_np(
+                    rng,
                     (int(n_paths), int(max_steps)),
                     mode=mode,
                     df=df,
-                    gamma=gamma,
-                    delta=delta,
                     bootstrap_returns=br,
                 )
-
-                if z_j is None:
-                    use_jax = False
-                else:
-                    z_j = z_j.astype(jnp.float32)  # type: ignore[attr-defined]
-                    drift_f = jnp.asarray(drift, dtype=jnp.float32)  # type: ignore[attr-defined]
-                    diffusion_f = jnp.asarray(diffusion, dtype=jnp.float32)  # type: ignore[attr-defined]
-                    increments = drift_f + diffusion_f * z_j  # type: ignore[attr-defined]
-                    def _row_cumsum(row):
-                        def _scan(carry, x):
-                            nxt = carry + x
-                            return nxt, nxt
-                        _, out = jax.lax.scan(_scan, 0.0, row)  # type: ignore[attr-defined]
-                        return out
-                    logret = jax.vmap(_row_cumsum)(increments)  # type: ignore[attr-defined]
-                    prices_jnp = float(s0) * jnp.exp(logret)  # type: ignore[attr-defined]
-                    prices = np.asarray(jax.device_get(prices_jnp), dtype=np.float64)  # type: ignore[attr-defined]
-            except Exception as e:
-                logger.warning(f"[MC] JAX path simulation failed, falling back to NumPy: {e}")
-                use_jax = False
-
-        if not use_jax:
-            rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
-            z = self._sample_increments_np(
-                rng,
-                (int(n_paths), int(max_steps)),
-                mode=mode,
-                df=df,
-                bootstrap_returns=br,
-            )
+                if z.shape[0] > int(n_paths):
+                    z = z[: int(n_paths)]
+            else:
+                z = self._sample_increments_np(
+                    rng,
+                    (int(n_paths), int(max_steps)),
+                    mode=mode,
+                    df=df,
+                    bootstrap_returns=br,
+                )
             logret = np.cumsum(drift + diffusion * z, axis=1)
             prices = s0 * np.exp(logret)
 

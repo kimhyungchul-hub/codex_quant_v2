@@ -2,7 +2,7 @@
 import bootstrap  # ensure environment vars are set before any imports
 import math
 import time
-import os
+import config
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -109,7 +109,7 @@ class MonteCarloEngine(BaseEngine):
         self.dt = 1.0 / 31536000.0  # seconds/year
         # Bybit maker round-trip(0.01% * 2) 기준, 레버리지와 무관한 고정 비용
         # USE_MAKER_ORDERS=true일 때 0.0002, 아니면 0.0012
-        _use_maker = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
+        _use_maker = bool(getattr(config, "USE_MAKER_ORDERS", True))
         self.fee_roundtrip_base = 0.0002 if _use_maker else 0.0012
         self.slippage_perc = 0.0001 if _use_maker else 0.0003  # 지정가는 슬리피지 거의 없음
         # tail mode defaults

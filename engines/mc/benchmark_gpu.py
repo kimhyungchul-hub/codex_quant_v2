@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import time
 import numpy as np
-from engines.mc.jax_backend import ensure_jax, jax, jnp
-from engines.mc.exit_policy_jax import simulate_exit_policy_rollforward_jax
+
+from engines.mc.torch_backend import _TORCH_OK, torch
+from engines.mc.exit_policy_torch import simulate_exit_policy_rollforward_batched_vmap_torch
 from engines.exit_policy_methods import simulate_exit_policy_rollforward
 
-# Configure JAX to use Metal backend
-jax.config.update('jax_platform_name', 'METAL')
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
 
 def benchmark():
+    if not _TORCH_OK or torch is None:
+        raise RuntimeError("PyTorch not available for GPU benchmark")
+
     # Parameters
     n_paths = 2048
     h_pts = 301
@@ -24,41 +25,38 @@ def benchmark():
     decision_dt_sec = 5
     horizon_sec = 300
     min_hold_sec = 10
-    
-    # Generate prices
+
     rng = np.random.default_rng(42)
-    price_paths = s0 * np.exp(np.cumsum(rng.normal(0, sigma_ps, (n_paths, h_pts-1)), axis=1))
+    price_paths = s0 * np.exp(np.cumsum(rng.normal(0, sigma_ps, (n_paths, h_pts - 1)), axis=1))
     price_paths = np.column_stack([np.full(n_paths, s0), price_paths])
-    
+
     print(f"Benchmarking with {n_paths} paths, {h_pts} steps...")
 
-    # Ensure JAX is available and configure
-    ensure_jax()
-    if jax is None:
-        raise RuntimeError("JAX not available for GPU benchmark")
-    jax.config.update('jax_platform_name', 'METAL')
-    jax.config.update("jax_compilation_cache_dir", "/tmp/jax_cache")
-
-    # JAX - Warmup
-    print("Warming up JAX...")
-    _ = simulate_exit_policy_rollforward_jax(
-        price_paths=jnp.asarray(price_paths, dtype=jnp.float32),
+    # Torch warmup
+    print("Warming up Torch...")
+    _ = simulate_exit_policy_rollforward_batched_vmap_torch(
+        price_paths=price_paths,
         s0=s0, mu_ps=mu_ps, sigma_ps=sigma_ps, leverage=leverage,
         fee_roundtrip=fee_roundtrip, exec_oneway=exec_oneway, impact_cost=impact_cost,
-        step_sec=1,
-        decision_dt_sec=decision_dt_sec, horizon_sec=horizon_sec, min_hold_sec=min_hold_sec,
-        flip_confirm_ticks=2, hold_bad_ticks=2,
+        decision_dt_sec=decision_dt_sec, step_sec=1, max_horizon_sec=horizon_sec,
+        side_now_batch=np.array([1], dtype=np.int32),
+        horizon_sec_batch=np.array([horizon_sec], dtype=np.int32),
+        min_hold_sec_batch=np.array([min_hold_sec], dtype=np.int32),
+        tp_target_roe_batch=np.array([0.003], dtype=np.float32),
+        sl_target_roe_batch=np.array([0.003], dtype=np.float32),
         p_pos_floor_enter=0.52, p_pos_floor_hold=0.5,
         p_sl_enter_ceiling=0.2, p_sl_hold_ceiling=0.25,
         p_sl_emergency=0.38, p_tp_floor_enter=0.15, p_tp_floor_hold=0.12,
         score_margin=0.0001, soft_floor=-0.0005,
-        side_now=1, enable_dd_stop=True, dd_stop_roe=-0.02
+        enable_dd_stop=True, dd_stop_roe_batch=np.array([-0.02], dtype=np.float32),
+        flip_confirm_ticks=2, hold_bad_ticks=2,
+        cvar_alpha=0.05, unified_lambda=1.0, unified_rho=0.0,
     )
-    
+
     # CPU Benchmark
     print("Running CPU Benchmark...")
     start_cpu = time.time()
-    res_cpu = simulate_exit_policy_rollforward(
+    _ = simulate_exit_policy_rollforward(
         price_paths=price_paths,
         s0=s0, mu=mu_ps, sigma=sigma_ps, leverage=leverage,
         fee_roundtrip=fee_roundtrip, exec_oneway=exec_oneway, impact_cost=impact_cost,
@@ -68,36 +66,31 @@ def benchmark():
     )
     end_cpu = time.time()
     print(f"CPU Time: {end_cpu - start_cpu:.4f}s")
-    
-    # GPU Benchmark
-    print("Running GPU Benchmark...")
+
+    # Torch Benchmark
+    print("Running Torch Benchmark...")
     start_gpu = time.time()
-    res_gpu = simulate_exit_policy_rollforward_jax(
-        price_paths=jnp.asarray(price_paths, dtype=jnp.float32),
+    _ = simulate_exit_policy_rollforward_batched_vmap_torch(
+        price_paths=price_paths,
         s0=s0, mu_ps=mu_ps, sigma_ps=sigma_ps, leverage=leverage,
         fee_roundtrip=fee_roundtrip, exec_oneway=exec_oneway, impact_cost=impact_cost,
-        step_sec=1,
-        decision_dt_sec=decision_dt_sec, horizon_sec=horizon_sec, min_hold_sec=min_hold_sec,
-        flip_confirm_ticks=2, hold_bad_ticks=2,
+        decision_dt_sec=decision_dt_sec, step_sec=1, max_horizon_sec=horizon_sec,
+        side_now_batch=np.array([1], dtype=np.int32),
+        horizon_sec_batch=np.array([horizon_sec], dtype=np.int32),
+        min_hold_sec_batch=np.array([min_hold_sec], dtype=np.int32),
+        tp_target_roe_batch=np.array([0.003], dtype=np.float32),
+        sl_target_roe_batch=np.array([0.003], dtype=np.float32),
         p_pos_floor_enter=0.52, p_pos_floor_hold=0.5,
         p_sl_enter_ceiling=0.2, p_sl_hold_ceiling=0.25,
         p_sl_emergency=0.38, p_tp_floor_enter=0.15, p_tp_floor_hold=0.12,
         score_margin=0.0001, soft_floor=-0.0005,
-        side_now=1, enable_dd_stop=True, dd_stop_roe=-0.02
+        enable_dd_stop=True, dd_stop_roe_batch=np.array([-0.02], dtype=np.float32),
+        flip_confirm_ticks=2, hold_bad_ticks=2,
+        cvar_alpha=0.05, unified_lambda=1.0, unified_rho=0.0,
     )
-    # Ensure completion
-    _ = res_gpu["ev_exit"].block_until_ready()
     end_gpu = time.time()
-    print(f"GPU Time: {end_gpu - start_gpu:.4f}s")
-    
-    print("\nResults Comparison:")
-    print(f"CPU EV: {res_cpu['ev_exit']:.6f}")
-    print(f"GPU EV: {res_gpu['ev_exit']:.6f}")
-    print(f"CPU p_pos: {res_cpu['p_pos_exit']:.4f}")
-    print(f"GPU p_pos: {res_gpu['p_pos_exit']:.4f}")
-    
-    speedup = (end_cpu - start_cpu) / (end_gpu - start_gpu)
-    print(f"\nSpeedup: {speedup:.2f}x")
+    print(f"Torch Time: {end_gpu - start_gpu:.4f}s")
+
 
 if __name__ == "__main__":
     benchmark()

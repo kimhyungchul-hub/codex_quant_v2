@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import config
 import asyncio
 import atexit
 import pickle
@@ -382,7 +383,7 @@ class RemoteEngineHub:
         retry_count: int = 2,
         fallback_local: bool = False,
     ):
-        self.url = url or os.environ.get("ENGINE_SERVER_URL", "http://localhost:8000")
+        self.url = url or str(getattr(config, "ENGINE_SERVER_URL", "http://localhost:8000"))
         self.timeout_single = timeout_single
         self.timeout_batch = timeout_batch
         self.retry_count = retry_count
@@ -556,13 +557,13 @@ def create_engine_hub(
     환경 설정에 따라 원격/프로세스/로컬 엔진 허브를 반환.
     """
     if use_remote is None:
-        use_remote = os.environ.get("USE_REMOTE_ENGINE", "0").lower() in ("1", "true", "yes")
+        use_remote = bool(getattr(config, "USE_REMOTE_ENGINE", False))
 
     if use_process is None:
-        use_process = os.environ.get("USE_PROCESS_ENGINE", "1").lower() in ("1", "true", "yes")
+        use_process = bool(getattr(config, "USE_PROCESS_ENGINE", True))
 
     if cpu_affinity is None:
-        affinity_env = os.environ.get("MC_ENGINE_CPU_AFFINITY", "")
+        affinity_env = str(getattr(config, "MC_ENGINE_CPU_AFFINITY", "")).strip()
         if affinity_env:
             try:
                 cpu_affinity = [int(x) for x in affinity_env.split(",") if x.strip()]
@@ -576,10 +577,10 @@ def create_engine_hub(
     if use_process:
         print("[create_engine_hub] Using ProcessEngineHub (shared memory IPC)")
         return ProcessEngineHub(
-            capacity=int(os.environ.get("MC_ENGINE_SHM_SLOTS", 32)),
-            slot_size=int(os.environ.get("MC_ENGINE_SHM_SLOT_SIZE", 131072)),
-            timeout_single=float(os.environ.get("MC_ENGINE_TIMEOUT_SINGLE", 2.0)),
-            timeout_batch=float(os.environ.get("MC_ENGINE_TIMEOUT_BATCH", 10.0)),
+            capacity=int(getattr(config, "MC_ENGINE_SHM_SLOTS", 32)),
+            slot_size=int(getattr(config, "MC_ENGINE_SHM_SLOT_SIZE", 131072)),
+            timeout_single=float(getattr(config, "MC_ENGINE_TIMEOUT_SINGLE", 2.0)),
+            timeout_batch=float(getattr(config, "MC_ENGINE_TIMEOUT_BATCH", 10.0)),
             cpu_affinity=cpu_affinity,
         )
 

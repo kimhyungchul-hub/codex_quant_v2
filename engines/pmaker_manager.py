@@ -1,4 +1,4 @@
-import os
+from engines.mc.config import config as mc_config
 import asyncio
 import numpy as np
 import time
@@ -15,8 +15,8 @@ except Exception:
 class PMakerManager:
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
-        self.enabled = bool(os.environ.get("PMAKER_ENABLE", "0") == "1")
-        self.model_path = str(os.environ.get("PMAKER_MODEL_PATH", "state/pmaker_survival_mlp.pt"))
+        self.enabled = bool(getattr(mc_config, "pmaker_enable", False))
+        self.model_path = str(getattr(mc_config, "pmaker_model_path", "state/pmaker_survival_mlp.pt"))
         self.surv = None
         
         # Cache and background tasks
@@ -26,8 +26,8 @@ class PMakerManager:
         self.predict_cache_ttl_sec = 5.0
         
         # Training configuration
-        self.train_steps = int(os.environ.get("PMAKER_TRAIN_STEPS", "1"))
-        self.batch = int(os.environ.get("PMAKER_BATCH", "32"))
+        self.train_steps = int(getattr(mc_config, "pmaker_train_steps", 1))
+        self.batch = int(getattr(mc_config, "pmaker_batch", 32))
         
         # Probe state
         self.probe_task = None
@@ -43,10 +43,10 @@ class PMakerManager:
         if self.enabled and _PMAKER_MLP_OK and PMakerSurvivalMLP is not None:
             try:
                 self.surv = PMakerSurvivalMLP(
-                    grid_ms=int(os.environ.get("PMAKER_GRID_MS", 50)),
-                    max_ms=int(os.environ.get("PMAKER_MAX_MS", 2500)),
-                    lr=float(os.environ.get("PMAKER_LR", "3e-4")),
-                    device=str(os.environ.get("PMAKER_DEVICE", "")),
+                    grid_ms=int(getattr(mc_config, "pmaker_grid_ms", 50)),
+                    max_ms=int(getattr(mc_config, "pmaker_max_ms", 2500)),
+                    lr=float(getattr(mc_config, "pmaker_lr", 3e-4)),
+                    device=str(getattr(mc_config, "pmaker_device", "")),
                 )
             except Exception as e:
                 print(f"[PMAKER_LOAD] Failed to init model: {e}")

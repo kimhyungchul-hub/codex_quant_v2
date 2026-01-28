@@ -35,6 +35,14 @@ class MCConfig:
     n_paths_exit: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_EXIT", 32768))
     verbose_print: bool = field(default_factory=lambda: get_env_bool("MC_VERBOSE_PRINT", False))
     jax_device: str = field(default_factory=lambda: os.environ.get("JAX_MC_DEVICE", "").strip().lower())
+    time_step_sec: int = field(default_factory=lambda: get_env_int("MC_TIME_STEP_SEC", 1))
+    logret_clip: float = field(default_factory=lambda: get_env_float("MC_LOGRET_CLIP", 12.0))
+    verify_drift: bool = field(default_factory=lambda: get_env_bool("MC_VERIFY_DRIFT", False))
+    cvar_n_boot: int = field(default_factory=lambda: get_env_int("MC_N_BOOT", 40))
+    use_global_batching: bool = field(default_factory=lambda: get_env_bool("USE_GLOBAL_BATCHING", True))
+    johnson_su_gamma: float = field(default_factory=lambda: get_env_float("MC_JOHNSON_SU_GAMMA", 0.0))
+    johnson_su_delta: float = field(default_factory=lambda: get_env_float("MC_JOHNSON_SU_DELTA", 1.0))
+    skip_exit_policy: bool = field(default_factory=lambda: get_env_bool("SKIP_EXIT_POLICY", False))
     
     # --- Alpha / Signal Features ---
     # ALPHA_SIGNAL_BOOST: 신호 강화 모드 (true면 공격적 설정 적용)
@@ -114,8 +122,8 @@ class MCConfig:
     exit_mode: str = field(default_factory=lambda: os.environ.get("EXIT_MODE", "").strip().lower())
     
     # --- Funnel Filters ---
-    funnel_win_floor_bull: float = field(default_factory=lambda: get_env_float("FUNNEL_WIN_FLOOR_BULL", 0.48))
-    funnel_win_floor_bear: float = field(default_factory=lambda: get_env_float("FUNNEL_WIN_FLOOR_BEAR", 0.48))
+    funnel_win_floor_bull: float = field(default_factory=lambda: get_env_float("FUNNEL_WIN_FLOOR_BULL", 0.50))
+    funnel_win_floor_bear: float = field(default_factory=lambda: get_env_float("FUNNEL_WIN_FLOOR_BEAR", 0.50))
     funnel_win_floor_chop: float = field(default_factory=lambda: get_env_float("FUNNEL_WIN_FLOOR_CHOP", 0.50))
     funnel_win_floor_volatile: float = field(default_factory=lambda: get_env_float("FUNNEL_WIN_FLOOR_VOLATILE", 0.50))
     
@@ -130,7 +138,7 @@ class MCConfig:
     funnel_event_cvar_floor_volatile: float = field(default_factory=lambda: get_env_float("FUNNEL_EVENT_CVAR_FLOOR_VOLATILE", -1.20))
     
     score_entry_min_size: float = field(default_factory=lambda: get_env_float("SCORE_ENTRY_MIN_SIZE", 0.01))
-    k_lev: float = field(default_factory=lambda: get_env_float("K_LEV", 10.0))
+    k_lev: float = field(default_factory=lambda: get_env_float("K_LEV", 2000.0))
     score_only_mode: bool = field(default_factory=lambda: get_env_bool("SCORE_ONLY_MODE", False))
     use_gpu_leverage: bool = field(default_factory=lambda: get_env_bool("USE_GPU_LEVERAGE", True))
     funnel_use_winrate_filter: bool = field(default_factory=lambda: get_env_bool("FUNNEL_USE_WINRATE_FILTER", False))
@@ -141,7 +149,7 @@ class MCConfig:
     kelly_boost_enabled: bool = field(default_factory=lambda: get_env_bool("KELLY_BOOST_ENABLED", True))
 
     ev_cost_mult_gate: float = field(default_factory=lambda: get_env_float("EV_COST_MULT_GATE", 0.0))
-    default_tp_pct: float = field(default_factory=lambda: get_env_float("DEFAULT_TP_PCT", 0.003))
+    default_tp_pct: float = field(default_factory=lambda: get_env_float("DEFAULT_TP_PCT", 0.006))
     default_sl_pct: float = field(default_factory=lambda: get_env_float("DEFAULT_SL_PCT", 0.005))
 
     # --- AlphaHit ML ---
@@ -149,7 +157,7 @@ class MCConfig:
     alpha_hit_beta: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_BETA", 1.0))
     alpha_hit_tp_atr_mult: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_TP_ATR_MULT", 2.0))
     alpha_hit_model_path: str = field(default_factory=lambda: os.environ.get("ALPHA_HIT_MODEL_PATH", "state/alpha_hit_mlp.pt"))
-    alpha_hit_device: str = field(default_factory=lambda: os.environ.get("ALPHA_HIT_DEVICE", "cuda"))
+    alpha_hit_device: str = field(default_factory=lambda: os.environ.get("ALPHA_HIT_DEVICE", "mps"))
     alpha_hit_lr: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_LR", 2e-4))
     alpha_hit_batch_size: int = field(default_factory=lambda: get_env_int("ALPHA_HIT_BATCH_SIZE", 256))
     alpha_hit_steps_per_tick: int = field(default_factory=lambda: get_env_int("ALPHA_HIT_STEPS_PER_TICK", 2))
@@ -158,6 +166,13 @@ class MCConfig:
     alpha_hit_max_loss: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_MAX_LOSS", 2.0))
     alpha_hit_data_half_life_sec: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_DATA_HALF_LIFE_SEC", 3600.0))
     alpha_hit_fallback: str = field(default_factory=lambda: os.environ.get("ALPHA_HIT_FALLBACK", "mc_to_hitprob").strip().lower())
+
+    # --- Alpha/PMaker Delay ---
+    pmaker_delay_penalty_mult: float = field(default_factory=lambda: get_env_float("PMAKER_DELAY_PENALTY_MULT", 1.0))
+    pmaker_exit_delay_penalty_mult: float = field(default_factory=lambda: get_env_float("PMAKER_EXIT_DELAY_PENALTY_MULT", 1.0))
+    alpha_delay_decay_tau_sec: float = field(default_factory=lambda: get_env_float("ALPHA_DELAY_DECAY_TAU_SEC", 30.0))
+    pmaker_entry_delay_shift: bool = field(default_factory=lambda: get_env_bool("PMAKER_ENTRY_DELAY_SHIFT", True))
+    pmaker_strict: bool = field(default_factory=lambda: get_env_bool("PMAKER_STRICT", False))
     
     # --- Exit Policy ---
     policy_enable_dd_stop: bool = field(default_factory=lambda: get_env_bool("POLICY_ENABLE_DD_STOP", True))
@@ -166,6 +181,15 @@ class MCConfig:
     sl_r_fixed: float = field(default_factory=lambda: get_env_float("SL_R_FIXED", 0.0020))
     trail_atr_mult: float = field(default_factory=lambda: get_env_float("TRAIL_ATR_MULT", 2.0))
     policy_min_hold_frac: float = field(default_factory=lambda: get_env_bool("POLICY_MIN_HOLD_FRAC", False))
+
+    # --- TP/SL Autoscale ---
+    tpsl_autoscale: bool = field(default_factory=lambda: get_env_bool("MC_TPSL_AUTOSCALE", True))
+    tp_base_roe: float = field(default_factory=lambda: get_env_float("MC_TP_BASE_ROE", 0.0015))
+    sl_base_roe: float = field(default_factory=lambda: get_env_float("MC_SL_BASE_ROE", 0.0020))
+    tpsl_sigma_ref: float = field(default_factory=lambda: get_env_float("MC_TPSL_SIGMA_REF", 0.5))
+    tpsl_sigma_min_scale: float = field(default_factory=lambda: get_env_float("MC_TPSL_SIGMA_MIN_SCALE", 0.6))
+    tpsl_sigma_max_scale: float = field(default_factory=lambda: get_env_float("MC_TPSL_SIGMA_MAX_SCALE", 2.5))
+    tpsl_h_scale_base: float = field(default_factory=lambda: get_env_float("MC_TPSL_H_SCALE_BASE", 60.0))
 
     # --- Portfolio Joint Simulation ---
     portfolio_enabled: bool = field(default_factory=lambda: get_env_bool("PORTFOLIO_JOINT_SIM_ENABLED", False))
@@ -183,6 +207,19 @@ class MCConfig:
     portfolio_individual_cap: float = field(default_factory=lambda: get_env_float("PORTFOLIO_INDIVIDUAL_CAP", 3.0))
     portfolio_risk_aversion: float = field(default_factory=lambda: get_env_float("PORTFOLIO_RISK_AVERSION", 0.5))
     portfolio_var_alpha: float = field(default_factory=lambda: get_env_float("PORTFOLIO_VAR_ALPHA", 0.05))
+
+    # --- PMAKER model ---
+    pmaker_enable: bool = field(default_factory=lambda: get_env_bool("PMAKER_ENABLE", False))
+    pmaker_model_path: str = field(default_factory=lambda: os.environ.get("PMAKER_MODEL_PATH", "state/pmaker_survival_mlp.pt"))
+    pmaker_train_steps: int = field(default_factory=lambda: get_env_int("PMAKER_TRAIN_STEPS", 1))
+    pmaker_batch: int = field(default_factory=lambda: get_env_int("PMAKER_BATCH", 32))
+    pmaker_grid_ms: int = field(default_factory=lambda: get_env_int("PMAKER_GRID_MS", 50))
+    pmaker_max_ms: int = field(default_factory=lambda: get_env_int("PMAKER_MAX_MS", 2500))
+    pmaker_lr: float = field(default_factory=lambda: get_env_float("PMAKER_LR", 3e-4))
+    pmaker_device: str = field(default_factory=lambda: os.environ.get("PMAKER_DEVICE", "").strip())
+
+    # --- Execution Costs ---
+    p_maker_fixed: Optional[str] = field(default_factory=lambda: os.environ.get("P_MAKER_FIXED"))
 
     @classmethod
     def from_env(cls) -> MCConfig:

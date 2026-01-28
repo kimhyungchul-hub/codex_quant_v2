@@ -4,7 +4,8 @@ import numpy as np
 import os
 from collections import deque
 from config import *
-from utils.helpers import now_ms, _env_float
+from utils.helpers import now_ms
+import config
 
 class DataManager:
     def __init__(self, orchestrator, symbols=None, data_exchange=None):
@@ -115,7 +116,7 @@ class DataManager:
                     self.data_updated_event.set()
             except Exception as e:
                 self.orch._log_err(f"[ERR] fetch_tickers: {e}")
-            ticker_sleep = _env_float("TICKER_SLEEP_SEC", 1.0)
+            ticker_sleep = float(getattr(config, "TICKER_SLEEP_SEC", 1.0))
             await asyncio.sleep(ticker_sleep)
 
     async def preload_all_ohlcv(self, limit: int = OHLCV_PRELOAD_LIMIT):

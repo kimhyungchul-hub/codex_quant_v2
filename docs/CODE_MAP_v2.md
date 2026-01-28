@@ -997,6 +997,7 @@ MC 리스크 헬퍼.
 ## 변경 로그
 | 날짜 | 내용 | 파일 |
 |------|------|------|
+| 2026-01-28 | JAX 제거 및 Torch 우선/NumPy fallback 전환 + 멀티피델리티/CI 게이트/분산감소 적용 + 전략별 `.env` 프리셋 추가 | `engines/mc/decision.py`, `engines/mc/entry_evaluation.py`, `engines/mc/path_simulation.py`, `engines/mc/first_passage.py`, `engines/mc/monte_carlo_engine.py`, `engines/mc/config.py`, `main_engine_mc_v2_final.py`, `.env.midterm`, `.env.scalp` |
 | 2026-01-27 | UnifiedScore 도입 및 랭킹/교체/대시보드 기준 통일 | `core/economic_brain.py`, `engines/mc/entry_evaluation.py`, `engines/mc/decision.py`, `main_engine_mc_v2_final.py`, `core/orchestrator.py`, `dashboard_v2.html`, `engines/engine_hub.py` |
 | 2026-01-21 | 개발 모드 `DEV_MODE=true` 일 때 JAX 비활성화하여 NumPy 경로 사용 — JAX 컴파일 시간 제거 | `main_engine_mc_v2_final.py` |
 | 2026-01-19 | CODE_MAP_v2 core/engines 상세 함수/클래스 보강 | `docs/CODE_MAP_v2.md` |

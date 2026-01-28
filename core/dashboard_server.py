@@ -1,9 +1,9 @@
 import json
 import asyncio
-import os
+import config
 import time
 from aiohttp import web
-from config import PORT, DASHBOARD_FILE, DASHBOARD_HISTORY_MAX, DASHBOARD_TRADE_TAPE_MAX, EXEC_MODE, MAKER_TIMEOUT_MS, MAKER_RETRIES, MAKER_POLL_MS, MAX_NOTIONAL_EXPOSURE
+from config import PORT, DASHBOARD_FILE, DASHBOARD_HISTORY_MAX, DASHBOARD_TRADE_TAPE_MAX, MAX_NOTIONAL_EXPOSURE
 from utils.helpers import now_ms, _sanitize_for_json
 
 def _fallback_rows(orch, ts: int):
@@ -209,10 +209,10 @@ def _build_payload(orch, rows, include_history, include_trade_tape, *, include_l
             "decision_eval_min_interval_sec": getattr(orch, "decision_eval_min_interval_sec", None),
             "mc_n_paths_live": getattr(orch, "mc_n_paths_live", None),
             "mc_n_paths_exit": getattr(orch, "mc_n_paths_exit", None),
-            "exec_mode": str(os.environ.get("EXEC_MODE", EXEC_MODE)).strip().lower(),
-            "maker_timeout_ms": int(os.environ.get("MAKER_TIMEOUT_MS", str(MAKER_TIMEOUT_MS))),
-            "maker_retries": int(os.environ.get("MAKER_RETRIES", str(MAKER_RETRIES))),
-            "maker_poll_ms": int(os.environ.get("MAKER_POLL_MS", str(MAKER_POLL_MS))),
+            "exec_mode": str(getattr(config, "EXEC_MODE", "maker_then_market")).strip().lower(),
+            "maker_timeout_ms": int(getattr(config, "MAKER_TIMEOUT_MS", 1500)),
+            "maker_retries": int(getattr(config, "MAKER_RETRIES", 2)),
+            "maker_poll_ms": int(getattr(config, "MAKER_POLL_MS", 200)),
             "exec_stats": _exec_stats_snapshot(orch),
             "pmaker": orch.pmaker.status_dict(),
         },
@@ -491,7 +491,7 @@ async def runtime_post_handler(request):
     if "exec_mode" in body:
         v = str(body.get("exec_mode") or "").strip().lower()
         if v in ("market", "maker_then_market"):
-            os.environ["EXEC_MODE"] = v
+            config.EXEC_MODE = v
 
     if "pmaker_enabled" in body:
         v = _b(body.get("pmaker_enabled"))

@@ -20,7 +20,8 @@ def _cvar_bootstrap(
     seed: int = 42,
 ) -> float:
     if n_boot is None:
-        n_boot = int(os.environ.get("MC_N_BOOT", "40"))
+        from engines.mc.config import config as mc_config
+        n_boot = int(getattr(mc_config, "cvar_n_boot", 40))
 
     if n_boot <= 1:
         return _cvar_empirical(pnl, alpha)

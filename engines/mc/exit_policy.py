@@ -260,7 +260,7 @@ class MonteCarloExitPolicyMixin:
         else:
             sl_target_roe = float(sl_r_price) * float(leverage)
 
-        use_torch = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
 
         if use_torch:
             try:
@@ -562,11 +562,11 @@ class MonteCarloExitPolicyMixin:
         dd_stop_roe_batch: Optional[np.ndarray] = None,
     ) -> list[Dict[str, Any]]:
         """
-        Computes exit policy metrics for a batch of (direction, horizon) combinations using JAX vmap.
+        Computes exit policy metrics for a batch of (direction, horizon) combinations using Torch vmap.
         """
-        use_jax = bool(getattr(self, "_use_jax", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
         
-        if not use_jax:
+        if not use_torch:
             # Fallback to sequential CPU processing
             results = []
             for i in range(len(batch_directions)):
@@ -590,7 +590,7 @@ class MonteCarloExitPolicyMixin:
                 results.append(res)
             return results
 
-        # JAX Batched execution
+        # Torch Batched execution
         try:
             dt = float(self.dt)
             mu_ps = mu / SECONDS_PER_YEAR
@@ -697,7 +697,7 @@ class MonteCarloExitPolicyMixin:
             return results
 
         except Exception as e:
-            logger.error(f"[JAX_BATCH_ROLLFORWARD] Failed: {e}. Falling back to sequential.")
+            logger.error(f"[TORCH_BATCH_ROLLFORWARD] Failed: {e}. Falling back to sequential.")
             # Fallback
             results = []
             for i in range(len(batch_directions)):
@@ -895,7 +895,7 @@ class MonteCarloExitPolicyMixin:
             return final_results
             
         except Exception as e:
-            logger.error(f"[JAX_MULTI_ERR] {e}")
+            logger.error(f"[TORCH_MULTI_ERR] {e}")
             import traceback
             logger.error(traceback.format_exc())
             return [self.compute_exit_policy_metrics_batched(**args) for args in symbols_args]

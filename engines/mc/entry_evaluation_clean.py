@@ -8,7 +8,6 @@ Clean Entry Evaluation Wrapper using Global Batching
 
 import numpy as np
 import time
-import os
 from typing import Dict, List, Any
 import logging
 
@@ -17,7 +16,9 @@ from engines.mc.entry_evaluation_vmap import GlobalBatchEvaluator
 logger = logging.getLogger(__name__)
 
 # Feature flag
-USE_GLOBAL_BATCHING = os.getenv("USE_GLOBAL_BATCHING", "1") == "1"
+from engines.mc.config import config as mc_config
+
+USE_GLOBAL_BATCHING = bool(getattr(mc_config, "use_global_batching", True))
 
 class CleanEntryEvaluator:
     """

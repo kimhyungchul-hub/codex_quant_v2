@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 import logging
 import os
+import config as base_config
 import time
+from statistics import NormalDist
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -14,14 +16,12 @@ from engines.mc import jax_backend as jax_backend
 from engines.mc.jax_backend import summarize_gbm_horizons_multi_symbol_jax
 from engines.mc.params import MCParams
 from engines.mc.config import config
-from engines.simulation_methods import mc_first_passage_tp_sl_jax
 from regime import adjust_mu_sigma
 
 # ✅ Exit Policy Flag - Full exit policy calculation by default to include all exit logic in MC simulation
 # Set SKIP_EXIT_POLICY=true to use simplified summary-based EV (faster but less accurate)
 # Default: false (empty string or "false" → full exit policy calculation)
-_skip_env = os.environ.get("SKIP_EXIT_POLICY", "").strip().lower()
-SKIP_EXIT_POLICY = _skip_env in ("1", "true", "yes")
+SKIP_EXIT_POLICY = bool(getattr(config, "skip_exit_policy", False))
 
 # ✅ Clean evaluator for horizon processing (fixes IndexError bug)
 try:
@@ -103,7 +103,7 @@ class MonteCarloEntryEvaluationMixin:
         USE_MAKER_ORDERS=true일 때 Maker 수수료 적용 (0.02% roundtrip)
         """
         # Defaults - Maker 우선 사용
-        _use_maker = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
+        _use_maker = bool(getattr(base_config, "USE_MAKER_ORDERS", True))
         fee_taker = float(ctx.get("fee_taker", 0.0006))
         fee_maker = float(ctx.get("fee_maker", 0.0001))
         
@@ -195,7 +195,8 @@ class MonteCarloEntryEvaluationMixin:
         liq_score = _s(ctx.get("liquidity_score"), 1.0)
         bar_seconds = _s(ctx.get("bar_seconds", 60.0), 60.0)
         # tail mode plumbing
-        self._use_jax = bool(ctx.get("use_jax", True))
+        self._use_torch = bool(ctx.get("use_torch", ctx.get("use_jax", True)))
+        self._use_jax = False
         self._tail_mode = str(ctx.get("tail_mode", self.default_tail_mode))
         self._student_t_df = _s(ctx.get("student_t_df", self.default_student_t_df), self.default_student_t_df)
         br = ctx.get("bootstrap_returns")
@@ -764,7 +765,7 @@ class MonteCarloEntryEvaluationMixin:
             n_paths=int(params.n_paths),
             n_steps=max_steps,
             dt=float(self.dt),
-            return_jax=True,
+            return_torch=True,
         )
         t1_gen1 = time.perf_counter()
 
@@ -784,6 +785,7 @@ class MonteCarloEntryEvaluationMixin:
             [min(int(max_steps), int(math.ceil(int(h) / float(step_sec)))) for h in h_cols],
             dtype=np.int32,
         )
+        policy_horizons_all = list(getattr(self, "POLICY_MULTI_HORIZONS_SEC", h_cols)) or list(h_cols)
         
         # Calculate stats (PyTorch/NumPy backend)
         try:
@@ -889,7 +891,7 @@ class MonteCarloEntryEvaluationMixin:
                 n_paths=int(params.n_paths),
                 n_steps=int(max_policy_steps),
                 dt=float(self.dt),
-                return_jax=True,
+                return_torch=True,
             )
             paths_reused = False
         t1_gen2 = time.perf_counter()
@@ -1153,7 +1155,7 @@ class MonteCarloEntryEvaluationMixin:
         dd_stop_roe_batch = []
         
         # We'll use a fixed drawdown stop ROE for the batch (usually -0.01 or from environment)
-        dd_stop_roe_val = float(os.getenv("PAPER_EXIT_POLICY_DD_STOP_ROE", -0.01))
+        dd_stop_roe_val = float(getattr(base_config, "PAPER_EXIT_POLICY_DD_STOP_ROE", -0.01))
         
         for idx, h in enumerate(policy_horizons):
             tp_r = float(tp_r_by_h.get(int(h), tp_r_by_h.get(str(int(h)), 0.0)))
@@ -1762,7 +1764,7 @@ class MonteCarloEntryEvaluationMixin:
         neighbor_pen_cap = config.policy_neighbor_penalty_cap
 
         # Default: enable veto with a short-term meaningful threshold (profit_target).
-        veto_env = os.environ.get("POLICY_NEIGHBOR_OPPOSE_VETO_ABS")
+        veto_env = str(getattr(config, "policy_neighbor_oppose_veto_abs", "") or "")
         if veto_env is None or (not str(veto_env).strip()):
             neighbor_veto_abs = float(getattr(params, "profit_target", 0.0) or 0.0)
         else:
@@ -2287,7 +2289,7 @@ class MonteCarloEntryEvaluationMixin:
                 )
         
         # Validation point 3: policy_horizons should match engine's multi-horizon config (short-term 0~5m).
-        expected_horizons = [15, 30, 60, 120, 180, 300]
+        expected_horizons = list(getattr(self, "POLICY_MULTI_HORIZONS_SEC", policy_horizons))
         if list(policy_horizons) != expected_horizons:
             diff2_validation_warnings.append(
                 f"policy_horizons={list(policy_horizons)} != expected {expected_horizons}"
@@ -2898,57 +2900,21 @@ class MonteCarloEntryEvaluationMixin:
         # ✅ 기본값 직접 완화: 0.3%/0.5% (이전: 0.05%/0.08%)
         tp_pct = config.default_tp_pct
         sl_pct = config.default_sl_pct
-        # ✅ first-passage JAX 사용 여부:
-        # - ctx/use_jax를 존중 (simulate_paths_price와 동일하게)
-        # - JAX 오류 시 항상 numpy fallback (엔진 전체가 실패하면 meta가 비어서 디버깅이 불가능해짐)
-        use_first_passage_jax = bool(getattr(self, "_use_jax", True)) and (jax is not None) and (not getattr(self, "_skip_first_passage_jax", False))
         # ✅ 격리 테스트: dist를 gaussian으로 고정
         dist_mode = "gaussian" if getattr(self, "_force_gaussian_dist", False) else str(getattr(self, "_tail_mode", self.default_tail_mode))
-        if use_first_passage_jax:
-            try:
-                event_metrics = mc_first_passage_tp_sl_jax(
-                    s0=price,
-                    tp_pct=tp_pct,
-                    sl_pct=sl_pct,
-                    mu=mu_adj,
-                    sigma=sigma,
-                    dt=self.dt,
-                    max_steps=int(max(self.horizons)),
-                    n_paths=int(params.n_paths),
-                    cvar_alpha=params.cvar_alpha,
-                    seed=seed,
-                    dist=dist_mode,
-                    df=float(getattr(self, "_student_t_df", self.default_student_t_df)),
-                    boot_rets=getattr(self, "_bootstrap_returns", None),
-                )
-            except Exception:
-                event_metrics = None
-            if not event_metrics:
-                event_metrics = self.mc_first_passage_tp_sl(
-                    s0=price,
-                    tp_pct=tp_pct,
-                    sl_pct=sl_pct,
-                    mu=mu_adj,
-                    sigma=sigma,
-                    dt=self.dt,
-                    max_steps=int(max(self.horizons)),
-                    n_paths=int(params.n_paths),
-                    cvar_alpha=params.cvar_alpha,
-                    seed=seed,
-                )
-        else:
-            event_metrics = self.mc_first_passage_tp_sl(
-                s0=price,
-                tp_pct=tp_pct,
-                sl_pct=sl_pct,
-                mu=mu_adj,
-                sigma=sigma,
-                dt=self.dt,
-                max_steps=int(max(self.horizons)),
-                n_paths=int(params.n_paths),
-                cvar_alpha=params.cvar_alpha,
-                seed=seed,
-            )
+        event_metrics = self.mc_first_passage_tp_sl(
+            s0=price,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            mu=mu_adj,
+            sigma=sigma,
+            dt=self.dt,
+            max_steps=int(max(self.horizons)),
+            n_paths=int(params.n_paths),
+            cvar_alpha=params.cvar_alpha,
+            seed=seed,
+            dist_override=dist_mode,
+        )
 
         # event EV/CVaR를 % 수익률 단위로 환산 (R * SL%)
         event_ev_pct = None
@@ -3131,7 +3097,7 @@ class MonteCarloEntryEvaluationMixin:
     from engines.mc.constants import JAX_STATIC_BATCH_SIZE
 
     def evaluate_entry_metrics_batch(
-        self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        self, tasks: List[Dict[str, Any]], n_paths_override: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         GLOBAL BATCHING: 여러 심볼에 대해 병렬로 Monte Carlo 평가를 수행한다.
         - tasks: List of {ctx, params, seed}
@@ -3207,7 +3173,7 @@ class MonteCarloEntryEvaluationMixin:
 
         t_prep0 = time.perf_counter()
 
-        n_paths = int(config.n_paths_live)
+        n_paths = int(n_paths_override) if n_paths_override is not None else int(config.n_paths_live)
         step_sec = int(getattr(self, "time_step_sec", 1) or 1)
         step_sec = int(max(1, step_sec))
         # CRITICAL FIX: dt must account for step_sec (step_sec/SECONDS_PER_YEAR)
@@ -3233,7 +3199,7 @@ class MonteCarloEntryEvaluationMixin:
 
         print(f"[BATCH_TIMING] prep={(t_prep1-t_prep0):.3f}s n_paths={n_paths} max_steps={max_steps} step_sec={step_sec} dt={dt:.2e}", flush=True)
 
-        use_torch = bool(getattr(jax_backend, "_TORCH_OK", False)) and (not bool(getattr(jax_backend, "DEV_MODE", False)))
+        use_torch = bool(getattr(self, "_use_torch", True)) and bool(getattr(jax_backend, "_TORCH_OK", False)) and (not bool(getattr(jax_backend, "DEV_MODE", False)))
 
         if use_torch:
             print("[BATCH_TIMING] Torch batch path simulation...", flush=True)
@@ -3268,6 +3234,38 @@ class MonteCarloEntryEvaluationMixin:
             )
             t_sum1 = time.perf_counter()
             print(f"[BATCH_TIMING] numpy sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
+
+        # Optional control variate adjustment for EV (variance reduction)
+        use_cv = str(os.environ.get("MC_USE_CONTROL_VARIATE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        if use_cv:
+            mode = str(getattr(self, "_tail_mode", self.default_tail_mode))
+            for i in range(num_symbols):
+                try:
+                    prices_np = np.asarray(jax_backend.to_numpy(price_paths_batch[i]), dtype=np.float64)
+                    s0_val = float(s0s_jax[i])
+                    lev_val = float(leverages_jax[i])
+                    fee_roe = float(fees_jax[i]) * lev_val
+                    mu_i = float(mus_jax[i])
+                    sigma_i = float(sigmas_jax[i])
+                    if mode in ("student_t", "bootstrap", "johnson_su"):
+                        drift_i = mu_i * dt
+                    else:
+                        drift_i = (mu_i - 0.5 * sigma_i * sigma_i) * dt
+                    diffusion_i = sigma_i * math.sqrt(dt)
+                    z_hat = self._infer_standardized_noise(prices_np, drift_i, diffusion_i)
+                    control = np.sum(z_hat, axis=1)
+                    for k, h_step in enumerate(h_indices):
+                        idx = int(min(max_steps, int(h_step)))
+                        tp = prices_np[:, idx]
+                        gross = (tp - s0_val) / max(s0_val, 1e-12)
+                        net_long = gross * lev_val - fee_roe
+                        net_short = -gross * lev_val - fee_roe
+                        cv_mean_long, _ = self._control_variate_mean(net_long, control)
+                        cv_mean_short, _ = self._control_variate_mean(net_short, control)
+                        summary_cpu["ev_long"][i, k] = cv_mean_long
+                        summary_cpu["ev_short"][i, k] = cv_mean_short
+                except Exception:
+                    continue
         
         # ✅ GLOBAL BATCH EXIT POLICY (can be skipped with SKIP_EXIT_POLICY=true)
         t_exit_prep0 = time.perf_counter()
@@ -3291,7 +3289,7 @@ class MonteCarloEntryEvaluationMixin:
                 print(f"[EV_DEBUG] {sym_name}: mu={mu_val:.4f} sigma={sigma_val:.4f} fee={fee_val:.6f} lev={lev_val:.1f} ev_long={ev_l.max():.6f} ev_short={ev_s.max():.6f}", flush=True)
             # Build simplified results from summary_cpu
             exit_policy_results = []
-            h_list = [60, 300, 600, 1800, 3600]
+            h_list = list(h_cols)
             directions = [1, -1]
             for i in range(pad_size):
                 slot_results = []
@@ -3311,7 +3309,7 @@ class MonteCarloEntryEvaluationMixin:
             # Prepare arguments for all slots (including padding)
             exit_policy_args = []
             # Fixed horizons and directions for all slots to maximize JIT efficiency
-            policy_horizons = [60, 300, 600, 1800, 3600]
+            policy_horizons = list(policy_horizons_all)
             directions = [1, -1] # LONG/SHORT
             batch_h_fixed = []
             batch_d_fixed = []
@@ -3322,7 +3320,7 @@ class MonteCarloEntryEvaluationMixin:
             
             batch_h_np = np.array(batch_h_fixed, dtype=np.int32)
             batch_d_np = np.array(batch_d_fixed, dtype=np.int32)
-            dd_stop_base = np.array([float(os.getenv("PAPER_EXIT_POLICY_DD_STOP_ROE", "-0.02")) for _ in batch_h_fixed], dtype=np.float32)
+            dd_stop_base = np.array([float(getattr(base_config, "PAPER_EXIT_POLICY_DD_STOP_ROE", -0.02)) for _ in batch_h_fixed], dtype=np.float32)
 
             for i in range(pad_size):
                 if i < num_symbols:
@@ -3404,7 +3402,7 @@ class MonteCarloEntryEvaluationMixin:
 
             # Aggregate stats from Exit Policy results
             # horizons = [60, 300, 600, 1800, 3600], directions = [1, -1]
-            h_list = [60, 300, 600, 1800, 3600]
+            h_list_exit = list(policy_horizons_all)
 
             best_ev_long = -999.0
             best_h_long = 300
@@ -3415,7 +3413,7 @@ class MonteCarloEntryEvaluationMixin:
             for j, res in enumerate(sym_results):
                 direction = 1 if (j % 2 == 0) else -1
                 h_idx = j // 2
-                h_val = h_list[h_idx]
+                h_val = h_list_exit[h_idx]
                 ev = float(res.get("ev_exit_policy", 0.0))
 
                 if math.isnan(ev):
@@ -3431,10 +3429,19 @@ class MonteCarloEntryEvaluationMixin:
                         best_h_short = h_val
 
             # Unified score (Psi) from cumulative EV/CVaR vectors
+            h_list = list(h_cols)
             ev_long_vec = np.asarray(summary_cpu["ev_long"][i], dtype=np.float64)
             ev_short_vec = np.asarray(summary_cpu["ev_short"][i], dtype=np.float64)
             cvar_long_vec = np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64)
             cvar_short_vec = np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64)
+            if "var_long" in summary_cpu:
+                var_long_vec = np.asarray(summary_cpu["var_long"][i], dtype=np.float64)
+            else:
+                var_long_vec = np.zeros_like(ev_long_vec, dtype=np.float64)
+            if "var_short" in summary_cpu:
+                var_short_vec = np.asarray(summary_cpu["var_short"][i], dtype=np.float64)
+            else:
+                var_short_vec = np.zeros_like(ev_short_vec, dtype=np.float64)
 
             lev_val = float(leverages_jax[i])
             cost_base = float(fees_jax[i])
@@ -3468,6 +3475,23 @@ class MonteCarloEntryEvaluationMixin:
 
             ev_vec = ev_long_vec if direction_best == 1 else ev_short_vec
             cvar_vec = cvar_long_vec if direction_best == 1 else cvar_short_vec
+            var_vec = var_long_vec if direction_best == 1 else var_short_vec
+
+            # Confidence-interval (LCB) gate for entry validity
+            ci_enabled = str(os.environ.get("ENTRY_CI_GATE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            ci_alpha = float(os.environ.get("ENTRY_CI_ALPHA", "0.05"))
+            ci_floor = float(os.environ.get("ENTRY_CI_FLOOR", "0.0"))
+            ci_lcb = None
+            if ci_enabled and len(h_list) > 0:
+                try:
+                    idx_best = int(h_list.index(int(best_h))) if int(best_h) in h_list else int(np.argmax(ev_vec))
+                    ev_at = float(ev_vec[idx_best])
+                    var_at = float(var_vec[idx_best])
+                    se = math.sqrt(max(var_at, 0.0) / max(float(n_paths), 1.0))
+                    z = float(NormalDist().inv_cdf(1.0 - ci_alpha))
+                    ci_lcb = float(ev_at - z * se)
+                except Exception:
+                    ci_lcb = None
 
             # [Sizing] Kelly calculation similar to sequential path
             if direction_best == 1:
@@ -3497,13 +3521,19 @@ class MonteCarloEntryEvaluationMixin:
                 "exit": float(t_exit1 - t_exit0),
             }
 
+            can_enter_score = bool(policy_ev_mix > 0.0001)
+            can_enter_ci = True
+            if ci_enabled:
+                can_enter_ci = (ci_lcb is not None) and (float(ci_lcb) >= float(ci_floor))
+            can_enter = bool(can_enter_score and can_enter_ci)
+
             out = {
                 "ok": True,
                 "ev": float(policy_ev_mix),
                 "score": float(policy_ev_mix),
                 "win": float(win_val),
                 "cvar": float(cvar_val),
-                "can_enter": bool(policy_ev_mix > 0.0001),
+                "can_enter": can_enter,
                 "best_h": int(best_h),
                 "direction": int(direction_best),
                 "kelly": float(kelly),
@@ -3518,7 +3548,7 @@ class MonteCarloEntryEvaluationMixin:
                 "cvar_vector": [float(x) for x in cvar_vec.tolist()],
                 "horizon_seq": [int(h) for h in h_list],
                 "meta": {
-                    "can_enter": bool(policy_ev_mix > 0.0001),
+                    "can_enter": can_enter,
                     "ev": float(policy_ev_mix),
                     "ev_raw": float(policy_ev_mix),
                     "win": float(win_val),
@@ -3553,6 +3583,12 @@ class MonteCarloEntryEvaluationMixin:
                     "policy_horizon_eff_sec": int(best_h),
                     "mu_alpha": float(mus[i]),
                     "policy_signal_strength": float(policy_ev_mix),
+                    "ci_enabled": bool(ci_enabled),
+                    "ci_alpha": float(ci_alpha),
+                    "ci_floor": float(ci_floor),
+                    "ci_lcb": float(ci_lcb) if ci_lcb is not None else None,
+                    "ci_gate_pass": bool(can_enter_ci),
+                    "n_paths": int(n_paths),
                     "perf": perf,
                 },
             }

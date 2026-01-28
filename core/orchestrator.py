@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
 import random
 import time
 from collections import deque
@@ -20,7 +19,8 @@ from engines.engine_hub import EngineHub
 from engines.pmaker_manager import PMakerManager
 from engines.probability_methods import _approx_p_pos_and_ev_hold, _approx_cvar_normal
 from engines.mc.constants import SECONDS_PER_YEAR
-from utils.helpers import _env_bool, _env_float, _env_int, _load_env_file, _safe_float, now_ms
+from engines.mc.config import config as mc_config
+from utils.helpers import _safe_float, now_ms
 
 
 class LiveOrchestrator:
@@ -64,50 +64,48 @@ class LiveOrchestrator:
         self.leverage = float(config.DEFAULT_LEVERAGE)
         self.max_leverage = float(config.MAX_LEVERAGE)
         self.enable_orders = bool(config.ENABLE_LIVE_ORDERS)
-        self.decision_refresh_sec = float(_env_float("DECISION_REFRESH_SEC", float(getattr(config, "DECISION_REFRESH_SEC", 2.0))))
+        self.decision_refresh_sec = float(getattr(config, "DECISION_REFRESH_SEC", 2.0))
         # Heavy decision compute is decoupled from dashboard refresh; this sets a minimum per-symbol re-eval interval.
-        self.decision_eval_min_interval_sec = float(
-            _env_float("DECISION_EVAL_MIN_INTERVAL_SEC", float(self.decision_refresh_sec))
-        )
-        self.decision_worker_sleep_sec = float(_env_float("DECISION_WORKER_SLEEP_SEC", 0.0))
+        self.decision_eval_min_interval_sec = float(getattr(config, "DECISION_EVAL_MIN_INTERVAL_SEC", self.decision_refresh_sec))
+        self.decision_worker_sleep_sec = float(getattr(config, "DECISION_WORKER_SLEEP_SEC", 0.0))
 
         # paper trading (no exchange orders)
-        self.paper_trading_enabled = _env_bool("PAPER_TRADING", True) and (not self.enable_orders)
-        self.paper_flat_on_wait = _env_bool("PAPER_FLAT_ON_WAIT", True)
+        self.paper_trading_enabled = bool(getattr(config, "PAPER_TRADING", True)) and (not self.enable_orders)
+        self.paper_flat_on_wait = bool(getattr(config, "PAPER_FLAT_ON_WAIT", True))
         # Paper sizing: by default use orchestrator defaults (fixed size/leverage).
         # If enabled, use engine-provided optimal sizing/leverage (often Kelly-like and can be extremely small).
-        self.paper_use_engine_sizing = _env_bool("PAPER_USE_ENGINE_SIZING", True)
+        self.paper_use_engine_sizing = bool(getattr(config, "PAPER_USE_ENGINE_SIZING", True))
         # If engine sizing is enabled, apply a multiplier and a floor/cap so paper positions don't become too tiny.
-        self.paper_engine_size_mult = float(_env_float("PAPER_ENGINE_SIZE_MULT", 1.0))
-        self.paper_engine_size_min_frac = float(_env_float("PAPER_ENGINE_SIZE_MIN_FRAC", 0.005))
-        self.paper_engine_size_max_frac = float(_env_float("PAPER_ENGINE_SIZE_MAX_FRAC", 0.20))
-        self.paper_size_frac_default = float(_env_float("PAPER_SIZE_FRAC", float(getattr(config, "DEFAULT_SIZE_FRAC", 0.10))))
-        self.paper_leverage_default = float(_env_float("PAPER_LEVERAGE", float(getattr(config, "DEFAULT_LEVERAGE", 5.0))))
-        self.paper_fee_roundtrip = float(_env_float("PAPER_FEE_ROUNDTRIP", 0.0))
-        self.paper_slippage_bps = float(_env_float("PAPER_SLIPPAGE_BPS", 0.0))
-        self.paper_min_hold_sec = int(_env_int("PAPER_MIN_HOLD_SEC", int(getattr(config, "POSITION_HOLD_MIN_SEC", 0))))
-        self.paper_max_hold_sec = int(_env_int("PAPER_MAX_HOLD_SEC", int(getattr(config, "MAX_POSITION_HOLD_SEC", 600))))
-        self.paper_max_positions = int(_env_int("PAPER_MAX_POSITIONS", int(getattr(config, "MAX_CONCURRENT_POSITIONS", 99999))))
+        self.paper_engine_size_mult = float(getattr(config, "PAPER_ENGINE_SIZE_MULT", 1.0))
+        self.paper_engine_size_min_frac = float(getattr(config, "PAPER_ENGINE_SIZE_MIN_FRAC", 0.005))
+        self.paper_engine_size_max_frac = float(getattr(config, "PAPER_ENGINE_SIZE_MAX_FRAC", 0.20))
+        self.paper_size_frac_default = float(getattr(config, "PAPER_SIZE_FRAC", getattr(config, "DEFAULT_SIZE_FRAC", 0.10)))
+        self.paper_leverage_default = float(getattr(config, "PAPER_LEVERAGE", getattr(config, "DEFAULT_LEVERAGE", 5.0)))
+        self.paper_fee_roundtrip = float(getattr(config, "PAPER_FEE_ROUNDTRIP", 0.0))
+        self.paper_slippage_bps = float(getattr(config, "PAPER_SLIPPAGE_BPS", 0.0))
+        self.paper_min_hold_sec = int(getattr(config, "PAPER_MIN_HOLD_SEC", getattr(config, "POSITION_HOLD_MIN_SEC", 0)))
+        self.paper_max_hold_sec = int(getattr(config, "PAPER_MAX_HOLD_SEC", getattr(config, "MAX_POSITION_HOLD_SEC", 600)))
+        self.paper_max_positions = int(getattr(config, "PAPER_MAX_POSITIONS", getattr(config, "MAX_CONCURRENT_POSITIONS", 99999)))
         # If enabled, exits/flips are driven by MC exit-policy heuristics (hold_bad/score_flip/dd_stop/time_stop),
         # and legacy "WAIT->FLAT" / "max_hold" paper rules are ignored for open positions.
-        self.paper_exit_policy_only = _env_bool("PAPER_EXIT_POLICY_ONLY", True)
-        self.paper_exit_policy_horizon_sec_default = int(_env_int("PAPER_EXIT_POLICY_HORIZON_SEC", 1800))
-        self.paper_exit_policy_min_hold_sec = int(_env_int("PAPER_EXIT_POLICY_MIN_HOLD_SEC", 180))
-        self.paper_exit_policy_decision_dt_sec = int(_env_int("PAPER_EXIT_POLICY_DECISION_DT_SEC", 5))
-        self.paper_exit_policy_flip_confirm_ticks = int(_env_int("PAPER_EXIT_POLICY_FLIP_CONFIRM_TICKS", 3))
-        self.paper_exit_policy_hold_bad_ticks = int(_env_int("PAPER_EXIT_POLICY_HOLD_BAD_TICKS", 3))
-        self.paper_exit_policy_score_margin = float(_env_float("PAPER_EXIT_POLICY_SCORE_MARGIN", 0.0001))
-        self.paper_exit_policy_soft_floor = float(_env_float("PAPER_EXIT_POLICY_SOFT_FLOOR", -0.001))
-        self.paper_exit_policy_p_pos_enter_floor = float(_env_float("PAPER_EXIT_POLICY_P_POS_ENTER_FLOOR", 0.52))
-        self.paper_exit_policy_p_pos_hold_floor = float(_env_float("PAPER_EXIT_POLICY_P_POS_HOLD_FLOOR", 0.50))
-        self.paper_exit_policy_dd_stop_enabled = _env_bool("PAPER_EXIT_POLICY_DD_STOP_ENABLED", True)
-        self.paper_exit_policy_dd_stop_roe = float(_env_float("PAPER_EXIT_POLICY_DD_STOP_ROE", -0.02))
+        self.paper_exit_policy_only = bool(getattr(config, "PAPER_EXIT_POLICY_ONLY", True))
+        self.paper_exit_policy_horizon_sec_default = int(getattr(config, "PAPER_EXIT_POLICY_HORIZON_SEC", 1800))
+        self.paper_exit_policy_min_hold_sec = int(getattr(config, "PAPER_EXIT_POLICY_MIN_HOLD_SEC", 180))
+        self.paper_exit_policy_decision_dt_sec = int(getattr(config, "PAPER_EXIT_POLICY_DECISION_DT_SEC", 5))
+        self.paper_exit_policy_flip_confirm_ticks = int(getattr(config, "PAPER_EXIT_POLICY_FLIP_CONFIRM_TICKS", 3))
+        self.paper_exit_policy_hold_bad_ticks = int(getattr(config, "PAPER_EXIT_POLICY_HOLD_BAD_TICKS", 3))
+        self.paper_exit_policy_score_margin = float(getattr(config, "PAPER_EXIT_POLICY_SCORE_MARGIN", 0.0001))
+        self.paper_exit_policy_soft_floor = float(getattr(config, "PAPER_EXIT_POLICY_SOFT_FLOOR", -0.001))
+        self.paper_exit_policy_p_pos_enter_floor = float(getattr(config, "PAPER_EXIT_POLICY_P_POS_ENTER_FLOOR", 0.52))
+        self.paper_exit_policy_p_pos_hold_floor = float(getattr(config, "PAPER_EXIT_POLICY_P_POS_HOLD_FLOOR", 0.50))
+        self.paper_exit_policy_dd_stop_enabled = bool(getattr(config, "PAPER_EXIT_POLICY_DD_STOP_ENABLED", True))
+        self.paper_exit_policy_dd_stop_roe = float(getattr(config, "PAPER_EXIT_POLICY_DD_STOP_ROE", -0.02))
 
         # MC runtime tuning (ctx/instance overrides)
-        self.mc_n_paths_live = int(_env_int("MC_N_PATHS_LIVE", int(getattr(config, "MC_N_PATHS_LIVE", 10000))))
-        self.mc_n_paths_exit = int(_env_int("MC_N_PATHS_EXIT", int(getattr(config, "MC_N_PATHS_EXIT", 512))))
-        self.mc_tail_mode = str(os.environ.get("MC_TAIL_MODE", "student_t")).strip().lower() or "student_t"
-        self.mc_student_t_df = float(_env_float("MC_STUDENT_T_DF", 6.0))
+        self.mc_n_paths_live = int(getattr(config, "MC_N_PATHS_LIVE", 10000))
+        self.mc_n_paths_exit = int(getattr(config, "MC_N_PATHS_EXIT", 512))
+        self.mc_tail_mode = str(getattr(config, "MC_TAIL_MODE", "student_t")).strip().lower() or "student_t"
+        self.mc_student_t_df = float(getattr(config, "MC_STUDENT_T_DF", 6.0))
         self._last_trade_event_by_sym: Dict[str, str] = {}
 
         self.exec_stats: Dict[str, Dict[str, Any]] = {}
@@ -121,10 +119,10 @@ class LiveOrchestrator:
         self._decide_cycle_ms: Optional[int] = None
 
         # Portfolio-level rebalancing config
-        self.rebalance_top_n = int(_env_int("PORTFOLIO_TOP_N", 4))
-        self.rebalance_cost_mult = float(_env_float("PORTFOLIO_SWITCH_COST_MULT", 1.2))
-        self.rebalance_kelly_cap = float(_env_float("PORTFOLIO_KELLY_CAP", 5.0))
-        self.portfolio_joint_interval_sec = float(_env_float("PORTFOLIO_JOINT_INTERVAL_SEC", 15.0))
+        self.rebalance_top_n = int(getattr(config, "PORTFOLIO_TOP_N", 4))
+        self.rebalance_cost_mult = float(getattr(config, "PORTFOLIO_SWITCH_COST_MULT", 1.2))
+        self.rebalance_kelly_cap = float(getattr(config, "PORTFOLIO_KELLY_CAP", 5.0))
+        self.portfolio_joint_interval_sec = float(getattr(config, "PORTFOLIO_JOINT_INTERVAL_SEC", 15.0))
         self._rebalance_last_decision: Dict[str, str] = {}
         self._last_portfolio_joint_ts: float = 0.0
         self._last_portfolio_report: Optional[Dict[str, Any]] = None
@@ -149,13 +147,13 @@ class LiveOrchestrator:
 
         # PMaker paper-mode self-training (simulated maker fills).
         # 목적: paper에서도 심볼별 fill_rate 통계를 누적해서 mu_alpha 보정/대시보드 표시가 가능하도록 함.
-        self.pmaker_paper_enabled = _env_bool("PMAKER_PAPER_ENABLE", True)
-        self.pmaker_paper_probe_interval_sec = float(_env_float("PMAKER_PAPER_PROBE_INTERVAL_SEC", 2.0))
-        self.pmaker_paper_probe_timeout_ms = int(_env_int("PMAKER_PAPER_PROBE_TIMEOUT_MS", int(getattr(config, "MAKER_TIMEOUT_MS", 1500))))
-        self.pmaker_paper_train_every_n = int(_env_int("PMAKER_PAPER_TRAIN_EVERY_N", 25))
-        self.pmaker_paper_save_every_sec = float(_env_float("PMAKER_PAPER_SAVE_EVERY_SEC", 30.0))
-        self.pmaker_paper_adverse_delay_sec = float(_env_float("PMAKER_ADVERSE_DELAY_SEC", 5.0))
-        self.pmaker_paper_adverse_ema_alpha = float(_env_float("PMAKER_ADVERSE_EMA_ALPHA", 0.2))
+        self.pmaker_paper_enabled = bool(getattr(config, "PMAKER_PAPER_ENABLE", True))
+        self.pmaker_paper_probe_interval_sec = float(getattr(config, "PMAKER_PAPER_PROBE_INTERVAL_SEC", 2.0))
+        self.pmaker_paper_probe_timeout_ms = int(getattr(config, "PMAKER_PAPER_PROBE_TIMEOUT_MS", getattr(config, "MAKER_TIMEOUT_MS", 1500)))
+        self.pmaker_paper_train_every_n = int(getattr(config, "PMAKER_PAPER_TRAIN_EVERY_N", 25))
+        self.pmaker_paper_save_every_sec = float(getattr(config, "PMAKER_PAPER_SAVE_EVERY_SEC", 30.0))
+        self.pmaker_paper_adverse_delay_sec = float(getattr(config, "PMAKER_ADVERSE_DELAY_SEC", 5.0))
+        self.pmaker_paper_adverse_ema_alpha = float(getattr(config, "PMAKER_ADVERSE_EMA_ALPHA", 0.2))
         self._pmaker_paper_active: Dict[str, Dict[str, Any]] = {}
         self._pmaker_paper_next_side: Dict[str, str] = {}
         self._pmaker_paper_last_start_ms: Dict[str, int] = {}
@@ -445,7 +443,7 @@ class LiveOrchestrator:
             "mc_n_paths_exit": int(self.mc_n_paths_exit),
             "mc_tail_mode": str(self.mc_tail_mode),
             "mc_student_t_df": float(self.mc_student_t_df),
-            "exec_mode": str(os.environ.get("EXEC_MODE", config.EXEC_MODE)).strip().lower(),
+            "exec_mode": str(getattr(config, "EXEC_MODE", "maker_then_market")).strip().lower(),
         }
 
     def set_enable_orders(self, enabled: bool) -> None:
@@ -455,7 +453,7 @@ class LiveOrchestrator:
         except Exception:
             pass
         # Keep paper mode consistent with live ordering.
-        self.paper_trading_enabled = _env_bool("PAPER_TRADING", True) and (not self.enable_orders)
+        self.paper_trading_enabled = bool(getattr(config, "PAPER_TRADING", True)) and (not self.enable_orders)
 
     def score_debug_for_symbol(self, sym: str) -> Dict[str, Any]:
         sym = str(sym).strip()
@@ -496,7 +494,7 @@ class LiveOrchestrator:
             if self.enable_orders and not warned:
                 self._log_err("[WARN] live_sync_loop is a stub (no live sync)")
                 warned = True
-            await asyncio.sleep(float(_env_float("LIVE_SYNC_SLEEP_SEC", 2.0)))
+            await asyncio.sleep(float(getattr(config, "LIVE_SYNC_SLEEP_SEC", 2.0)))
 
     def _paper_mark_position(self, sym: str, mark_price: Optional[float], ts_ms: int) -> None:
         pos = self.positions.get(sym)
@@ -605,7 +603,7 @@ class LiveOrchestrator:
 
     @staticmethod
     def _paper_exec_mode() -> str:
-        return str(os.environ.get("EXEC_MODE", config.EXEC_MODE)).strip().lower()
+        return str(getattr(config, "EXEC_MODE", "maker_then_market")).strip().lower()
 
     @staticmethod
     def _paper_p_maker_from_detail(detail: Optional[Dict[str, Any]], *, leg: str) -> float:
@@ -1003,14 +1001,14 @@ class LiveOrchestrator:
                 
                 # Get trailing factor from env (default 0.6 = 60% retention)
                 try:
-                    trailing_factor = float(os.environ.get("POLICY_SCORE_TRAILING_FACTOR", "0.6") or 0.6)
+                    trailing_factor = float(getattr(config, "POLICY_SCORE_TRAILING_FACTOR", 0.6))
                 except Exception:
                     trailing_factor = 0.6
                 trailing_factor = float(max(0.3, min(0.9, trailing_factor)))
                 
                 # Get flip margin from env (default 0.001)
                 try:
-                    flip_margin = float(os.environ.get("POLICY_SCORE_FLIP_MARGIN", "0.001") or 0.001)
+                    flip_margin = float(getattr(config, "POLICY_SCORE_FLIP_MARGIN", 0.001))
                 except Exception:
                     flip_margin = 0.001
                 flip_margin = float(max(0.0, flip_margin))
@@ -1079,11 +1077,11 @@ class LiveOrchestrator:
 
         # scores / probabilities (deterministic approximation, UnifiedScore-aligned)
         try:
-            lambda_val = float(_env_float("UNIFIED_RISK_LAMBDA", 1.0))
+            lambda_val = float(getattr(config, "UNIFIED_RISK_LAMBDA", 1.0))
         except Exception:
             lambda_val = 1.0
         try:
-            rho_val = float(_env_float("UNIFIED_RHO", 0.0))
+            rho_val = float(getattr(config, "UNIFIED_RHO", 0.0))
         except Exception:
             rho_val = 0.0
 
@@ -1915,7 +1913,7 @@ class LiveOrchestrator:
         policy_exit_hold_bad_frac = _opt_float(mc_meta.get("policy_exit_hold_bad_frac"))
         policy_exit_score_flip_frac = _opt_float(mc_meta.get("policy_exit_score_flip_frac"))
 
-        exec_mode = str(os.environ.get("EXEC_MODE", config.EXEC_MODE)).strip().lower()
+        exec_mode = str(getattr(config, "EXEC_MODE", "maker_then_market")).strip().lower()
         pmaker_entry = _opt_float(mc_meta.get("pmaker_entry"))
         pmaker_entry_delay_sec = _opt_float(mc_meta.get("pmaker_entry_delay_sec"))
         pmaker_entry_delay_penalty_r = _opt_float(mc_meta.get("pmaker_entry_delay_penalty_r"))
@@ -2148,7 +2146,7 @@ class LiveOrchestrator:
         spread_pct: Optional[float],
     ) -> Optional[Dict[str, Any]]:
         try:
-            min_candles = int(_env_int("DECISION_MIN_CANDLES", 20))
+            min_candles = int(getattr(config, "DECISION_MIN_CANDLES", 20))
         except Exception:
             min_candles = 20
 
@@ -2241,7 +2239,7 @@ class LiveOrchestrator:
             surv = getattr(pm, "surv", None) if pm is not None else None
             if pm is not None and bool(getattr(pm, "enabled", False)) and surv is not None:
                 ctx["pmaker_surv"] = surv
-                ctx["pmaker_timeout_ms"] = int(os.environ.get("MAKER_TIMEOUT_MS", str(getattr(config, "MAKER_TIMEOUT_MS", 1500))))
+                ctx["pmaker_timeout_ms"] = int(getattr(config, "MAKER_TIMEOUT_MS", 1500))
             ctx["pmaker_adverse_move"] = float(self._pmaker_paper_adverse_ema.get(sym, 0.0) or 0.0)
         except Exception:
             pass
@@ -2605,11 +2603,6 @@ class LiveOrchestrator:
 
 
 async def build_exchange() -> ccxt.Exchange:
-    _load_env_file(str(config.BASE_DIR / "state" / "bybit.env"))
-    # Only load the example template when the real env file is missing.
-    # (The example often enables BYBIT_TESTNET=1 which would otherwise hijack prices.)
-    if not (config.BASE_DIR / "state" / "bybit.env").exists():
-        _load_env_file(str(config.BASE_DIR / "state" / "bybit.env.example"))
 
     # Public-data mode (paper trading / dashboards) should not require auth.
     # Invalid keys can break `load_markets()` on Bybit because it may hit private endpoints.
@@ -2625,7 +2618,7 @@ async def build_exchange() -> ccxt.Exchange:
             }
         )
     exchange = ccxt.bybit(ex_cfg)
-    if str(os.environ.get("BYBIT_TESTNET", "0")).strip().lower() in ("1", "true", "yes"):
+    if bool(getattr(config, "BYBIT_TESTNET", False)):
         exchange.set_sandbox_mode(True)
     return exchange
 
@@ -2637,16 +2630,12 @@ async def build_data_exchange() -> ccxt.Exchange:
     Sandbox selection is controlled via DATA_BYBIT_TESTNET (separate from BYBIT_TESTNET).
     """
 
-    _load_env_file(str(config.BASE_DIR / "state" / "bybit.env"))
-    if not (config.BASE_DIR / "state" / "bybit.env").exists():
-        _load_env_file(str(config.BASE_DIR / "state" / "bybit.env.example"))
-
     ex_cfg: Dict[str, Any] = {
         "enableRateLimit": True,
         "timeout": int(config.CCXT_TIMEOUT_MS),
     }
     exchange = ccxt.bybit(ex_cfg)
 
-    if str(os.environ.get("DATA_BYBIT_TESTNET", "0")).strip().lower() in ("1", "true", "yes"):
+    if bool(getattr(config, "DATA_BYBIT_TESTNET", False)):
         exchange.set_sandbox_mode(True)
     return exchange

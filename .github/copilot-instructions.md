@@ -156,6 +156,15 @@ from engines.mc.constants import (
 참고: 상세 변경 사항과 사용법은 `docs/CODE_MAP_v2.md`의 최신 Change Log 항목을 확인하세요.
 
 ## 📋 Change Log
+### [2026-01-28] MC 엔진 Torch 우선 전환 및 전략 프리셋 정합
+**변경사항:**
+1. **JAX 제거 및 Torch 우선/NumPy fallback 전환**: MC 핵심 경로(`decision`, `entry_evaluation`, `first_passage`, `path_simulation`)에서 Torch → NumPy 순으로 동작하도록 전환.
+2. **통계적 안정성 강화**: 멀티 피델리티 MC, CI 기반 진입 게이트, 분산감소(antithetic/control variate) 적용.
+3. **시간 일관성/기본값 정합**: `DEFAULT_TP_PCT=0.006`, `K_LEV=2000`, `ALPHA_HIT_DEVICE=mps`, `FUNNEL_WIN_FLOOR_*` 통일.
+4. **전략별 `.env` 프리셋 추가**: 중기(1h) 스윙/초단기 스캘핑에 맞춘 TP/SL·호라이즌·홀드 타임 설정.
+
+**영향 파일:** `engines/mc/decision.py`, `engines/mc/entry_evaluation.py`, `engines/mc/first_passage.py`, `engines/mc/path_simulation.py`, `engines/mc/config.py`, `main_engine_mc_v2_final.py`, `.env.midterm`, `.env.scalp`, `gemini.md`, `docs/CODE_MAP_v2.md`
+
 ### [2026-01-27] 대시보드 안정성 개선 및 Price Fallback 강화
 **문제:**
 1. **Dashboard 데이터 미표시**: `fetch_prices_loop`가 ticker 가격을 가져오기 전에 `decision_loop`이 시작되어 모든 `price=None`으로 브로드캐스트됨

@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
+import config as base_config
+from engines.mc.config import config as mc_config
 from typing import Dict, List, Optional, Tuple
 
 from engines.base import BaseEngine
@@ -31,6 +34,30 @@ except Exception:  # pragma: no cover
     _ALPHA_HIT_MLP_OK = False
 
 logger = logging.getLogger(__name__)
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except Exception:
+        return int(default)
+
+def _parse_int_list_env(name: str, default: Tuple[int, ...]) -> Tuple[int, ...]:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return tuple(default)
+    parts = re.split(r"[,\s]+", raw)
+    vals: list[int] = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            v = int(float(p))
+        except (TypeError, ValueError):
+            continue
+        if v <= 0:
+            continue
+        vals.append(v)
+    return tuple(vals) if vals else tuple(default)
 
 
 class MonteCarloEngine(
@@ -75,17 +102,17 @@ class MonteCarloEngine(
     POLICY_MULTI_HORIZONS_SEC = (60, 300, 600, 1800, 3600)
     SCORE_MARGIN_DEFAULT = 0.0001
     POLICY_VALUE_SOFT_FLOOR_AFTER_COST = -0.0005
-    N_PATHS_EXIT_POLICY = int(getattr(config, "n_paths_exit", 2048))
+    N_PATHS_EXIT_POLICY = int(getattr(mc_config, "n_paths_exit", 2048))
 
     TP_R_BY_H = {15: 0.0002, 30: 0.0003, 60: 0.0005, 120: 0.0008, 180: 0.0012, 300: 0.0015, 600: 0.0030, 1800: 0.0050, 3600: 0.0080}
     SL_R_FIXED = 0.0020
-    TP_SL_AUTOSCALE = str(os.environ.get("MC_TPSL_AUTOSCALE", "1")).strip().lower() in ("1", "true", "yes")
-    TP_SL_BASE_TP = float(os.environ.get("MC_TP_BASE_ROE", "0.0015"))
-    TP_SL_BASE_SL = float(os.environ.get("MC_SL_BASE_ROE", str(SL_R_FIXED)))
-    TP_SL_SIGMA_REF = float(os.environ.get("MC_TPSL_SIGMA_REF", "0.5"))
-    TP_SL_SIGMA_MIN_SCALE = float(os.environ.get("MC_TPSL_SIGMA_MIN_SCALE", "0.6"))
-    TP_SL_SIGMA_MAX_SCALE = float(os.environ.get("MC_TPSL_SIGMA_MAX_SCALE", "2.5"))
-    TP_SL_H_SCALE_BASE = float(os.environ.get("MC_TPSL_H_SCALE_BASE", "60.0"))
+    TP_SL_AUTOSCALE = bool(getattr(mc_config, "tpsl_autoscale", True))
+    TP_SL_BASE_TP = float(getattr(mc_config, "tp_base_roe", 0.0015))
+    TP_SL_BASE_SL = float(getattr(mc_config, "sl_base_roe", SL_R_FIXED))
+    TP_SL_SIGMA_REF = float(getattr(mc_config, "tpsl_sigma_ref", 0.5))
+    TP_SL_SIGMA_MIN_SCALE = float(getattr(mc_config, "tpsl_sigma_min_scale", 0.6))
+    TP_SL_SIGMA_MAX_SCALE = float(getattr(mc_config, "tpsl_sigma_max_scale", 2.5))
+    TP_SL_H_SCALE_BASE = float(getattr(mc_config, "tpsl_h_scale_base", 60.0))
 
     def _tp_sl_table(self, horizon_sec: float) -> tuple[float, float]:
         horizon_key = int(round(float(max(0.0, horizon_sec))))
@@ -140,33 +167,49 @@ class MonteCarloEngine(
     POLICY_MIN_EV_GAP = 0.00005
 
     def __init__(self):
-        # Mid-term horizons
-        self.horizons = (60, 300, 600, 1800, 3600)
+        policy_multi = _parse_int_list_env(
+            "POLICY_MULTI_HORIZONS_SEC",
+            tuple(getattr(self, "POLICY_MULTI_HORIZONS_SEC", (60, 300, 600, 1800, 3600))),
+        )
+        self.POLICY_MULTI_HORIZONS_SEC = policy_multi
+        self.POLICY_HORIZON_SEC = max(
+            1, _env_int("POLICY_HORIZON_SEC", int(getattr(self, "POLICY_HORIZON_SEC", 3600)))
+        )
+        self.POLICY_DECISION_DT_SEC = max(
+            1, _env_int("POLICY_DECISION_DT_SEC", int(getattr(self, "POLICY_DECISION_DT_SEC", 10)))
+        )
+        # Align simulation horizons with policy horizons by default.
+        if self.POLICY_MULTI_HORIZONS_SEC:
+            self.horizons = tuple(self.POLICY_MULTI_HORIZONS_SEC)
+        else:
+            self.horizons = (60, 300, 600, 1800, 3600)
         # Time resolution: one simulation step represents this many seconds.
         # Larger values reduce compute by reducing n_steps.
-        self.time_step_sec = int(os.environ.get("MC_TIME_STEP_SEC", "1"))
+        self.time_step_sec = int(getattr(mc_config, "time_step_sec", 1))
         self.time_step_sec = int(max(1, self.time_step_sec))
         # dt is year-fraction per simulation step.
         self.dt = float(self.time_step_sec) / 31536000.0
         
         # Fee settings: USE_MAKER_ORDERS=true → Maker fee (0.02% roundtrip)
-        _use_maker = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
+        _use_maker = bool(getattr(base_config, "USE_MAKER_ORDERS", True))
         self.fee_roundtrip_base = 0.0002 if _use_maker else 0.0012  # Maker: 0.02%, Taker: 0.12%
         self.fee_roundtrip_maker_base = 0.0002  # 0.01% * 2 sides
         self.slippage_perc = 0.0001 if _use_maker else 0.0003  # Maker: ~0, Taker: slippage
 
         self.default_tail_mode = "student_t"
         self.default_student_t_df = 6.0
-        self._use_jax = True
+        # JAX disabled: use PyTorch-first with NumPy fallback.
+        self._use_torch = str(os.environ.get("MC_USE_TORCH", "1")).strip().lower() in ("1", "true", "yes", "on")
+        self._use_jax = False
         self._tail_mode = self.default_tail_mode
         self._student_t_df = self.default_student_t_df
         self._bootstrap_returns = None
         self._ofi_hist: Dict[Tuple[str, str], List[float]] = {}
         self._gate_log_count = 0
 
-        self.alpha_hit_enabled = _ALPHA_HIT_MLP_OK and str(os.environ.get("ALPHA_HIT_ENABLE", "1")).strip().lower() in ("1", "true", "yes")
-        self.alpha_hit_beta = float(os.environ.get("ALPHA_HIT_BETA", "1.0"))
-        self.alpha_hit_model_path = str(os.environ.get("ALPHA_HIT_MODEL_PATH", "state/alpha_hit_mlp.pt"))
+        self.alpha_hit_enabled = _ALPHA_HIT_MLP_OK and bool(getattr(mc_config, "alpha_hit_enable", True))
+        self.alpha_hit_beta = float(getattr(mc_config, "alpha_hit_beta", 1.0))
+        self.alpha_hit_model_path = str(getattr(mc_config, "alpha_hit_model_path", "state/alpha_hit_mlp.pt"))
         self.alpha_hit_trainer = None
         self.alpha_hit_mlp = None
 
@@ -178,12 +221,12 @@ class MonteCarloEngine(
                 trainer_cfg = AlphaTrainerConfig(
                     horizons_sec=policy_horizons,
                     n_features=n_features,
-                    device=str(os.environ.get("ALPHA_HIT_DEVICE", "cuda" if (torch and torch.cuda.is_available()) else "cpu")),
-                    lr=float(os.environ.get("ALPHA_HIT_LR", "2e-4")),
-                    batch_size=int(os.environ.get("ALPHA_HIT_BATCH_SIZE", "256")),
-                    steps_per_tick=int(os.environ.get("ALPHA_HIT_STEPS_PER_TICK", "2")),
-                    max_buffer=int(os.environ.get("ALPHA_HIT_MAX_BUFFER", "200000")),
-                    data_half_life_sec=float(os.environ.get("ALPHA_HIT_DATA_HALF_LIFE_SEC", "3600.0")),
+                    device=str(getattr(mc_config, "alpha_hit_device", "cuda" if (torch and torch.cuda.is_available()) else "cpu")),
+                    lr=float(getattr(mc_config, "alpha_hit_lr", 2e-4)),
+                    batch_size=int(getattr(mc_config, "alpha_hit_batch_size", 256)),
+                    steps_per_tick=int(getattr(mc_config, "alpha_hit_steps_per_tick", 2)),
+                    max_buffer=int(getattr(mc_config, "alpha_hit_max_buffer", 200000)),
+                    data_half_life_sec=float(getattr(mc_config, "alpha_hit_data_half_life_sec", 3600.0)),
                     ckpt_path=self.alpha_hit_model_path,
                     enable=True,
                 )
@@ -202,11 +245,11 @@ class MonteCarloEngine(
         self._force_zero_cost = False
         self._force_horizon_600 = False
 
-        self.PMAKER_DELAY_PENALTY_MULT = float(os.getenv("PMAKER_DELAY_PENALTY_MULT", "1.0"))
-        self.PMAKER_EXIT_DELAY_PENALTY_MULT = float(os.getenv("PMAKER_EXIT_DELAY_PENALTY_MULT", "1.0"))
-        self.ALPHA_DELAY_DECAY_TAU_SEC = float(os.getenv("ALPHA_DELAY_DECAY_TAU_SEC", "30.0"))
-        self.PMAKER_ENTRY_DELAY_SHIFT = os.getenv("PMAKER_ENTRY_DELAY_SHIFT", "1") == "1"
-        self.PMAKER_STRICT = bool(os.getenv("PMAKER_STRICT", "0") == "1")
+        self.PMAKER_DELAY_PENALTY_MULT = float(getattr(mc_config, "pmaker_delay_penalty_mult", 1.0))
+        self.PMAKER_EXIT_DELAY_PENALTY_MULT = float(getattr(mc_config, "pmaker_exit_delay_penalty_mult", 1.0))
+        self.ALPHA_DELAY_DECAY_TAU_SEC = float(getattr(mc_config, "alpha_delay_decay_tau_sec", 30.0))
+        self.PMAKER_ENTRY_DELAY_SHIFT = bool(getattr(mc_config, "pmaker_entry_delay_shift", True))
+        self.PMAKER_STRICT = bool(getattr(mc_config, "pmaker_strict", False))
 
         # ============================================================================
         # [STATIC SHAPE WARMUP] JAX JIT 재컴파일 방지

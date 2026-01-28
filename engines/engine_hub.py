@@ -263,8 +263,7 @@ class EngineHub:
         if mc_engine and hasattr(mc_engine, "decide_batch"):
             try:
                 # MC 엔진의 배치 버전 호출 (로그/타이밍 추가)
-                import time, os
-                env_flag = str(os.environ.get("MC_VERBOSE_PRINT", "0")).strip().lower() in ("1", "true", "yes")
+                import time
                 # Always log batch call timing
                 print(f"[ENGINEHUB_BATCH] calling mc_engine.decide_batch for {len(ctx_list)} ctxs")
                 t0 = time.perf_counter()

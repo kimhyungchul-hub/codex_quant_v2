@@ -6,7 +6,6 @@ with long/short metrics. Falls back to NumPy if PyTorch is unavailable.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -14,7 +13,9 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 # DEV_MODE: force CPU path (no GPU acceleration)
-DEV_MODE = os.environ.get("DEV_MODE", "").lower() in ("1", "true", "yes")
+import config as base_config
+
+DEV_MODE = bool(getattr(base_config, "DEV_MODE", False))
 
 # Lazy torch init
 _TORCH_OK = False
@@ -137,6 +138,8 @@ def summarize_gbm_horizons_numpy(
     win_long = np.mean(net_long > 0.0, axis=0)
     ev_short = np.mean(net_short, axis=0)
     win_short = np.mean(net_short > 0.0, axis=0)
+    var_long = np.var(net_long, axis=0)
+    var_short = np.var(net_short, axis=0)
 
     k = max(1, int(net_long.shape[0] * float(alpha)))
     part_long = np.partition(net_long, kth=k - 1, axis=0)
@@ -151,6 +154,8 @@ def summarize_gbm_horizons_numpy(
         "ev_short": ev_short,
         "win_short": win_short,
         "cvar_short": cvar_short,
+        "var_long": var_long,
+        "var_short": var_short,
     }
 
 
@@ -186,6 +191,8 @@ def summarize_gbm_horizons_torch(
     win_long = torch.mean((net_long > 0.0).float(), dim=0)
     ev_short = torch.mean(net_short, dim=0)
     win_short = torch.mean((net_short > 0.0).float(), dim=0)
+    var_long = torch.var(net_long, dim=0, unbiased=False)
+    var_short = torch.var(net_short, dim=0, unbiased=False)
 
     k = max(1, int(net_long.shape[0] * float(alpha)))
     sorted_long, _ = torch.sort(net_long, dim=0)
@@ -200,6 +207,8 @@ def summarize_gbm_horizons_torch(
         "ev_short": ev_short.cpu(),
         "win_short": win_short.cpu(),
         "cvar_short": cvar_short.cpu(),
+        "var_long": var_long.cpu(),
+        "var_short": var_short.cpu(),
     }
 
 
@@ -244,6 +253,8 @@ def summarize_gbm_horizons_multi_symbol_torch(
     win_long = torch.mean((net_long > 0.0).float(), dim=1)
     ev_short = torch.mean(net_short, dim=1)
     win_short = torch.mean((net_short > 0.0).float(), dim=1)
+    var_long = torch.var(net_long, dim=1, unbiased=False)
+    var_short = torch.var(net_short, dim=1, unbiased=False)
 
     k = max(1, int(net_long.shape[1] * float(alpha)))
     sorted_long, _ = torch.sort(net_long, dim=1)
@@ -258,6 +269,8 @@ def summarize_gbm_horizons_multi_symbol_torch(
         "ev_short": ev_short.cpu(),
         "win_short": win_short.cpu(),
         "cvar_short": cvar_short.cpu(),
+        "var_long": var_long.cpu(),
+        "var_short": var_short.cpu(),
     }
 
 
@@ -281,6 +294,8 @@ def summarize_gbm_horizons_multi_symbol_numpy(
     win_long = np.mean(net_long > 0.0, axis=1)
     ev_short = np.mean(net_short, axis=1)
     win_short = np.mean(net_short > 0.0, axis=1)
+    var_long = np.var(net_long, axis=1)
+    var_short = np.var(net_short, axis=1)
 
     k = max(1, int(net_long.shape[1] * float(alpha)))
     part_long = np.partition(net_long, kth=k - 1, axis=1)
@@ -295,6 +310,8 @@ def summarize_gbm_horizons_multi_symbol_numpy(
         "ev_short": ev_short,
         "win_short": win_short,
         "cvar_short": cvar_short,
+        "var_long": var_long,
+        "var_short": var_short,
     }
 
 
@@ -314,4 +331,3 @@ def torch_covariance(returns):
 
 # Initialize on import
 ensure_torch()
-

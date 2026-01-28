@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import logging
-import os
+import config as base_config
 import time
 from typing import Any, Dict, Optional, Sequence
 
@@ -12,17 +12,11 @@ from engines.cvar_methods import cvar_ensemble
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
 from engines.mc import jax_backend
 from engines.mc.jax_backend import (
-    _JAX_OK,
-    jax,
-    jnp,
-    jrand,
-    lax,
     summarize_gbm_horizons_jax,
     summarize_gbm_horizons_multi_symbol_jax,
 )
 from engines.mc.params import MCParams
 from engines.mc.config import config
-from engines.simulation_methods import mc_first_passage_tp_sl_jax
 from regime import adjust_mu_sigma
 
 logger = logging.getLogger(__name__)
@@ -102,7 +96,8 @@ class MonteCarloEntryEvaluationMixin:
         liq_score = _s(ctx.get("liquidity_score"), 1.0)
         bar_seconds = _s(ctx.get("bar_seconds", 60.0), 60.0)
         # tail mode plumbing
-        self._use_jax = bool(ctx.get("use_jax", True))
+        self._use_torch = bool(ctx.get("use_torch", ctx.get("use_jax", True)))
+        self._use_jax = False
         self._tail_mode = str(ctx.get("tail_mode", self.default_tail_mode))
         self._student_t_df = _s(ctx.get("student_t_df", self.default_student_t_df), self.default_student_t_df)
         br = ctx.get("bootstrap_returns")
@@ -667,7 +662,7 @@ class MonteCarloEntryEvaluationMixin:
             n_paths=int(params.n_paths),
             n_steps=max_steps,
             dt=float(self.dt),
-            return_jax=True,
+            return_torch=True,
         )
         t1_gen1 = time.perf_counter()
 
@@ -778,7 +773,7 @@ class MonteCarloEntryEvaluationMixin:
                 n_paths=int(params.n_paths),
                 n_steps=int(max_policy_h),
                 dt=float(self.dt),
-                return_jax=True,
+                return_torch=True,
             )
             paths_reused = False
         t1_gen2 = time.perf_counter()
@@ -1046,7 +1041,7 @@ class MonteCarloEntryEvaluationMixin:
         dd_stop_roe_batch = []
         
         # We'll use a fixed drawdown stop ROE for the batch (usually -0.01 or from environment)
-        dd_stop_roe_val = float(os.getenv("PAPER_EXIT_POLICY_DD_STOP_ROE", -0.01))
+        dd_stop_roe_val = float(getattr(base_config, "PAPER_EXIT_POLICY_DD_STOP_ROE", -0.01))
         
         for idx, h in enumerate(policy_horizons):
             tp_r_base = float(tp_r_by_h.get(int(h), tp_r_by_h.get(str(int(h)), 0.0)))
@@ -1939,7 +1934,7 @@ class MonteCarloEntryEvaluationMixin:
         neighbor_pen_cap = config.policy_neighbor_penalty_cap
 
         # Default: enable veto with a short-term meaningful threshold (profit_target).
-        veto_env = os.environ.get("POLICY_NEIGHBOR_OPPOSE_VETO_ABS")
+        veto_env = str(getattr(config, "policy_neighbor_oppose_veto_abs", "") or "")
         if veto_env is None or (not str(veto_env).strip()):
             neighbor_veto_abs = float(getattr(params, "profit_target", 0.0) or 0.0)
         else:
@@ -2463,7 +2458,7 @@ class MonteCarloEntryEvaluationMixin:
                 )
         
         # Validation point 3: policy_horizons should match engine's multi-horizon config (short-term 0~5m).
-        expected_horizons = [15, 30, 60, 120, 180, 300]
+        expected_horizons = list(getattr(self, "POLICY_MULTI_HORIZONS_SEC", policy_horizons))
         if list(policy_horizons) != expected_horizons:
             diff2_validation_warnings.append(
                 f"policy_horizons={list(policy_horizons)} != expected {expected_horizons}"
@@ -3055,57 +3050,21 @@ class MonteCarloEntryEvaluationMixin:
         # ✅ 기본값 직접 완화: 0.3%/0.5% (이전: 0.05%/0.08%)
         tp_pct = config.default_tp_pct
         sl_pct = config.default_sl_pct
-        # ✅ first-passage JAX 사용 여부:
-        # - ctx/use_jax를 존중 (simulate_paths_price와 동일하게)
-        # - JAX 오류 시 항상 numpy fallback (엔진 전체가 실패하면 meta가 비어서 디버깅이 불가능해짐)
-        use_first_passage_jax = bool(getattr(self, "_use_jax", True)) and (jax is not None) and (not getattr(self, "_skip_first_passage_jax", False))
         # ✅ 격리 테스트: dist를 gaussian으로 고정
         dist_mode = "gaussian" if getattr(self, "_force_gaussian_dist", False) else str(getattr(self, "_tail_mode", self.default_tail_mode))
-        if use_first_passage_jax:
-            try:
-                event_metrics = mc_first_passage_tp_sl_jax(
-                    s0=price,
-                    tp_pct=tp_pct,
-                    sl_pct=sl_pct,
-                    mu=mu_adj,
-                    sigma=sigma,
-                    dt=self.dt,
-                    max_steps=int(max(self.horizons)),
-                    n_paths=int(params.n_paths),
-                    cvar_alpha=params.cvar_alpha,
-                    seed=seed,
-                    dist=dist_mode,
-                    df=float(getattr(self, "_student_t_df", self.default_student_t_df)),
-                    boot_rets=getattr(self, "_bootstrap_returns", None),
-                )
-            except Exception:
-                event_metrics = None
-            if not event_metrics:
-                event_metrics = self.mc_first_passage_tp_sl(
-                    s0=price,
-                    tp_pct=tp_pct,
-                    sl_pct=sl_pct,
-                    mu=mu_adj,
-                    sigma=sigma,
-                    dt=self.dt,
-                    max_steps=int(max(self.horizons)),
-                    n_paths=int(params.n_paths),
-                    cvar_alpha=params.cvar_alpha,
-                    seed=seed,
-                )
-        else:
-            event_metrics = self.mc_first_passage_tp_sl(
-                s0=price,
-                tp_pct=tp_pct,
-                sl_pct=sl_pct,
-                mu=mu_adj,
-                sigma=sigma,
-                dt=self.dt,
-                max_steps=int(max(self.horizons)),
-                n_paths=int(params.n_paths),
-                cvar_alpha=params.cvar_alpha,
-                seed=seed,
-            )
+        event_metrics = self.mc_first_passage_tp_sl(
+            s0=price,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct,
+            mu=mu_adj,
+            sigma=sigma,
+            dt=self.dt,
+            max_steps=int(max(self.horizons)),
+            n_paths=int(params.n_paths),
+            cvar_alpha=params.cvar_alpha,
+            seed=seed,
+            dist_override=dist_mode,
+        )
 
         # event EV/CVaR를 % 수익률 단위로 환산 (R * SL%)
         event_ev_pct = None
@@ -3273,7 +3232,7 @@ class MonteCarloEntryEvaluationMixin:
             "meta_detail": meta_detail,
         }
         return res
-    def evaluate_entry_metrics_batch(self, tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def evaluate_entry_metrics_batch(self, tasks: List[Dict[str, Any]], n_paths_override: Optional[int] = None) -> List[Dict[str, Any]]:
         """
         GLOBAL BATCHING: 여러 심볼에 대해 병렬로 Monte Carlo 평가를 수행한다.
         - tasks: List of {ctx, params, seed}
@@ -3309,7 +3268,7 @@ class MonteCarloEntryEvaluationMixin:
         mus = np.array(mus)
         sigmas = np.array(sigmas)
         
-        n_paths = int(config.n_paths_live)
+        n_paths = int(n_paths_override) if n_paths_override is not None else int(config.n_paths_live)
         dt = float(self.dt)
         step_sec = int(getattr(self, "time_step_sec", 1) or 1)
         step_sec = int(max(1, step_sec))
@@ -3381,7 +3340,7 @@ class MonteCarloEntryEvaluationMixin:
                 "batch_horizons": np.array(batch_h),
                 "tp_target_roe_batch": np.array([float(self.TP_R_BY_H.get(h, 0.001)) for h in batch_h]),
                 "sl_target_roe_batch": np.array([float(self.SL_R_FIXED) for _ in batch_h]),
-                "dd_stop_roe_batch": np.array([float(os.getenv("PAPER_EXIT_POLICY_DD_STOP_ROE", "-0.02")) for _ in batch_h]),
+                "dd_stop_roe_batch": np.array([float(getattr(base_config, "PAPER_EXIT_POLICY_DD_STOP_ROE", -0.02)) for _ in batch_h]),
                 "price_paths": price_paths_batch[i] # Keep it as DeviceArray!
             }
             exit_policy_args.append(arg)

@@ -1,24 +1,8 @@
 from __future__ import annotations
 
 import os
-
-# [메모리 최적화 설정] JAX가 메모리를 무조건 선점하지 않도록 설정
-# 반드시 어떤 다른 모듈보다도 가장 먼저 위치해야 합니다.
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # 90% 선점 기능 끄기
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform" # 필요할 때만 메모리 할당
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.40" # 혹시 선점하더라도 최대 40%까지만
-
 import sys
 
-# ============================================================================
-# JAX Memory Preallocation Prevention (CRITICAL)
-# ============================================================================
-# These MUST be set BEFORE any module that imports JAX
-# ONLY WORKS with JAX 0.4.20 + jax-metal 0.0.5
-# Print immediately to confirm these are set BEFORE any imports
-print(f"🗃️ [BOOTSTRAP] JAX env set: PREALLOCATE={os.environ['XLA_PYTHON_CLIENT_PREALLOCATE']}, MEM_FRACTION={os.environ.get('XLA_PYTHON_CLIENT_MEM_FRACTION', 'N/A')}")
-
-# Now import bootstrap (which validates version)
 import bootstrap
 
 from pathlib import Path
@@ -35,14 +19,6 @@ GPU_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu_worker"
 
 # Timeout (seconds) for decide_batch GPU/remote calls. Centralized in engines.mc.constants
 DECIDE_BATCH_TIMEOUT_SEC = MC_DECIDE_BATCH_TIMEOUT_SEC
-
-# JAX platform 설정 - GPU 전용 모드 (CPU 폴백 없음)
-platform_env = os.environ.get("JAX_PLATFORMS", "").strip()
-if platform_env.lower() == "metal":
-    os.environ.pop("JAX_PLATFORMS", None)
-platform_name_env = os.environ.get("JAX_PLATFORM_NAME", "").strip()
-if platform_name_env.lower() == "metal":
-    os.environ.pop("JAX_PLATFORM_NAME", None)
 
 import asyncio
 import json
@@ -62,8 +38,8 @@ from core.risk_manager import RiskManager
 
 
 # 원격 엔진 서버 사용 여부 (환경 변수로 제어)
-USE_REMOTE_ENGINE = os.environ.get("USE_REMOTE_ENGINE", "0").lower() in ("1", "true", "yes")
-ENGINE_SERVER_URL = os.environ.get("ENGINE_SERVER_URL", "http://localhost:8000")
+USE_REMOTE_ENGINE = bool(getattr(config, "USE_REMOTE_ENGINE", False))
+ENGINE_SERVER_URL = str(getattr(config, "ENGINE_SERVER_URL", "http://localhost:8000"))
 
 # -------------------------------------------------------------------
 # aiohttp 일부 macOS 환경에서 TCP keepalive 설정 시 OSError(22)가 날 수 있다.
@@ -89,7 +65,6 @@ from regime import adjust_mu_sigma, time_regime, get_regime_mu_sigma
 from engines.running_stats import RunningStats
 from engines.kelly_allocator import KellyAllocator
 from core.continuous_opportunity import ContinuousOpportunityChecker
-from core.napv_engine_jax import get_napv_engine, NAPVEngineJAX
 from core.multi_timeframe_scoring import check_position_switching
 
 PORT = 9999
@@ -137,14 +112,14 @@ ALERT_THROTTLE_SEC = 30
 ERROR_BURST_LIMIT = 3
 ERROR_BURST_WINDOW_SEC = 120
 DEFAULT_SIZE_FRAC = 0.10            # balance 대비 기본 진입 비중 (더 공격적)
-MAX_POSITION_HOLD_SEC = 600         # 10분 이상 보유 시 강제 청산 (더 공격적)
+MAX_POSITION_HOLD_SEC = int(getattr(config, "MAX_POSITION_HOLD_SEC", 600))  # 보유 상한(환경변수 기반)
 POSITION_CAP_ENABLED = False        # 포지션 개수 제한 비활성화(무제한 진입)
 EXPOSURE_CAP_ENABLED = True         # 노출 한도 사용
 MAX_CONCURRENT_POSITIONS = 99999
 MAX_NOTIONAL_EXPOSURE = 5.0         # 총 노출을 잔고 대비 500%까지 허용
 REBALANCE_THRESHOLD_FRAC = 0.02     # 목표 노출 대비 2% 이상 차이 나면 리밸런싱(더 잦게)
 EV_DROP_THRESHOLD = 0.0003          # EV 급락 exit 감지 임계
-K_LEV = 4.0                         # 레버리지 스케일(실계좌는 3~5 권장)
+K_LEV = float(getattr(config, "K_LEV", 2000.0))  # 레버리지 스케일 (환경변수 기반)
 EV_EXIT_FLOOR = {"bull": -0.0003, "bear": -0.0003, "chop": -0.0002, "volatile": -0.0002}
 EV_DROP = {"bull": 0.0010, "bear": 0.0010, "chop": 0.0008, "volatile": 0.0008}
 PSL_RISE = {"bull": 0.05, "bear": 0.05, "chop": 0.03, "volatile": 0.03}
@@ -152,10 +127,10 @@ MAX_DRAWDOWN_LIMIT = 0.10           # Kill Switch 기준 (10% DD)
 EXECUTION_MODE = "maker_dynamic"   # maker_dynamic | market
 
 # ---- Portfolio Selection (TOP N 종목 선택)
-TOP_N_SYMBOLS = int(os.environ.get("TOP_N_SYMBOLS", "4"))  # 상위 N개 종목만 진입
-USE_KELLY_ALLOCATION = os.environ.get("USE_KELLY_ALLOCATION", "true").lower() in ("1", "true", "yes")
-USE_CONTINUOUS_OPPORTUNITY = os.environ.get("USE_CONTINUOUS_OPPORTUNITY", "true").lower() in ("1", "true", "yes")
-SWITCHING_COST_MULT = float(os.environ.get("SWITCHING_COST_MULT", "2.0"))  # 교체 비용 승수 (수수료 × 승수)
+TOP_N_SYMBOLS = int(getattr(config, "TOP_N_SYMBOLS", 4))  # 상위 N개 종목만 진입
+USE_KELLY_ALLOCATION = bool(getattr(config, "USE_KELLY_ALLOCATION", True))
+USE_CONTINUOUS_OPPORTUNITY = bool(getattr(config, "USE_CONTINUOUS_OPPORTUNITY", True))
+SWITCHING_COST_MULT = float(getattr(config, "SWITCHING_COST_MULT", 2.0))  # 교체 비용 승수 (수수료 × 승수)
 MAKER_TIMEOUT_SEC = 2.0
 VOLATILITY_MARKET_THRESHOLD = 0.012
 
@@ -183,7 +158,7 @@ BYBIT_TAKER_FEE = 0.0006  # 0.06% per side (시장가)
 BYBIT_MAKER_FEE = 0.0001  # 0.01% per side (지정가)
 TAKER_FEE_RATE = BYBIT_TAKER_FEE  # alias for portfolio switching cost
 MAKER_FEE_RATE = BYBIT_MAKER_FEE  # alias for portfolio switching cost
-USE_MAKER_ORDERS = os.environ.get("USE_MAKER_ORDERS", "true").lower() in ("1", "true", "yes")
+USE_MAKER_ORDERS = bool(getattr(config, "USE_MAKER_ORDERS", True))
 
 # EV auto-tuning (p95 of recent EVs)
 EV_TUNE_WINDOW_SEC = 30 * 60   # 30 minutes
@@ -211,11 +186,12 @@ class LiveOrchestrator:
             self.hub = RemoteEngineHub(url=ENGINE_SERVER_URL, fallback_local=True)
         else:
             # 기본값: 프로세스 분리 허브를 사용하여 GIL 차단을 제거
-            use_process = os.environ.get("USE_PROCESS_ENGINE", "1").lower() in ("1", "true", "yes")
+            use_process = bool(getattr(config, "USE_PROCESS_ENGINE", True))
             cpu_affinity = None
-            if os.environ.get("MC_ENGINE_CPU_AFFINITY"):
+            affinity_env = str(getattr(config, "MC_ENGINE_CPU_AFFINITY", "")).strip()
+            if affinity_env:
                 try:
-                    cpu_affinity = [int(x) for x in os.environ.get("MC_ENGINE_CPU_AFFINITY", "").split(",") if x.strip()]
+                    cpu_affinity = [int(x) for x in affinity_env.split(",") if x.strip()]
                 except Exception:
                     cpu_affinity = None
             self.hub = create_engine_hub(use_remote=False, use_process=use_process, cpu_affinity=cpu_affinity)
@@ -234,8 +210,8 @@ class LiveOrchestrator:
         self._last_alert_ts = {}
         self._error_burst = 0
         self._last_error_ts = 0.0
-        self._telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        self._telegram_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        self._telegram_token = str(getattr(config, "TELEGRAM_BOT_TOKEN", "")).strip()
+        self._telegram_chat_id = str(getattr(config, "TELEGRAM_CHAT_ID", "")).strip()
         self._telegram_enabled = bool(self._telegram_token and self._telegram_chat_id)
 
         self.balance = 10_000.0
@@ -259,7 +235,7 @@ class LiveOrchestrator:
         self.fee_maker = BYBIT_MAKER_FEE
         # Maker 주문 사용시 수수료 0.02% (왕복), Taker는 0.12%
         self.fee_mode = "maker" if USE_MAKER_ORDERS else "taker"
-        self._decision_log_every = int(os.environ.get("DECISION_LOG_EVERY", "10"))
+        self._decision_log_every = int(getattr(config, "DECISION_LOG_EVERY", 10))
         self._decision_cycle = 0
         self.spread_pairs = SPREAD_PAIRS
         self.spread_enabled = SPREAD_ENABLED
@@ -287,7 +263,7 @@ class LiveOrchestrator:
         self._dyn_leverage = {s: self.leverage for s in SYMBOLS}
         self.trade_tape = deque(maxlen=20_000)
         self.eval_history = deque(maxlen=5_000)  # 예측 vs 실제 품질 평가용
-        event_min_score = float(os.environ.get("EVENT_EXIT_SCORE", "-0.0005"))
+        event_min_score = float(getattr(config, "EVENT_EXIT_SCORE", -0.0005))
         self.exit_policy = ExitPolicy(
             min_event_score=event_min_score,
             max_event_p_sl=0.55,
@@ -334,7 +310,6 @@ class LiveOrchestrator:
         # ---- Portfolio Management (TOP N 선택 + Kelly 배분 + 교체 비용 평가)
         self.kelly_allocator = KellyAllocator(max_leverage=MAX_LEVERAGE, half_kelly=0.5)
         self.opportunity_checker = ContinuousOpportunityChecker(self)
-        self.napv_engine = get_napv_engine()
         self._symbol_scores: dict[str, float] = {}  # sym -> score (EV or NAPV)
         self._symbol_hold_scores: dict[str, float] = {}  # sym -> score for current side (hold)
         self._symbol_ranks: dict[str, int] = {}     # sym -> rank (1=best)
@@ -1719,7 +1694,7 @@ class LiveOrchestrator:
             except Exception:
                 pass
 
-        is_dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
+        is_dev_mode = bool(getattr(config, "DEV_MODE", False))
 
         return {
             "symbol": sym,
@@ -1737,7 +1712,8 @@ class LiveOrchestrator:
             "regime_params": regime_params,
             "session": session,
             "spread_pct": spread_pct,
-            "use_jax": not is_dev_mode,
+            "use_torch": True,
+            "use_jax": False,
             "tail_mode": "student_t",
             "tail_model": "student_t",
             "tail_df": 6.0,
@@ -1816,7 +1792,7 @@ class LiveOrchestrator:
             
             # Build minimal ctx dict for backward compatibility
             # (향후 완전 SoA 전환 시 제거 가능)
-            is_dev_mode = os.environ.get("DEV_MODE", "false").lower() == "true"
+            is_dev_mode = bool(getattr(config, "DEV_MODE", False))
             ctx = {
                 "symbol": sym,
                 "price": float(price),
@@ -1831,7 +1807,8 @@ class LiveOrchestrator:
                 "mu_base": float(mu_base),
                 "sigma": float(max(sigma, 0.0)),
                 "session": session,
-                "use_jax": not is_dev_mode,
+                "use_torch": True,
+                "use_jax": False,
                 "ev": None,
                 "position_side": pos_side_val,
                 "has_position": bool(pos_qty != 0.0),
@@ -3051,7 +3028,8 @@ async def main():
                 # Instantiate the real orchestrator (this may spawn workers/processes)
                 # On macOS shared_memory/process workers can be unstable; prefer
                 # in-process EngineHub where possible to avoid startup failures.
-                os.environ["USE_PROCESS_ENGINE"] = os.environ.get("USE_PROCESS_ENGINE", "0")
+                if not bool(getattr(config, "USE_PROCESS_ENGINE_SET", False)):
+                    config.USE_PROCESS_ENGINE = False
                 real_orch = LiveOrchestrator(exchange)
 
                 # Transfer any connected WS clients from the stub to the real orchestrator

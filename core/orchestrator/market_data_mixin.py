@@ -244,7 +244,7 @@ class MarketDataMixin:
                 n_states=getattr(self, "REGIME_N_STATES", 3),
                 window=getattr(self, "REGIME_WINDOW", 256),
                 alpha=getattr(self, "REGIME_ALPHA", 0.05),
-                use_jax=getattr(self, "REGIME_USE_JAX", True),
+                use_jax=getattr(self, "REGIME_USE_JAX", False),
             )
             self._regime_detectors[key] = detector
         return detector
