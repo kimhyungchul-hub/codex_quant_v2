@@ -4,57 +4,106 @@ import math
 from typing import Any, Dict, Tuple
 
 import numpy as np
-
-from engines.probability_methods import _approx_p_pos_and_ev_hold, _prob_max_geq, _prob_min_leq
-from engines.mc.torch_backend import _TORCH_OK, torch, to_torch, to_numpy, get_torch_device
+from engines.mc.torch_backend import _TORCH_OK, torch, to_torch, get_torch_device
 
 
-def _policy_metrics_batch(
+def _norm_cdf_torch(x: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+
+def _norm_pdf_torch(x: torch.Tensor) -> torch.Tensor:
+    return torch.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _norm_ppf_torch(p: torch.Tensor) -> torch.Tensor:
+    return math.sqrt(2.0) * torch.erfinv(torch.clamp(2.0 * p - 1.0, min=-0.999999, max=0.999999))
+
+
+def _prob_max_geq_torch(mu0: torch.Tensor, sig0: float, T: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    T = torch.clamp(T, min=0.0)
+    sig = float(max(1e-12, sig0))
+    s = sig * torch.sqrt(torch.clamp(T, min=0.0))
+    s_safe = torch.clamp(s, min=1e-12)
+    z1 = (a - mu0 * T) / s_safe
+    expo = (2.0 * mu0 * a) / max(1e-12, sig * sig)
+    expo = torch.clamp(expo, min=-80.0, max=80.0)
+    term = torch.exp(expo) * _norm_cdf_torch((-a - mu0 * T) / s_safe)
+    p = (1.0 - _norm_cdf_torch(z1)) + term
+    # Handle degenerate cases
+    p = torch.where(T <= 0.0, (a <= 0.0).float(), p)
+    return torch.clamp(p, 0.0, 1.0)
+
+
+def _prob_min_leq_torch(mu0: torch.Tensor, sig0: float, T: torch.Tensor, neg_a: torch.Tensor) -> torch.Tensor:
+    a = -neg_a
+    return _prob_max_geq_torch(-mu0, sig0, T, torch.abs(a))
+
+
+def _approx_unified_score_torch(
+    ev: torch.Tensor,
+    cvar: torch.Tensor,
+    tau_sec: torch.Tensor,
+    rho: float,
+    lambda_param: float,
+) -> torch.Tensor:
+    tau_safe = torch.clamp(tau_sec, min=1e-6)
+    util_rate = (ev - float(lambda_param) * torch.abs(cvar)) / tau_safe
+    rho_f = float(rho) if rho is not None else 0.0
+    if rho_f <= 0.0:
+        return util_rate
+    factor = (1.0 - torch.exp(-rho_f * tau_safe)) / torch.clamp(rho_f * tau_safe, min=1e-9)
+    return (util_rate - rho_f) * factor
+
+
+def _policy_metrics_torch(
     mu_ps: float,
     sigma_ps: float,
-    tau_sec: np.ndarray,
-    side_now: np.ndarray,
+    tau_sec: torch.Tensor,
+    side_now: torch.Tensor,
     leverage: float,
     fee_exit_only: float,
-    tp_target_roe: np.ndarray,
-    sl_target_roe: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute policy metrics per batch (numpy)."""
-    batch = len(side_now)
-    p_pos_cur = np.zeros(batch, dtype=np.float32)
-    p_pos_alt = np.zeros(batch, dtype=np.float32)
-    ev_cur = np.zeros(batch, dtype=np.float32)
-    ev_alt = np.zeros(batch, dtype=np.float32)
-    p_sl_cur = np.zeros(batch, dtype=np.float32)
-    p_sl_alt = np.zeros(batch, dtype=np.float32)
-    p_tp_cur = np.zeros(batch, dtype=np.float32)
-    p_tp_alt = np.zeros(batch, dtype=np.float32)
+    tp_target_roe: torch.Tensor,
+    sl_target_roe: torch.Tensor,
+    unified_lambda: float,
+    unified_rho: float,
+    cvar_alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    tau = torch.clamp(tau_sec, min=0.0)
+    side = torch.where(side_now >= 0, 1.0, -1.0)
+    alt_side = -side
 
-    for i in range(batch):
-        tau = float(max(0.0, tau_sec[i]))
-        side = 1 if int(side_now[i]) >= 0 else -1
-        alt_side = -side
-        p_pos_c, ev_c = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, side, leverage, fee_exit_only)
-        p_pos_a, ev_a = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, alt_side, leverage, fee_exit_only)
+    m = float(mu_ps) * tau
+    s = float(sigma_ps) * torch.sqrt(torch.clamp(tau, min=0.0))
+    s_safe = torch.clamp(s, min=1e-12)
 
-        target_tp = (float(tp_target_roe[i]) / max(1e-12, leverage)) * float(side)
-        target_sl = (float(sl_target_roe[i]) / max(1e-12, leverage)) * float(side)
+    thr = float(fee_exit_only) / max(1e-12, float(leverage))
+    z_cur = (side * m - thr) / s_safe
+    z_alt = (alt_side * m - thr) / s_safe
+    p_pos_cur = _norm_cdf_torch(z_cur)
+    p_pos_alt = _norm_cdf_torch(z_alt)
 
-        p_tp_c = _prob_max_geq(mu_ps * side, sigma_ps, tau, target_tp)
-        p_sl_c = _prob_min_leq(mu_ps * side, sigma_ps, tau, target_sl)
-        p_tp_a = _prob_max_geq(mu_ps * alt_side, sigma_ps, tau, -target_tp)
-        p_sl_a = _prob_min_leq(mu_ps * alt_side, sigma_ps, tau, -target_sl)
+    ev_cur = side * m * float(leverage) - float(fee_exit_only)
+    ev_alt = alt_side * m * float(leverage) - float(fee_exit_only)
 
-        p_pos_cur[i] = p_pos_c
-        p_pos_alt[i] = p_pos_a
-        ev_cur[i] = ev_c
-        ev_alt[i] = ev_a
-        p_sl_cur[i] = p_sl_c
-        p_sl_alt[i] = p_sl_a
-        p_tp_cur[i] = p_tp_c
-        p_tp_alt[i] = p_tp_a
+    std = s_safe * float(leverage)
+    alpha_t = torch.full_like(tau, float(min(0.5, max(1e-6, float(cvar_alpha)))))
+    z_alpha = _norm_ppf_torch(alpha_t)
+    pdf_alpha = _norm_pdf_torch(z_alpha)
+    cvar_cur = ev_cur - std * (pdf_alpha / alpha_t)
+    cvar_alt = ev_alt - std * (pdf_alpha / alpha_t)
 
-    return p_pos_cur, p_pos_alt, ev_cur, ev_alt, p_sl_cur, p_sl_alt, p_tp_cur, p_tp_alt
+    score_cur = _approx_unified_score_torch(ev_cur, cvar_cur, tau, unified_rho, unified_lambda)
+    score_alt = _approx_unified_score_torch(ev_alt, cvar_alt, tau, unified_rho, unified_lambda)
+
+    target_tp = (tp_target_roe / max(1e-12, float(leverage))) * side
+    target_sl = (sl_target_roe / max(1e-12, float(leverage))) * side
+
+    p_tp_cur = _prob_max_geq_torch(float(mu_ps) * side, float(sigma_ps), tau, target_tp)
+    p_sl_cur = _prob_min_leq_torch(float(mu_ps) * side, float(sigma_ps), tau, target_sl)
+    p_tp_alt = _prob_max_geq_torch(float(mu_ps) * alt_side, float(sigma_ps), tau, -target_tp)
+    p_sl_alt = _prob_min_leq_torch(float(mu_ps) * alt_side, float(sigma_ps), tau, -target_sl)
+
+    return p_pos_cur, p_pos_alt, score_cur, score_alt, p_sl_cur, p_sl_alt, p_tp_cur, p_tp_alt
 
 
 def simulate_exit_policy_rollforward_batched_vmap_torch(
@@ -89,6 +138,8 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
     hold_bad_ticks: int,
     fee_exit_only_override: float = -1.0,
     cvar_alpha: float = 0.05,
+    unified_lambda: float = 1.0,
+    unified_rho: float = 0.0,
 ) -> Dict[str, Any]:
     """Torch implementation of batched exit-policy simulation."""
     if not _TORCH_OK or torch is None:
@@ -159,29 +210,25 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
         after_min_hold = t >= min_hold_steps
         t_sec = float(t) * float(step_sec)
 
-        # Dynamic policy metrics (vectorized via numpy -> torch)
+        # Dynamic policy metrics (pure torch)
         tau_sec = (H_steps - t).clamp(min=0).to(torch.float32) * float(step_sec)
-        p_pos_cur, p_pos_alt, ev_cur, ev_alt, p_sl_cur, p_sl_alt, p_tp_cur, p_tp_alt = _policy_metrics_batch(
+        p_pos_cur_t, p_pos_alt_t, score_cur_t, score_alt_raw_t, p_sl_cur_t, p_sl_alt_t, p_tp_cur_t, p_tp_alt_t = _policy_metrics_torch(
             float(mu_ps),
             float(sigma_ps),
-            to_numpy(tau_sec),
-            to_numpy(side_now),
+            tau_sec,
+            side_now,
             float(leverage),
             float(fee_exit_only),
-            to_numpy(tp_target),
-            to_numpy(sl_target),
+            tp_target,
+            sl_target,
+            float(unified_lambda),
+            float(unified_rho),
+            float(cvar_alpha),
         )
-        p_pos_cur_t = to_torch(p_pos_cur, device=device)
-        p_pos_alt_t = to_torch(p_pos_alt, device=device)
-        ev_cur_t = to_torch(ev_cur, device=device)
-        ev_alt_t = to_torch(ev_alt, device=device)
-        p_sl_cur_t = to_torch(p_sl_cur, device=device)
-        p_sl_alt_t = to_torch(p_sl_alt, device=device)
-        p_tp_cur_t = to_torch(p_tp_cur, device=device)
-        p_tp_alt_t = to_torch(p_tp_alt, device=device)
-
-        gap_eff = ev_cur_t - (ev_alt_t - switch_cost)
-        alt_value_after_cost = ev_alt_t - float(exec_oneway)
+        tau_safe = torch.clamp(tau_sec, min=1.0)
+        score_alt_t = score_alt_raw_t - (float(switch_cost) / tau_safe)
+        alt_value_after_cost = score_alt_raw_t - (float(exec_oneway) / tau_safe)
+        gap_eff = score_cur_t - score_alt_t
 
         flip_ok = (p_pos_alt_t >= float(p_pos_floor_enter)) & (
             (alt_value_after_cost > 0.0) | (alt_value_after_cost > float(soft_floor))
@@ -198,7 +245,7 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
             torch.zeros_like(flip_streak),
         )
 
-        bad_hold = (ev_cur_t < -float(score_margin)) | (~hold_ok)
+        bad_hold = (score_cur_t < -float(score_margin)) | (~hold_ok)
         hold_bad = torch.where(
             bad_hold[:, None] & active_mask,
             hold_bad + 1,
@@ -323,6 +370,8 @@ def simulate_exit_policy_multi_symbol_torch(*args, **kwargs):
     hold_bad_ticks = int(args[28])
     fee_exit_only_override = float(args[29])
     cvar_alpha = float(args[30])
+    unified_lambda = float(args[31]) if len(args) > 31 else 1.0
+    unified_rho = float(args[32]) if len(args) > 32 else 0.0
 
     # Try vmap if available
     torch_vmap = None
@@ -380,6 +429,8 @@ def simulate_exit_policy_multi_symbol_torch(*args, **kwargs):
                 hold_bad_ticks,
                 fee_exit_only_override,
                 cvar_alpha,
+                unified_lambda,
+                unified_rho,
             )
             return (
                 res["p_pos_exit"],
@@ -460,6 +511,8 @@ def simulate_exit_policy_multi_symbol_torch(*args, **kwargs):
             hold_bad_ticks,
             fee_exit_only_override,
             cvar_alpha,
+            unified_lambda,
+            unified_rho,
         )
         for k in results:
             results[k].append(res[k])

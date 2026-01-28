@@ -70,3 +70,39 @@ UnifiedScore = max_T Score(a, L, T)
   - 랭킹/교체/배분 UnifiedScore 기반
 - `core/economic_brain.py`
   - `calculate_unified_score` 제공 (마진율 기반)
+
+## 변경로그
+- 2026-01-28: 청산(Exit) 로직을 UnifiedScore 기반으로 통일 (리스크/손실 반영)
+  - MC exit-policy가 EV 대신 UnifiedScore(=EV−λ|CVaR|)로 hold/flip 판단
+  - switch/flip 비용을 시간당 페널티로 반영(τ로 나눔)
+  - Torch exit-policy는 순수 torch로 계산하도록 변경, unified_lambda/unified_rho 전달
+  - 실제 청산 로직도 WAIT/flip 조건을 UnifiedScore 기준으로 갱신
+  - EMA/EV-drop 청산 기준을 unified_score로 전환
+  - paper exit/trailing/flip에도 UnifiedScore 우선 적용
+
+## 청산(Exit) 로직 업데이트
+### 1) MC Exit-Policy (시뮬레이션 기준)
+- 입력: `mu_ps, sigma_ps, leverage, fee_exit_only, tp/sl, horizon`
+- 계산:
+  - EV/PPOS + CVaR 근사 → UnifiedScore로 변환
+  - `score_cur vs score_alt` 비교로 flip/hold/exit 판단
+  - 비용은 `switch_cost / tau`, `exec_oneway / tau`로 시간당 반영
+- 적용 경로:
+  - CPU: `engines/exit_policy_methods.py`
+  - Torch: `engines/mc/exit_policy_torch.py`
+  - 라우팅: `engines/mc/exit_policy.py`
+
+### 2) 실시간 청산 (라이브 엔진)
+- `main_engine_mc_v2_final.py`에서:
+  - WAIT → 즉시 청산 제거
+  - UnifiedScore 기준 `flip`/`cash` 판단
+  - EMA/EV-drop 청산도 unified_score 기반으로 전환
+
+### 3) Paper Exit
+- `core/orchestrator.py`, `core/paper_broker.py`에서:
+  - trailing/flip 로직을 UnifiedScore 우선으로 평가
+
+### 4) 이벤트 기반 Exit
+- 이벤트 기반 exit는 기존처럼 별도 안전 장치로 유지
+  - `main_engine_mc_v2_final.py:_evaluate_event_exit`
+  - `engines/mc_risk.py:should_exit_position`

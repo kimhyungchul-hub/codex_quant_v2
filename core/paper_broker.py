@@ -167,9 +167,9 @@ class PaperBroker:
                 position["policy_horizon_sec"] = int(entry_h)
                 position["dynamic_min_hold"] = int(dyn_hold)
 
-            # Score-Based Exit
-            score_long = float(meta.get("policy_ev_score_long") or detail.get("policy_ev_score_long") or 0.0)
-            score_short = float(meta.get("policy_ev_score_short") or detail.get("policy_ev_score_short") or 0.0)
+            # Score-Based Exit (UnifiedScore preferred)
+            score_long = float(meta.get("unified_score_long") or detail.get("unified_score_long") or meta.get("policy_ev_score_long") or detail.get("policy_ev_score_long") or 0.0)
+            score_short = float(meta.get("unified_score_short") or detail.get("unified_score_short") or meta.get("policy_ev_score_short") or detail.get("policy_ev_score_short") or 0.0)
             entry_score_side = score_long if side_u == "LONG" else score_short
             position["entry_score_long"] = score_long
             position["entry_score_short"] = score_short

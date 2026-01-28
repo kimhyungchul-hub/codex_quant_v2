@@ -256,6 +256,7 @@ class MonteCarloDecisionMixin:
         lev_val = float(ctx_final.get("leverage") or 1.0)
         cost_base = float(metrics.get("fee_roundtrip_total", metrics.get("execution_cost", 0.0)) or 0.0)
         cost_roe = float(cost_base * lev_val)
+        cost_roe_exit = float(0.5 * cost_base * lev_val)
         rho_val = float(ctx_final.get("rho", config.unified_rho))
         lambda_val = float(ctx_final.get("unified_lambda", config.unified_risk_lambda))
 
@@ -274,6 +275,15 @@ class MonteCarloDecisionMixin:
             cost=cost_roe, rho=rho_val, lambda_param=lambda_val,
         ) if horizons_short and ev_short_gross and cvar_short_gross else (0.0, 0.0)
 
+        score_long_hold, _ = _calc_unified_score(
+            horizons_long, ev_long_gross, cvar_long_gross,
+            cost=cost_roe_exit, rho=rho_val, lambda_param=lambda_val,
+        ) if horizons_long and ev_long_gross and cvar_long_gross else (0.0, 0.0)
+        score_short_hold, _ = _calc_unified_score(
+            horizons_short, ev_short_gross, cvar_short_gross,
+            cost=cost_roe_exit, rho=rho_val, lambda_param=lambda_val,
+        ) if horizons_short and ev_short_gross and cvar_short_gross else (0.0, 0.0)
+
         if score_long >= score_short:
             best_score = float(score_long)
             best_dir = 1
@@ -286,9 +296,9 @@ class MonteCarloDecisionMixin:
         hold_score = None
         pos_side = int(ctx_final.get("position_side", 0) or 0)
         if pos_side == 1:
-            hold_score = float(score_long)
+            hold_score = float(score_long_hold)
         elif pos_side == -1:
-            hold_score = float(score_short)
+            hold_score = float(score_short_hold)
 
         if config.score_only_mode:
             if best_dir == 1:
@@ -309,12 +319,14 @@ class MonteCarloDecisionMixin:
         metrics["unified_score"] = float(best_score)
         metrics["unified_score_long"] = float(score_long)
         metrics["unified_score_short"] = float(score_short)
+        metrics["unified_score_hold"] = float(hold_score) if hold_score is not None else None
         metrics["unified_t_star"] = float(best_t)
         metrics["unified_t_star_long"] = float(t_long)
         metrics["unified_t_star_short"] = float(t_short)
         metrics["unified_lambda"] = float(lambda_val)
         metrics["unified_rho"] = float(rho_val)
         metrics["unified_cost_roe"] = float(cost_roe)
+        metrics["unified_cost_roe_exit"] = float(cost_roe_exit)
         metrics["unified_direction"] = int(best_dir)
         if best_t > 0:
             metrics["best_h"] = int(best_t)
@@ -403,6 +415,41 @@ class MonteCarloDecisionMixin:
 
                 score_long = float(metrics.get("unified_score_long", metrics.get("policy_ev_score_long", 0.0)) or 0.0)
                 score_short = float(metrics.get("unified_score_short", metrics.get("policy_ev_score_short", 0.0)) or 0.0)
+                meta = metrics.get("meta", {}) if isinstance(metrics, dict) else {}
+                hold_score = None
+                try:
+                    src = meta if isinstance(meta, dict) else metrics
+                    horizons = _get_vector(src, "horizon_seq")
+                    ev_long_vec = _get_vector(src, "ev_by_horizon_long")
+                    ev_short_vec = _get_vector(src, "ev_by_horizon_short")
+                    cvar_long_vec = _get_vector(src, "cvar_by_horizon_long")
+                    cvar_short_vec = _get_vector(src, "cvar_by_horizon_short")
+                    if horizons and ev_long_vec and ev_short_vec and cvar_long_vec and cvar_short_vec:
+                        lev_val = float(src.get("leverage", metrics.get("leverage", 1.0)) or 1.0)
+                        cost_base = float(src.get("fee_roundtrip_total", metrics.get("fee_roundtrip_total", 0.0)) or 0.0)
+                        cost_roe_full = float(cost_base * lev_val)
+                        cost_roe_exit = float(0.5 * cost_roe_full)
+                        rho_val = float(src.get("unified_rho", config.unified_rho))
+                        lambda_val = float(src.get("unified_lambda", config.unified_risk_lambda))
+                        ev_long_gross = [v + cost_roe_full for v in ev_long_vec]
+                        ev_short_gross = [v + cost_roe_full for v in ev_short_vec]
+                        cvar_long_gross = [v + cost_roe_full for v in cvar_long_vec]
+                        cvar_short_gross = [v + cost_roe_full for v in cvar_short_vec]
+                        score_long_hold, _ = _calc_unified_score(
+                            horizons, ev_long_gross, cvar_long_gross,
+                            cost=cost_roe_exit, rho=rho_val, lambda_param=lambda_val,
+                        )
+                        score_short_hold, _ = _calc_unified_score(
+                            horizons, ev_short_gross, cvar_short_gross,
+                            cost=cost_roe_exit, rho=rho_val, lambda_param=lambda_val,
+                        )
+                        pos_side = int(ctx.get("position_side", 0) or 0)
+                        if pos_side == 1:
+                            hold_score = float(score_long_hold)
+                        elif pos_side == -1:
+                            hold_score = float(score_short_hold)
+                except Exception:
+                    hold_score = None
 
                 direction = 0
                 if score_long > score_short:
@@ -426,10 +473,13 @@ class MonteCarloDecisionMixin:
                 metric_copy["unified_score_short"] = float(score_short)
 
                 pos_side = int(ctx.get("position_side", 0) or 0)
-                if pos_side == 1:
-                    metric_copy["unified_score_hold"] = float(score_long)
-                elif pos_side == -1:
-                    metric_copy["unified_score_hold"] = float(score_short)
+                if hold_score is None:
+                    if pos_side == 1:
+                        hold_score = float(score_long)
+                    elif pos_side == -1:
+                        hold_score = float(score_short)
+                if hold_score is not None:
+                    metric_copy["unified_score_hold"] = float(hold_score)
 
                 target_action = "WAIT"
                 if config.score_only_mode:

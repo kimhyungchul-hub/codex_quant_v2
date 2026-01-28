@@ -1314,11 +1314,31 @@ class LiveOrchestrator:
         lev_safe = float(pos.get("leverage", self.leverage) or 1.0)
         base_notional = notional / max(lev_safe, 1e-6) if notional else 0.0
         roe_unreal = pnl_unreal / base_notional if base_notional else 0.0
+        unified_score_hold = None
+        if decision:
+            unified_score_hold = decision.get("unified_score_hold")
+            if unified_score_hold is None:
+                if side == "LONG":
+                    unified_score_hold = decision.get("unified_score_long")
+                elif side == "SHORT":
+                    unified_score_hold = decision.get("unified_score_short")
+        unified_score_hold = float(unified_score_hold) if unified_score_hold is not None else None
+
+        unified_score_rev = None
+        if decision:
+            if side == "LONG":
+                unified_score_rev = decision.get("unified_score_short")
+            elif side == "SHORT":
+                unified_score_rev = decision.get("unified_score_long")
+        unified_score_rev = float(unified_score_rev) if unified_score_rev is not None else None
+
         exit_reasons = []
-        if action == "WAIT":
-            exit_reasons.append("engine WAIT")
-        elif action in ("LONG", "SHORT") and action != pos["side"]:
-            exit_reasons.append("signal flip")
+        if action in ("LONG", "SHORT") and action != pos["side"]:
+            if unified_score_hold is None or unified_score_rev is None or unified_score_rev > unified_score_hold:
+                exit_reasons.append("unified_flip")
+        elif action == "WAIT":
+            if unified_score_hold is not None and unified_score_hold <= 0.0:
+                exit_reasons.append("unified_cash")
         if age_ms >= hold_limit_ms:
             exit_reasons.append("hold timeout")
         # 공격적 손실 컷 (미실현 ROE 기준)
@@ -2093,7 +2113,7 @@ class LiveOrchestrator:
     def _check_ema_ev_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
         """EMA-based EV/PSL deterioration exit. Returns True if exited."""
         meta = decision.get("meta") or {}
-        ev_now = float(decision.get("ev", 0.0) or 0.0)
+        ev_now = float(decision.get("unified_score", decision.get("ev", 0.0)) or 0.0)
         p_sl_now = float(meta.get("event_p_sl", 0.0) or 0.0)
         ev_ema = self._ema_update(self._ema_ev, sym, ev_now, half_life_sec=30, ts_ms=ts)
         psl_ema = self._ema_update(self._ema_psl, sym, p_sl_now, half_life_sec=30, ts_ms=ts)
@@ -2116,7 +2136,7 @@ class LiveOrchestrator:
 
     def _check_ev_drop_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
         """EV drop exit logic. Returns True if exited."""
-        ev_now = float(decision.get("ev", 0.0) or 0.0)
+        ev_now = float(decision.get("unified_score", decision.get("ev", 0.0)) or 0.0)
         meta_now = decision.get("meta") or {}
         ev_floor = float(meta_now.get("ev_entry_threshold_dyn") or meta_now.get("ev_entry_threshold") or 0.0)
         prev_ev = self._ev_drop_state[sym].get("prev")

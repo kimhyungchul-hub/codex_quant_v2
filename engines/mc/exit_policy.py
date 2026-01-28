@@ -231,6 +231,20 @@ class MonteCarloExitPolicyMixin:
         except Exception:
             fee_exit_only_override = None
 
+        # Unified score parameters (risk/loss aware)
+        meta_src = decision_meta if isinstance(decision_meta, dict) else {}
+        nested_meta = meta_src.get("meta") if isinstance(meta_src, dict) else None
+        if isinstance(nested_meta, dict):
+            meta_src = nested_meta
+        try:
+            unified_lambda = float(meta_src.get("unified_lambda", config.unified_risk_lambda))
+        except Exception:
+            unified_lambda = float(config.unified_risk_lambda)
+        try:
+            unified_rho = float(meta_src.get("unified_rho", config.unified_rho))
+        except Exception:
+            unified_rho = float(config.unified_rho)
+
         # Determine TP/SL targets (ROE units)
         # ✅ If explicit overrides are provided, use them. 
         # Otherwise, fallback to TP_R_BY_H and SL_R_FIXED but scale them by leverage
@@ -283,6 +297,8 @@ class MonteCarloExitPolicyMixin:
                     hold_bad_ticks=int(self.POLICY_HOLD_BAD_TICKS),
                     fee_exit_only_override=float(fee_exit_only_override if fee_exit_only_override is not None else -1.0),
                     cvar_alpha=float(cvar_alpha),
+                    unified_lambda=float(unified_lambda),
+                    unified_rho=float(unified_rho),
                 )
 
                 res_batch_cpu = {k: to_numpy(v) for k, v in res_batch.items()}
@@ -347,6 +363,9 @@ class MonteCarloExitPolicyMixin:
                 fee_exit_only_override=fee_exit_only_override,
                 tp_target_roe=float(tp_target_roe),
                 sl_target_roe=float(sl_target_roe),
+                unified_lambda=float(unified_lambda),
+                unified_rho=float(unified_rho),
+                cvar_alpha=float(cvar_alpha),
             )
 
         delay_penalty_r_total = float(extra_entry_delay_penalty_r) + float(extra_exit_delay_penalty_r)
@@ -423,8 +442,12 @@ class MonteCarloExitPolicyMixin:
             nested = decision_meta.get("meta") if isinstance(decision_meta, dict) else None
             if isinstance(nested, dict):
                 meta_src = nested
-            score_long = _opt_float(meta_src.get("policy_ev_score_long"))
-            score_short = _opt_float(meta_src.get("policy_ev_score_short"))
+            score_long = _opt_float(meta_src.get("unified_score_long"))
+            if score_long is None:
+                score_long = _opt_float(meta_src.get("policy_ev_score_long"))
+            score_short = _opt_float(meta_src.get("unified_score_short"))
+            if score_short is None:
+                score_short = _opt_float(meta_src.get("policy_ev_score_short"))
             if score_long is not None or score_short is not None:
                 horizon_scale = math.sqrt(max(1.0, float(horizon_sec)) / 180.0)
                 entry_th = max(0.0, float(config.score_entry_threshold)) * horizon_scale
@@ -617,6 +640,8 @@ class MonteCarloExitPolicyMixin:
                 flip_confirm_ticks=int(self.FLIP_CONFIRM_TICKS),
                 hold_bad_ticks=int(self.POLICY_HOLD_BAD_TICKS),
                 cvar_alpha=float(cvar_alpha),
+                unified_lambda=float(config.unified_risk_lambda),
+                unified_rho=float(config.unified_rho),
             )
 
             # Unpack results
@@ -822,7 +847,8 @@ class MonteCarloExitPolicyMixin:
                 score_margin_v, soft_floor_v,
                 True, dd_stop_b,
                 int(self.FLIP_CONFIRM_TICKS), int(self.POLICY_HOLD_BAD_TICKS),
-                -1.0, float(symbols_args[0].get("cvar_alpha", 0.05))
+                -1.0, float(symbols_args[0].get("cvar_alpha", 0.05)),
+                float(config.unified_risk_lambda), float(config.unified_rho)
             )
             
             # Transfer all results in one go

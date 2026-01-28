@@ -31,8 +31,8 @@ def get_env_int(name: str, default: int) -> int:
 @dataclass
 class MCConfig:
     # --- Performance & Simulation ---
-    n_paths_live: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_LIVE", 16384))
-    n_paths_exit: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_EXIT", 16384))
+    n_paths_live: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_LIVE", 32768))
+    n_paths_exit: int = field(default_factory=lambda: get_env_int("MC_N_PATHS_EXIT", 32768))
     verbose_print: bool = field(default_factory=lambda: get_env_bool("MC_VERBOSE_PRINT", False))
     jax_device: str = field(default_factory=lambda: os.environ.get("JAX_MC_DEVICE", "").strip().lower())
     

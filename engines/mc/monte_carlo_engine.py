@@ -144,7 +144,7 @@ class MonteCarloEngine(
         self.horizons = (60, 300, 600, 1800, 3600)
         # Time resolution: one simulation step represents this many seconds.
         # Larger values reduce compute by reducing n_steps.
-        self.time_step_sec = int(os.environ.get("MC_TIME_STEP_SEC", "10"))
+        self.time_step_sec = int(os.environ.get("MC_TIME_STEP_SEC", "1"))
         self.time_step_sec = int(max(1, self.time_step_sec))
         # dt is year-fraction per simulation step.
         self.dt = float(self.time_step_sec) / 31536000.0

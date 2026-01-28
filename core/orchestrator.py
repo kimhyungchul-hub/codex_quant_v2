@@ -18,7 +18,7 @@ from core.data_manager import DataManager
 from core.database_manager import DatabaseManager, TradingMode
 from engines.engine_hub import EngineHub
 from engines.pmaker_manager import PMakerManager
-from engines.probability_methods import _approx_p_pos_and_ev_hold
+from engines.probability_methods import _approx_p_pos_and_ev_hold, _approx_cvar_normal
 from engines.mc.constants import SECONDS_PER_YEAR
 from utils.helpers import _env_bool, _env_float, _env_int, _load_env_file, _safe_float, now_ms
 
@@ -756,9 +756,9 @@ class LiveOrchestrator:
             if entry_h > 0:
                 self.positions[sym]["dynamic_min_hold"] = int(entry_h)
             
-            # ✅ Score-Based Exit: Track entry scores and max scores for trailing stop
-            score_long = float(detail.get("policy_ev_score_long") or 0.0)
-            score_short = float(detail.get("policy_ev_score_short") or 0.0)
+            # ✅ Score-Based Exit: Track entry scores and max scores for trailing stop (UnifiedScore preferred)
+            score_long = float(detail.get("unified_score_long") or detail.get("policy_ev_score_long") or 0.0)
+            score_short = float(detail.get("unified_score_short") or detail.get("policy_ev_score_short") or 0.0)
             self.positions[sym]["entry_score_long"] = score_long
             self.positions[sym]["entry_score_short"] = score_short
             self.positions[sym]["max_score_long"] = score_long
@@ -987,9 +987,9 @@ class LiveOrchestrator:
         # ✅ Score-Based Exit: Update and check score trailing stop
         if detail is not None:
             try:
-                # Get current scores from detail
-                current_score_long = float(detail.get("policy_ev_score_long") or 0.0)
-                current_score_short = float(detail.get("policy_ev_score_short") or 0.0)
+                # Get current scores (UnifiedScore preferred)
+                current_score_long = float(detail.get("unified_score_long") or detail.get("policy_ev_score_long") or 0.0)
+                current_score_short = float(detail.get("unified_score_short") or detail.get("policy_ev_score_short") or 0.0)
                 
                 # Update max_score
                 max_score_long = pos.get("max_score_long", -999.0)
@@ -1077,10 +1077,32 @@ class LiveOrchestrator:
         exec_oneway = float(fee_exit_only)
         switch_cost = float(max(0.0, 2.0 * float(exec_oneway)))
 
-        # scores / probabilities (deterministic approximation)
-        p_pos_cur, score_cur = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, side_now, lev, fee_exit_only)
-        p_pos_alt, score_alt_raw = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, alt_side, lev, fee_exit_only)
-        score_alt = float(score_alt_raw) - float(switch_cost)
+        # scores / probabilities (deterministic approximation, UnifiedScore-aligned)
+        try:
+            lambda_val = float(_env_float("UNIFIED_RISK_LAMBDA", 1.0))
+        except Exception:
+            lambda_val = 1.0
+        try:
+            rho_val = float(_env_float("UNIFIED_RHO", 0.0))
+        except Exception:
+            rho_val = 0.0
+
+        def _approx_unified_score(ev_val: float, cvar_val: float, tau_sec: float) -> float:
+            tau_f = float(max(1e-6, float(tau_sec)))
+            util_rate = (float(ev_val) - float(lambda_val) * abs(float(cvar_val))) / tau_f
+            if float(rho_val) <= 0.0:
+                return float(util_rate)
+            factor = (1.0 - math.exp(-float(rho_val) * tau_f)) / max(1e-9, float(rho_val) * tau_f)
+            return float((util_rate - float(rho_val)) * factor)
+
+        p_pos_cur, ev_cur = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, side_now, lev, fee_exit_only)
+        p_pos_alt, ev_alt = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, alt_side, lev, fee_exit_only)
+        cvar_cur = _approx_cvar_normal(mu_ps, sigma_ps, tau, side_now, lev, fee_exit_only, alpha=0.05)
+        cvar_alt = _approx_cvar_normal(mu_ps, sigma_ps, tau, alt_side, lev, fee_exit_only, alpha=0.05)
+        score_cur = _approx_unified_score(ev_cur, cvar_cur, tau)
+        score_alt_raw = _approx_unified_score(ev_alt, cvar_alt, tau)
+        tau_safe = float(max(1.0, float(tau)))
+        score_alt = float(score_alt_raw) - (float(switch_cost) / float(tau_safe))
         gap_eff = float(score_cur) - float(score_alt)
 
         mgn = float(max(0.0, float(self.paper_exit_policy_score_margin)))
@@ -1094,7 +1116,7 @@ class LiveOrchestrator:
             hold_bad = 0
         pos["policy_hold_bad"] = int(hold_bad)
 
-        alt_value_after_cost = float(score_alt_raw) - float(exec_oneway)
+        alt_value_after_cost = float(score_alt_raw) - (float(exec_oneway) / float(tau_safe))
         flip_ok = bool(
             (float(p_pos_alt) >= float(self.paper_exit_policy_p_pos_enter_floor))
             and ((alt_value_after_cost > 0.0) or (alt_value_after_cost > float(self.paper_exit_policy_soft_floor)))
@@ -1606,7 +1628,12 @@ class LiveOrchestrator:
 
     def _decision_metrics(self, decision: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         mc_meta = self._extract_mc_meta(decision)
-        ev = _safe_float(decision.get("ev", mc_meta.get("ev", 0.0)) if decision else 0.0, 0.0)
+        ev_src = decision.get("unified_score") if decision else None
+        if ev_src is None:
+            ev_src = mc_meta.get("unified_score")
+        if ev_src is None:
+            ev_src = decision.get("ev", mc_meta.get("ev", 0.0)) if decision else 0.0
+        ev = _safe_float(ev_src, 0.0)
         exec_cost = _safe_float(
             mc_meta.get("execution_cost", mc_meta.get("fee_roundtrip_fee_mix", 0.0)),
             0.0,

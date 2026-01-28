@@ -5,7 +5,28 @@ from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
-from engines.probability_methods import _approx_p_pos_and_ev_hold, _prob_max_geq, _prob_min_leq
+from engines.probability_methods import (
+    _approx_p_pos_and_ev_hold,
+    _approx_cvar_normal,
+    _prob_max_geq,
+    _prob_min_leq,
+)
+
+
+def _approx_unified_score_from_cumulative(
+    ev: float,
+    cvar: float,
+    tau_sec: float,
+    rho: float,
+    lambda_param: float,
+) -> float:
+    tau = float(max(1e-6, float(tau_sec)))
+    util_rate = (float(ev) - float(lambda_param) * abs(float(cvar))) / tau
+    rho_f = float(rho) if rho is not None else 0.0
+    if rho_f <= 0.0:
+        return float(util_rate)
+    factor = (1.0 - math.exp(-rho_f * tau)) / max(1e-9, (rho_f * tau))
+    return float((util_rate - rho_f) * factor)
 
 
 def simulate_exit_policy_rollforward(
@@ -42,6 +63,9 @@ def simulate_exit_policy_rollforward(
     tp_target_roe: float = 0.006,
     sl_target_roe: float = 0.005,
     meta_provider=None,
+    unified_lambda: float = 1.0,
+    unified_rho: float = 0.0,
+    cvar_alpha: float = 0.05,
 ) -> Dict[str, Any]:
     price_paths = np.asarray(price_paths, dtype=np.float64)
     if price_paths.ndim != 2:
@@ -77,6 +101,10 @@ def simulate_exit_policy_rollforward(
     def _meta_default_fn(tau: float) -> dict:
         ppos_cur, ev_cur = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, int(side_now), float(leverage), float(fee_exit_only))
         ppos_alt, ev_alt = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, int(alt_side), float(leverage), float(fee_exit_only))
+        cvar_cur = _approx_cvar_normal(mu_ps, sigma_ps, tau, int(side_now), float(leverage), float(fee_exit_only), alpha=float(cvar_alpha))
+        cvar_alt = _approx_cvar_normal(mu_ps, sigma_ps, tau, int(alt_side), float(leverage), float(fee_exit_only), alpha=float(cvar_alpha))
+        score_cur = _approx_unified_score_from_cumulative(ev_cur, cvar_cur, tau, float(unified_rho), float(unified_lambda))
+        score_alt = _approx_unified_score_from_cumulative(ev_alt, cvar_alt, tau, float(unified_rho), float(unified_lambda))
         lev = float(max(1e-12, float(leverage)))
         tp = float(tp_dyn)
         sl = float(sl_dyn)
@@ -100,8 +128,8 @@ def simulate_exit_policy_rollforward(
 
         if int(side_now) == 1:
             return {
-                "score_long": float(ev_cur),
-                "score_short": float(ev_alt),
+                "score_long": float(score_cur),
+                "score_short": float(score_alt),
                 "p_pos_long": float(ppos_cur),
                 "p_pos_short": float(ppos_alt),
                 "p_sl_long": float(p_sl_long),
@@ -110,8 +138,8 @@ def simulate_exit_policy_rollforward(
                 "p_tp_short": float(p_tp_short) if math.isfinite(float(p_tp_short)) else float("nan"),
             }
         return {
-            "score_long": float(ev_alt),
-            "score_short": float(ev_cur),
+            "score_long": float(score_alt),
+            "score_short": float(score_cur),
             "p_pos_long": float(ppos_alt),
             "p_pos_short": float(ppos_cur),
             "p_sl_long": float(p_sl_long),
@@ -153,6 +181,7 @@ def simulate_exit_policy_rollforward(
     for t in range(0, H, dt_dec):
         age = int(t)
         tau = float(max(0, H - t))
+        tau_safe = float(max(1.0, tau))
 
         # ✅ TP/SL per-path hit check (priority exit)
         tp_hit = (~decided) & (roe_simple[:, t] >= float(tp_target_roe))
@@ -212,10 +241,10 @@ def simulate_exit_policy_rollforward(
             p_sl_cur, p_sl_alt = float(p_sl_S), float(p_sl_L)
             p_tp_cur, p_tp_alt = float(p_tp_S), float(p_tp_L)
 
-        score_alt = float(score_alt_raw) - float(switch_cost)
+        score_alt = float(score_alt_raw) - (float(switch_cost) / float(tau_safe))
         gap_eff = float(score_cur - score_alt)
 
-        alt_value_after_cost = float(score_alt_raw) - float(exec_oneway)
+        alt_value_after_cost = float(score_alt_raw) - (float(exec_oneway) / float(tau_safe))
         flip_ok = bool(
             (p_pos_alt >= float(p_pos_floor_enter))
             and ((alt_value_after_cost > 0.0) or (alt_value_after_cost > float(soft_floor_f)))
@@ -347,6 +376,9 @@ def simulate_exit_policy_rollforward_analytic(
     fee_exit_only_override: Optional[float] = None,
     p_tp_valid_long: bool = True,
     p_tp_valid_short: bool = True,
+    unified_lambda: float = 1.0,
+    unified_rho: float = 0.0,
+    cvar_alpha: float = 0.05,
 ) -> Dict[str, Any]:
     H = int(max(1, int(horizon_sec)))
     dt_dec = int(max(1, int(decision_dt_sec)))
@@ -362,6 +394,10 @@ def simulate_exit_policy_rollforward_analytic(
     def _meta_default_fn(tau: float) -> dict:
         ppos_cur, ev_cur = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, int(side_now), float(leverage), float(fee_exit_only))
         ppos_alt, ev_alt = _approx_p_pos_and_ev_hold(mu_ps, sigma_ps, tau, int(alt_side), float(leverage), float(fee_exit_only))
+        cvar_cur = _approx_cvar_normal(mu_ps, sigma_ps, tau, int(side_now), float(leverage), float(fee_exit_only), alpha=float(cvar_alpha))
+        cvar_alt = _approx_cvar_normal(mu_ps, sigma_ps, tau, int(alt_side), float(leverage), float(fee_exit_only), alpha=float(cvar_alpha))
+        score_cur = _approx_unified_score_from_cumulative(ev_cur, cvar_cur, tau, float(unified_rho), float(unified_lambda))
+        score_alt = _approx_unified_score_from_cumulative(ev_alt, cvar_alt, tau, float(unified_rho), float(unified_lambda))
         lev = float(max(1e-12, float(leverage)))
         tp = float(tp_dyn)
         sl = float(sl_dyn)
@@ -385,8 +421,8 @@ def simulate_exit_policy_rollforward_analytic(
 
         if int(side_now) == 1:
             return {
-                "score_long": float(ev_cur),
-                "score_short": float(ev_alt),
+                "score_long": float(score_cur),
+                "score_short": float(score_alt),
                 "p_pos_long": float(ppos_cur),
                 "p_pos_short": float(ppos_alt),
                 "p_sl_long": float(p_sl_long),
@@ -395,8 +431,8 @@ def simulate_exit_policy_rollforward_analytic(
                 "p_tp_short": float(p_tp_short) if math.isfinite(float(p_tp_short)) else float("nan"),
             }
         return {
-            "score_long": float(ev_alt),
-            "score_short": float(ev_cur),
+            "score_long": float(score_alt),
+            "score_short": float(score_cur),
             "p_pos_long": float(ppos_alt),
             "p_pos_short": float(ppos_cur),
             "p_sl_long": float(p_sl_long),
@@ -413,6 +449,7 @@ def simulate_exit_policy_rollforward_analytic(
     for t in range(0, H + 1, dt_dec):
         age = int(t)
         tau = max(0.0, float(H - t))
+        tau_safe = float(max(1.0, tau))
         m = _meta_default_fn(float(tau))
 
         score_long = float(m.get("score_long", 0.0))
@@ -437,10 +474,10 @@ def simulate_exit_policy_rollforward_analytic(
             p_sl_cur, p_sl_alt = float(p_sl_S), float(p_sl_L)
             p_tp_cur, p_tp_alt = float(p_tp_S), float(p_tp_L)
 
-        score_alt = float(score_alt_raw) - float(switch_cost)
+        score_alt = float(score_alt_raw) - (float(switch_cost) / float(tau_safe))
         gap_eff = float(score_cur - score_alt)
 
-        alt_value_after_cost = float(score_alt_raw) - float(exec_oneway)
+        alt_value_after_cost = float(score_alt_raw) - (float(exec_oneway) / float(tau_safe))
         flip_ok = bool(
             (p_pos_alt >= float(p_pos_floor_enter))
             and ((alt_value_after_cost > 0.0) or (alt_value_after_cost > float(soft_floor_f)))
