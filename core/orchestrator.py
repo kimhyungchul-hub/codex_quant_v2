@@ -1868,6 +1868,7 @@ class LiveOrchestrator:
         event_t_median = _opt_float(mc_meta.get("event_t_median", meta.get("event_t_median")))
         event_ev_r = _opt_float(mc_meta.get("event_ev_r", meta.get("event_ev_r")))
         event_cvar_r = _opt_float(mc_meta.get("event_cvar_r", meta.get("event_cvar_r")))
+        event_unified_score = _opt_float(mc_meta.get("event_unified_score", meta.get("event_unified_score")))
 
         mc_win_rate = _opt_float(mc_meta.get("win_rate"))
         mc_cvar = _opt_float(mc_meta.get("cvar05"))
@@ -1964,6 +1965,7 @@ class LiveOrchestrator:
             "event_t_median": event_t_median,
             "event_ev_r": event_ev_r,
             "event_cvar_r": event_cvar_r,
+            "event_unified_score": event_unified_score,
             "funnel_reason": funnel_reason,
             "mu_alpha": mu_alpha,
             "mu_alpha_raw": mu_alpha_raw,

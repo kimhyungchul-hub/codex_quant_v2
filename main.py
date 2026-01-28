@@ -23,6 +23,7 @@ import bootstrap
 
 from pathlib import Path
 import config
+from engines.mc.config import config as mc_config
 from concurrent.futures import ThreadPoolExecutor
 from engines.mc.constants import DECIDE_BATCH_TIMEOUT_SEC as MC_DECIDE_BATCH_TIMEOUT_SEC
 
@@ -286,8 +287,9 @@ class LiveOrchestrator:
         self._dyn_leverage = {s: self.leverage for s in SYMBOLS}
         self.trade_tape = deque(maxlen=20_000)
         self.eval_history = deque(maxlen=5_000)  # 예측 vs 실제 품질 평가용
+        event_min_score = float(os.environ.get("EVENT_EXIT_SCORE", "-0.0005"))
         self.exit_policy = ExitPolicy(
-            min_event_ev_r=-0.0005,
+            min_event_score=event_min_score,
             max_event_p_sl=0.55,
             min_event_p_tp=0.30,
             grace_sec=20,
@@ -2064,13 +2066,24 @@ class LiveOrchestrator:
             p_sl_evt = float(m_evt.get("event_p_sl", 0.0) or 0.0)
             ev_pct_evt = ev_r_evt * sl_rem
             cvar_pct_evt = cvar_r_evt * sl_rem
+            t_med_evt = float(m_evt.get("event_t_median", 0.0) or 0.0)
+            tau_evt = float(max(1.0, t_med_evt if t_med_evt > 0 else 1.0))
+            lambda_evt = float(getattr(mc_config, "unified_risk_lambda", 1.0))
+            rho_evt = float(getattr(mc_config, "unified_rho", 0.0))
+            event_score = float(ev_pct_evt - lambda_evt * abs(cvar_pct_evt) - rho_evt * tau_evt)
         else:
             ev_pct_evt, cvar_pct_evt, p_sl_evt = 0.0, 0.0, 0.0
+            event_score = 0.0
 
-        if m_evt and ((ev_pct_evt < -0.0005) or (cvar_pct_evt < -0.006) or p_sl_evt >= 0.55):
+        if m_evt and (
+            (event_score <= float(self.exit_policy.min_event_score))
+            or (abs(cvar_pct_evt) >= float(self.exit_policy.max_abs_event_cvar_r))
+            or (p_sl_evt >= float(self.exit_policy.max_event_p_sl))
+        ):
             self._log(
                 f"[{sym}] EXIT by MC "
-                f"(EV%={ev_pct_evt*100:.2f}%, "
+                f"(Score={event_score*100:.4f}%, "
+                f"EV%={ev_pct_evt*100:.2f}%, "
                 f"CVaR%={cvar_pct_evt*100:.2f}%, "
                 f"P_SL={p_sl_evt:.2f})"
             )

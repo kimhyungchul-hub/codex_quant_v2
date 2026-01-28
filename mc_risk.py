@@ -45,7 +45,7 @@ class PyramidTracker:
 @dataclass
 class ExitPolicy:
     # --- tunable via WF ---
-    min_event_ev_r: float = -0.0005     # event EV가 이보다 나쁘면 exit
+    min_event_score: float = -0.0005   # event UnifiedScore가 이보다 나쁘면 exit
     max_event_p_sl: float = 0.55        # SL 먼저 맞을 확률이 너무 크면 exit
     time_stop_mult: float = 2.2        # event_t_median * 배수 넘어가면 exit
 
@@ -74,14 +74,26 @@ def should_exit_position(pos: Dict[str, Any], meta: Dict[str, Any], *, age_sec: 
     p_tp = _f(meta.get("event_p_tp"))
     t_med = _f(meta.get("event_t_median"))
     cvar_r = _f(meta.get("event_cvar_r"))
+    event_score = _f(meta.get("event_unified_score"))
+    sl_pct = _f(meta.get("event_sl_pct"))
+    lambda_val = _f(meta.get("unified_lambda"))
+    rho_val = _f(meta.get("unified_rho"))
 
     # 0) grace
     if age_sec < policy.grace_sec:
         return False, "grace"
 
-    # 1) EV deteriorated
-    if ev_r is not None and ev_r <= policy.min_event_ev_r:
-        return True, f"event_ev_r<= {policy.min_event_ev_r:.5f}"
+    # 1) UnifiedScore deteriorated
+    if event_score is None and ev_r is not None and cvar_r is not None:
+        sl_pct_f = float(sl_pct) if sl_pct is not None else 1.0
+        ev_pct = float(ev_r) * sl_pct_f
+        cvar_pct = float(cvar_r) * sl_pct_f
+        tau = float(t_med) if (t_med is not None and t_med > 0) else 1.0
+        lam = float(lambda_val) if lambda_val is not None else 1.0
+        rho = float(rho_val) if rho_val is not None else 0.0
+        event_score = ev_pct - lam * abs(cvar_pct) - rho * tau
+    if event_score is not None and event_score <= policy.min_event_score:
+        return True, f"event_score<= {policy.min_event_score:.6f}"
 
     # 2) SL-risk too high
     if p_sl is not None and p_sl >= policy.max_event_p_sl:

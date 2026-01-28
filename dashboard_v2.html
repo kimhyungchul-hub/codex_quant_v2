@@ -89,20 +89,6 @@
     .down{color:var(--bad)}
     .wait{color:var(--warn)}
     .muted{color:var(--muted)}
-    /* ✅ 필터 신호등 스타일 - 필터에 걸리면 빨간불 */
-    .filter-lights{
-      display:flex;gap:2px;align-items:center;
-    }
-    .filter-light{
-      width:16px;height:16px;border-radius:3px;
-      font-size:7px;font-weight:700;
-      display:flex;align-items:center;justify-content:center;
-      color:#fff;cursor:help;
-      transition:background 0.2s;
-    }
-    .filter-light.ok{background:#d1d5db;color:#6b7280}  /* 통과: 회색 (꺼진 상태) */
-    .filter-light.blocked{background:var(--bad);box-shadow:0 0 6px rgba(220,38,38,0.5)}  /* 차단: 빨간불 */
-    .filter-light.na{background:#e5e7eb;color:#9ca3af}
     /* 테이블 열 간격 줄이기 */
     thead th{padding:7px 6px !important;font-size:11px !important}
     tbody td{padding:6px !important}
@@ -150,14 +136,14 @@
               <th data-k="symbol">SYM</th>
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
-              <th data-k="filters">FILTERS</th>
-              <th data-k="unified_score">UNIFIED</th>
-              <th data-k="scorep">SCORE%</th>
+              <th data-k="unified_score">Ψ</th>
+              <th data-k="unified_score_hold">Ψ_HOLD</th>
+              <th data-k="unified_t_star">T*</th>
               <th data-k="kelly">KELLY</th>
               <th data-k="pos_roe">ROE%</th>
               <th data-k="pos_leverage">LEV</th>
               <th data-k="rebalance">REBAL</th>
-              <th data-k="delta_ev">ΔEV</th>
+              <th data-k="delta_ev">ΔΨ</th>
               <th data-k="exec_cost">COST</th>
               <th data-k="wgt">WGT</th>
             </tr>
@@ -199,7 +185,7 @@
         <table>
           <thead>
             <tr>
-              <th>TIME</th><th>SYM</th><th>TYPE</th><th>SIDE</th><th>PRICE</th><th>PNL</th><th>ROE%</th><th>LEV</th><th>NOTE</th>
+              <th>TIME</th><th>SYM</th><th>TYPE</th><th>SIDE</th><th>PRICE</th><th>PNL</th><th>ROE%</th><th>LEV</th><th>EXIT</th><th>NOTE</th>
             </tr>
           </thead>
           <tbody id="tradeBody"></tbody>
@@ -300,29 +286,28 @@
     return 'muted';
   }
 
-  // ✅ 필터 신호등 렌더링 함수
-  // 필터에 "걸리면" (false) 빨간불, 통과하면 (true) 회색 (꺼진 상태)
-  // 라벨: N=NAPV, E=EV, W=Win%, C=CVaR, X=EvtCVaR, D=Direction
-  function renderFilterLights(filterStates){
-    const filters = [
-      { key: 'napv', label: 'N', title: 'NAPV (순현재가치)' },
-      { key: 'ev', label: 'E', title: 'EV (기대값 > 0)' },
-      { key: 'winrate', label: 'W', title: 'Win% (승률)' },
-      { key: 'cvar', label: 'C', title: 'CVaR (위험)' },
-      { key: 'event_cvar', label: 'X', title: 'Event CVaR' },
-      { key: 'direction', label: 'D', title: 'Direction (방향)' },
-    ];
-    let html = '<div class="filter-lights">';
-    for(const f of filters){
-      // filterStates가 없으면 기본값은 true (모두 통과)
-      const val = filterStates ? filterStates[f.key] : true;
-      // val === true: 통과 → 회색 (ok), val === false: 차단 → 빨간불 (blocked)
-      const cls = (val === false) ? 'blocked' : (val === true) ? 'ok' : 'na';
-      const statusText = (val === false) ? '❌ 차단' : (val === true) ? '✓ 통과' : '?';
-      html += `<span class="filter-light ${cls}" title="${f.title}: ${statusText}">${f.label}</span>`;
-    }
-    html += '</div>';
-    return html;
+  function exitKeyword(t){
+    const direct = (t.exit_tag || t.exit_kind || '').toString().toLowerCase();
+    if(direct) return direct;
+    const r = `${t.reason||''} ${t.note||''}`.toLowerCase();
+    if(r.includes('event_mc')) return 'event_mc';
+    if(r.includes('mc_exit') || r.includes('exit-policy')) return 'exit-policy';
+    if(r.includes('ev_psl_ema')) return 'ema_psl';
+    if(r.includes('ev_drop')) return 'ev_drop';
+    if(r.includes('unrealized_dd') || r.includes('dd_stop')) return 'dd_stop';
+    if(r.includes('score_flip') || r.includes('unified_flip')) return 'unified_flip';
+    if(r.includes('unified_cash')) return 'unified_cash';
+    if(r.includes('hold timeout') || r.includes('time_stop')) return 'time_stop';
+    if(r.includes('rebalance')) return 'rebalance';
+    if(r.includes('kill') || r.includes('emergency')) return 'kill';
+    return '';
+  }
+
+  function exitBadge(tag){
+    if(!tag) return '<span class="pill muted">-</span>';
+    const t = tag.toLowerCase();
+    const cls = t.includes('kill') ? 'down' : (t.includes('event') ? 'wait' : '');
+    return `<span class="pill ${cls}">${tag}</span>`;
   }
 
   // ✅ trade type badge (ENTER/EXIT/REBAL/SPREAD clearly visible)
@@ -446,30 +431,16 @@
       const confp = (x.conf||0)*100;
       const mc_win = (x.mc_win_rate||0)*100;
       const pos_roe = (x.pos_roe||0)*100;
+      const unified_score_hold = (x.unified_score_hold!==undefined && x.unified_score_hold!==null) ? Number(x.unified_score_hold) :
+        (x.meta && x.meta.unified_score_hold!==undefined && x.meta.unified_score_hold!==null) ? Number(x.meta.unified_score_hold) : null;
+      const unified_t_star = (x.unified_t_star!==undefined && x.unified_t_star!==null) ? Number(x.unified_t_star) :
+        (x.meta && x.meta.unified_t_star!==undefined && x.meta.unified_t_star!==null) ? Number(x.meta.unified_t_star) : null;
 
       const action_type =
         x.action_type ||
         (x.meta && (x.meta.action_type || x.meta.event || x.meta.trade_event)) ||
         '-';
 
-      // ✅ 필터 상태 추출
-      let filter_states = x.filter_states || null;
-      if(!filter_states && x.meta){
-        filter_states = x.meta.filter_states || null;
-      }
-      if(!filter_states && x.details && Array.isArray(x.details)){
-        for(const d of x.details){
-          if(d && d.filter_states){
-            filter_states = d.filter_states;
-            break;
-          }
-          if(d && d.meta && d.meta.filter_states){
-            filter_states = d.meta.filter_states;
-            break;
-          }
-        }
-      }
-      
       return {
         raw:x,
         symbol:sym,
@@ -477,8 +448,9 @@
         status: x.status || 'WAIT',
         regime: x.regime || '-',
         action_type: action_type || '-',
-        filter_states: filter_states,  // ✅ 필터 상태 추가
         unified_score,
+        unified_score_hold,
+        unified_t_star,
         scorep,
         confp,
         kelly: x.kelly ?? x.kelly_frac ?? null,
@@ -544,7 +516,7 @@
       // Top-4 표시: rank 1~4는 굵게 표시
       const isTop4 = (r.rank!==null && r.rank!==undefined && r.rank <= 4);
 
-      // column mapping: rank, symbol, price, status, filters, unified, score%, kelly, roe%, lev
+      // column mapping: rank, symbol, price, status, ψ, ψ_hold, t*, kelly, roe%, lev
       c[0].className = 'mono'; 
       c[0].innerHTML = isTop4 ? `<b style="color:var(--accent)">${r.rank}</b>` : (r.rank!==null && r.rank!==undefined ? String(r.rank) : '-');
       
@@ -557,15 +529,14 @@
       c[3].className = ''; 
       c[3].innerHTML = `<span class="pill ${cls}">${r.status}</span>`;
       
-      // ✅ 필터 신호등 (FILTERS 열)
-      c[4].className = ''; 
-      c[4].innerHTML = renderFilterLights(r.filter_states);
+      c[4].className = 'mono'; 
+      c[4].textContent = (isNum(r.unified_score) ? (Number(r.unified_score)*100).toFixed(2) : '-');
       
       c[5].className = 'mono'; 
-      c[5].textContent = (isNum(r.unified_score) ? (Number(r.unified_score)*100).toFixed(2) : '-');
+      c[5].textContent = (isNum(r.unified_score_hold) ? (Number(r.unified_score_hold)*100).toFixed(2) : '-');
       
-      c[6].className = `mono ${(r.scorep>=0)?'up':'down'}`; 
-      c[6].textContent = (r.scorep===null||r.scorep===undefined)?'-':(isNum(r.scorep)?r.scorep.toFixed(2):r.scorep);
+      c[6].className = 'mono';
+      c[6].textContent = (isNum(r.unified_t_star) ? `${Number(r.unified_t_star).toFixed(0)}s` : '-');
       
       c[7].className = 'mono'; 
       c[7].textContent = (r.kelly===null?'-':(isNum(r.kelly)?f2(r.kelly):r.kelly));
@@ -584,7 +555,7 @@
       else if(reb==='SWITCH'){ c[10].innerHTML = '<span class="pill">SWITCH</span>'; }
       else { c[10].innerHTML = `<span class="pill muted">${reb}</span>`; }
 
-      // ΔEV (show as percentage if number)
+      // ΔΨ (show as percentage if number)
       c[11].className = 'mono';
       c[11].textContent = (r.rebalance_delta_ev===null||r.rebalance_delta_ev===undefined)?'-':(isNum(r.rebalance_delta_ev)?(Number(r.rebalance_delta_ev)*100).toFixed(2):r.rebalance_delta_ev);
 
@@ -681,6 +652,7 @@
       }
 
       const tr = document.createElement('tr');
+      const exitTag = (ttype === 'EXIT') ? exitKeyword(t) : '';
       tr.innerHTML = `
         <td class="mono">${t.time||'-'}</td>
         <td class="mono"><b>${normSym(sym)}</b></td>
@@ -690,13 +662,14 @@
         <td class="mono ${(pnl!==null&&pnl<0)?'down':'up'}">${pnl===null||pnl===undefined?'-':f2(pnl)}</td>
         <td class="mono">${roe===null||roe===undefined?'-':(roe*100).toFixed(2)}</td>
         <td class="mono">${t.leverage===null||t.leverage===undefined?'-':t.leverage}</td>
+        <td>${exitBadge(exitTag)}</td>
         <td class="muted">${t.tag||''} ${t.reason||t.note||''}</td>
       `;
       tradeBody.appendChild(tr);
     });
 
     if(!tradeTape.length){
-      tradeBody.innerHTML = `<tr><td class="muted" colspan="9">아직 트레이드 이벤트 없음 (logs에서 ENTER/EXIT가 찍히면 자동으로 들어옴)</td></tr>`;
+      tradeBody.innerHTML = `<tr><td class="muted" colspan="10">아직 트레이드 이벤트 없음 (logs에서 ENTER/EXIT가 찍히면 자동으로 들어옴)</td></tr>`;
     }
   }
 

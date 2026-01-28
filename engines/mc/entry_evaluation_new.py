@@ -3110,6 +3110,7 @@ class MonteCarloEntryEvaluationMixin:
         # event EV/CVaR를 % 수익률 단위로 환산 (R * SL%)
         event_ev_pct = None
         event_cvar_pct = None
+        event_unified_score = None
         try:
             if event_metrics.get("event_ev_r") is not None:
                 event_ev_pct = float(event_metrics["event_ev_r"]) * sl_pct
@@ -3120,6 +3121,15 @@ class MonteCarloEntryEvaluationMixin:
                 event_cvar_pct = float(event_metrics["event_cvar_r"]) * sl_pct
         except Exception:
             event_cvar_pct = None
+        try:
+            if event_ev_pct is not None and event_cvar_pct is not None:
+                lambda_val = float(ctx.get("unified_lambda", config.unified_risk_lambda))
+                rho_val = float(ctx.get("rho", config.unified_rho))
+                tau_evt = float(event_metrics.get("event_t_median") or max(self.horizons))
+                tau_evt = float(max(1.0, tau_evt))
+                event_unified_score = float(event_ev_pct - lambda_val * abs(event_cvar_pct) - rho_val * tau_evt)
+        except Exception:
+            event_unified_score = None
 
         # ✅ BTC 상관관계 반영 (리스크 관리)
         btc_corr = _s(ctx.get("btc_corr"), 0.0)
@@ -3208,8 +3218,13 @@ class MonteCarloEntryEvaluationMixin:
             "event_p_timeout": event_metrics.get("event_p_timeout"),
             "event_ev_r": event_metrics.get("event_ev_r"),
             "event_cvar_r": event_metrics.get("event_cvar_r"),
+            "event_unified_score": event_unified_score,
+            "event_sl_pct": float(sl_pct),
+            "event_tp_pct": float(tp_pct),
             "event_t_median": event_metrics.get("event_t_median"),
             "event_t_mean": event_metrics.get("event_t_mean"),
+            "unified_lambda": float(ctx.get("unified_lambda", config.unified_risk_lambda)),
+            "unified_rho": float(ctx.get("rho", config.unified_rho)),
             "ev_by_horizon": [float(x) for x in ev_list] if ev_list else [],
             # Directional EV curves for Score_A (vector: LONG/SHORT).
             # These are hold-to-horizon EVs (net ROE) for each side.
