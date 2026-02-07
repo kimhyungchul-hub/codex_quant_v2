@@ -197,7 +197,25 @@ class EngineHub:
         if is_score_only:
             final_action = best["action"]
         else:
-            final_action = best["action"] if total_ev > 0 else "WAIT"
+            try:
+                entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+            except Exception:
+                entry_floor = 0.0
+            best_score = None
+            try:
+                best_score = best.get("unified_score")
+            except Exception:
+                best_score = None
+            if best_score is None:
+                try:
+                    meta_best = best.get("meta") if isinstance(best, dict) else None
+                    if isinstance(meta_best, dict):
+                        best_score = meta_best.get("unified_score")
+                except Exception:
+                    best_score = None
+            if best_score is None:
+                best_score = best.get("ev", 0.0)
+            final_action = best["action"] if float(best_score or 0.0) > entry_floor else "WAIT"
 
         if MC_VERBOSE_PRINT:
             print(
@@ -232,6 +250,12 @@ class EngineHub:
                 final["unified_score_short"] = unified_src.get("unified_score_short")
                 final["unified_score_hold"] = unified_src.get("unified_score_hold")
                 final["unified_t_star"] = unified_src.get("unified_t_star")
+                if unified_src.get("hybrid_score") is not None:
+                    final["hybrid_score"] = float(unified_src.get("hybrid_score"))
+                    final["hybrid_score_logw"] = unified_src.get("hybrid_score_logw")
+                    final["hybrid_score_long"] = unified_src.get("hybrid_score_long")
+                    final["hybrid_score_short"] = unified_src.get("hybrid_score_short")
+                    final["hybrid_score_hold"] = unified_src.get("hybrid_score_hold")
         except Exception:
             pass
 

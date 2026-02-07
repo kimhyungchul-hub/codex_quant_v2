@@ -201,6 +201,15 @@ class MonteCarloExitPolicyMixin:
                 # 너무 짧으면 그대로 두되, horizon_eff는 최소 1로
                 h_eff = max(1, min(h_eff, pp.shape[1] - 1))
 
+        cash_exit_enabled = bool(getattr(config, "policy_cash_exit_enabled", False))
+        cash_exit_score = float(getattr(config, "policy_cash_exit_score", 0.0))
+        max_hold_sec = int(getattr(config, "policy_max_hold_sec", 0) or 0)
+        if max_hold_sec > 0:
+            h_eff = int(min(int(h_eff), max_hold_sec))
+        max_hold_steps = 0
+        if max_hold_sec > 0:
+            max_hold_steps = int(math.ceil(float(max_hold_sec) / float(step_sec)))
+
         h_eff_steps = int(max(1, math.ceil(float(h_eff) / float(step_sec))))
         h_eff_pts = int(h_eff_steps + 1)
         if pp is not None and pp.shape[1] > h_eff_pts:
@@ -299,6 +308,8 @@ class MonteCarloExitPolicyMixin:
                     cvar_alpha=float(cvar_alpha),
                     unified_lambda=float(unified_lambda),
                     unified_rho=float(unified_rho),
+                    cash_exit_score=(cash_exit_score if cash_exit_enabled else None),
+                    max_hold_sec=int(max_hold_sec),
                 )
 
                 res_batch_cpu = {k: to_numpy(v) for k, v in res_batch.items()}
@@ -322,6 +333,8 @@ class MonteCarloExitPolicyMixin:
                     4: "unrealized_dd",
                     5: "tp_hit",
                     6: "sl_hit",
+                    7: "unified_cash",
+                    8: "max_hold",
                 }
                 counts = {}
                 for idx in reason_idxs:
@@ -357,6 +370,8 @@ class MonteCarloExitPolicyMixin:
                 p_tp_floor_hold=float(p_tp_floor_hold if p_tp_floor_hold is not None else self.POLICY_P_TP_HOLD_MIN_BY_REGIME.get(regime, 0.12)),
                 score_margin=float(self.SCORE_MARGIN_DEFAULT),
                 soft_floor=float(self.POLICY_VALUE_SOFT_FLOOR_AFTER_COST),
+                cash_exit_score=(cash_exit_score if cash_exit_enabled else None),
+                max_hold_sec=int(max_hold_steps),
                 side_now=int(direction),
                 enable_dd_stop=bool(enable_dd_stop),
                 dd_stop_roe=float(dd_stop_roe_eff),
@@ -507,6 +522,9 @@ class MonteCarloExitPolicyMixin:
         out_meta["policy_horizon_eff_sec"] = int(h_eff)
         out_meta["policy_dd_stop_roe"] = float(dd_stop_roe)
         out_meta["policy_dd_stop_enabled"] = bool(enable_dd_stop)
+        out_meta["policy_cash_exit_enabled"] = bool(cash_exit_enabled)
+        out_meta["policy_cash_exit_score"] = float(cash_exit_score)
+        out_meta["policy_max_hold_sec"] = int(max_hold_sec)
         if MC_VERBOSE_PRINT:
             print(f"[PMAKER_DEBUG] {symbol} | compute_exit_policy_metrics: out_meta keys={list(out_meta.keys())} horizon_eff={h_eff}")
             logger.info(f"[PMAKER_DEBUG] {symbol} | compute_exit_policy_metrics: out_meta keys={list(out_meta.keys())} horizon_eff={h_eff}")
@@ -564,6 +582,9 @@ class MonteCarloExitPolicyMixin:
         """
         Computes exit policy metrics for a batch of (direction, horizon) combinations using Torch vmap.
         """
+        cash_exit_enabled = bool(getattr(config, "policy_cash_exit_enabled", False))
+        cash_exit_score = float(getattr(config, "policy_cash_exit_score", 0.0))
+        max_hold_sec = int(getattr(config, "policy_max_hold_sec", 0) or 0)
         use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK and simulate_exit_policy_rollforward_batched_vmap_jax is not None
         
         if not use_torch:
@@ -602,6 +623,8 @@ class MonteCarloExitPolicyMixin:
             # Prepare batched inputs
             # batch_horizons are seconds
             horizon_sec_batch = batch_horizons.astype(np.int32)
+            if max_hold_sec > 0:
+                horizon_sec_batch = np.minimum(horizon_sec_batch, int(max_hold_sec)).astype(np.int32)
             max_horizon_sec = int(np.max(horizon_sec_batch))
             
             min_hold_sec_batch = np.array([
@@ -642,6 +665,8 @@ class MonteCarloExitPolicyMixin:
                 cvar_alpha=float(cvar_alpha),
                 unified_lambda=float(config.unified_risk_lambda),
                 unified_rho=float(config.unified_rho),
+                cash_exit_score=(cash_exit_score if cash_exit_enabled else None),
+                max_hold_sec=int(max_hold_sec),
             )
 
             # Unpack results
@@ -654,6 +679,8 @@ class MonteCarloExitPolicyMixin:
                 4: "unrealized_dd",
                 5: "tp_hit",
                 6: "sl_hit",
+                7: "unified_cash",
+                8: "max_hold",
             }
 
             # Convert torch -> numpy once
@@ -758,6 +785,7 @@ class MonteCarloExitPolicyMixin:
         - symbols_args: 각 심볼별 compute_exit_policy_metrics_batched에 필요한 인자 리스트
         - 반환: 각 심볼별 결과 리스트의 리스트
         """
+        global simulate_exit_policy_multi_symbol_jax
         if not _TORCH_OK or simulate_exit_policy_multi_symbol_jax is None:
             # Fallback (sequential)
             return [self.compute_exit_policy_metrics_batched(**args) for args in symbols_args]
@@ -771,6 +799,9 @@ class MonteCarloExitPolicyMixin:
             decision_dt_sec = int(getattr(self, "POLICY_DECISION_DT_SEC", 5))
             step_sec = int(getattr(self, "time_step_sec", 1) or 1)
             step_sec = int(max(1, step_sec))
+            cash_exit_enabled = bool(getattr(config, "policy_cash_exit_enabled", False))
+            cash_exit_score = float(getattr(config, "policy_cash_exit_score", 0.0))
+            max_hold_sec = int(getattr(config, "policy_max_hold_sec", 0) or 0)
             
             # Prepare flattened batches
             batch_sizes = [len(args["batch_directions"]) for args in symbols_args]
@@ -811,6 +842,8 @@ class MonteCarloExitPolicyMixin:
                 side_now_b[i, :bs] = args["batch_directions"]
                 h_sec = args["batch_horizons"]
                 horizon_pts = h_sec.astype(np.int32)
+                if max_hold_sec > 0:
+                    horizon_pts = np.minimum(horizon_pts, int(max_hold_sec)).astype(np.int32)
                 horizon_sec_b[i, :bs] = horizon_pts
                 max_horizon_pts_overall = max(max_horizon_pts_overall, int(np.max(horizon_pts)))
                 
@@ -836,10 +869,14 @@ class MonteCarloExitPolicyMixin:
                 price_paths_b[i, :, :steps_to_copy] = np.asarray(p_paths_np[:, :steps_to_copy], dtype=np.float32)
 
             # Torch multi-symbol kernel call
+            decision_dt_sec_v = np.full(num_symbols, decision_dt_sec, dtype=np.int64)
+            step_sec_v = np.full(num_symbols, step_sec, dtype=np.int64)
+            max_horizon_sec_v = np.full(num_symbols, max_horizon_pts_overall, dtype=np.int64)
+
             res_jax_multi = simulate_exit_policy_multi_symbol_jax(
                 price_paths_b,
                 s0_v, mu_ps_v, sigma_ps_v, leverage_v, fee_rt_v, exec_ow_v, impact_v,
-                decision_dt_sec, step_sec, max_horizon_pts_overall,
+                decision_dt_sec_v, step_sec_v, max_horizon_sec_v,
                 side_now_b, horizon_sec_b, min_hold_b, tp_target_b, sl_target_b,
                 p_pos_floor_enter_v, p_pos_floor_hold_v,
                 p_sl_enter_ceiling_v, p_sl_hold_ceiling_v, p_sl_emergency_v,
@@ -848,7 +885,9 @@ class MonteCarloExitPolicyMixin:
                 True, dd_stop_b,
                 int(self.FLIP_CONFIRM_TICKS), int(self.POLICY_HOLD_BAD_TICKS),
                 -1.0, float(symbols_args[0].get("cvar_alpha", 0.05)),
-                float(config.unified_risk_lambda), float(config.unified_rho)
+                float(config.unified_risk_lambda), float(config.unified_rho),
+                cash_exit_score=cash_exit_score if cash_exit_enabled else None,
+                max_hold_sec=int(max_hold_sec),
             )
             
             # Transfer all results in one go
@@ -863,6 +902,8 @@ class MonteCarloExitPolicyMixin:
                 4: "unrealized_dd",
                 5: "tp_hit",
                 6: "sl_hit",
+                7: "unified_cash",
+                8: "max_hold",
             }
             
             for i in range(num_symbols):
@@ -898,4 +939,11 @@ class MonteCarloExitPolicyMixin:
             logger.error(f"[TORCH_MULTI_ERR] {e}")
             import traceback
             logger.error(traceback.format_exc())
+            try:
+                # Disable multi-symbol torch path for the rest of the run to avoid repeated failures.
+                simulate_exit_policy_multi_symbol_jax = None
+            except Exception:
+                pass
+            # Gracefully fall back to per-symbol evaluation so the worker still responds
+            return [self.compute_exit_policy_metrics_batched(**args) for args in symbols_args]
             return [self.compute_exit_policy_metrics_batched(**args) for args in symbols_args]

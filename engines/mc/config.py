@@ -166,6 +166,9 @@ class MCConfig:
     alpha_hit_max_loss: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_MAX_LOSS", 2.0))
     alpha_hit_data_half_life_sec: float = field(default_factory=lambda: get_env_float("ALPHA_HIT_DATA_HALF_LIFE_SEC", 3600.0))
     alpha_hit_fallback: str = field(default_factory=lambda: os.environ.get("ALPHA_HIT_FALLBACK", "mc_to_hitprob").strip().lower())
+    alpha_hit_warmup_samples: int = field(default_factory=lambda: get_env_int("ALPHA_HIT_WARMUP_SAMPLES", 512))
+    alpha_hit_replay_path: str = field(default_factory=lambda: os.environ.get("ALPHA_HIT_REPLAY_PATH", "state/alpha_hit_replay.npz"))
+    alpha_hit_replay_save_every: int = field(default_factory=lambda: get_env_int("ALPHA_HIT_REPLAY_SAVE_EVERY", 2000))
 
     # --- Alpha/PMaker Delay ---
     pmaker_delay_penalty_mult: float = field(default_factory=lambda: get_env_float("PMAKER_DELAY_PENALTY_MULT", 1.0))
@@ -177,6 +180,9 @@ class MCConfig:
     # --- Exit Policy ---
     policy_enable_dd_stop: bool = field(default_factory=lambda: get_env_bool("POLICY_ENABLE_DD_STOP", True))
     policy_dd_stop_roe: float = field(default_factory=lambda: get_env_float("POLICY_DD_STOP_ROE", -0.01))
+    policy_cash_exit_enabled: bool = field(default_factory=lambda: get_env_bool("POLICY_CASH_EXIT_ENABLED", False))
+    policy_cash_exit_score: float = field(default_factory=lambda: get_env_float("POLICY_CASH_EXIT_SCORE", 0.0))
+    policy_max_hold_sec: int = field(default_factory=lambda: get_env_int("POLICY_MAX_HOLD_SEC", 0))
     policy_w_prior_half_life_base_sec: float = field(default_factory=lambda: get_env_float("POLICY_W_PRIOR_HALF_LIFE_BASE_SEC", 3600.0))
     sl_r_fixed: float = field(default_factory=lambda: get_env_float("SL_R_FIXED", 0.0020))
     trail_atr_mult: float = field(default_factory=lambda: get_env_float("TRAIL_ATR_MULT", 2.0))
@@ -207,6 +213,14 @@ class MCConfig:
     portfolio_individual_cap: float = field(default_factory=lambda: get_env_float("PORTFOLIO_INDIVIDUAL_CAP", 3.0))
     portfolio_risk_aversion: float = field(default_factory=lambda: get_env_float("PORTFOLIO_RISK_AVERSION", 0.5))
     portfolio_var_alpha: float = field(default_factory=lambda: get_env_float("PORTFOLIO_VAR_ALPHA", 0.05))
+    portfolio_market_factor_scale: float = field(default_factory=lambda: get_env_float("PORTFOLIO_MARKET_FACTOR_SCALE", 1.0))
+    portfolio_residual_scale: float = field(default_factory=lambda: get_env_float("PORTFOLIO_RESIDUAL_SCALE", 1.0))
+    portfolio_rebalance_sim_enabled: bool = field(default_factory=lambda: get_env_bool("PORTFOLIO_REBAL_SIM_ENABLED", False))
+    portfolio_rebalance_interval: int = field(default_factory=lambda: get_env_int("PORTFOLIO_REBAL_INTERVAL", 1))
+    portfolio_rebalance_fee_bps: float = field(default_factory=lambda: get_env_float("PORTFOLIO_REBAL_FEE_BPS", 6.0))
+    portfolio_rebalance_slip_bps: float = field(default_factory=lambda: get_env_float("PORTFOLIO_REBAL_SLIP_BPS", 4.0))
+    portfolio_rebalance_score_noise: float = field(default_factory=lambda: get_env_float("PORTFOLIO_REBAL_SCORE_NOISE", 0.0))
+    portfolio_rebalance_min_score: float = field(default_factory=lambda: get_env_float("PORTFOLIO_REBAL_MIN_SCORE", 0.0))
 
     # --- PMAKER model ---
     pmaker_enable: bool = field(default_factory=lambda: get_env_bool("PMAKER_ENABLE", False))

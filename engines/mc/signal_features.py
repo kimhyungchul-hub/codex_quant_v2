@@ -116,6 +116,43 @@ class MonteCarloSignalFeaturesMixin:
             return float(mu_ann), float(lr), float(tau)
 
         mom_cfg = ((15, 0.35), (30, 0.30), (60, 0.25), (120, 0.10))
+        use_dual = str(os.environ.get("MU_ALPHA_DUAL_SPEED", "0")).strip().lower() in ("1", "true", "yes", "on")
+        try:
+            fast_weight = float(os.environ.get("MU_ALPHA_FAST_WEIGHT", 0.6) or 0.6)
+        except Exception:
+            fast_weight = 0.6
+        fast_weight = float(max(0.0, min(1.0, fast_weight)))
+
+        def _parse_int_list(raw: str, default: Sequence[int]) -> list[int]:
+            if not raw:
+                return list(default)
+            out: list[int] = []
+            for part in raw.replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    v = int(float(part))
+                except Exception:
+                    continue
+                if v > 1:
+                    out.append(v)
+            return out or list(default)
+
+        def _parse_float_list(raw: str, default: Sequence[float]) -> list[float]:
+            if not raw:
+                return list(default)
+            out: list[float] = []
+            for part in raw.replace(";", ",").split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    v = float(part)
+                except Exception:
+                    continue
+                out.append(v)
+            return out or list(default)
         mom_terms_w = []
         mom_w = []
         mom_each: Dict[str, Any] = {}
@@ -128,6 +165,31 @@ class MonteCarloSignalFeaturesMixin:
                 mom_terms_w.append(float(mu_w) * float(wt))
                 mom_w.append(float(wt))
         mu_mom = float(sum(mom_terms_w) / max(1e-12, float(sum(mom_w)))) if mom_terms_w else 0.0
+
+        mu_mom_fast = 0.0
+        mu_mom_slow = float(mu_mom)
+        mom_each_fast: Dict[str, Any] = {}
+        if use_dual:
+            fast_windows = _parse_int_list(os.environ.get("MU_ALPHA_FAST_WINDOWS", ""), (5, 10, 20, 40))
+            fast_weights = _parse_float_list(os.environ.get("MU_ALPHA_FAST_WEIGHTS", ""), (0.4, 0.3, 0.2, 0.1))
+            if len(fast_windows) != len(fast_weights):
+                if fast_windows:
+                    fast_weights = [1.0 / len(fast_windows)] * len(fast_windows)
+                else:
+                    fast_weights = []
+            mom_terms_fast = []
+            mom_w_fast = []
+            for w, wt in zip(fast_windows, fast_weights):
+                if n > int(w) + 1:
+                    mu_w, lr_w, tau_w = _mom_mu_ann(int(w))
+                    mom_each_fast[f"mu_mom_fast_{int(w)}"] = float(mu_w)
+                    mom_each_fast[f"lr_mom_fast_{int(w)}"] = float(lr_w)
+                    mom_each_fast[f"tau_mom_fast_{int(w)}_sec"] = float(tau_w)
+                    mom_terms_fast.append(float(mu_w) * float(wt))
+                    mom_w_fast.append(float(wt))
+            if mom_terms_fast:
+                mu_mom_fast = float(sum(mom_terms_fast) / max(1e-12, float(sum(mom_w_fast))))
+            mu_mom = float((1.0 - fast_weight) * float(mu_mom_slow) + float(fast_weight) * float(mu_mom_fast))
 
         # OFI는 매우 단기 알파로 취급 (연율로 스케일)
         try:
@@ -178,33 +240,41 @@ class MonteCarloSignalFeaturesMixin:
 
         regime_scale = float(1.0 - (1.0 - scale_min) * float(chop_score))
 
-        # Adaptive weighting (always-on): vol이 낮으면 OFI 비중↑, vol이 높으면 모멘텀 비중↑
+        # Adaptive weighting (optional): vol이 낮으면 OFI 비중↑, vol이 높으면 모멘텀 비중↑
         w_mom = 0.70
         w_ofi = 0.30
         vol_short = None
         vol_long = None
         vol_ratio = None
         try:
+            use_vol_adaptive = str(os.environ.get("MU_ALPHA_VOL_ADAPTIVE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            use_vol_adaptive = True
+        try:
             w_mom_base = config.mu_alpha_w_mom_base
             w_mom_min = config.mu_alpha_w_mom_min
             w_mom_max = config.mu_alpha_w_mom_max
-            short_bars = config.mu_alpha_vol_short_bars
-            long_bars = config.mu_alpha_vol_long_bars
-            short_bars = max(5, short_bars)
-            long_bars = max(short_bars, long_bars)
+            if use_vol_adaptive:
+                short_bars = config.mu_alpha_vol_short_bars
+                long_bars = config.mu_alpha_vol_long_bars
+                short_bars = max(5, short_bars)
+                long_bars = max(short_bars, long_bars)
 
-            x = np.asarray(closes, dtype=np.float64)
-            rets = np.diff(np.log(x))
-            if rets.size >= 5:
-                sb = min(int(short_bars), int(rets.size))
-                lb = min(int(long_bars), int(rets.size))
-                vol_short = float(np.std(rets[-sb:])) if sb >= 2 else None
-                vol_long = float(np.std(rets[-lb:])) if lb >= 2 else None
-                if vol_short is not None and vol_long is not None and vol_long > 1e-12:
-                    vol_ratio = float(vol_short / vol_long)
-                    # 변동성이 평소보다 크면 모멘텀 비중↑ (base*ratio)
-                    w_mom = float(max(w_mom_min, min(w_mom_max, w_mom_base * vol_ratio)))
-                    w_ofi = float(1.0 - w_mom)
+                x = np.asarray(closes, dtype=np.float64)
+                rets = np.diff(np.log(x))
+                if rets.size >= 5:
+                    sb = min(int(short_bars), int(rets.size))
+                    lb = min(int(long_bars), int(rets.size))
+                    vol_short = float(np.std(rets[-sb:])) if sb >= 2 else None
+                    vol_long = float(np.std(rets[-lb:])) if lb >= 2 else None
+                    if vol_short is not None and vol_long is not None and vol_long > 1e-12:
+                        vol_ratio = float(vol_short / vol_long)
+                        # 변동성이 평소보다 크면 모멘텀 비중↑ (base*ratio)
+                        w_mom = float(max(w_mom_min, min(w_mom_max, w_mom_base * vol_ratio)))
+                        w_ofi = float(1.0 - w_mom)
+            else:
+                w_mom = float(max(w_mom_min, min(w_mom_max, w_mom_base)))
+                w_ofi = float(1.0 - w_mom)
         except Exception:
             # fallback to fixed weights
             w_mom = 0.70
@@ -263,6 +333,10 @@ class MonteCarloSignalFeaturesMixin:
             "ofi_scale": float(ofi_scale),
             "mu_ofi": float(mu_ofi),
             "mu_mom": float(mu_mom),
+            "mu_mom_slow": float(mu_mom_slow),
+            "mu_mom_fast": float(mu_mom_fast),
+            "mu_alpha_fast_weight": float(fast_weight),
+            "mu_alpha_dual_speed": bool(use_dual),
             "alpha_scaling_factor": float(scaling),
             "trend_boost": float(trend_boost),
             "mu_alpha_raw_before": float(mu_alpha_raw_before),
@@ -272,6 +346,8 @@ class MonteCarloSignalFeaturesMixin:
             "mu_alpha": float(mu_alpha),
         }
         out.update(mom_each)
+        if mom_each_fast:
+            out.update(mom_each_fast)
         
         # Debug: Print mu_alpha calculation
         if MC_VERBOSE_PRINT:

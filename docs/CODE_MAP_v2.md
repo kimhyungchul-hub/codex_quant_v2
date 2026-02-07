@@ -138,6 +138,13 @@ DD_STOP_ROE = -0.02  # -2% 미실현 손실 시 강제 청산
 - **권장하지 않음** — 프로덕션 환경에서는 false 사용
 
 **Change Log (selected):**
+- 2026-02-06: Entry 필터/Pre-MC 게이트 통합 + 대시보드 툴팁 강화 — pre-MC 포트폴리오 시뮬레이션 결과를 진입 필터에 반영(사이즈 스케일/차단), TOP-N/유동성/최소 노티오널/캡 상태를 필터 영역에 노출하고 툴팁으로 상세 사유 표시 (`main_engine_mc_v2_final.py`, `dashboard_v2.html`).
+- 2026-02-06: 문서 업데이트 — Hybrid Planner(LSM+Beam) 기반 UnifiedScore 대체 경로 및 Hybrid-only 런타임 플래그 정리 (`docs/CODE_MAP_v2.md`).
+- 2026-01-31: AlphaHit EV 블렌딩 + 온라인 학습 파이프라인 연결 — MC 확률과 AlphaHit 확률을 신뢰도/베타로 혼합해 EV 재계산, 진입/청산에서 AlphaHit feature/라벨을 수집해 온라인 학습으로 전달, Replay 버퍼 저장/로드 및 CSV OHLCV 백필 스크립트 추가 (`engines/mc/entry_evaluation.py`, `core/orchestrator.py`, `trainers/online_alpha_trainer.py`, `engines/mc/alpha_hit.py`, `scripts/backfill_alpha_hit_from_csv.py`, `.env`).
+- 2026-01-31: AlphaHit ML 상태 가시화 — 대시보드와 Orchestrator에 Buffer/Replay/Training 메트릭을 추가하여 `scripts/backfill_alpha_hit_from_csv.py`로 채운 샘플이 반영되었는지 확인하고 replay 파일(`state/alpha_hit_replay.npz`) 상태를 실시간으로 보여줍니다 (`core/orchestrator.py`, `core/dashboard_server.py`, `dashboard_v2.html`, `state/alpha_hit_replay.npz`).
+- 2026-01-31: Batch EV 정합성 & AlphaHit 적용 보정 — 배치 평가에서 Exit Policy 기반 EV/CVaR 벡터를 사용해 UnifiedScore를 계산하고, AlphaHit 예측을 배치 경로에도 블렌딩하여 EV가 실제 학습 신호를 반영하도록 정합성 개선. AlphaHit 예측 텐서를 1D로 변환해 모든 horizon에 적용하고, filter 로그에 `EV_best` 표시 추가 (`engines/mc/entry_evaluation.py`, `engines/mc/entry_evaluation_new.py`, `main_engine_mc_v2_final.py`).
+- 2026-01-31: Alpha Hit ML 모듈 복원 및 고도화 — `trainers/online_alpha_trainer.py` 신규 구현. Multi-head MLP(Residual Connection), Online Learning(Experience Replay), Advanced Features(RunningNormalizer, LR Scheduler, Label Smoothing, Brier Score, Gradient Accumulation) 적용. `ALPHA_SIGNAL_BOOST=true`로 신호 강화 (`trainers/online_alpha_trainer.py`, `.env.midterm`, `.env.scalp`).
+- 2026-01-31: 메모리 최적화 및 Control Variate 비활성화 — 배치 처리 후 대형 배열(`price_paths_batch` 등) 명시적 해제(`del`, `gc.collect`, `empty_cache`) 추가 및 `MC_USE_CONTROL_VARIATE=0` 설정으로 RAM 사용량 2-3GB 목표 달성 (`engines/mc/entry_evaluation.py`, `.env.midterm`, `.env.scalp`).
 - 2026-01-27: UnifiedScore(마진율 기반 NAPV) 도입 및 랭킹/교체/대시보드 기준 통일 — 단일 점수로 결정/랭킹/교체 수행, UI 컬럼 및 Top-4 정렬을 UnifiedScore 기준으로 변경 (`core/economic_brain.py`, `engines/mc/entry_evaluation.py`, `engines/mc/decision.py`, `main_engine_mc_v2_final.py`, `core/orchestrator.py`, `dashboard_v2.html`, `engines/engine_hub.py`).
 - 2026-01-27: Exit policy 경로 수 기본값을 16384로 상향, TP/SL 경로별 우선 판정 로직 유지 명시 (`engines/mc/config.py`, `docs/CODE_MAP_v2.md`, `engines/exit_policy_methods.py`, `engines/mc/exit_policy_torch.py`).
 - 2026-01-27: PyTorch 기반 MC Exit Policy 배치 경로/TP·SL 경로별 반영 및 n_paths 기본값 복원 — torch 배치 exit policy 추가, TP/SL 경로 히트 반영, `MC_N_PATHS_LIVE=16384`, `MC_N_PATHS_EXIT=2048` 문서 갱신 (`engines/mc/exit_policy_torch.py`, `engines/mc/exit_policy.py`, `engines/exit_policy_methods.py`, `engines/mc/path_simulation.py`, `engines/mc/entry_evaluation.py`, `engines/mc/config.py`, `docs/CODE_MAP_v2.md`).
@@ -494,6 +501,26 @@ MC 시뮬레이션 기반 의사결정 엔진. 다중 믹스인 상속.
 
 ---
 
+### Hybrid Planner (UnifiedScore 대체 경로)
+Hybrid Planner는 LSM(Log-Utility) + Beam Search로 cash/long/short 스위칭을 최적화하며, **Hybrid-only 모드에서는 UnifiedScore를 하이브리드 점수로 대체**합니다.
+
+**관련 파일**
+- `engines/mc/hybrid_planner.py` — LSM + Beam 결합, 히스테리시스/시그니처 락
+- `engines/mc/lsm_switching_solver.py` — LSM 회귀/동적 비용/스위칭 비용
+- `engines/mc/trajectory_optimizer.py` — Beam 기반 경로 최적화
+
+**런타임 플래그 (핵심)**
+- `MC_USE_HYBRID_PLANNER=1`: 하이브리드 결과로 액션 오버라이드
+- `MC_HYBRID_ONLY=1`: 하이브리드 점수만 사용 (UnifiedScore 대체)
+- `MC_HYBRID_IN_BATCH=1`: 배치 경로에서도 하이브리드 적용
+- `HYBRID_ENTRY_FLOOR`, `HYBRID_AUTO_ENTRY`, `HYBRID_CONF_SCALE`, `HYBRID_AUTO_CONF`: 진입/신뢰도 게이트
+- `HYBRID_SCORE_SOURCE`, `HYBRID_SCORE_TIME_SCALE`, `HYBRID_ENTRY_BIAS_EPS`: 점수 해석/바이어스 제어
+
+**호환성 메모**
+- Hybrid-only 경로에서도 `unified_score`, `unified_score_long/short/hold` 키가 하이브리드 점수로 채워져 TOP‑N 랭킹/필터가 동작합니다.
+
+---
+
 ### `engines/mc/entry_evaluation_new.py`
 차세대 엔트리 평가(개선판). 지표/샘플링 보강.
 
@@ -755,6 +782,96 @@ PMaker 모델 생명주기 관리.
 
 ---
 
+### `trainers/online_alpha_trainer.py` — Alpha Hit ML
+Horizon별 TP/SL hit 확률을 예측하는 온라인 학습 MLP.
+
+**구성요소:**
+
+| 클래스 | 역할 | 설명 |
+|--------|------|------|
+| `AlphaTrainerConfig` | 설정 dataclass | horizons, n_features, device, lr, buffer_size 등 |
+| `AlphaHitMLP` | Multi-head MLP | 4개 출력 헤드, Residual Connection, 107k 파라미터 |
+| `OnlineAlphaTrainer` | 학습/예측 관리 | Experience replay, 온라인 학습, 고급 기능(Normalizer, Scheduler 등) |
+| `RunningNormalizer` | Feature 정규화 | Running mean/std 기반 실시간 입력 정규화 |
+
+**`OnlineAlphaTrainer` 메서드:**
+
+| 메서드 | 시그니처 | 설명 | 한글 |
+|--------|----------|------|------|
+| `__init__` | `(cfg: AlphaTrainerConfig)` | 초기화, 체크포인트 로드 | — |
+| `predict` | `(features: np.ndarray) → Dict` | TP/SL 확률 예측 | 정규화 적용 후 예측 |
+| `add_sample` | `(x, y, ts_ms, symbol)` | 학습 샘플 추가 | 심볼별 통계 업데이트 포함 |
+| `train_tick` | `() → Dict` | 온라인 학습 스텝 | Grad Accumulation, Label Smoothing 적용 |
+| `get_symbol_stats` | `(symbol) → Dict` | 심볼별 통계 조회 | TP/SL rate 등 |
+| `get_calibration_stats` | `() → Dict` | 보정 지표 조회 | Brier score 등 |
+
+**아키텍처:**
+```
+입력 (20 features) → Linear(256) → LayerNorm → GELU → Dropout(0.1)
+                   → Linear(128) → LayerNorm → GELU → Dropout(0.1)
+                   → 4 Output Heads (각 n_horizons개 출력)
+```
+
+**입력 특성 (20개):**
+- `mu × SECONDS_PER_YEAR` (연율 기대수익)
+- `sigma × sqrt(SECONDS_PER_YEAR)` (연율 변동성)
+- `momentum_z`, `ofi_z` (표준화된 신호)
+- `leverage`, `price`
+- Regime one-hot (bull, bear, chop, volatile)
+- `spread_pct`, `kelly`, `confidence`, `ev`, `mu_alpha`
+- 5개 padding (확장용)
+
+**활성화 조건:**
+1. `ALPHA_HIT_ENABLE=true` (기본값: true)
+2. PyTorch 사용 가능
+3. `state/alpha_hit_mlp.pt` 체크포인트 로드 성공
+
+**관련 설정:**
+
+| 환경변수 | 기본값 | 설명 |
+|---------|-------|------|
+| `ALPHA_HIT_ENABLE` | `true` | Alpha Hit ML 활성화 여부 |
+| `ALPHA_HIT_DEVICE` | `mps` | 학습/추론 디바이스 |
+| `ALPHA_HIT_LR` | `2e-4` | 학습률 |
+| `ALPHA_HIT_BATCH_SIZE` | `256` | 배치 크기 |
+| `ALPHA_HIT_STEPS_PER_TICK` | `2` | 호출당 학습 스텝 |
+| `ALPHA_HIT_MAX_BUFFER` | `200000` | 최대 샘플 버퍼 |
+| `ALPHA_HIT_DATA_HALF_LIFE_SEC` | `3600.0` | 샘플 가중치 반감기 |
+
+**데이터 흐름:**
+```mermaid
+graph LR
+    A[거래 진입] --> B[특성 추출]
+    B --> C[AlphaHitMLP 예측]
+    C --> D[TP/SL 확률]
+    D --> E[EV 계산에 반영]
+    
+    F[거래 청산] --> G[결과 수집]
+    G --> H[add_sample]
+    H --> I[train_tick]
+    I --> J[모델 업데이트]
+```
+
+---
+
+### Alpha Signal Boost (신호 강화)
+
+`ALPHA_SIGNAL_BOOST=true` 설정 시 mu_alpha 신호가 약 3배 강화됩니다.
+
+| 파라미터 | 기본값 | BOOST 활성화 |
+|---------|-------|-------------|
+| `mu_alpha_cap` | 5.0 | **15.0** |
+| `alpha_scaling_factor` | 1.0 | **1.5** |
+| `mu_ofi_scale` | 10.0 | **15.0** |
+| `mu_mom_ann_cap` | 3.0 | **10.0** |
+| `mu_mom_lr_cap` | 0.10 | **0.15** |
+| `mu_mom_tau_floor_sec` | 1800 | **900** |
+
+**적용 파일:** `.env.midterm`, `.env.scalp`
+
+---
+
+
 ## 7. 유틸리티 / Utils
 
 ### `utils/helpers.py`
@@ -997,6 +1114,12 @@ MC 리스크 헬퍼.
 ## 변경 로그
 | 날짜 | 내용 | 파일 |
 |------|------|------|
+| 2026-02-06 | 사전 포트폴리오 MC에 리밸런스/부분청산/제로청산 시뮬레이션 추가 + 포트폴리오 프리MC 결과 요약 전송 | `engines/mc/portfolio_joint_sim.py`, `engines/mc/config.py`, `main_engine_mc_v2_final.py` |
+| 2026-02-06 | 진입 필터 강화(최소 노출/유동성/스프레드 상한) 및 대시보드 필터 배지 확장 | `main_engine_mc_v2_final.py`, `config.py`, `dashboard_v2.html`, `.env.midterm` |
+| 2026-02-06 | 테스트용 DD 완화 지원: `MAX_DRAWDOWN_LIMIT` 환경변수화 | `main_engine_mc_v2_final.py`, `.env.midterm` |
+| 2026-02-06 | 런타임 시작 시 초기 자본 기준 리셋 옵션 추가 (`RESET_INITIAL_EQUITY_ON_START`) | `config.py`, `main_engine_mc_v2_final.py`, `.env.midterm` |
+| 2026-02-06 | 대시보드 유지: Emergency stop 시 `sys.exit` 제거 및 Safety 모드로만 전환 (데이터 송신 유지) | `main_engine_mc_v2_final.py` |
+| 2026-02-06 | 문서 업데이트 — Hybrid Planner(LSM+Beam) 기반 UnifiedScore 대체 경로 및 Hybrid-only 런타임 플래그 정리 | `docs/CODE_MAP_v2.md` |
 | 2026-01-28 | JAX 제거 및 Torch 우선/NumPy fallback 전환 + 멀티피델리티/CI 게이트/분산감소 적용 + 전략별 `.env` 프리셋 추가 | `engines/mc/decision.py`, `engines/mc/entry_evaluation.py`, `engines/mc/path_simulation.py`, `engines/mc/first_passage.py`, `engines/mc/monte_carlo_engine.py`, `engines/mc/config.py`, `main_engine_mc_v2_final.py`, `.env.midterm`, `.env.scalp` |
 | 2026-01-27 | UnifiedScore 도입 및 랭킹/교체/대시보드 기준 통일 | `core/economic_brain.py`, `engines/mc/entry_evaluation.py`, `engines/mc/decision.py`, `main_engine_mc_v2_final.py`, `core/orchestrator.py`, `dashboard_v2.html`, `engines/engine_hub.py` |
 | 2026-01-21 | 개발 모드 `DEV_MODE=true` 일 때 JAX 비활성화하여 NumPy 경로 사용 — JAX 컴파일 시간 제거 | `main_engine_mc_v2_final.py` |

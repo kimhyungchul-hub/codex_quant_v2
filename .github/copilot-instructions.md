@@ -10,7 +10,7 @@
    - 형식: `[YYYY-MM-DD] 변경 내용 요약 (수정된 파일명)`
    - `CODE_MAP_v2.md` 구조 변경 시 업데이트 제안 포함.
 4. **수학 공식:** 공식 수정/참조 시 `docs/MATHEMATICS.md`를 기준으로 삼으십시오.
-
+5. 로그를 읽거나 명령을 실행하는데에 있어서 권한 문제로 막힌다면 서버를 백그라운드에서 실행하고, 로그는 /tmp/server.log에 저장해서 읽을 것. 또는 tail 명령 대신 read 명령을 사용해서 100줄 정도를 읽어볼 것.
 ## 🛠 기술 스택 및 환경
 - **Language:** Python 3.11 (JAX 호환성 고정), Shell Script (Bash)
 - **Core Libs:** JAX (GPU/Metal), NumPy (CPU/Dev), Pandas, FastAPI
@@ -118,7 +118,25 @@ from engines.mc.constants import (
 )
 
     DEFAULT_IMPACT_CONSTANT, # Square-Root Market Impact 계수 (default=0.75)
-```
+의사결정(진입/레버리지/필터/Exit)에 직접 쓰이는 EV 계열만 추리면 이거예요.
+
+**ev값 정리**
+ev (= unified_score)
+   진입/필터/레버리지/consensus 모두 이 값 사용
+   사용 위치: main_engine_mc_v2_final.py (필터, 레버리지, consensus), decision.py (action 결정)
+policy_ev_mix
+   ev의 원천값 (entry_evaluation에서 최종 EV 산출)
+   사용 위치: entry_evaluation.py
+policy_ev_score_long / policy_ev_score_short
+   direction 선택에 사용 (long vs short)
+   사용 위치: decision.py
+event_ev_r
+   이벤트 기반 exit 판단에 사용
+   사용 위치: main_engine_mc_v2_final.py (_evaluate_event_exit)
+ev_entry_threshold / ev_entry_threshold_dyn
+   EV 기반 진입 임계치 필터
+   사용 위치: main_engine_mc_v2_final.py (_min_filter_states/동적 임계치)
+   참고: ev_expected/ev_best는 현재 의사결정에 직접 사용되지 않음 (로그/메타용).
 
 **적용 파일:**
 - `engines/mc/constants.py` - 중앙 정의 (Source of Truth)
@@ -148,6 +166,7 @@ from engines.mc.constants import (
 
 ## Recent Changes (2026-01-24)
 
+- Alpha Hit ML 복원: `OnlineAlphaTrainer`가 신규 구현되어 Horizon별 TP/SL 확률을 예측하고 온라인으로 학습합니다. `ALPHA_SIGNAL_BOOST=true`로 신호가 강화되었습니다.
 - RL 통합: `train_transformer_gpu.py`가 `MonteCarloEngine` + `ExecutionCostModel`를 사용하도록 통합되었습니다. 비용 인지형(Pre-trade) 로직이 추가되어 과도한 거래는 자동으로 스킵됩니다.
 - 통합 검증 스크립트: `verify_integration.py` 추가 — 데이터 로드 → JAX 초기화 → MC 시뮬레이션 → 비용 계산 → 행동 결정의 플로우를 검증합니다.
 - JAX/MC 안정화: `engines/mc/entry_evaluation_vmap.py` warmup 고정(static small shape) 및 mask 기반 연산으로 JIT 트레이싱 오류를 방지했고, `engines/mc/entry_evaluation.py`에 빈 배열 방어 로직(`_ensure_len`)을 추가했습니다.
@@ -156,6 +175,142 @@ from engines.mc.constants import (
 참고: 상세 변경 사항과 사용법은 `docs/CODE_MAP_v2.md`의 최신 Change Log 항목을 확인하세요.
 
 ## 📋 Change Log
+### [2026-01-31] AlphaHit Online 학습 파이프라인 강화
+**문제:** AlphaHit 예측이 EV에 미반영되고, 학습 버퍼가 실거래/백테스트 데이터를 공유하지 못함
+
+**해결:**
+1. **AlphaHit EV 블렌딩 도입** — MC 확률과 AlphaHit 확률을 신뢰도/베타로 혼합하여 EV 재계산 (`engines/mc/entry_evaluation.py`)
+2. **Replay 버퍼 영속화** — AlphaHit 버퍼를 `state/alpha_hit_replay.npz`로 저장/로드 (`trainers/online_alpha_trainer.py`, `engines/mc/config.py`, `engines/mc/monte_carlo_engine.py`)
+3. **실거래 학습 연결** — 진입 시 feature 저장, 청산 시 TP/SL 라벨 수집하여 AlphaHit 온라인 학습 연결 (`core/orchestrator.py`, `engines/mc/alpha_hit.py`)
+4. **CSV 백필 스크립트** — `data/*.csv` OHLCV로 AlphaHit 버퍼 채우는 스크립트 추가 (`scripts/backfill_alpha_hit_from_csv.py`)
+
+**영향 파일:** `engines/mc/entry_evaluation.py`, `trainers/online_alpha_trainer.py`, `engines/mc/config.py`, `engines/mc/monte_carlo_engine.py`, `core/orchestrator.py`, `engines/mc/alpha_hit.py`, `scripts/backfill_alpha_hit_from_csv.py`, `.env`
+### [2026-01-31] AlphaHit 상태 대시보드 & 오케스트레이터 모니터링
+**문제:** 데이터 백필이나 라이브/페이퍼 학습이 실제로 버퍼에 들어갔는지 확인할 수 없고, replay 파일/훈련 상태를 대시보드에서 확인할 수 없음
+
+**해결:**
+1. **Orchestrator 통계 수집** — `LiveOrchestrator.alpha_hit_status()`에서 trainer buffer, total samples, loss, warmup 여부, replay 경로/크기 정보를 수집하여 dashboard payload에 포함 (`core/orchestrator.py`, `core/dashboard_server.py`)
+2. **UI 표시** — `dashboard_v2.html`에 AlphaHit chips(`αBuf`, `αLoss`, `αReplay`)을 추가하여 replay buffer(샘플/최소치), loss, replay 파일 존재 여부를 실시간으로 노출
+3. **파일 기반 검증** — replay를 `state/alpha_hit_replay.npz`에 저장/로드하면서 크기/존재 여부를 함께 노출하므로 `scripts/backfill_alpha_hit_from_csv.py` 실행 결과를 UI에서 검증 가능
+
+**영향 파일:** `core/orchestrator.py`, `core/dashboard_server.py`, `dashboard_v2.html`, `state/alpha_hit_replay.npz`
+### [2026-01-31] Batch EV 정합성 & AlphaHit 예측 적용
+**문제:** 배치 경로에서 UnifiedScore가 summary EV 기반으로만 계산되어 AlphaHit 효과가 반영되지 않고, AlphaHit 예측 텐서가 `[1, H]` 형태로 남아 대부분 horizon에 적용되지 않음
+
+**해결:**
+1. **배치 EV 정합성** — Exit Policy 결과로부터 EV/CVaR 벡터를 구축해 UnifiedScore를 계산하고, 배치 경로에서도 AlphaHit 확률 블렌딩을 적용 (`engines/mc/entry_evaluation.py`)
+2. **AlphaHit 예측 형상 수정** — `[1, H]` 텐서를 1D로 변환해 모든 horizon에 적용 (`engines/mc/entry_evaluation.py`, `engines/mc/entry_evaluation_new.py`)
+3. **로그 개선** — 필터 로그에 `EV_best` 표시를 추가해 UnifiedScore(Ψ)와 실제 horizon EV를 구분 (`main_engine_mc_v2_final.py`)
+
+**영향 파일:** `engines/mc/entry_evaluation.py`, `engines/mc/entry_evaluation_new.py`, `main_engine_mc_v2_final.py`
+### [2026-01-31] Alpha Hit ML 복원 및 고도화
+**문제:** Alpha Hit ML 모듈(`OnlineAlphaTrainer`) 누락으로 TP/SL 확률 예측 정밀도 저하
+
+**해결:** `trainers/online_alpha_trainer.py` 신규 구현.
+1. **Multi-head MLP**: Horizon별 TP/SL 확률 동시 예측 (107k 파라미터, Residual Connection)
+2. **Online Learning**: Experience Replay Buffer + Exponential Decay
+3. **Advanced Features**: RunningNormalizer, LR Scheduler(Warmup+Cosine), Label Smoothing, Gradient Accumulation
+4. **Signal Boost**: `ALPHA_SIGNAL_BOOST=true`로 mu_alpha 신호 3배 강화
+
+**영향 파일:** `trainers/online_alpha_trainer.py`, `.env.midterm`, `.env.scalp`
+
+### [2026-01-31] UnifiedScore 필터 진단 및 최적화 도구 추가
+
+**문제:**
+1. `UNIFIED_ENTRY_FLOOR=-0.0001`인데도 진입이 거의 없음
+2. UnifiedScore가 과소평가되는지, 다른 필터(spread/event_cvar/cooldown/TOP_N)가 차단하는지 파악 불가
+3. 적절한 threshold를 찾을 방법이 부재
+
+**해결:**
+1. **자동 통계 로깅 추가** ([main_engine_mc_v2_final.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/main_engine_mc_v2_final.py:0:0-0:0)):
+   - [decision_loop](cci:1://file:///Users/jeonghwakim/codex_quant_clean/main_engine_mc_v2_final.py:2865:4-3177:40) Stage 2.5 직후에 10분마다 UnifiedScore 분포 통계 자동 출력
+   - Mean, Median, Std, Min, Max, P25/P50/P75 표시
+   - 현재 `UNIFIED_ENTRY_FLOOR` threshold 통과율 표시
+   - 필터별 차단 통계 (unified, spread, event_cvar, cooldown)
+   - 최적 threshold 자동 제안 (P50, Mean)
+   - 로그 태그: `[SCORE_STATS]`, `[FILTER_STATS]`, `[THRESHOLD_HINT]`
+
+2. **분석 스크립트 3종 추가**:
+   - [scripts/analyze_unified_score_live.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/scripts/analyze_unified_score_live.py:0:0-0:0): WebSocket API 기반 실시간 분석 (현재 API 엔드포인트 부재로 미사용)
+   - [scripts/analyze_score_from_logs.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/scripts/analyze_score_from_logs.py:0:0-0:0): 로그 파일 기반 분포 분석 및 최적 threshold 제안
+   - [scripts/backtest_unified_threshold.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/scripts/backtest_unified_threshold.py:0:0-0:0): SQLite 거래 히스토리 기반 threshold 백테스팅 (승률/수익률 시뮬레이션)
+
+3. **종합 가이드 문서**: [docs/UNIFIED_SCORE_FILTER_GUIDE.md](cci:7://file:///Users/jeonghwakim/codex_quant_clean/docs/UNIFIED_SCORE_FILTER_GUIDE.md:0:0-0:0)
+   - 5가지 진단 방법 상세 설명
+   - Threshold 설정 가이드 (보수적/균형/공격적)
+   - 추가 필터 완화 방법 (spread/event_cvar/TOP_N)
+   - 빠른 디버깅 명령어 모음
+   - 체크리스트 및 트러블슈팅 가이드
+
+**권장 조치:**
+1. **즉시**: `TOP_N_SYMBOLS=8`로 증가 (현재 4개 → 8개, 진입 기회 2배 증가)
+2. **10분 후**: `[SCORE_STATS]` 로그 확인
+3. **1시간 후**: Mean 또는 P50 값으로 `UNIFIED_ENTRY_FLOOR` 조정
+4. **1일 후**: 백테스팅 스크립트로 최적값 검증
+
+**효과:**
+- 실시간 UnifiedScore 분포 가시화
+- 데이터 기반 threshold 최적화 가능
+- 진입 차단 원인 명확한 진단 가능
+
+**영향 파일:**
+- [main_engine_mc_v2_final.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/main_engine_mc_v2_final.py:0:0-0:0) (통계 로깅 추가, line 2985-3035)
+- [scripts/analyze_unified_score_live.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/scripts/analyze_unified_score_live.py:0:0-0:0) (신규)
+- [scripts/analyze_score_from_logs.py](cci:7://file:///Users/jeonghwakim/codex_quant_clean/scripts/analyze_score_from_logs.py:0:0-0:0) (신규)
+   - [scripts/backtest_unified_threshold.py](scripts/backtest_unified_threshold.py) (신규)
+   - [docs/UNIFIED_SCORE_FILTER_GUIDE.md](docs/UNIFIED_SCORE_FILTER_GUIDE.md) (신규)
+
+### [2026-01-31] UnifiedScore 진단 로깅 긴급 수정
+**문제:** `SCORE_STATS` 미출력(Kelly 옵션 의존성), `all_pass` 상황에서 진입 실패 원인 불명확
+**해결:**
+1. 통계 로깅을 `USE_KELLY_ALLOCATION` 블록 밖으로 이동 (항상 실행)
+2. `[FILTER] ... all_pass` 로그에 Action/Score/EV 정보 추가
+**영향 파일:** `main_engine_mc_v2_final.py`
+
+### [2026-01-31] SQLite 데이터베이스 마이그레이션
+**목표:**
+- JSON 파일 기반 저장을 SQLite로 전환하여 데이터 무결성 및 I/O 성능 향상
+
+**변경사항:**
+1. **`main_engine_mc_v2_final.py` 수정**:
+   - `DatabaseManager` import 및 초기화 추가
+   - `_record_trade()`: SQLite에 거래 기록 저장 (`log_trade_background()`)
+   - `_persist_state()`: SQLite에 equity 및 positions 저장
+   - `_trading_mode` 동적 설정 (`enable_orders` 기반)
+
+2. **`core/database_manager.py` 수정**:
+   - SQL INSERT 문 컬럼/값 개수 불일치 수정 (trades: 26, equity: 12, positions: 29)
+
+3. **DB 경로**: `/tmp/codex_quant_db/bot_data.db` (macOS 권한 문제 임시 회피)
+
+**검증:**
+- equity_history 테이블에 데이터 저장 확인
+- 대시보드 정상 작동 확인 (http://127.0.0.1:9999)
+
+**영향 파일:** `main_engine_mc_v2_final.py`, `core/database_manager.py`
+
+### [2026-01-31] 메모리 최적화 및 Control Variate 비활성화
+**문제:**
+- RAM 메모리 사용량이 과도하게 높음 (목표: 2-3GB)
+- `evaluate_entry_metrics_batch()` 함수에서 대형 배열이 함수 종료 후에도 메모리에 유지됨
+
+**해결책:**
+1. **메모리 정리 코드 추가** (`engines/mc/entry_evaluation.py` line 3625-3661):
+   - 배치 처리 완료 후 대형 객체 명시적 해제: `price_paths_batch`, `exit_policy_args`, `summary_cpu`
+   - 강제 가비지 컬렉션: `gc.collect()`
+   - PyTorch GPU 메모리 캐시 정리: `torch.mps.empty_cache()` / `torch.cuda.empty_cache()`
+
+2. **Control Variate 비활성화** (`.env.midterm`, `.env.scalp`):
+   - `MC_USE_CONTROL_VARIATE=0` 설정
+   - 효과: 각 심볼별 prices_np CPU 복사본 생성 방지로 메모리 절감
+   - 영향: n_paths=4096+ 에서 분산 감소 효과 미미하므로 실질적 성능 차이 없음
+
+**GPU 상태 확인:**
+- PyTorch MPS (Apple Metal) 정상 작동
+- `[BATCH_TIMING] Torch batch path simulation...` 로그로 GPU 경로 사용 확인
+
+**영향 파일:** `engines/mc/entry_evaluation.py`, `.env.midterm`, `.env.scalp`, `.github/copilot-instructions.md`
+
 ### [2026-01-28] MC 엔진 Torch 우선 전환 및 전략 프리셋 정합
 **변경사항:**
 1. **JAX 제거 및 Torch 우선/NumPy fallback 전환**: MC 핵심 경로(`decision`, `entry_evaluation`, `first_passage`, `path_simulation`)에서 Torch → NumPy 순으로 동작하도록 전환.

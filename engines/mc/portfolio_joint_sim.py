@@ -157,6 +157,9 @@ class PortfolioConfig:
     individual_cap: float = 3.0
     min_vol_floor: float = 0.005
     risk_aversion: float = 0.5  # penalize liquidation prob in scoring
+    # Correlation strength controls
+    market_factor_scale: float = 1.0
+    residual_scale: float = 1.0
 
     # Portfolio-level "account liquidation proxy"
     # If portfolio pnl <= -(1/target_leverage) - buffer => account liquidated proxy
@@ -164,6 +167,14 @@ class PortfolioConfig:
 
     # Risk report
     var_alpha: float = 0.05  # 5% VaR/CVaR
+
+    # Rebalance policy simulation (pre-MC)
+    rebalance_sim_enabled: bool = False
+    rebalance_interval: int = 1  # steps between rebalances
+    rebalance_fee_bps: float = 6.0
+    rebalance_slippage_bps: float = 4.0
+    rebalance_score_noise: float = 0.0  # score perturbation per rebalance
+    rebalance_min_score: float = 0.0  # scores below -> zero weight
 
 
 # -----------------------------
@@ -548,6 +559,8 @@ class PortfolioJointSimEngine:
                 # JAX Bootstrap sampling
                 mkt_path = self._sample_block_bootstrap_jax(d["mkt"], score, days, block, b, k_bs1)
                 res_path = self._sample_block_bootstrap_jax(d["resid"], score, days, block, b, k_bs2)
+                mkt_path = mkt_path * float(cfg.market_factor_scale)
+                res_path = res_path * float(cfg.residual_scale)
                 sim_r = d["beta"] * mkt_path + res_path + drift
 
                 jump_any = jnp.zeros((b, days), dtype=bool)
@@ -584,6 +597,8 @@ class PortfolioJointSimEngine:
                 # Numpy Fallback
                 mkt_path = self._sample_block_bootstrap(d["mkt"], score, days, block, b)
                 res_path = self._sample_block_bootstrap(d["resid"], score, days, block, b)
+                mkt_path = mkt_path * float(cfg.market_factor_scale)
+                res_path = res_path * float(cfg.residual_scale)
                 sim_r = d["beta"] * mkt_path + res_path + drift
 
                 jump_any = np.zeros((b, days), dtype=bool)
@@ -665,6 +680,12 @@ class PortfolioJointSimEngine:
 
         # Joint portfolio simulation with FINAL weights
         port_metrics = self.simulate_portfolio_joint(weights, tp_mult=tp_mult, sl_mult=sl_mult)
+        rebalance_metrics = None
+        if cfg.rebalance_sim_enabled:
+            try:
+                rebalance_metrics = self.simulate_portfolio_rebalance(valid, raw_scores, weights=weights)
+            except Exception as e:
+                logger.warning(f"[PORTFOLIO_REBAL_SIM] failed: {e}")
         
         # ✅ FINAL LOG: Show scores to user clearly
         logger.info(
@@ -674,12 +695,15 @@ class PortfolioJointSimEngine:
             f"Total_Lev: {port_metrics['total_leverage_allocated']:.2f}x"
         )
 
-        return weights, {
+        report = {
             "weights": weights,
             "n_valid_symbols": int(len(valid)),
             "per_symbol_metrics": per_sym,
             **port_metrics,
         }
+        if rebalance_metrics:
+            report.update({f"rebalance_{k}": v for k, v in rebalance_metrics.items()})
+        return weights, report
 
     def simulate_portfolio_joint(self, weights: Dict[str, float], tp_mult: float = 4.0, sl_mult: float = 2.0) -> Dict[str, Any]:
         """
@@ -758,6 +782,7 @@ class PortfolioJointSimEngine:
                 
                 # Shared market path (JAX)
                 mkt_path = self._sample_block_bootstrap_jax(market_series, market_score, days, block, b, k_bs_m)
+                mkt_path = mkt_path * float(cfg.market_factor_scale)
                 jump_mkt_mask = jnp.zeros((b, days), dtype=bool)
                 if cfg.use_jumps:
                     jump_mkt_mask = jrand.uniform(k_j_m, shape=(b, days)) < cfg.p_jump_market
@@ -773,6 +798,7 @@ class PortfolioJointSimEngine:
                     
                     d = sym_data[i]
                     res_path = self._sample_block_bootstrap_jax(d["resid"], float(scores[i]), days, block, b, k_bs_r)
+                    res_path = res_path * float(cfg.residual_scale)
                     sim_r = beta[i] * mkt_path + res_path + drifts[i]
 
                     jump_any = jump_mkt_mask.copy()
@@ -797,6 +823,7 @@ class PortfolioJointSimEngine:
                 any_liq[done:done + b] = np.asarray(batch_any_liq)
             else:
                 mkt_path = self._sample_block_bootstrap(market_series, market_score, days, block, b)
+                mkt_path = mkt_path * float(cfg.market_factor_scale)
                 jump_mkt_mask = np.zeros((b, days), dtype=bool)
                 if cfg.use_jumps:
                     u = self.rng.random((b, days))
@@ -810,6 +837,7 @@ class PortfolioJointSimEngine:
                 for i, s in enumerate(syms):
                     d = sym_data[i]
                     res_path = self._sample_block_bootstrap(d["resid"], float(scores[i]), days, block, b)
+                    res_path = res_path * float(cfg.residual_scale)
                     sim_r = beta[i] * mkt_path + res_path + drifts[i]
                     jump_any = jump_mkt_mask.copy()
                     if cfg.use_jumps:
@@ -852,4 +880,166 @@ class PortfolioJointSimEngine:
             "account_liq_threshold_proxy": float(acc_liq_thresh),
             "total_leverage_allocated": float(total_lev),
             "portfolio_pnl_samples_head": head,
+        }
+
+    def _weights_from_scores(self, scores: np.ndarray) -> np.ndarray:
+        cfg = self.cfg
+        s = np.asarray(scores, dtype=np.float64)
+        if cfg.rebalance_min_score > 0:
+            s = np.where(s >= float(cfg.rebalance_min_score), s, 0.0)
+        s = np.clip(s, 0.0, None)
+        if s.size == 0 or float(s.sum()) <= 0:
+            return np.zeros_like(s)
+        return _force_fill_with_caps(s, cfg.target_leverage, cfg.individual_cap)
+
+    def simulate_portfolio_rebalance(
+        self,
+        symbols: List[str],
+        scores: List[float],
+        *,
+        weights: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Pre-MC portfolio simulation with explicit rebalancing (partial/zero exits).
+        Uses joint market path + residual bootstraps, then rebalances to target weights
+        at a fixed interval with cost and turnover tracking.
+        """
+        cfg = self.cfg
+        if not symbols:
+            return {
+                "expected_portfolio_pnl": 0.0,
+                "turnover_mean": 0.0,
+                "turnover_p95": 0.0,
+                "cost_mean": 0.0,
+                "prob_account_liq_proxy": 0.0,
+                "steps": int(cfg.days),
+            }
+
+        syms = list(symbols)
+        base_scores = np.asarray(scores, dtype=np.float64)
+        if weights is None:
+            w_target = self._weights_from_scores(base_scores)
+        else:
+            w_target = np.array([float(weights.get(s, 0.0)) for s in syms], dtype=np.float64)
+
+        total_lev = float(np.sum(np.abs(w_target)))
+        if total_lev <= 1e-12:
+            return {
+                "expected_portfolio_pnl": 0.0,
+                "turnover_mean": 0.0,
+                "turnover_p95": 0.0,
+                "cost_mean": 0.0,
+                "prob_account_liq_proxy": 0.0,
+                "steps": int(cfg.days),
+            }
+
+        sym_data = [self._get_symbol_data(s) for s in syms]
+        price0 = np.array([d["last_price"] for d in sym_data], dtype=np.float64)
+        beta = np.array([d["beta"] for d in sym_data], dtype=np.float64)
+        vol = np.array([max(cfg.min_vol_floor, d["recent_vol"]) for d in sym_data], dtype=np.float64)
+        drifts = np.array([self._score_to_drift(float(base_scores[i]), vol[i]) for i in range(len(syms))], dtype=np.float64)
+
+        days = int(cfg.days)
+        if days <= 0:
+            days = 1
+        block = max(3, min(cfg.block_size, max(3, days * 4)))
+
+        # Market series for bootstrap
+        if self.market_ret.size == 0:
+            market_series = np.zeros(500, dtype=np.float64)
+        else:
+            market_series = self.market_ret
+
+        total = int(cfg.simulations)
+        done = 0
+        port_pnls = np.empty(total, dtype=np.float64)
+        turnovers = np.empty(total, dtype=np.float64)
+        costs = np.empty(total, dtype=np.float64)
+
+        acc_liq_thresh = -(1.0 / max(cfg.target_leverage, 1e-9)) - cfg.portfolio_maintenance_buffer
+        cost_rate = float(cfg.rebalance_fee_bps + cfg.rebalance_slippage_bps) / 10000.0
+        reb_interval = max(1, int(cfg.rebalance_interval))
+
+        while done < total:
+            b = int(min(cfg.batch_size, total - done))
+            # Sample market returns
+            mkt_path = self._sample_block_bootstrap(market_series, 0.0, days, block, b)
+            mkt_path = mkt_path * float(cfg.market_factor_scale)
+            if cfg.use_jumps:
+                u = self.rng.random((b, days))
+                jump_mkt_mask = u < cfg.p_jump_market
+                drop = self.rng.uniform(cfg.jump_market_drop_lo, cfg.jump_market_drop_hi, size=(b, days))
+                mkt_path = mkt_path + _price_drop_to_logshock(drop) * jump_mkt_mask
+
+            # Build per-symbol step returns: (b, days, S)
+            step_ret = np.zeros((b, days, len(syms)), dtype=np.float64)
+            for i, s in enumerate(syms):
+                d = sym_data[i]
+                res_path = self._sample_block_bootstrap(d["resid"], float(base_scores[i]), days, block, b)
+                res_path = res_path * float(cfg.residual_scale)
+                sim_r = beta[i] * mkt_path + res_path + drifts[i]
+                if cfg.use_jumps:
+                    u2 = self.rng.random((b, days))
+                    jump_idio_mask = u2 < cfg.p_jump_idio
+                    drop2 = self.rng.uniform(cfg.jump_idio_drop_lo, cfg.jump_idio_drop_hi, size=(b, days))
+                    sim_r = sim_r + _price_drop_to_logshock(drop2) * jump_idio_mask
+                step_ret[:, :, i] = np.exp(sim_r) - 1.0
+
+            equity = np.ones(b, dtype=np.float64)
+            pos_notional = equity[:, None] * w_target[None, :]
+            turnover = np.zeros(b, dtype=np.float64)
+            cost_acc = np.zeros(b, dtype=np.float64)
+            alive = np.ones(b, dtype=bool)
+
+            for t in range(days):
+                r_t = step_ret[:, t, :]
+                pnl = np.sum(pos_notional * r_t, axis=1)
+                equity = equity + pnl
+                pos_notional = pos_notional * (1.0 + r_t)
+
+                # liquidation proxy
+                liq_mask = (equity <= (1.0 + acc_liq_thresh)) & alive
+                if np.any(liq_mask):
+                    alive[liq_mask] = False
+                    pos_notional[liq_mask] = 0.0
+
+                if not np.any(alive):
+                    break
+
+                # Rebalance at interval
+                if ((t + 1) % reb_interval) == 0:
+                    if cfg.rebalance_score_noise > 0:
+                        noise = self.rng.normal(0.0, float(cfg.rebalance_score_noise), size=base_scores.shape)
+                        scores_eff = base_scores + noise
+                    else:
+                        scores_eff = base_scores
+                    w_target = self._weights_from_scores(scores_eff)
+                    target_notional = equity[:, None] * w_target[None, :]
+                    delta = target_notional - pos_notional
+                    turnover_step = np.sum(np.abs(delta), axis=1)
+                    cost_step = turnover_step * cost_rate
+                    equity = equity - cost_step
+                    cost_acc = cost_acc + cost_step
+                    turnover = turnover + turnover_step
+                    pos_notional = target_notional
+
+            port_pnls[done:done + b] = equity - 1.0
+            turnovers[done:done + b] = turnover
+            costs[done:done + b] = cost_acc
+            done += b
+
+        exp_pnl = float(np.mean(port_pnls))
+        turn_mean = float(np.mean(turnovers))
+        turn_p95 = float(np.quantile(turnovers, 0.95))
+        cost_mean = float(np.mean(costs))
+        prob_acc_liq = float(np.mean(port_pnls <= acc_liq_thresh))
+
+        return {
+            "expected_portfolio_pnl": exp_pnl,
+            "turnover_mean": turn_mean,
+            "turnover_p95": turn_p95,
+            "cost_mean": cost_mean,
+            "prob_account_liq_proxy": prob_acc_liq,
+            "steps": int(days),
+            "total_leverage_allocated": float(total_lev),
         }

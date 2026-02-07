@@ -710,6 +710,15 @@ class MonteCarloEngine(BaseEngine):
         # Event-based MC (first passage TP/SL)
         tp_pct = float(max(params.profit_target, 0.0005))
         sl_pct = float(max(tp_pct * 0.8, 0.0008))
+        step_sec_evt = float(bar_seconds) if bar_seconds else 60.0
+        if step_sec_evt <= 0:
+            step_sec_evt = 60.0
+        dt_evt = float(step_sec_evt) / 31536000.0
+        try:
+            max_horizon_sec = float(max(self.horizons)) if self.horizons else float(step_sec_evt)
+        except Exception:
+            max_horizon_sec = float(step_sec_evt)
+        max_steps_evt = max(1, int(round(max_horizon_sec / float(step_sec_evt))))
         if jax is not None:
             event_metrics = mc_first_passage_tp_sl_jax(
                 s0=price,
@@ -717,8 +726,8 @@ class MonteCarloEngine(BaseEngine):
                 sl_pct=sl_pct,
                 mu=mu_adj,
                 sigma=sigma,
-                dt=1.0,
-                max_steps=int(max(self.horizons)),
+                dt=dt_evt,
+                max_steps=int(max_steps_evt),
                 n_paths=int(params.n_paths),
                 cvar_alpha=params.cvar_alpha,
                 seed=seed,
@@ -730,8 +739,8 @@ class MonteCarloEngine(BaseEngine):
                     sl_pct=sl_pct,
                     mu=mu_adj,
                     sigma=sigma,
-                    dt=1.0,
-                    max_steps=int(max(self.horizons)),
+                    dt=dt_evt,
+                    max_steps=int(max_steps_evt),
                     n_paths=int(params.n_paths),
                     cvar_alpha=params.cvar_alpha,
                     seed=seed,
@@ -743,12 +752,20 @@ class MonteCarloEngine(BaseEngine):
                 sl_pct=sl_pct,
                 mu=mu_adj,
                 sigma=sigma,
-                dt=1.0,
-                max_steps=int(max(self.horizons)),
+                dt=dt_evt,
+                max_steps=int(max_steps_evt),
                 n_paths=int(params.n_paths),
                 cvar_alpha=params.cvar_alpha,
                 seed=seed,
             )
+        if event_metrics:
+            try:
+                if event_metrics.get("event_t_median") is not None:
+                    event_metrics["event_t_median"] = float(event_metrics["event_t_median"]) * step_sec_evt
+                if event_metrics.get("event_t_mean") is not None:
+                    event_metrics["event_t_mean"] = float(event_metrics["event_t_mean"]) * step_sec_evt
+            except Exception:
+                pass
 
         # event EV/CVaR를 % 수익률 단위로 환산 (R * SL%)
         event_ev_pct = None

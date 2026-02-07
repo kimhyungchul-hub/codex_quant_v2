@@ -190,6 +190,13 @@ UnifiedScore = max_T Score(a, L, T)
 - `MC_ENGINE_TIMEOUT_BATCH`: 배치 요청 타임아웃(초)
 - `DECIDE_BATCH_TIMEOUT_SEC`: 배치 결정 타임아웃(초)
 
+### MPS/Metal 임시 디렉터리 이슈 (macOS)
+증상: `Error creating directory`, `Function Can't set size of /tmp file failed` 로그가 반복되면서 MPS가 unavailable.
+원인: MPS/Metal이 `/tmp`가 아니라 `$TMPDIR` 아래에 임시/캐시 디렉터리를 만들는데, 해당 경로가 없거나 쓰기 불가였음.
+해결: `$TMPDIR`를 쓰기 가능한 경로로 지정.
+- 예시(권장): `export TMPDIR=~/tmp` (디렉터리 생성 후 사용)
+- 예시(시스템 경로 복구): `export TMPDIR=$(getconf DARWIN_USER_TEMP_DIR)` 후 `ls -ld "$TMPDIR"`로 쓰기 확인
+
 #### 1-1) JAX/플랫폼
 - `XLA_PYTHON_CLIENT_PREALLOCATE`: JAX 메모리 선점 여부
 - `XLA_PYTHON_CLIENT_ALLOCATOR`: JAX 메모리 allocator

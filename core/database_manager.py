@@ -409,11 +409,34 @@ class DatabaseManager:
 
     # 내부적으로 동기/비동기 공용으로 사용할 파라미터 빌더
     def _prepare_trade_params(self, trade_data: Dict[str, Any], mode: TradingMode) -> Tuple:
-        target = trade_data.get("target_price") or trade_data.get("price", 0)
-        fill = trade_data.get("fill_price") or trade_data.get("price", 0)
-        slippage_bps = 0
-        if target and target > 0:
-            slippage_bps = (fill - target) / target * 10000
+        def _f(val: Any, default: float = 0.0) -> float:
+            if val is None:
+                return float(default)
+            try:
+                return float(val)
+            except Exception:
+                return float(default)
+
+        def _fn(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        target_raw = trade_data.get("target_price")
+        if target_raw is None:
+            target_raw = trade_data.get("price")
+        fill_raw = trade_data.get("fill_price")
+        if fill_raw is None:
+            fill_raw = trade_data.get("price")
+
+        target = _f(target_raw, 0.0)
+        fill = _f(fill_raw, 0.0)
+        slippage_bps = 0.0
+        if target > 0:
+            slippage_bps = (fill - target) / target * 10000.0
 
         return (
             trade_data.get("symbol"),
@@ -421,12 +444,12 @@ class DatabaseManager:
             trade_data.get("action", "OPEN"),
             target,
             fill,
-            float(trade_data.get("qty", 0)),
-            float(trade_data.get("notional", 0)),
+            _f(trade_data.get("qty"), 0.0),
+            _f(trade_data.get("notional"), 0.0),
             slippage_bps,
-            trade_data.get("slippage_est_bps"),
-            float(trade_data.get("fee", 0)),
-            trade_data.get("fee_rate"),
+            _fn(trade_data.get("slippage_est_bps")),
+            _f(trade_data.get("fee"), 0.0),
+            _fn(trade_data.get("fee_rate")),
             mode.value,
             trade_data.get("pos_source"),
             trade_data.get("exec_type"),
@@ -435,12 +458,12 @@ class DatabaseManager:
             trade_data.get("entry_group"),
             trade_data.get("entry_rank"),
             trade_data.get("entry_reason"),
-            trade_data.get("entry_ev"),
-            trade_data.get("entry_kelly"),
-            trade_data.get("entry_confidence"),
-            trade_data.get("realized_pnl"),
-            trade_data.get("roe"),
-            trade_data.get("hold_duration_sec"),
+            _fn(trade_data.get("entry_ev")),
+            _fn(trade_data.get("entry_kelly")),
+            _fn(trade_data.get("entry_confidence")),
+            _fn(trade_data.get("realized_pnl")),
+            _fn(trade_data.get("roe")),
+            _fn(trade_data.get("hold_duration_sec")),
             json.dumps(trade_data),
         )
 
@@ -517,7 +540,7 @@ class DatabaseManager:
                     trading_mode, pos_source, exec_type, order_id, timestamp_ms,
                     entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
                     realized_pnl, roe, hold_duration_sec, raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, params)
             conn.commit()
 
@@ -531,7 +554,7 @@ class DatabaseManager:
                 trading_mode, pos_source, exec_type, order_id, timestamp_ms,
                 entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
                 realized_pnl, roe, hold_duration_sec, raw_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )
@@ -576,7 +599,7 @@ class DatabaseManager:
                     total_equity, wallet_balance, available_balance, unrealized_pnl,
                     position_count, total_notional, total_margin,
                     margin_ratio, total_leverage
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, params)
             conn.commit()
 
@@ -589,7 +612,7 @@ class DatabaseManager:
                 total_equity, wallet_balance, available_balance, unrealized_pnl,
                 position_count, total_notional, total_margin,
                 margin_ratio, total_leverage
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )
@@ -636,7 +659,7 @@ class DatabaseManager:
                     policy_horizon_sec, policy_flip_streak, policy_hold_bad,
                     policy_last_eval_ms, policy_mu_annual, policy_sigma_annual,
                     raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, params)
             conn.commit()
 
@@ -652,7 +675,7 @@ class DatabaseManager:
                 policy_horizon_sec, policy_flip_streak, policy_hold_bad,
                 policy_last_eval_ms, policy_mu_annual, policy_sigma_annual,
                 raw_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )
@@ -665,6 +688,12 @@ class DatabaseManager:
         """포지션을 삭제합니다."""
         with self.lock, self._get_connection() as conn:
             conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+            conn.commit()
+
+    def delete_positions_by_mode(self, mode: TradingMode):
+        """모드별 포지션 전체 삭제."""
+        with self.lock, self._get_connection() as conn:
+            conn.execute("DELETE FROM positions WHERE trading_mode = ?", (mode.value,))
             conn.commit()
 
     def get_all_positions(self, mode: Optional[TradingMode] = None) -> Dict[str, Dict]:

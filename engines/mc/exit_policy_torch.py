@@ -4,7 +4,7 @@ import math
 from typing import Any, Dict, Tuple
 
 import numpy as np
-from engines.mc.torch_backend import _TORCH_OK, torch, to_torch, get_torch_device
+from engines.mc.torch_backend import _TORCH_OK, torch, to_torch, to_numpy, get_torch_device
 
 
 def _norm_cdf_torch(x: torch.Tensor) -> torch.Tensor:
@@ -140,6 +140,8 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
     cvar_alpha: float = 0.05,
     unified_lambda: float = 1.0,
     unified_rho: float = 0.0,
+    cash_exit_score: float | None = None,
+    max_hold_sec: int = 0,
 ) -> Dict[str, Any]:
     """Torch implementation of batched exit-policy simulation."""
     if not _TORCH_OK or torch is None:
@@ -171,6 +173,10 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
     H_steps = torch.clamp(H_steps, min=1)
 
     min_hold_steps = torch.ceil(min_hold_sec / float(step_sec)).to(torch.int64)
+    max_hold_steps = None
+    if max_hold_sec and int(max_hold_sec) > 0:
+        max_hold_steps = int(math.ceil(float(max_hold_sec) / float(step_sec)))
+        max_hold_steps = int(max(1, min(max_hold_steps, max_steps_avail)))
 
     exit_t = torch.full((batch_size, n_paths), max_steps_avail, dtype=torch.int64, device=device)
     reason = torch.zeros((batch_size, n_paths), dtype=torch.int64, device=device)
@@ -237,6 +243,20 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
 
         hold_ok = (gap_eff >= -float(score_margin)) & (p_pos_cur_t >= float(p_pos_floor_hold))
         hold_ok = hold_ok & (p_sl_cur_t <= float(p_sl_hold_ceiling)) & (p_tp_cur_t >= float(p_tp_floor_hold))
+
+        if max_hold_steps is not None and t >= int(max_hold_steps):
+            max_mask = active_mask
+            if torch.any(max_mask):
+                exit_t[max_mask] = t
+                reason[max_mask] = 8  # max_hold
+                decided[max_mask] = True
+
+        if cash_exit_score is not None:
+            cash_mask = active_mask & after_min_hold[:, None] & (score_cur_t[:, None] <= float(cash_exit_score))
+            if torch.any(cash_mask):
+                exit_t[cash_mask] = t
+                reason[cash_mask] = 7  # unified_cash
+                decided[cash_mask] = True
 
         pref_alt = (gap_eff < -float(score_margin)) & flip_ok
         flip_streak = torch.where(
@@ -317,37 +337,40 @@ def simulate_exit_policy_rollforward_batched_vmap_torch(
 
 
 def simulate_exit_policy_multi_symbol_torch(*args, **kwargs):
-    """Multi-symbol wrapper (sequential per symbol to control memory)."""
+    """Multi-symbol wrapper with per-symbol torch rollforward (vector thresholds)."""
     price_paths_batch = args[0]
     if not isinstance(price_paths_batch, torch.Tensor):
         price_paths_batch = to_torch(price_paths_batch, device=get_torch_device())
 
+    cash_exit_score = kwargs.get("cash_exit_score", None)
+    max_hold_sec = kwargs.get("max_hold_sec", 0)
+
     num_symbols = int(price_paths_batch.shape[0])
-    results = {
-        "p_pos_exit": [],
-        "ev_exit": [],
-        "exit_t_mean_sec": [],
-        "reason_idx": [],
-        "cvar_exit": [],
-        "p_tp": [],
-        "p_sl": [],
-        "p_other": [],
-        "net_out": [],
-        "exit_t": [],
-    }
 
-    # Unpack scalar/vector args as tensors for indexing
-    s0_batch = np.asarray(args[1])
-    mu_ps_batch = np.asarray(args[2])
-    sigma_ps_batch = np.asarray(args[3])
-    leverage_batch = np.asarray(args[4])
-    fee_roundtrip_batch = np.asarray(args[5])
-    exec_oneway_batch = np.asarray(args[6])
-    impact_cost_batch = np.asarray(args[7])
+    # Unpack scalar/vector args
+    s0_batch = np.asarray(args[1], dtype=np.float32)
+    mu_ps_batch = np.asarray(args[2], dtype=np.float32)
+    sigma_ps_batch = np.asarray(args[3], dtype=np.float32)
+    leverage_batch = np.asarray(args[4], dtype=np.float32)
+    fee_roundtrip_batch = np.asarray(args[5], dtype=np.float32)
+    exec_oneway_batch = np.asarray(args[6], dtype=np.float32)
+    impact_cost_batch = np.asarray(args[7], dtype=np.float32)
 
-    decision_dt_sec = int(args[8])
-    step_sec = int(args[9])
-    max_horizon_sec = int(args[10])
+    def _as_int_vector(val: Any) -> np.ndarray:
+        arr = np.asarray(val, dtype=np.int64)
+        if arr.ndim == 0:
+            return np.full(num_symbols, int(arr), dtype=np.int64)
+        arr = arr.reshape(-1)
+        if arr.size == 1:
+            return np.full(num_symbols, int(arr[0]), dtype=np.int64)
+        if arr.size < num_symbols:
+            pad = np.full(num_symbols - arr.size, int(arr[-1]), dtype=np.int64)
+            return np.concatenate([arr, pad], axis=0)
+        return arr[:num_symbols]
+
+    decision_dt_sec_v = _as_int_vector(args[8])
+    step_sec_v = _as_int_vector(args[9])
+    max_horizon_sec_v = _as_int_vector(args[10])
 
     side_now_batch = np.asarray(args[11])
     horizon_sec_batch = np.asarray(args[12])
@@ -355,130 +378,54 @@ def simulate_exit_policy_multi_symbol_torch(*args, **kwargs):
     tp_target_roe_batch = np.asarray(args[14])
     sl_target_roe_batch = np.asarray(args[15])
 
-    p_pos_floor_enter = float(args[16])
-    p_pos_floor_hold = float(args[17])
-    p_sl_enter_ceiling = float(args[18])
-    p_sl_hold_ceiling = float(args[19])
-    p_sl_emergency = float(args[20])
-    p_tp_floor_enter = float(args[21])
-    p_tp_floor_hold = float(args[22])
-    score_margin = float(args[23])
-    soft_floor = float(args[24])
-    enable_dd_stop = bool(args[25])
+    p_pos_floor_enter_v = np.asarray(args[16], dtype=np.float32)
+    p_pos_floor_hold_v = np.asarray(args[17], dtype=np.float32)
+    p_sl_enter_ceiling_v = np.asarray(args[18], dtype=np.float32)
+    p_sl_hold_ceiling_v = np.asarray(args[19], dtype=np.float32)
+    p_sl_emergency_v = np.asarray(args[20], dtype=np.float32)
+    p_tp_floor_enter_v = np.asarray(args[21], dtype=np.float32)
+    p_tp_floor_hold_v = np.asarray(args[22], dtype=np.float32)
+    score_margin_v = np.asarray(args[23], dtype=np.float32)
+    soft_floor_v = np.asarray(args[24], dtype=np.float32)
+    enable_dd_stop = bool(np.array(args[25], dtype=np.int64).flatten()[0])
     dd_stop_roe_batch = np.asarray(args[26])
-    flip_confirm_ticks = int(args[27])
-    hold_bad_ticks = int(args[28])
-    fee_exit_only_override = float(args[29])
-    cvar_alpha = float(args[30])
-    unified_lambda = float(args[31]) if len(args) > 31 else 1.0
-    unified_rho = float(args[32]) if len(args) > 32 else 0.0
+    flip_confirm_ticks = int(np.array(args[27], dtype=np.int64).flatten()[0])
+    hold_bad_ticks = int(np.array(args[28], dtype=np.int64).flatten()[0])
+    fee_exit_only_override = float(np.array(args[29], dtype=np.float64).flatten()[0])
+    cvar_alpha = float(np.array(args[30], dtype=np.float64).flatten()[0])
+    unified_lambda = float(np.array(args[31], dtype=np.float64).flatten()[0]) if len(args) > 31 else 1.0
+    unified_rho = float(np.array(args[32], dtype=np.float64).flatten()[0]) if len(args) > 32 else 0.0
 
-    # Try vmap if available
-    torch_vmap = None
-    try:
-        from torch.func import vmap as torch_vmap  # type: ignore
-    except Exception:
-        torch_vmap = getattr(torch, "vmap", None)
+    max_batch = horizon_sec_batch.shape[1] if horizon_sec_batch.ndim > 1 else horizon_sec_batch.shape[0]
 
-    if torch_vmap is not None:
-        def _rollforward_tuple(
-            price_paths_i,
-            s0_i,
-            mu_i,
-            sigma_i,
-            leverage_i,
-            fee_rt_i,
-            exec_ow_i,
-            impact_i,
-            side_i,
-            horizon_i,
-            min_hold_i,
-            tp_i,
-            sl_i,
-            dd_stop_i,
-        ):
-            res = simulate_exit_policy_rollforward_batched_vmap_torch(
-                price_paths_i,
-                float(s0_i),
-                float(mu_i),
-                float(sigma_i),
-                float(leverage_i),
-                float(fee_rt_i),
-                float(exec_ow_i),
-                float(impact_i),
-                decision_dt_sec,
-                step_sec,
-                max_horizon_sec,
-                side_i,
-                horizon_i,
-                min_hold_i,
-                tp_i,
-                sl_i,
-                p_pos_floor_enter,
-                p_pos_floor_hold,
-                p_sl_enter_ceiling,
-                p_sl_hold_ceiling,
-                p_sl_emergency,
-                p_tp_floor_enter,
-                p_tp_floor_hold,
-                score_margin,
-                soft_floor,
-                enable_dd_stop,
-                dd_stop_i,
-                flip_confirm_ticks,
-                hold_bad_ticks,
-                fee_exit_only_override,
-                cvar_alpha,
-                unified_lambda,
-                unified_rho,
-            )
-            return (
-                res["p_pos_exit"],
-                res["ev_exit"],
-                res["exit_t_mean_sec"],
-                res["reason_idx"],
-                res["cvar_exit"],
-                res["p_tp"],
-                res["p_sl"],
-                res["p_other"],
-                res["net_out"],
-                res["exit_t"],
-            )
+    # Preallocate result arrays
+    def _zeros():
+        return np.zeros((num_symbols, max_batch), dtype=np.float32)
 
-        tup = torch_vmap(
-            _rollforward_tuple,
-            in_dims=(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
-        )(
-            price_paths_batch,
-            to_torch(s0_batch, device=get_torch_device()),
-            to_torch(mu_ps_batch, device=get_torch_device()),
-            to_torch(sigma_ps_batch, device=get_torch_device()),
-            to_torch(leverage_batch, device=get_torch_device()),
-            to_torch(fee_roundtrip_batch, device=get_torch_device()),
-            to_torch(exec_oneway_batch, device=get_torch_device()),
-            to_torch(impact_cost_batch, device=get_torch_device()),
-            to_torch(side_now_batch, device=get_torch_device()),
-            to_torch(horizon_sec_batch, device=get_torch_device()),
-            to_torch(min_hold_sec_batch, device=get_torch_device()),
-            to_torch(tp_target_roe_batch, device=get_torch_device()),
-            to_torch(sl_target_roe_batch, device=get_torch_device()),
-            to_torch(dd_stop_roe_batch, device=get_torch_device()),
-        )
-        return {
-            "p_pos_exit": tup[0],
-            "ev_exit": tup[1],
-            "exit_t_mean_sec": tup[2],
-            "reason_idx": tup[3],
-            "cvar_exit": tup[4],
-            "p_tp": tup[5],
-            "p_sl": tup[6],
-            "p_other": tup[7],
-            "net_out": tup[8],
-            "exit_t": tup[9],
-        }
+    p_pos_exit = _zeros()
+    ev_exit = _zeros()
+    exit_t_mean_sec = _zeros()
+    cvar_exit = _zeros()
+    p_tp = _zeros()
+    p_sl = _zeros()
+    p_other = _zeros()
+    reason_idx = np.empty((num_symbols, max_batch), dtype=object)
+    net_out = np.empty((num_symbols, max_batch), dtype=object)
+    exit_t = np.empty((num_symbols, max_batch), dtype=object)
 
-    # Fallback: sequential per symbol
     for i in range(num_symbols):
+        h_row = horizon_sec_batch[i]
+        bs = int(np.count_nonzero(h_row))
+        if bs <= 0:
+            bs = max_batch
+
+        side_i = side_now_batch[i][:bs]
+        horizon_i = h_row[:bs]
+        min_hold_i = min_hold_sec_batch[i][:bs]
+        tp_i = tp_target_roe_batch[i][:bs]
+        sl_i = sl_target_roe_batch[i][:bs]
+        dd_stop_i = dd_stop_roe_batch[i][:bs]
+
         res = simulate_exit_policy_rollforward_batched_vmap_torch(
             price_paths_batch[i],
             float(s0_batch[i]),
@@ -488,36 +435,60 @@ def simulate_exit_policy_multi_symbol_torch(*args, **kwargs):
             float(fee_roundtrip_batch[i]),
             float(exec_oneway_batch[i]),
             float(impact_cost_batch[i]),
-            decision_dt_sec,
-            step_sec,
-            max_horizon_sec,
-            side_now_batch[i],
-            horizon_sec_batch[i],
-            min_hold_sec_batch[i],
-            tp_target_roe_batch[i],
-            sl_target_roe_batch[i],
-            p_pos_floor_enter,
-            p_pos_floor_hold,
-            p_sl_enter_ceiling,
-            p_sl_hold_ceiling,
-            p_sl_emergency,
-            p_tp_floor_enter,
-            p_tp_floor_hold,
-            score_margin,
-            soft_floor,
+            int(decision_dt_sec_v[i]),
+            int(step_sec_v[i]),
+            int(max_horizon_sec_v[i]),
+            side_i,
+            horizon_i,
+            min_hold_i,
+            tp_i,
+            sl_i,
+            float(p_pos_floor_enter_v[i]),
+            float(p_pos_floor_hold_v[i]),
+            float(p_sl_enter_ceiling_v[i]),
+            float(p_sl_hold_ceiling_v[i]),
+            float(p_sl_emergency_v[i]),
+            float(p_tp_floor_enter_v[i]),
+            float(p_tp_floor_hold_v[i]),
+            float(score_margin_v[i]),
+            float(soft_floor_v[i]),
             enable_dd_stop,
-            dd_stop_roe_batch[i],
+            dd_stop_i,
             flip_confirm_ticks,
             hold_bad_ticks,
             fee_exit_only_override,
             cvar_alpha,
             unified_lambda,
             unified_rho,
+            cash_exit_score,
+            max_hold_sec,
         )
-        for k in results:
-            results[k].append(res[k])
 
-    out = {}
-    for k, v in results.items():
-        out[k] = torch.stack(v, dim=0)
-    return out
+        p_pos_exit[i, :bs] = to_numpy(res["p_pos_exit"])
+        ev_exit[i, :bs] = to_numpy(res["ev_exit"])
+        exit_t_mean_sec[i, :bs] = to_numpy(res["exit_t_mean_sec"])
+        cvar_exit[i, :bs] = to_numpy(res["cvar_exit"])
+        p_tp[i, :bs] = to_numpy(res.get("p_tp", np.zeros_like(p_pos_exit[i, :bs])))
+        p_sl[i, :bs] = to_numpy(res.get("p_sl", np.zeros_like(p_pos_exit[i, :bs])))
+        p_other[i, :bs] = to_numpy(res.get("p_other", np.zeros_like(p_pos_exit[i, :bs])))
+
+        res_reason = to_numpy(res.get("reason_idx", np.zeros((bs,), dtype=np.int32)))
+        res_net_out = to_numpy(res.get("net_out", np.zeros((bs, 0), dtype=np.float32)))
+        res_exit_t = to_numpy(res.get("exit_t", np.zeros((bs, 0), dtype=np.int64)))
+        for j in range(bs):
+            reason_idx[i, j] = res_reason[j] if len(res_reason) > j else np.array([], dtype=np.int32)
+            net_out[i, j] = res_net_out[j] if len(res_net_out) > j else np.array([], dtype=np.float32)
+            exit_t[i, j] = res_exit_t[j] if len(res_exit_t) > j else np.array([], dtype=np.int64)
+
+    return {
+        "p_pos_exit": p_pos_exit,
+        "ev_exit": ev_exit,
+        "exit_t_mean_sec": exit_t_mean_sec,
+        "reason_idx": reason_idx,
+        "cvar_exit": cvar_exit,
+        "p_tp": p_tp,
+        "p_sl": p_sl,
+        "p_other": p_other,
+        "net_out": net_out,
+        "exit_t": exit_t,
+    }

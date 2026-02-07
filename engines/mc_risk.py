@@ -52,7 +52,7 @@ class ExitPolicy:
     # --- fixed safety ---
     min_event_p_tp: float = 0.30        # TP 도달 확률이 너무 낮으면 exit(유예 후)
     grace_sec: int = 20                 # 진입 직후 흔들림 유예
-    max_hold_sec: int = 600             # 절대 보유 제한(초)
+    max_hold_sec: int = 0               # 절대 보유 제한(초) (0=disabled)
     max_abs_event_cvar_r: float = 0.010 # |CVaR|이 크면 축소/청산
 
 
@@ -113,7 +113,11 @@ def should_exit_position(pos: Dict[str, Any], meta: Dict[str, Any], *, age_sec: 
         return True, f"time_stop>{policy.time_stop_mult:.1f}x_median"
 
     # 6) absolute max hold
-    if age_sec >= policy.max_hold_sec:
+    try:
+        max_hold = float(policy.max_hold_sec)
+    except Exception:
+        max_hold = 0.0
+    if max_hold and max_hold > 0 and age_sec >= max_hold:
         return True, "max_hold"
 
     return False, "hold"

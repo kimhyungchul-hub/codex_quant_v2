@@ -5,12 +5,21 @@ import time
 from typing import Any, Dict, Optional, List, Sequence
 from utils.helpers import now_ms, _safe_float
 
-try:
-    from engines.p_maker_survival_mlp import PMakerSurvivalMLP
-    _PMAKER_MLP_OK = True
-except Exception:
-    PMakerSurvivalMLP = None
-    _PMAKER_MLP_OK = False
+PMakerSurvivalMLP = None
+_PMAKER_MLP_OK = False
+
+
+def _maybe_load_pmaker_mlp() -> None:
+    global PMakerSurvivalMLP, _PMAKER_MLP_OK
+    if _PMAKER_MLP_OK or PMakerSurvivalMLP is not None:
+        return
+    try:
+        from engines.p_maker_survival_mlp import PMakerSurvivalMLP as _PMakerSurvivalMLP
+        PMakerSurvivalMLP = _PMakerSurvivalMLP
+        _PMAKER_MLP_OK = True
+    except Exception:
+        PMakerSurvivalMLP = None
+        _PMAKER_MLP_OK = False
 
 class PMakerManager:
     def __init__(self, orchestrator):
@@ -40,6 +49,8 @@ class PMakerManager:
         self.probe_last = None
         self.probe_started_ms = None
         
+        if self.enabled:
+            _maybe_load_pmaker_mlp()
         if self.enabled and _PMAKER_MLP_OK and PMakerSurvivalMLP is not None:
             try:
                 self.surv = PMakerSurvivalMLP(

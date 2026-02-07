@@ -92,7 +92,7 @@ class EngineHub:
             print(f"⚠️ Engine skipped: {e}")
 
     def _load_mc_engine(self):
-        from mc_engine import MonteCarloEngine
+        from engines.mc.monte_carlo_engine import MonteCarloEngine
         return MonteCarloEngine()
 
     # =========================

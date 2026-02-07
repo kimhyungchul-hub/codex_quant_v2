@@ -1,111 +1,421 @@
 <!DOCTYPE html>
 <html lang="ko">
+
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Trading Dashboard v4 (Light, Table, Charts)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
-    :root{
-      --bg:#f6f8fb;
-      --panel:#ffffff;
-      --text:#111827;
-      --muted:#6b7280;
-      --line:#e5e7eb;
-      --shadow:0 6px 18px rgba(17,24,39,.06);
-      --radius:14px;
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --shadow: 0 6px 18px rgba(17, 24, 39, .06);
+      --radius: 14px;
 
-      --good:#16a34a;
-      --bad:#dc2626;
-      --warn:#d97706;
-      --accent:#2563eb;
-      --accent2:#0ea5e9;
-      --chip:#f3f4f6;
+      --good: #16a34a;
+      --bad: #dc2626;
+      --warn: #d97706;
+      --accent: #2563eb;
+      --accent2: #0ea5e9;
+      --chip: #f3f4f6;
     }
-    *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--text);font-family:ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial}
-    .wrap{max-width:1400px;margin:0 auto;padding:14px}
-    .topbar{
-      display:flex;gap:10px;flex-wrap:wrap;align-items:center;
-      background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-      padding:10px 12px;box-shadow:var(--shadow);
-      position:sticky;top:0;z-index:10;
+
+    * {
+      box-sizing: border-box
     }
-    .chip{display:flex;gap:8px;align-items:baseline;padding:7px 10px;border-radius:999px;background:var(--chip);border:1px solid var(--line);font-size:13px}
-    .chip b{font-size:12px;color:var(--muted);font-weight:600}
-    .chip .v{font-weight:700}
-    .chip .on{color:var(--bad)}
-    .chip .off{color:var(--good)}
-    .spacer{flex:1}
-    .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-    .input{
-      border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:#fff;
-      font-size:13px;min-width:220px;
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial
     }
-    .btn{
-      border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:#fff;
-      font-size:13px;cursor:pointer;
+
+    .wrap {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 14px
     }
-    .btn:hover{border-color:#cbd5e1}
-    .grid{
-      display:grid;grid-template-columns: 1.55fr .95fr;
-      gap:12px;margin-top:12px;
+
+    .topbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      box-shadow: var(--shadow);
+      position: sticky;
+      top: 0;
+      z-index: 10;
     }
-    .panel{
-      background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
-      box-shadow:var(--shadow);overflow:hidden;
+
+    .chip {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: var(--chip);
+      border: 1px solid var(--line);
+      font-size: 13px
     }
-    .panel h3{
-      margin:0;padding:10px 12px;border-bottom:1px solid var(--line);
-      font-size:14px;display:flex;gap:10px;align-items:center;
+
+    .chip b {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600
     }
-    .panel h3 .sub{color:var(--muted);font-weight:600;font-size:12px}
-    .panel .body{padding:10px 12px}
-    .tight{padding:0}
-    .tableWrap{overflow:visible;max-height:none}
-    table{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px}
-    thead th{
-      position:sticky;top:0;z-index:3;
-      background:linear-gradient(#fff,#fbfbfd);
-      border-bottom:1px solid var(--line);
-      padding:9px 10px;text-align:left;white-space:nowrap;
-      font-size:12px;color:#374151;font-weight:700;
-      cursor:pointer;
+
+    .chip .v {
+      font-weight: 700
     }
-    tbody td{
-      border-bottom:1px solid var(--line);
-      padding:8px 10px;white-space:nowrap;
-      vertical-align:middle;
+
+    .chip .on {
+      color: var(--bad)
     }
-    tbody tr:hover{background:#f8fafc}
-    tbody tr.sel{outline:2px solid rgba(37,99,235,.25);background:#eff6ff}
-    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
-    .pill{
-      display:inline-flex;align-items:center;gap:6px;
-      padding:3px 8px;border-radius:999px;border:1px solid var(--line);background:#fff;
-      font-size:11px;font-weight:700;
+
+    .chip .off {
+      color: var(--good)
     }
-    .up{color:var(--good)}
-    .down{color:var(--bad)}
-    .wait{color:var(--warn)}
-    .muted{color:var(--muted)}
+
+    .spacer {
+      flex: 1
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center
+    }
+
+    .input {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #fff;
+      font-size: 13px;
+      min-width: 220px;
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px 10px;
+      background: #fff;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .btn.mini {
+      padding: 4px 6px;
+      font-size: 11px;
+      border-radius: 8px;
+    }
+
+    .btn:hover {
+      border-color: #cbd5e1
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    .btn.danger {
+      border-color: #fecaca;
+      background: #fff5f5;
+      color: #b91c1c;
+    }
+
+    .btn.danger:hover {
+      border-color: #fca5a5;
+      background: #ffe4e4;
+    }
+
+    .btn.warn {
+      border-color: #fde68a;
+      background: #fffbeb;
+      color: #b45309;
+    }
+
+    .btn.warn:hover {
+      border-color: #fcd34d;
+      background: #fef3c7;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.55fr .95fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel h3 {
+      margin: 0;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .panel h3 .sub {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 12px
+    }
+
+    .panel .body {
+      padding: 10px 12px
+    }
+
+    .tight {
+      padding: 0
+    }
+
+    .tableWrap {
+      overflow: visible;
+      max-height: none
+    }
+
+    table {
+      width: 100%;
+      border-collapse: separate;
+      border-spacing: 0;
+      font-size: 12.5px
+    }
+
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 3;
+      background: linear-gradient(#fff, #fbfbfd);
+      border-bottom: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      white-space: nowrap;
+      font-size: 12px;
+      color: #374151;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    tbody td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 10px;
+      white-space: nowrap;
+      vertical-align: middle;
+    }
+
+    tbody tr:hover {
+      background: #f8fafc
+    }
+
+    tbody tr.sel {
+      outline: 2px solid rgba(37, 99, 235, .25);
+      background: #eff6ff
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    .wait-reason {
+      font-size: 11px;
+      color: var(--warn);
+      margin-bottom: 4px;
+      max-width: 240px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .wait-reason.muted {
+      color: var(--muted);
+    }
+
+    .up {
+      color: var(--good)
+    }
+
+    .down {
+      color: var(--bad)
+    }
+
+    .wait {
+      color: var(--warn)
+    }
+
+    .muted {
+      color: var(--muted)
+    }
+
     /* 테이블 열 간격 줄이기 */
-    thead th{padding:7px 6px !important;font-size:11px !important}
-    tbody td{padding:6px !important}
-    .right{display:flex;flex-direction:column;gap:12px}
-    .charts{display:grid;grid-template-columns:1fr;gap:12px}
-    canvas{width:100% !important;height:240px !important}
-    #equityChart{height:360px !important}
-    .mini{height:170px !important}
-    .sectionRow{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-    .tableWrap.small{max-height:280px}
-    details{border-top:1px solid var(--line)}
-    summary{padding:10px 12px;cursor:pointer;color:#374151;font-weight:700;font-size:13px}
-    .log{max-height:240px;overflow:auto;padding:10px 12px;border-top:1px solid var(--line);font-family:ui-monospace, monospace;font-size:12px}
-    .kpi{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
-    .kpi .pill{background:#f8fafc}
+    thead th {
+      padding: 7px 6px !important;
+      font-size: 11px !important
+    }
+
+    tbody td {
+      padding: 6px !important
+    }
+
+    .right {
+      display: flex;
+      flex-direction: column;
+      gap: 12px
+    }
+
+    .charts {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px
+    }
+
+    canvas {
+      width: 100% !important;
+      height: 240px !important
+    }
+
+    #equityChart {
+      height: 360px !important
+    }
+
+    #liveEquityChart {
+      height: 240px !important
+    }
+
+    .eq-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+      font-size: 12px
+    }
+
+    .eq-controls select,
+    .eq-controls input[type="range"] {
+      height: 28px
+    }
+
+    .eq-controls #eqPan {
+      width: 180px
+    }
+
+    .chart-mini {
+      height: 170px !important
+    }
+
+    .sectionRow {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px
+    }
+
+    .tableWrap.small {
+      max-height: 420px;
+      overflow: auto
+    }
+
+    /* Compact current-positions table */
+    #posWrap {
+      overflow: visible;
+      max-height: none
+    }
+
+    #posWrap thead th {
+      padding: 2px 6px !important;
+      font-size: 11px !important;
+      line-height: 1.1
+    }
+
+    #posWrap tbody td {
+      padding: 2px 6px !important;
+      line-height: 1.1
+    }
+
+    #posWrap .btn.mini {
+      padding: 2px 6px;
+      font-size: 11px;
+      line-height: 1.0
+    }
+
+    details {
+      border-top: 1px solid var(--line)
+    }
+
+    summary {
+      padding: 10px 12px;
+      cursor: pointer;
+      color: #374151;
+      font-weight: 700;
+      font-size: 13px
+    }
+
+    .log {
+      max-height: 240px;
+      overflow: auto;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      font-family: ui-monospace, monospace;
+      font-size: 12px
+    }
+
+    .kpi {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 8px
+    }
+
+    .kpi .pill {
+      background: #f8fafc
+    }
+
+    .warnbar {
+      margin-top: 8px;
+      padding: 8px 12px;
+      border: 1px solid #ef4444;
+      background: #fff1f2;
+      color: #7f1d1d;
+      border-radius: 10px;
+      font-weight: 700;
+      font-size: 12px
+    }
   </style>
 </head>
+
 <body>
   <div class="wrap">
     <div class="topbar">
@@ -113,21 +423,38 @@
       <div class="chip"><b>Equity</b><span id="eq" class="v">-</span></div>
       <div class="chip"><b>WS</b><span id="ws" class="v">-</span></div>
       <div class="chip"><b>Feed</b><span id="feed" class="v">-</span></div>
+      <div class="chip" title="Last MC decide_batch latency"><b>MC</b><span id="mcTime" class="v">-</span></div>
+      <div class="chip" title="MC backend/device"><b>MC Dev</b><span id="mcDev" class="v">-</span></div>
       <div class="chip"><b>Util</b><span id="util" class="v">-</span></div>
       <div class="chip"><b>Brier</b><span id="brier" class="v">-</span></div>
       <div class="chip"><b>Hit%</b><span id="hit" class="v">-</span></div>
+      <div class="chip" title="Alpha Hit ML 활성화 상태"><b>αML</b><span id="alphaHit" class="v">-</span></div>
+      <div class="chip" title="Alpha Signal Boost 상태 (mu_alpha 3x 증폭)"><b>αBoost</b><span id="alphaBst"
+          class="v">-</span></div>
+      <div class="chip" title="AlphaHit replay buffer (samples/min_buffer)"><b>αBuf</b><span id="alphaBuf"
+          class="v">-</span></div>
+      <div class="chip" title="AlphaHit training loss / EMA"><b>αLoss</b><span id="alphaLoss"
+          class="v">-</span></div>
+      <div class="chip" title="AlphaHit replay file status"><b>αReplay</b><span id="alphaReplay"
+          class="v">-</span></div>
+      <div class="chip" title="Loaded env profile/file"><b>ENV</b><span id="envSrc" class="v">-</span></div>
       <div class="chip"><b>Selected</b><span id="selSym" class="v">-</span></div>
       <div class="spacer"></div>
       <div class="controls">
         <input id="search" class="input" placeholder="심볼/상태/레짐 검색 (예: BTC, LONG, chop)" />
+        <button id="clearSafety" class="btn warn" title="안전모드 해제 (수동 오버라이드)">안전모드 해제</button>
         <button id="clearTrades" class="btn">트레이드 테이프 비우기</button>
+        <button id="liquidateAll" class="btn danger" title="즉시 전 포지션 청산 요청">전체 포지션 청산</button>
+        <button id="liquidateAllSafety" class="btn danger" title="전 포지션 청산 + 안전모드 진입">청산+안전모드</button>
       </div>
     </div>
+    <div id="outsideWarn" class="warnbar" style="display:none"></div>
 
     <div class="panel tight">
       <h3>시장/신호 테이블 <span class="sub">실시간 랭킹 · Top-4는 자본 배분 대상</span></h3>
       <!-- Top-4 capital allocation summary -->
-      <div id="top4Panel" style="padding:10px 12px; display:flex; gap:10px; flex-wrap:wrap; border-bottom:1px solid var(--line)"></div>
+      <div id="top4Panel"
+        style="padding:10px 12px; display:flex; gap:10px; flex-wrap:wrap; border-bottom:1px solid var(--line)"></div>
       <div class="tableWrap" id="mktWrap">
         <table id="mktTable">
           <thead>
@@ -136,14 +463,17 @@
               <th data-k="symbol">SYM</th>
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
-              <th data-k="unified_score">Ψ</th>
-              <th data-k="unified_score_hold">Ψ_HOLD</th>
-              <th data-k="unified_t_star">T*</th>
+              <th data-k="filters">FILTER</th>
+              <th data-k="hybrid_score">HYBRID</th>
+              <th data-k="hybrid_score_hold">HYB_HOLD</th>
+              <th data-k="hybrid_score_logw">LOGW</th>
               <th data-k="kelly">KELLY</th>
               <th data-k="pos_roe">ROE%</th>
               <th data-k="pos_leverage">LEV</th>
               <th data-k="rebalance">REBAL</th>
-              <th data-k="delta_ev">ΔΨ</th>
+              <th data-k="direction_reason">REASON</th>
+              <th data-k="ls_scores">HYB_LS</th>
+              <th data-k="delta_ev">ΔH</th>
               <th data-k="exec_cost">COST</th>
               <th data-k="wgt">WGT</th>
             </tr>
@@ -157,6 +487,24 @@
       <h3>포트폴리오 그래프 <span class="sub">Equity (미실현 포함 실시간)</span></h3>
       <div class="body">
         <canvas id="equityChart"></canvas>
+        <div class="eq-controls">
+          <span class="pill">시간창</span>
+          <select id="eqWindow" class="input">
+            <option value="1h">1시간</option>
+            <option value="6h" selected>6시간</option>
+            <option value="12h">12시간</option>
+            <option value="1d">1일</option>
+            <option value="3d">3일</option>
+            <option value="7d">7일</option>
+            <option value="30d">30일</option>
+            <option value="all">전체</option>
+          </select>
+          <button id="eqPanLeft" class="btn">◀</button>
+          <input id="eqPan" type="range" min="0" max="1000" value="0" />
+          <button id="eqPanRight" class="btn">▶</button>
+          <button id="eqLatest" class="btn">최신</button>
+          <span id="eqRangeLabel" class="mono muted">-</span>
+        </div>
         <div class="kpi">
           <span class="pill">Balance <span class="mono" id="balKpi">-</span></span>
           <span class="pill">Equity <span class="mono" id="eqKpi">-</span></span>
@@ -165,16 +513,64 @@
       </div>
     </div>
 
+    <div class="panel">
+      <h3>LIVE Equity Curve <span class="sub">실제 계좌 실시간 잔고</span></h3>
+      <div class="body">
+        <canvas id="liveEquityChart"></canvas>
+        <div class="kpi">
+          <span class="pill">Wallet <span class="mono" id="liveWalletKpi">-</span></span>
+          <span class="pill">Equity <span class="mono" id="liveEqKpi">-</span></span>
+          <span class="pill">Free <span class="mono" id="liveFreeKpi">-</span></span>
+          <span class="pill">IM/MM <span class="mono" id="liveMarginKpi">-</span></span>
+          <span class="pill">Sync <span class="mono" id="liveSyncKpi">-</span></span>
+        </div>
+      </div>
+    </div>
+
     <div class="panel tight" style="margin-top:12px">
       <h3>현재 포지션 <span class="sub">실시간 수익률/방향/레버리지/진입가/현재가</span></h3>
+      <div class="tableWrap small" id="posWrap">
+        <table>
+          <thead>
+            <tr>
+              <th>SYM</th>
+              <th>SIDE</th>
+              <th>ENTRY</th>
+              <th>CUR</th>
+              <th>PNL</th>
+              <th>ROE%</th>
+              <th>ROE%×L</th>
+              <th>LEV</th>
+              <th>CAP%</th>
+              <th>AGE</th>
+              <th>T'ENTRY</th>
+              <th>T'NOW</th>
+              <th>HOLD_EVAL</th>
+              <th>H_PICK</th>
+              <th>CLOSE</th>
+            </tr>
+          </thead>
+          <tbody id="posBody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel tight" style="margin-top:12px">
+      <h3>아카이브된 포지션 <span class="sub">유니버스 밖 자동 정리 내역</span></h3>
       <div class="tableWrap small">
         <table>
           <thead>
             <tr>
-              <th>SYM</th><th>SIDE</th><th>ENTRY</th><th>CUR</th><th>PNL</th><th>PNL%</th><th>LEV</th><th>CAP%</th><th>AGE(s)</th>
+              <th>TIME</th>
+              <th>SYM</th>
+              <th>SIDE</th>
+              <th>QTY</th>
+              <th>ENTRY</th>
+              <th>NOTIONAL</th>
+              <th>SOURCE</th>
             </tr>
           </thead>
-          <tbody id="posBody"></tbody>
+          <tbody id="archBody"></tbody>
         </table>
       </div>
     </div>
@@ -185,7 +581,16 @@
         <table>
           <thead>
             <tr>
-              <th>TIME</th><th>SYM</th><th>TYPE</th><th>SIDE</th><th>PRICE</th><th>PNL</th><th>ROE%</th><th>LEV</th><th>EXIT</th><th>NOTE</th>
+              <th>TIME</th>
+              <th>SYM</th>
+              <th>TYPE</th>
+              <th>SIDE</th>
+              <th>PRICE</th>
+              <th>PNL</th>
+              <th>ROE%</th>
+              <th>LEV</th>
+              <th>EXIT</th>
+              <th>NOTE</th>
             </tr>
           </thead>
           <tbody id="tradeBody"></tbody>
@@ -207,666 +612,1575 @@
     </div>
   </div>
 
-<script>
-  const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
-  const ws = new WebSocket(wsUrl);
+  <script>
+    const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
+    const ws = new WebSocket(wsUrl);
 
-  const $ = (id)=>document.getElementById(id);
-  const ksEl=$('ks'), eqEl=$('eq'), wsEl=$('ws'), feedEl=$('feed'), utilEl=$('util'), brierEl=$('brier'), hitEl=$('hit');
-  const selSymEl=$('selSym'), searchEl=$('search');
-  const mktBody=$('mktBody'), posBody=$('posBody'), tradeBody=$('tradeBody'), logsEl=$('logs'), alertsEl=$('alerts');
-  const balKpi=$('balKpi'), eqKpi=$('eqKpi'), ddKpi=$('ddKpi');
+    const $ = (id) => document.getElementById(id);
+    const ksEl = $('ks'), eqEl = $('eq'), wsEl = $('ws'), feedEl = $('feed'), utilEl = $('util'), brierEl = $('brier'), hitEl = $('hit');
+    const mcTimeEl = $('mcTime'), mcDevEl = $('mcDev');
+    const alphaHitEl = $('alphaHit'), alphaBstEl = $('alphaBst');
+    const alphaBufEl = $('alphaBuf'), alphaLossEl = $('alphaLoss'), alphaReplayEl = $('alphaReplay');
+    const envSrcEl = $('envSrc');
+    const selSymEl = $('selSym'), searchEl = $('search');
+    const outsideWarnEl = $('outsideWarn');
+    const mktBody = $('mktBody'), posBody = $('posBody'), posWrap = $('posWrap'), archBody = $('archBody'), tradeBody = $('tradeBody'), logsEl = $('logs'), alertsEl = $('alerts');
+    const balKpi = $('balKpi'), eqKpi = $('eqKpi'), ddKpi = $('ddKpi');
+    const liveWalletKpi = $('liveWalletKpi'), liveEqKpi = $('liveEqKpi'), liveFreeKpi = $('liveFreeKpi');
+    const liveMarginKpi = $('liveMarginKpi'), liveSyncKpi = $('liveSyncKpi');
+    const liquidateBtn = $('liquidateAll');
+    const liquidateSafeBtn = $('liquidateAllSafety');
+    const clearSafetyBtn = $('clearSafety');
+    const eqWindowSel = $('eqWindow');
+    const eqPan = $('eqPan');
+    const eqPanLeft = $('eqPanLeft');
+    const eqPanRight = $('eqPanRight');
+    const eqLatestBtn = $('eqLatest');
+    const eqRangeLabel = $('eqRangeLabel');
+    let lastPositions = [];
+    let lastPositionsTs = 0;
 
-  $('clearTrades').onclick=()=>{
-    tradeTape.length = 0;
-    seenTradeMsg.clear();
-    renderTradeTape();
-  };
-
-  // ---------- state ----------
-  let selectedSym = null;
-  let sortKey = 'symbol';
-  let sortAsc = true;
-
-  // history for charts
-  const maxPoints = 20000;
-  const equityHist = []; // {t, equity}
-  const sparkHist = new Map(); // sym -> [price...]
-
-  // trade tape
-  const tradeTape = []; // {time,sym,type,side,price,pnl,roe,leverage,tag,reason,note}
-  const seenTradeMsg = new Set();
-  let equitySeeded = false;
-
-  // ✅ smoother rendering
-  let latestPayload = null;
-  let rafScheduled = false;
-
-  // ✅ market row cache for smooth update
-  const rowCache = new Map(); // symbol -> {tr, cells[]}
-
-  // ---------- helpers ----------
-  const f2 = (x)=> (x===null || x===undefined || isNaN(x)) ? '-' : Number(x).toFixed(2);
-  const clamp = (a, lo, hi)=>Math.max(lo, Math.min(hi, a));
-
-  function isNum(x){ return x !== null && x !== undefined && !isNaN(Number(x)); }
-
-  // ✅ smooth number update (no design change)
-  function smoothSetText(el, target, fmt=(v)=>String(v), durMs=260){
-    if(!isNum(target)){
-      el.textContent = fmt(target);
-      el.dataset.v = '';
-      return;
-    }
-    const to = Number(target);
-    const from = isNum(el.dataset.v) ? Number(el.dataset.v) : to;
-    if(from === to){
-      el.textContent = fmt(to);
-      el.dataset.v = String(to);
-      return;
-    }
-    const t0 = performance.now();
-    const d = Math.max(80, durMs);
-    const step = (t)=>{
-      const p = Math.min(1, (t - t0)/d);
-      const e = 1 - Math.pow(1-p, 3);
-      const v = from + (to - from)*e;
-      el.textContent = fmt(v);
-      if(p < 1) requestAnimationFrame(step);
-      else el.dataset.v = String(to);
+    $('clearTrades').onclick = () => {
+      tradeTape.length = 0;
+      seenTradeMsg.clear();
+      renderTradeTape();
     };
-    requestAnimationFrame(step);
-  }
 
-  function normSym(s){ return (s||'').replace(':USDT',''); }
-  function statusClass(status){
-    if(status==='LONG') return 'up';
-    if(status==='SHORT') return 'down';
-    if(status==='WAIT') return 'wait';
-    return 'muted';
-  }
+    if (liquidateBtn) {
+      liquidateBtn.onclick = async () => {
+        if (!confirm('모든 포지션을 즉시 청산합니다. 계속할까요?')) return;
+        const prevText = liquidateBtn.textContent;
+        liquidateBtn.disabled = true;
+        liquidateBtn.textContent = '청산 요청중...';
+        try {
+          const res = await fetch('/api/liquidate_all', { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok) {
+            const msg = data.error || `HTTP ${res.status}`;
+            throw new Error(msg);
+          }
+          alert('청산 요청 완료');
+        } catch (e) {
+          alert(`청산 요청 실패: ${e.message || e}`);
+        } finally {
+          liquidateBtn.disabled = false;
+          liquidateBtn.textContent = prevText;
+        }
+      };
+    }
+    if (liquidateSafeBtn) {
+      liquidateSafeBtn.onclick = async () => {
+        if (!confirm('전 포지션 청산 후 안전모드로 전환합니다. 계속할까요?')) return;
+        const prevText = liquidateSafeBtn.textContent;
+        liquidateSafeBtn.disabled = true;
+        liquidateSafeBtn.textContent = '청산+안전모드...';
+        try {
+          const res = await fetch('/api/liquidate_all_safety', { method: 'POST' });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok) {
+            const msg = data.error || `HTTP ${res.status}`;
+            throw new Error(msg);
+          }
+          alert('청산+안전모드 요청 완료');
+        } catch (e) {
+          alert(`요청 실패: ${e.message || e}`);
+        } finally {
+          liquidateSafeBtn.disabled = false;
+          liquidateSafeBtn.textContent = prevText;
+        }
+      };
+    }
 
-  function exitKeyword(t){
-    const direct = (t.exit_tag || t.exit_kind || '').toString().toLowerCase();
-    if(direct) return direct;
-    const r = `${t.reason||''} ${t.note||''}`.toLowerCase();
-    if(r.includes('event_mc')) return 'event_mc';
-    if(r.includes('mc_exit') || r.includes('exit-policy')) return 'exit-policy';
-    if(r.includes('ev_psl_ema')) return 'ema_psl';
-    if(r.includes('ev_drop')) return 'ev_drop';
-    if(r.includes('unrealized_dd') || r.includes('dd_stop')) return 'dd_stop';
-    if(r.includes('score_flip') || r.includes('unified_flip')) return 'unified_flip';
-    if(r.includes('unified_cash')) return 'unified_cash';
-    if(r.includes('hold timeout') || r.includes('time_stop')) return 'time_stop';
-    if(r.includes('rebalance')) return 'rebalance';
-    if(r.includes('kill') || r.includes('emergency')) return 'kill';
-    return '';
-  }
+    if (clearSafetyBtn) {
+      clearSafetyBtn.onclick = async () => {
+        const safetyOn = !!(latestPayload && (latestPayload.kill_switch || (latestPayload.engine && latestPayload.engine.safety_mode)));
+        if (!safetyOn) {
+          alert('안전모드가 활성화되어 있지 않습니다.');
+          return;
+        }
+        if (!confirm('안전모드를 해제합니다. 기준자본을 현재로 리셋하고 DD 기준을 재설정합니다. 계속할까요?')) return;
+        const prevText = clearSafetyBtn.textContent;
+        safetyReqInFlight = true;
+        clearSafetyBtn.disabled = true;
+        clearSafetyBtn.textContent = '해제 요청중...';
+        try {
+          const res = await fetch('/api/safety_mode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'clear', reset_equity: true })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok || !data.ok) {
+            const msg = data.error || `HTTP ${res.status}`;
+            throw new Error(msg);
+          }
+          alert('안전모드 해제 요청 완료');
+        } catch (e) {
+          alert(`안전모드 해제 실패: ${e.message || e}`);
+        } finally {
+          safetyReqInFlight = false;
+          clearSafetyBtn.disabled = false;
+          clearSafetyBtn.textContent = prevText;
+        }
+      };
+    }
 
-  function exitBadge(tag){
-    if(!tag) return '<span class="pill muted">-</span>';
-    const t = tag.toLowerCase();
-    const cls = t.includes('kill') ? 'down' : (t.includes('event') ? 'wait' : '');
-    return `<span class="pill ${cls}">${tag}</span>`;
-  }
-
-  // ✅ trade type badge (ENTER/EXIT/REBAL/SPREAD clearly visible)
-  function tradeTypeBadge(type){
-    if(!type) return '<span class="pill muted">-</span>';
-    const t = String(type).toUpperCase();
-    if(t === 'ENTER') return '<span class="pill up">ENTER</span>';
-    if(t === 'EXIT') return '<span class="pill down">EXIT</span>';
-    if(t === 'REBAL') return '<span class="pill">REBAL</span>';
-    if(t === 'REBALANCE') return '<span class="pill">REBAL</span>';
-    if(t === 'SPREAD') return '<span class="pill wait">SPREAD</span>';
-    if(t === 'PYRAMID') return '<span class="pill">PYRAMID</span>';
-    if(t === 'KILL') return '<span class="pill down">KILL</span>';
-    return `<span class="pill muted">${t}</span>`;
-  }
-
-  // Parse log lines like: "[BTC/USDT:USDT] ENTER LONG @ 42000.00"
-  function parseTradeMsg(msg){
-    if(!msg) return null;
-    const m = msg.match(/\\[(.+?)\\]\\s+(ENTER|EXIT|REBAL|REBALANCE|SPREAD|PYRAMID|KILL)\\s*(LONG|SHORT)?\\s*(?:@\\s*([0-9.]+))?/i);
-    if(!m) return null;
-    const sym = m[1];
-    const type = (m[2]||'').toUpperCase();
-    const side = (m[3]||'').toUpperCase();
-    const price = m[4] ? Number(m[4]) : null;
-    const pnlMatch = msg.match(/pnl=([-0-9.]+)/i);
-    const roeMatch = msg.match(/roe=([-0-9.]+)/i);
-    const pnl = pnlMatch ? Number(pnlMatch[1]) : null;
-    const roe = roeMatch ? Number(roeMatch[1]) : null;
-    return {sym, type, side, price, pnl, roe, note: msg};
-  }
-
-  // ---------- charts ----------
-  const equityChart = new Chart($('equityChart'), {
-    type:'line',
-    data:{
-      labels:[],
-      datasets:[
-        { label:'Equity', data:[], pointRadius:0, borderWidth:2, tension:.25, borderColor:'#2563eb' },
-      ]
-    },
-    options:{
-      animation:false,
-      responsive:true,
-      plugins:{ legend:{display:true} },
-      scales:{
-        x:{
-          display:true,
-          ticks:{ autoSkip:true, maxTicksLimit:14 }
-        },
-        y:{ ticks:{ callback:(v)=>v } }
+    async function closeLimit(sym, px) {
+      if (!sym) return;
+      const defPx = isNum(px) ? Number(px).toFixed(4) : '';
+      const val = prompt(`${sym} 지정가 청산 가격`, defPx);
+      if (val === null) return;
+      const price = Number(val);
+      if (!isNum(price) || price <= 0) {
+        alert('가격이 올바르지 않습니다.');
+        return;
+      }
+      try {
+        const res = await fetch('/api/close_limit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: sym, price })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          const msg = data.error || `HTTP ${res.status}`;
+          throw new Error(msg);
+        }
+        alert('지정가 청산 주문 요청 완료');
+      } catch (e) {
+        alert(`지정가 청산 실패: ${e.message || e}`);
       }
     }
-  });
 
-  function formatTimeLabel(ts, tfMin){
-    const d = new Date(ts);
-    if(tfMin >= 1440){
-      return `${d.getMonth()+1}/${d.getDate()}`;
-    }
-    if(tfMin >= 60){
-      return d.toLocaleString([], {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
-    }
-    return d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'});
-  }
+    // ---------- state ----------
+    let selectedSym = null;
+    let sortKey = 'symbol';
+    let sortAsc = true;
 
-  function buildEquitySeries(){
-    const tfMin = 1; // Fixed 1-minute timeframe
-    const bucketMs = tfMin * 60 * 1000;
-    if(!equityHist.length) return {labels:[], values:[]};
-    const buckets = new Map();
-    equityHist.forEach(p=>{
-      const b = Math.floor(p.t / bucketMs);
-      buckets.set(b, p);
-    });
-    const sorted = Array.from(buckets.entries()).sort((a,b)=>a[0]-b[0]).map(e=>e[1]);
-    return {
-      labels: sorted.map(p=>formatTimeLabel(p.t, tfMin)),
-      values: sorted.map(p=>p.equity),
+    // history for charts
+    const maxPoints = 20000;
+    const equityHist = []; // {t, equity}
+    const liveEquityHist = []; // {t, equity}
+    const sparkHist = new Map(); // sym -> [price...]
+    const equityView = { windowKey: '6h', panPct: 0 };
+
+    // trade tape
+    const tradeTape = []; // {time,sym,type,side,price,pnl,roe,leverage,tag,reason,note}
+    const seenTradeMsg = new Set();
+    let equitySeeded = false;
+    let liveEquitySeeded = false;
+
+    // ✅ smoother rendering
+    let latestPayload = null;
+    let rafScheduled = false;
+    let safetyReqInFlight = false;
+
+    // ✅ market row cache for smooth update
+    const rowCache = new Map(); // symbol -> {tr, cells[]}
+
+    function refreshEquityView() {
+      updateEquityChart();
+      updateLiveEquityChart();
+    }
+
+    if (eqWindowSel) {
+      eqWindowSel.value = equityView.windowKey;
+      eqWindowSel.onchange = () => {
+        equityView.windowKey = eqWindowSel.value || '6h';
+        equityView.panPct = 0;
+        if (eqPan) eqPan.value = 0;
+        refreshEquityView();
+      };
+    }
+    if (eqPan) {
+      eqPan.oninput = () => {
+        equityView.panPct = clamp(Number(eqPan.value || 0), 0, 1000);
+        refreshEquityView();
+      };
+    }
+    if (eqPanLeft) {
+      eqPanLeft.onclick = () => {
+        const step = 50;
+        equityView.panPct = clamp((equityView.panPct || 0) + step, 0, 1000);
+        if (eqPan) eqPan.value = equityView.panPct;
+        refreshEquityView();
+      };
+    }
+    if (eqPanRight) {
+      eqPanRight.onclick = () => {
+        const step = 50;
+        equityView.panPct = clamp((equityView.panPct || 0) - step, 0, 1000);
+        if (eqPan) eqPan.value = equityView.panPct;
+        refreshEquityView();
+      };
+    }
+    if (eqLatestBtn) {
+      eqLatestBtn.onclick = () => {
+        equityView.panPct = 0;
+        if (eqPan) eqPan.value = 0;
+        refreshEquityView();
+      };
+    }
+
+    // ---------- helpers ----------
+    const f2 = (x) => (x === null || x === undefined || isNaN(x)) ? '-' : Number(x).toFixed(2);
+    const clamp = (a, lo, hi) => Math.max(lo, Math.min(hi, a));
+
+    function isNum(x) { return x !== null && x !== undefined && !isNaN(Number(x)); }
+    function coercePositions(positions) {
+      if (!positions) return [];
+      if (Array.isArray(positions)) return positions;
+      if (typeof positions !== 'object') return [];
+      const out = [];
+      for (const [sym, pos] of Object.entries(positions)) {
+        if (pos && typeof pos === 'object') {
+          const rec = { ...pos };
+          if (!rec.symbol) rec.symbol = sym;
+          out.push(rec);
+        } else {
+          out.push({ symbol: sym });
+        }
+      }
+      return out;
+    }
+    const escAttr = (s) => String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    const fmtNum = (v, digits = 6) => (isNum(v) ? Number(v).toFixed(digits) : 'n/a');
+    const fmtPct = (v, digits = 4) => (isNum(v) ? (Number(v) * 100).toFixed(digits) + '%' : 'n/a');
+    const fmtUsd = (v) => (isNum(v) ? f2(v) : 'n/a');
+    function fmtHMSPrime(sec, maxSec = 3600) {
+      if (!isNum(sec)) return '-';
+      let s = Math.max(0, Math.round(Number(sec)));
+      if (isNum(maxSec) && Number(maxSec) > 0) {
+        s = Math.min(s, Math.round(Number(maxSec)));
+      }
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const ss = s % 60;
+      const mm = String(m).padStart(2, '0');
+      const ss2 = String(ss).padStart(2, '0');
+      return `${h}'${mm}'${ss2}`;
+    }
+    const shortTxt = (s, n = 80) => {
+      const txt = (s === null || s === undefined) ? '' : String(s);
+      if (!txt) return '';
+      return txt.length > n ? `${txt.slice(0, n - 1)}…` : txt;
     };
-  }
 
-  function updateEquityChart(){
-    const {labels, values} = buildEquitySeries();
-    equityChart.data.labels = labels;
-    equityChart.data.datasets[0].data = values;
-    equityChart.update('none');
-  }
+    // ✅ smooth number update (no design change)
+    function smoothSetText(el, target, fmt = (v) => String(v), durMs = 260) {
+      if (!isNum(target)) {
+        el.textContent = fmt(target);
+        el.dataset.v = '';
+        return;
+      }
+      const to = Number(target);
+      const from = isNum(el.dataset.v) ? Number(el.dataset.v) : to;
+      if (from === to) {
+        el.textContent = fmt(to);
+        el.dataset.v = String(to);
+        return;
+      }
+      const t0 = performance.now();
+      const d = Math.max(80, durMs);
+      const step = (t) => {
+        const p = Math.min(1, (t - t0) / d);
+        const e = 1 - Math.pow(1 - p, 3);
+        const v = from + (to - from) * e;
+        el.textContent = fmt(v);
+        if (p < 1) requestAnimationFrame(step);
+        else el.dataset.v = String(to);
+      };
+      requestAnimationFrame(step);
+    }
 
-  function pushEquityPoint(t, equity){
-    equityHist.push({t, equity});
-    if(equityHist.length>maxPoints) equityHist.shift();
-    updateEquityChart();
-  }
+    function normSym(s) { return (s || '').replace(':USDT', ''); }
+    function statusClass(status) {
+      if (status === 'LONG') return 'up';
+      if (status === 'SHORT') return 'down';
+      if (status === 'WAIT') return 'wait';
+      return 'muted';
+    }
 
-  function pushSymPoint(sym, t, price){
-    if(!sparkHist.has(sym)) sparkHist.set(sym, []);
-    const sp = sparkHist.get(sym);
-    sp.push(price);
-    if(sp.length>60) sp.shift();
-  }
+    function exitKeyword(t) {
+      const direct = (t.exit_tag || t.exit_kind || '').toString().toLowerCase();
+      if (direct) return direct;
+      const r = `${t.reason || ''} ${t.note || ''}`.toLowerCase();
+      if (r.includes('event_mc')) return 'event_mc';
+      if (r.includes('mc_exit') || r.includes('exit-policy')) return 'exit-policy';
+      if (r.includes('ev_psl_ema')) return 'ema_psl';
+      if (r.includes('ev_drop')) return 'ev_drop';
+      if (r.includes('unrealized_dd') || r.includes('dd_stop')) return 'dd_stop';
+      if (r.includes('score_flip') || r.includes('unified_flip')) return 'unified_flip';
+      if (r.includes('unified_cash')) return 'unified_cash';
+      if (r.includes('hold timeout') || r.includes('time_stop')) return 'time_stop';
+      if (r.includes('rebalance')) return 'rebalance';
+      if (r.includes('kill') || r.includes('emergency')) return 'kill';
+      return '';
+    }
 
-  // ---------- rendering ----------
-  function renderMarketTable(rows){
-    const q = (searchEl.value||'').trim().toLowerCase();
+    function exitBadge(tag) {
+      if (!tag) return '<span class="pill muted">-</span>';
+      const t = tag.toLowerCase();
+      const cls = t.includes('kill') ? 'down' : (t.includes('event') ? 'wait' : '');
+      return `<span class="pill ${cls}">${tag}</span>`;
+    }
 
-    const data = (rows||[]).map(x=>{
-      const sym = normSym(x.symbol);
-      const unified_score = (function(){
-        if(x.unified_score!==undefined && x.unified_score!==null) return Number(x.unified_score);
-        if(x.meta && x.meta.unified_score!==undefined && x.meta.unified_score!==null) return Number(x.meta.unified_score);
-        if(Array.isArray(x.details)){
-          for(const d of x.details){
-            if(d && d.meta && d.meta.unified_score!==undefined) return Number(d.meta.unified_score);
+    // ✅ trade type badge (ENTER/EXIT/REBAL/SPREAD clearly visible)
+    function tradeTypeBadge(type) {
+      if (!type) return '<span class="pill muted">-</span>';
+      const t = String(type).toUpperCase();
+      if (t === 'ENTER') return '<span class="pill up">ENTER</span>';
+      if (t === 'EXIT') return '<span class="pill down">EXIT</span>';
+      if (t === 'REBAL') return '<span class="pill">REBAL</span>';
+      if (t === 'REBALANCE') return '<span class="pill">REBAL</span>';
+      if (t === 'SPREAD') return '<span class="pill wait">SPREAD</span>';
+      if (t === 'PYRAMID') return '<span class="pill">PYRAMID</span>';
+      if (t === 'KILL') return '<span class="pill down">KILL</span>';
+      return `<span class="pill muted">${t}</span>`;
+    }
+
+    // Parse log lines like: "[BTC/USDT:USDT] ENTER LONG @ 42000.00"
+    function parseTradeMsg(msg) {
+      if (!msg) return null;
+      const m = msg.match(/\\[(.+?)\\]\\s+(ENTER|EXIT|REBAL|REBALANCE|SPREAD|PYRAMID|KILL)\\s*(LONG|SHORT)?\\s*(?:@\\s*([0-9.]+))?/i);
+      if (!m) return null;
+      const sym = m[1];
+      const type = (m[2] || '').toUpperCase();
+      const side = (m[3] || '').toUpperCase();
+      const price = m[4] ? Number(m[4]) : null;
+      const pnlMatch = msg.match(/pnl=([-0-9.]+)/i);
+      const roeMatch = msg.match(/roe=([-0-9.]+)/i);
+      const pnl = pnlMatch ? Number(pnlMatch[1]) : null;
+      const roe = roeMatch ? Number(roeMatch[1]) : null;
+      return { sym, type, side, price, pnl, roe, note: msg };
+    }
+
+    // ---------- charts ----------
+    const hasChart = (typeof Chart !== 'undefined');
+    let equityChart = null;
+    let liveEquityChart = null;
+    if (hasChart) {
+      equityChart = new Chart($('equityChart'), {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            { label: 'Equity', data: [], pointRadius: 0, borderWidth: 2, tension: .25, borderColor: '#2563eb' },
+          ]
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          plugins: { legend: { display: true } },
+          scales: {
+            x: {
+              display: true,
+              ticks: { autoSkip: true, maxTicksLimit: 14 }
+            },
+            y: { ticks: { callback: (v) => v } }
           }
         }
-        if(x.ev!==undefined && x.ev!==null) return Number(x.ev);
-        return 0;
-      })();
-      const scorep = unified_score * 100;
-      const confp = (x.conf||0)*100;
-      const mc_win = (x.mc_win_rate||0)*100;
-      const pos_roe = (x.pos_roe||0)*100;
-      const unified_score_hold = (x.unified_score_hold!==undefined && x.unified_score_hold!==null) ? Number(x.unified_score_hold) :
-        (x.meta && x.meta.unified_score_hold!==undefined && x.meta.unified_score_hold!==null) ? Number(x.meta.unified_score_hold) : null;
-      const unified_t_star = (x.unified_t_star!==undefined && x.unified_t_star!==null) ? Number(x.unified_t_star) :
-        (x.meta && x.meta.unified_t_star!==undefined && x.meta.unified_t_star!==null) ? Number(x.meta.unified_t_star) : null;
-
-      const action_type =
-        x.action_type ||
-        (x.meta && (x.meta.action_type || x.meta.event || x.meta.trade_event)) ||
-        '-';
-
-      return {
-        raw:x,
-        symbol:sym,
-        price: x.price ?? null,
-        status: x.status || 'WAIT',
-        regime: x.regime || '-',
-        action_type: action_type || '-',
-        unified_score,
-        unified_score_hold,
-        unified_t_star,
-        scorep,
-        confp,
-        kelly: x.kelly ?? x.kelly_frac ?? null,
-        pos_roe,
-        pos_leverage: x.pos_leverage ?? null,
-      };
-    }).filter(r=>{
-      if(!q) return true;
-      const hay = `${r.symbol} ${r.status}`.toLowerCase();
-      return hay.includes(q);
-    });
-
-    // compute ranking by unified score
-    data.forEach((d)=>{ d._score_for_rank = isNum(d.unified_score) ? d.unified_score : 0; });
-
-    data.sort((a,b)=>{
-      const va = a[sortKey], vb = b[sortKey];
-      const na = (va===null||va===undefined) ? -Infinity : va;
-      const nb = (vb===null||vb===undefined) ? -Infinity : vb;
-      if(na<nb) return sortAsc ? -1 : 1;
-      if(na>nb) return sortAsc ? 1 : -1;
-      return 0;
-    });
-
-    // If user is sorting by default (symbol), inject a computed rank by score
-    if(sortKey === 'symbol'){
-      const byScore = data.slice().sort((a,b)=> b._score_for_rank - a._score_for_rank);
-      const rankMap = new Map();
-      byScore.forEach((d,i)=> rankMap.set(d.symbol, i+1));
-      data.forEach(d=> d.rank = rankMap.get(d.symbol) || null);
-    }
-
-    // ✅ smooth: reuse <tr> nodes, reorder with fragment
-    const frag = document.createDocumentFragment();
-
-    data.forEach(r=>{
-      let cached = rowCache.get(r.symbol);
-      if(!cached){
-        const tr = document.createElement('tr');
-        const cells = [];
-        for(let i=0;i<14;i++){  // 확장: 14열 (rebalance 컬럼 포함)
-          const td = document.createElement('td');
-          cells.push(td);
-          tr.appendChild(td);
-        }
-        tr.onclick=()=>{
-          selectedSym = r.symbol;
-          selSymEl.textContent = selectedSym;
-          renderMarketTable(rows);
-        };
-        cached = {tr, cells};
-        rowCache.set(r.symbol, cached);
-      }
-
-      const tr = cached.tr;
-      const c = cached.cells;
-
-      if(selectedSym===r.symbol) tr.classList.add('sel');
-      else tr.classList.remove('sel');
-
-      const cls = statusClass(r.status);
-      
-      // Top-4 표시: rank 1~4는 굵게 표시
-      const isTop4 = (r.rank!==null && r.rank!==undefined && r.rank <= 4);
-
-      // column mapping: rank, symbol, price, status, ψ, ψ_hold, t*, kelly, roe%, lev
-      c[0].className = 'mono'; 
-      c[0].innerHTML = isTop4 ? `<b style="color:var(--accent)">${r.rank}</b>` : (r.rank!==null && r.rank!==undefined ? String(r.rank) : '-');
-      
-      c[1].className = 'mono'; 
-      c[1].innerHTML = `<b>${r.symbol}</b>`;
-      
-      c[2].className = 'mono'; 
-      c[2].textContent = (r.price!==null?f2(r.price):'-');
-      
-      c[3].className = ''; 
-      c[3].innerHTML = `<span class="pill ${cls}">${r.status}</span>`;
-      
-      c[4].className = 'mono'; 
-      c[4].textContent = (isNum(r.unified_score) ? (Number(r.unified_score)*100).toFixed(2) : '-');
-      
-      c[5].className = 'mono'; 
-      c[5].textContent = (isNum(r.unified_score_hold) ? (Number(r.unified_score_hold)*100).toFixed(2) : '-');
-      
-      c[6].className = 'mono';
-      c[6].textContent = (isNum(r.unified_t_star) ? `${Number(r.unified_t_star).toFixed(0)}s` : '-');
-      
-      c[7].className = 'mono'; 
-      c[7].textContent = (r.kelly===null?'-':(isNum(r.kelly)?f2(r.kelly):r.kelly));
-      
-      c[8].className = `mono ${(r.pos_roe>=0)?'up':'down'}`; 
-      c[8].textContent = (r.pos_roe===null||r.pos_roe===undefined)?'-':(isNum(r.pos_roe)?r.pos_roe.toFixed(2):r.pos_roe);
-      
-      c[9].className='mono'; 
-      c[9].textContent = (r.pos_leverage===null?'-':(isNum(r.pos_leverage)?r.pos_leverage:r.pos_leverage));
-
-      // Rebalance decision badge
-      c[10].className = '';
-      const reb = r.rebalance_decision || null;
-      if(reb===null){ c[10].innerHTML = '<span class="pill muted">-</span>'; }
-      else if(reb==='HOLD'){ c[10].innerHTML = '<span class="pill wait">HOLD</span>'; }
-      else if(reb==='SWITCH'){ c[10].innerHTML = '<span class="pill">SWITCH</span>'; }
-      else { c[10].innerHTML = `<span class="pill muted">${reb}</span>`; }
-
-      // ΔΨ (show as percentage if number)
-      c[11].className = 'mono';
-      c[11].textContent = (r.rebalance_delta_ev===null||r.rebalance_delta_ev===undefined)?'-':(isNum(r.rebalance_delta_ev)?(Number(r.rebalance_delta_ev)*100).toFixed(2):r.rebalance_delta_ev);
-
-      // Exec cost (bps) display
-      c[12].className = 'mono';
-      c[12].textContent = (r.rebalance_exec_cost===null||r.rebalance_exec_cost===undefined)?'-':(isNum(r.rebalance_exec_cost)?f2(r.rebalance_exec_cost*100):r.rebalance_exec_cost);
-
-      // Joint weight (fraction of leverage allocated)
-      c[13].className = 'mono';
-      c[13].textContent = (r.rebalance_weight===null||r.rebalance_weight===undefined)?'-':(isNum(r.rebalance_weight)?(Number(r.rebalance_weight)).toFixed(4):r.rebalance_weight);
-
-      frag.appendChild(tr);
-    });
-
-    mktBody.replaceChildren(frag);
-
-    if(!selectedSym && data.length){
-      selectedSym = data[0].symbol;
-      selSymEl.textContent = selectedSym;
-    }
-  }
-
-  function renderPositions(positions, marketRows){
-    const bySym = new Map((marketRows||[]).map(r=>[normSym(r.symbol), r]));
-
-    posBody.innerHTML = '';
-    (positions||[]).forEach(p=>{
-      const sym = normSym(p.symbol);
-      const m = bySym.get(sym) || {};
-      const side = p.side || m.status || '-';
-      const entry = p.entry_price ?? p.entry ?? null;
-      const cur = p.current ?? p.price ?? null;
-      const pnl = p.pnl ?? null;
-
-      const lev = p.leverage ?? (m.pos_leverage ?? 1.0);
-      const pnlPctRaw = (entry && cur) ? ((side==='LONG' ? (cur-entry) : (entry-cur)) / entry) * 100 : null;
-      const pnlPct = pnlPctRaw===null?null:(pnlPctRaw * (lev ?? 1.0));
-      const cap = p.cap_frac!==undefined && p.cap_frac!==null ? Number(p.cap_frac)*100 : null;
-      const age = p.age_sec ?? (p.time ? Math.max(0, (Date.now()-p.time)/1000) : null);
-
-      const cls = (side==='LONG')?'up':(side==='SHORT')?'down':'muted';
-      const pnlCls = (pnl!==null && pnl<0) ? 'down' : 'up';
-
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td class="mono"><b>${sym}</b></td>
-        <td><span class="pill ${cls}">${side}</span></td>
-        <td class="mono">${entry===null?'-':f2(entry)}</td>
-        <td class="mono">${cur===null?'-':f2(cur)}</td>
-        <td class="mono ${pnlCls}">${pnl===null?'-':f2(pnl)}</td>
-        <td class="mono ${pnlPct!==null && pnlPct<0 ? 'down':'up'}">${pnlPct===null?'-':pnlPct.toFixed(2)}</td>
-        <td class="mono">${lev===null?'-':lev}</td>
-        <td class="mono">${cap===null?'-':cap.toFixed(1)}</td>
-        <td class="mono">${age===null?'-':Number(age).toFixed(0)}</td>
-      `;
-      posBody.appendChild(tr);
-    });
-
-    if(!(positions||[]).length){
-      posBody.innerHTML = `<tr><td class="muted" colspan="9">열려있는 포지션 없음</td></tr>`;
-    }
-  }
-
-  function renderTradeTape(){
-    tradeBody.innerHTML = '';
-    tradeTape.slice(-200).reverse().forEach(t=>{
-      const sym = t.sym || t.symbol;
-
-      // ✅ TYPE 확정 로직: payload 우선 → 없으면 문자열 파싱 fallback
-      const findType = (txt)=>{ const m = (txt||'').match(/\\b(ENTER|EXIT|REBAL|REBALANCE|SPREAD|PYRAMID|KILL)\\b/i); return m?m[1].toUpperCase():null; };
-      let ttype = (t.action_type || t.ttype || t.type || t.event || '').toString().toUpperCase();
-      if(ttype === 'REBALANCE') ttype = 'REBAL';
-      if(!ttype || ttype==='-'){
-        ttype = findType(t.reason) || findType(t.note) || "-";
-      }
-
-      const side = (t.side || '').toUpperCase();
-      const cls = (side==='LONG')?'up':(side==='SHORT')?'down':'muted';
-
-      const findPnl = (txt)=>{ const pm = (txt||'').match(/pnl=([-0-9.]+)/i); return pm?Number(pm[1]):null; };
-      const findRoe = (txt)=>{ const rm = (txt||'').match(/roe=([-0-9.]+)/i); return rm?Number(rm[1]):null; };
-
-      let pnl = (t.pnl!==undefined)?t.pnl:null;
-      let roe = (t.roe!==undefined)?t.roe:null;
-
-      if((pnl===null || pnl===undefined)) pnl = findPnl(t.note) ?? findPnl(t.reason);
-      if((roe===null || roe===undefined)) roe = findRoe(t.note) ?? findRoe(t.reason);
-
-      if((pnl===null || pnl===undefined) && t.realized_r!==undefined && t.notional){
-        try { pnl = Number(t.realized_r) * Number(t.notional); } catch(e){}
-      }
-      if((roe===null || roe===undefined) && t.realized_r!==undefined){
-        try { roe = Number(t.realized_r); } catch(e){}
-      }
-
-      const tr = document.createElement('tr');
-      const exitTag = (ttype === 'EXIT') ? exitKeyword(t) : '';
-      tr.innerHTML = `
-        <td class="mono">${t.time||'-'}</td>
-        <td class="mono"><b>${normSym(sym)}</b></td>
-        <td>${tradeTypeBadge(ttype)}</td>
-        <td><span class="pill ${cls}">${side||'-'}</span></td>
-        <td class="mono">${t.price===null||t.price===undefined?'-':f2(t.price)}</td>
-        <td class="mono ${(pnl!==null&&pnl<0)?'down':'up'}">${pnl===null||pnl===undefined?'-':f2(pnl)}</td>
-        <td class="mono">${roe===null||roe===undefined?'-':(roe*100).toFixed(2)}</td>
-        <td class="mono">${t.leverage===null||t.leverage===undefined?'-':t.leverage}</td>
-        <td>${exitBadge(exitTag)}</td>
-        <td class="muted">${t.tag||''} ${t.reason||t.note||''}</td>
-      `;
-      tradeBody.appendChild(tr);
-    });
-
-    if(!tradeTape.length){
-      tradeBody.innerHTML = `<tr><td class="muted" colspan="10">아직 트레이드 이벤트 없음 (logs에서 ENTER/EXIT가 찍히면 자동으로 들어옴)</td></tr>`;
-    }
-  }
-
-  function updateTradeTapeFromLogs(logs){
-    (logs||[]).forEach(l=>{
-      const key = `${l.time}|${l.msg}`;
-      if(seenTradeMsg.has(key)) return;
-      const p = parseTradeMsg(l.msg);
-      if(!p) return;
-      seenTradeMsg.add(key);
-      tradeTape.push({ time:l.time, ...p });
-      if(tradeTape.length>1000) tradeTape.shift();
-    });
-    renderTradeTape();
-  }
-
-  function renderLogs(logs){
-    logsEl.innerHTML = '';
-    (logs||[]).slice(-250).forEach(l=>{
-      const lvl = (l.level||'INFO').toUpperCase();
-      logsEl.innerHTML += `<div>[${l.time}] <span class="muted">${lvl}</span> ${l.msg}</div>`;
-    });
-  }
-
-  function renderAlerts(alerts){
-    alertsEl.innerHTML = '';
-    (alerts||[]).slice(-200).reverse().forEach(a=>{
-      const sev = (a.severity||'info').toUpperCase();
-      const ts = a.ts ? new Date(a.ts).toLocaleTimeString() : '-';
-      const msg = a.message || '';
-      const kind = a.kind || '-';
-      const cls = sev==='CRITICAL' ? 'down' : (sev==='WARN' ? 'wait' : 'muted');
-      alertsEl.innerHTML += `<div>[${ts}] <span class="pill ${cls}">${sev}</span> <span class="mono">${kind}</span> ${msg}</div>`;
-    });
-    if(!(alerts||[]).length){
-      alertsEl.innerHTML = `<div class="muted">알림 없음</div>`;
-    }
-  }
-
-  // Sorting
-  document.querySelectorAll('#mktTable thead th').forEach(th=>{
-    th.addEventListener('click', ()=>{
-      const k = th.dataset.k;
-      if(!k) return;
-      if(sortKey===k) sortAsc = !sortAsc;
-      else { sortKey = k; sortAsc = true; }
-      if(latestPayload && latestPayload.market) renderMarketTable(latestPayload.market);
-    });
-  });
-
-  searchEl.addEventListener('input', ()=>{
-    if(latestPayload && latestPayload.market) renderMarketTable(latestPayload.market);
-  });
-
-  function applyUpdate(d){
-    if(d.type !== 'full_update') return;
-
-    // topbar
-    const ksOn = !!(d.kill_switch || (d.engine && d.engine.safety_mode));
-    ksEl.textContent = ksOn ? 'ON' : 'OFF';
-    ksEl.className = `v ${ksOn?'on':'off'}`;
-
-    const equity = Number((d.portfolio && d.portfolio.equity) || 0);
-    smoothSetText(eqEl, equity, (v)=>Number(v).toFixed(2), 260);
-
-    wsEl.textContent = (d.engine && d.engine.ws_clients !== undefined) ? d.engine.ws_clients : '-';
-    feedEl.textContent = (d.feed && d.feed.connected) ? 'OK' : 'STALE';
-
-    const utilVal = (d.portfolio && d.portfolio.utilization!==undefined) ? d.portfolio.utilization : null;
-    const utilCap = d.portfolio ? d.portfolio.utilization_cap : null;
-    utilEl.textContent = utilVal===null?'-':(utilVal*100).toFixed(1)+'%'+(utilCap?`/${(utilCap*100).toFixed(0)}%`:'');
-
-    const evalm = d.eval_metrics || {};
-    brierEl.textContent = evalm.brier===null||evalm.brier===undefined?'-':evalm.brier.toFixed(4);
-    hitEl.textContent = evalm.hit_rate===null||evalm.hit_rate===undefined?'-':(evalm.hit_rate*100).toFixed(1)+'%';
-    selSymEl.textContent = selectedSym || '-';
-
-    // KPIs
-    const bal = Number((d.portfolio && d.portfolio.balance) || 0);
-    smoothSetText(balKpi, bal, (v)=>Number(v).toFixed(2), 260);
-    smoothSetText(eqKpi, equity, (v)=>Number(v).toFixed(2), 260);
-
-    // dd
-    const peak = equityHist.reduce((m,p)=>Math.max(m,p.equity), equity);
-    const dd = peak>0 ? ((equity-peak)/peak)*100 : 0;
-    ddKpi.textContent = `${dd.toFixed(2)}%`;
-
-    // seed history
-    if(!equitySeeded && d.portfolio && Array.isArray(d.portfolio.history) && d.portfolio.history.length){
-      equityHist.length = 0;
-      d.portfolio.history.forEach(p=>{
-        equityHist.push({t:p.time || p.ts || Date.now(), equity:p.equity});
       });
-      equitySeeded = true;
+
+      liveEquityChart = new Chart($('liveEquityChart'), {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [
+            { label: 'LIVE Equity', data: [], pointRadius: 0, borderWidth: 2, tension: .25, borderColor: '#10b981' },
+          ]
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          plugins: { legend: { display: true } },
+          scales: {
+            x: {
+              display: true,
+              ticks: { autoSkip: true, maxTicksLimit: 14 }
+            },
+            y: { ticks: { callback: (v) => v } }
+          }
+        }
+      });
+    } else {
+      console.warn('Chart.js not loaded; charts disabled.');
+    }
+
+    function formatTimeLabel(ts, tfMin) {
+      const d = new Date(ts);
+      if (tfMin >= 1440) {
+        return `${d.getMonth() + 1}/${d.getDate()}`;
+      }
+      if (tfMin >= 60) {
+        return d.toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+      }
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    }
+
+    function windowKeyToMs(key) {
+      const k = String(key || '').toLowerCase();
+      if (k === '1h') return 60 * 60 * 1000;
+      if (k === '6h') return 6 * 60 * 60 * 1000;
+      if (k === '12h') return 12 * 60 * 60 * 1000;
+      if (k === '1d') return 24 * 60 * 60 * 1000;
+      if (k === '3d') return 3 * 24 * 60 * 60 * 1000;
+      if (k === '7d') return 7 * 24 * 60 * 60 * 1000;
+      if (k === '30d') return 30 * 24 * 60 * 60 * 1000;
+      if (k === 'all') return 0;
+      return 6 * 60 * 60 * 1000;
+    }
+
+    function fmtDuration(ms) {
+      if (!isNum(ms) || ms <= 0) return '전체';
+      const sec = Math.floor(ms / 1000);
+      const min = Math.floor(sec / 60);
+      const hr = Math.floor(min / 60);
+      const day = Math.floor(hr / 24);
+      if (day >= 1) return `${day}일`;
+      if (hr >= 1) return `${hr}시간`;
+      if (min >= 1) return `${min}분`;
+      return `${sec}초`;
+    }
+
+    function normalizeHist(hist) {
+      if (!Array.isArray(hist) || !hist.length) return;
+      hist.sort((a, b) => (a.t || 0) - (b.t || 0));
+      // dedupe same timestamp
+      for (let i = hist.length - 2; i >= 0; i--) {
+        if (hist[i].t === hist[i + 1].t) {
+          hist[i] = hist[i + 1];
+          hist.splice(i + 1, 1);
+        }
+      }
+    }
+
+    function computeViewWindow(hist, view) {
+      if (!hist.length) return { startTs: 0, endTs: 0, windowMs: 0, maxOffset: 0, totalRange: 0 };
+      const minTs = hist[0].t;
+      const maxTs = hist[hist.length - 1].t;
+      const totalRange = Math.max(0, maxTs - minTs);
+      let windowMs = windowKeyToMs(view.windowKey);
+      if (!windowMs || windowMs <= 0 || windowMs >= totalRange) {
+        windowMs = totalRange;
+      }
+      const maxOffset = Math.max(0, totalRange - windowMs);
+      const panPct = clamp(Number(view.panPct || 0), 0, 1000);
+      const offsetMs = maxOffset * (panPct / 1000);
+      const endTs = maxTs - offsetMs;
+      const startTs = endTs - windowMs;
+      return { startTs, endTs, windowMs, maxOffset, totalRange };
+    }
+
+    function buildEquitySeries(hist, view = equityView) {
+      const tfMin = 1; // Fixed 1-minute timeframe
+      const bucketMs = tfMin * 60 * 1000;
+      if (!hist.length) return { labels: [], values: [] };
+      normalizeHist(hist);
+      const vw = computeViewWindow(hist, view);
+      const startTs = vw.startTs;
+      const endTs = vw.endTs;
+      if (eqPan) {
+        eqPan.disabled = (vw.maxOffset <= 0);
+        if (vw.maxOffset <= 0) {
+          equityView.panPct = 0;
+          eqPan.value = 0;
+        }
+      }
+      const buckets = new Map();
+      hist.forEach(p => {
+        if (p.t < startTs || p.t > endTs) return;
+        const b = Math.floor(p.t / bucketMs);
+        buckets.set(b, p);
+      });
+      const sorted = Array.from(buckets.entries()).sort((a, b) => a[0] - b[0]).map(e => e[1]);
+      if (eqRangeLabel && hist.length) {
+        const s = new Date(startTs);
+        const e = new Date(endTs);
+        const rangeTxt = `${s.toLocaleString()} ~ ${e.toLocaleString()} (${fmtDuration(vw.windowMs)})`;
+        eqRangeLabel.textContent = rangeTxt;
+        eqRangeLabel.title = `range=${fmtDuration(vw.windowMs)} | total=${fmtDuration(vw.totalRange)}`;
+      }
+      return {
+        labels: sorted.map(p => formatTimeLabel(p.t, tfMin)),
+        values: sorted.map(p => p.equity),
+      };
+    }
+
+    function updateEquityChart(hist = equityHist) {
+      if (!equityChart) return;
+      const { labels, values } = buildEquitySeries(hist, equityView);
+      equityChart.data.labels = labels;
+      equityChart.data.datasets[0].data = values;
+      equityChart.update('none');
+    }
+
+    function updateLiveEquityChart() {
+      if (!liveEquityChart) return;
+      const { labels, values } = buildEquitySeries(liveEquityHist, equityView);
+      liveEquityChart.data.labels = labels;
+      liveEquityChart.data.datasets[0].data = values;
+      liveEquityChart.update('none');
+    }
+
+    function pushEquityPoint(t, equity) {
+      if (!isNum(equity)) return;
+      const last = equityHist[equityHist.length - 1];
+      const bucket = Math.floor(t / 60000);
+      const lastBucket = last ? Math.floor(last.t / 60000) : null;
+      if (last && (last.t === t || lastBucket === bucket)) {
+        last.t = t;
+        last.equity = equity;
+      } else {
+        equityHist.push({ t, equity });
+      }
       updateEquityChart();
     }
 
-    const t = d.server_time || Date.now();
-    pushEquityPoint(t, equity);
+    function pushLiveEquityPoint(t, equity) {
+      if (!isNum(equity)) return;
+      const last = liveEquityHist[liveEquityHist.length - 1];
+      const bucket = Math.floor(t / 60000);
+      const lastBucket = last ? Math.floor(last.t / 60000) : null;
+      if (last && (last.t === t || lastBucket === bucket)) {
+        last.t = t;
+        last.equity = equity;
+      } else {
+        liveEquityHist.push({ t, equity });
+      }
+      updateLiveEquityChart();
+    }
 
-    // market
-    const rows = d.market || [];
-    rows.forEach(x=>{
-      const sym = normSym(x.symbol);
-      const price = Number(x.price || 0);
-      pushSymPoint(sym, t, price);
-    });
-    // render top-4 summary and full market table
-    renderTop4(rows);
-    renderMarketTable(rows);
+    function pushSymPoint(sym, t, price) {
+      if (!sparkHist.has(sym)) sparkHist.set(sym, []);
+      const sp = sparkHist.get(sym);
+      sp.push(price);
+      if (sp.length > 60) sp.shift();
+    }
 
-    // positions
-    const positions = (d.portfolio && d.portfolio.positions) ? d.portfolio.positions : [];
-    renderPositions(positions, rows);
+    // ---------- rendering ----------
+    function renderMarketTable(rows) {
+      const q = (searchEl.value || '').trim().toLowerCase();
 
-    // trade tape: payload 우선 → logs fallback
-    if(Array.isArray(d.trade_tape) && d.trade_tape.length){
-      tradeTape.length = 0;
-      d.trade_tape.slice(-500).forEach(t=> tradeTape.push(t));
+      const data = (rows || []).map(x => {
+        const sym = normSym(x.symbol);
+        const hybrid_score = (function () {
+          if (x.hybrid_score !== undefined && x.hybrid_score !== null) return Number(x.hybrid_score);
+          if (x.meta && x.meta.hybrid_score !== undefined && x.meta.hybrid_score !== null) return Number(x.meta.hybrid_score);
+          if (Array.isArray(x.details)) {
+            for (const d of x.details) {
+              if (d && d.meta && d.meta.hybrid_score !== undefined) return Number(d.meta.hybrid_score);
+            }
+          }
+          return 0;
+        })();
+        const scorep = hybrid_score * 100;
+        const confp = (x.conf || 0) * 100;
+        const mc_win = (x.mc_win_rate || 0) * 100;
+        const pos_roe = (x.pos_roe || 0) * 100;
+        const hybrid_score_hold = (x.hybrid_score_hold !== undefined && x.hybrid_score_hold !== null) ? Number(x.hybrid_score_hold) :
+          (x.meta && x.meta.hybrid_score_hold !== undefined && x.meta.hybrid_score_hold !== null) ? Number(x.meta.hybrid_score_hold) : null;
+        const hybrid_score_logw = (x.hybrid_score_logw !== undefined && x.hybrid_score_logw !== null) ? Number(x.hybrid_score_logw) :
+          (x.meta && x.meta.hybrid_score_logw !== undefined && x.meta.hybrid_score_logw !== null) ? Number(x.meta.hybrid_score_logw) : null;
+
+        const action_type =
+          x.action_type ||
+          (x.meta && (x.meta.action_type || x.meta.event || x.meta.trade_event)) ||
+          '-';
+
+        return {
+          raw: x,
+          symbol: sym,
+          price: x.price ?? null,
+          status: x.status || 'WAIT',
+          regime: x.regime || '-',
+          action_type: action_type || '-',
+          filter_states: x.filter_states || (x.meta && x.meta.filter_states) || null,
+          hybrid_score,
+          hybrid_score_hold,
+          hybrid_score_logw,
+          scorep,
+          confp,
+          kelly: x.kelly ?? x.kelly_frac ?? null,
+          pos_roe,
+          pos_leverage: x.pos_leverage ?? null,
+          decision_leverage: x.decision_leverage ?? (x.meta && x.meta.lev) ?? null,
+          dyn_leverage: x.dyn_leverage ?? null,
+          lev_source: x.lev_source ?? (x.meta && x.meta.lev_source) ?? null,
+        };
+      }).filter(r => {
+        if (!q) return true;
+        const hay = `${r.symbol} ${r.status}`.toLowerCase();
+        return hay.includes(q);
+      });
+
+      // compute ranking by hybrid score
+      data.forEach((d) => { d._score_for_rank = isNum(d.hybrid_score) ? d.hybrid_score : 0; });
+
+      data.sort((a, b) => {
+        const va = a[sortKey], vb = b[sortKey];
+        const na = (va === null || va === undefined) ? -Infinity : va;
+        const nb = (vb === null || vb === undefined) ? -Infinity : vb;
+        if (na < nb) return sortAsc ? -1 : 1;
+        if (na > nb) return sortAsc ? 1 : -1;
+        return 0;
+      });
+
+      // If user is sorting by default (symbol), inject a computed rank by score
+      if (sortKey === 'symbol') {
+        const byScore = data.slice().sort((a, b) => b._score_for_rank - a._score_for_rank);
+        const rankMap = new Map();
+        byScore.forEach((d, i) => rankMap.set(d.symbol, i + 1));
+        data.forEach(d => d.rank = rankMap.get(d.symbol) || null);
+      }
+
+      // ✅ smooth: reuse <tr> nodes, reorder with fragment
+      const frag = document.createDocumentFragment();
+
+      data.forEach(r => {
+        let cached = rowCache.get(r.symbol);
+        if (!cached) {
+          const tr = document.createElement('tr');
+          const cells = [];
+          for (let i = 0; i < 17; i++) {  // 확장: 17열 (REASON, LS_SCORE 추가)
+            const td = document.createElement('td');
+            cells.push(td);
+            tr.appendChild(td);
+          }
+          tr.onclick = () => {
+            selectedSym = r.symbol;
+            selSymEl.textContent = selectedSym;
+            renderMarketTable((latestPayload && latestPayload.market) ? latestPayload.market : rows);
+          };
+          cached = { tr, cells };
+          rowCache.set(r.symbol, cached);
+        }
+
+        const tr = cached.tr;
+        const c = cached.cells;
+
+        if (selectedSym === r.symbol) tr.classList.add('sel');
+        else tr.classList.remove('sel');
+
+        const cls = statusClass(r.status);
+
+        // Top-4 표시: rank 1~4는 굵게 표시
+        const isTop4 = (r.rank !== null && r.rank !== undefined && r.rank <= 4);
+
+        // column mapping: rank, symbol, price, status, filter, ψ, ψ_hold, t*, kelly, roe%, lev
+        c[0].className = 'mono';
+        c[0].innerHTML = isTop4 ? `<b style="color:var(--accent)">${r.rank}</b>` : (r.rank !== null && r.rank !== undefined ? String(r.rank) : '-');
+
+        c[1].className = 'mono';
+        c[1].innerHTML = `<b>${r.symbol}</b>`;
+
+        c[2].className = 'mono';
+        c[2].textContent = (r.price !== null ? f2(r.price) : '-');
+
+        c[3].className = '';
+        c[3].innerHTML = `<span class="pill ${cls}">${r.status}</span>`;
+
+        // Minimal filter badges + tooltips
+        c[4].className = '';
+        const fs = r.filter_states || {};
+        const m = r.raw || {};
+        const badge = (label, ok, tip) => {
+          const cls = (ok === undefined || ok === null) ? 'muted' : (ok ? 'up' : 'down');
+          const title = tip ? ` title="${escAttr(tip)}"` : '';
+          return `<span class="pill ${cls}"${title}>${label}</span>`;
+        };
+        const badges = [];
+        const help = {
+          HYB: 'HYB: hybrid score >= entry floor to allow entry',
+          SPR: 'SPR: spread gap must be below cap',
+          CV: 'CV: event CVaR risk must be below limit',
+          EMC: 'EMC: event MC exit metrics within limits',
+          LIQ: 'LIQ: liquidity score must meet minimum',
+          MIN: 'MIN: estimated notional must meet minimum',
+          MEX: 'MEX: exposure notional must meet minimum',
+          FEE: 'FEE: expected EV must cover roundtrip fee+slippage',
+          TOP: 'TOP: only top-ranked symbols allowed',
+          PMC: 'PMC: pre-MC portfolio gate (EV/CVaR/liq) must pass',
+          CAP: 'CAP: safety/position/exposure cap must allow entry',
+          SAFE: 'SAFE: safety mode off required',
+          POS: 'POS: max positions not reached',
+          EXP: 'EXP: total exposure below cap',
+        };
+        const hybFloor = (m.entry_floor_eff !== undefined && m.entry_floor_eff !== null) ? m.entry_floor_eff : m.unified_entry_floor;
+        const hybTip = `${help.HYB} | score=${fmtNum(r.hybrid_score)} | floor=${fmtNum(hybFloor)} | min_entry_score=${fmtNum(m.min_entry_score)}`;
+        const sprTip = `${help.SPR} | spread gap=${fmtPct(m.spread_pct)} | cap=${fmtPct(m.spread_cap)}`;
+        const cvTip = (isNum(m.cvar_floor))
+          ? `${help.CV} | event_cvar_r=${fmtNum(m.event_cvar_r, 4)} | floor=${fmtNum(m.cvar_floor, 4)}`
+          : `${help.CV} | disabled`;
+        const evtExitTip = (isNum(m.event_exit_score) || isNum(m.event_p_sl) || isNum(m.event_cvar_pct))
+          ? `${help.EMC} | score=${fmtPct(m.event_exit_score, 4)} | EV%=${fmtPct(m.event_ev_pct, 4)} | CVaR%=${fmtPct(m.event_cvar_pct, 4)} | P_SL=${fmtPct(m.event_p_sl, 2)} | min_score=${fmtPct(m.event_exit_min_score, 4)} | max_cvar=${fmtPct(m.event_exit_max_cvar, 4)} | max_p_sl=${fmtPct(m.event_exit_max_p_sl, 2)}`
+          : `${help.EMC} | disabled`;
+        const liqTip = (isNum(m.min_liq_score))
+          ? `${help.LIQ} | liq_score=${fmtNum(m.liq_score, 2)} | min=${fmtNum(m.min_liq_score, 2)}`
+          : `${help.LIQ} | disabled | score=${fmtNum(m.liq_score, 2)}`;
+        const minTip = (isNum(m.min_entry_notional))
+          ? `${help.MIN} | est_notional=${fmtUsd(m.est_notional)} | min=${fmtUsd(m.min_entry_notional)}`
+          : `${help.MIN} | disabled | est_notional=${fmtUsd(m.est_notional)}`;
+        const minExpTip = (isNum(m.min_entry_exposure_notional))
+          ? `${help.MEX} | est_notional=${fmtUsd(m.est_notional)} | min=${fmtUsd(m.min_entry_exposure_notional)} | pct=${fmtPct(m.min_entry_exposure_pct, 3)}`
+          : `${help.MEX} | disabled | est_notional=${fmtUsd(m.est_notional)}`;
+        const feeTip = (isNum(m.fee_filter_cost) || isNum(m.fee_filter_ev))
+          ? `${help.FEE} | ev=${fmtPct(m.fee_filter_ev, 4)} | ev_eff=${fmtPct(m.fee_filter_ev_eff, 4)} | lev=${fmtNum(m.fee_filter_lev, 2)} | cost=${fmtPct(m.fee_filter_cost, 4)} | base=${fmtPct(m.fee_filter_base, 4)} | mult=${fmtNum(m.fee_filter_mult, 2)}`
+          : `${help.FEE} | disabled`;
+        const posTxt = (m.max_positions === null || m.max_positions === undefined)
+          ? `${(m.positions_count ?? 'n/a')}/∞`
+          : `${(m.positions_count ?? 'n/a')}/${m.max_positions}`;
+        const expTxt = isNum(m.exposure_cap_limit)
+          ? `${fmtUsd(m.total_open_notional)} / ${fmtUsd(m.exposure_cap_limit)}`
+          : `cap off | open=${fmtUsd(m.total_open_notional)}`;
+        const capTip = `${help.CAP} | safety=${m.safety_mode ? 'on' : 'off'} | positions=${posTxt} | exposure=${expTxt}`;
+        const topTip = (!m.top_n_active)
+          ? `${help.TOP} | inactive`
+          : `${help.TOP} | rank=${(m.top_n_rank ?? 'n/a')} | limit=${(m.top_n_limit ?? 'n/a')}`;
+        let pmcTip = '';
+        if (!m.pre_mc_active) {
+          pmcTip = `${help.PMC} | disabled`;
+        } else {
+          const expTxt = fmtPct(m.pre_mc_expected_pnl, 3);
+          const cvarTxt = fmtPct(m.pre_mc_cvar, 3);
+          const liqTxt = fmtPct(m.pre_mc_prob_liq, 3);
+          const expSrc = m.pre_mc_expected_pnl_source ? `(${m.pre_mc_expected_pnl_source})` : '';
+          const liqSrc = m.pre_mc_prob_liq_source ? `(${m.pre_mc_prob_liq_source})` : '';
+          pmcTip = `${help.PMC} | exp_pnl=${expTxt}${expSrc} | cvar=${cvarTxt} | liq_prob=${liqTxt}${liqSrc} | min_exp=${fmtPct(m.pre_mc_min_expected_pnl, 3)} | min_cvar=${fmtPct(m.pre_mc_min_cvar, 3)} | max_liq=${fmtPct(m.pre_mc_max_liq_prob, 3)}`;
+          if (m.pre_mc_reason) pmcTip += ` | reason=${m.pre_mc_reason}`;
+          if (m.pre_mc_scaled) pmcTip += ` | size_scaled x${fmtNum(m.pre_mc_scale, 2)}`;
+          if (m.pre_mc_block_on_fail) pmcTip += ' | block_on_fail=on';
+        }
+
+        // WAIT reason summary (blocked filters)
+        const blocked = [];
+        const blockedTips = [];
+        const addBlocked = (label, tip) => {
+          blocked.push(label);
+          if (tip) blockedTips.push(`${label}: ${tip}`);
+        };
+        const entryBlocks = Array.isArray(m.entry_blocked_filters) ? m.entry_blocked_filters : null;
+        const entryEval = (m.entry_filter_eval === true);
+        const blockLabel = {
+          unified: ['HYB', hybTip],
+          spread: ['SPR', sprTip],
+          event_cvar: ['CV', cvTip],
+          event_mc_exit: ['EMC', evtExitTip],
+          liquidity: ['LIQ', liqTip],
+          min_notional: ['MIN', minTip],
+          min_exposure: ['MEX', minExpTip],
+          fee: ['FEE', feeTip],
+          top_n: ['TOP', topTip],
+          pre_mc: ['PMC', pmcTip],
+          cap: ['CAP', capTip],
+        };
+        if (entryBlocks && entryBlocks.length) {
+          entryBlocks.forEach(k => {
+            const rec = blockLabel[k];
+            if (rec) addBlocked(rec[0], rec[1]);
+            else addBlocked(String(k).toUpperCase(), '');
+          });
+        } else if (entryEval) {
+          if (fs.unified === false) addBlocked('HYB', hybTip);
+          if (fs.spread === false) addBlocked('SPR', sprTip);
+          if (fs.event_cvar === false) addBlocked('CV', cvTip);
+          if (fs.event_exit === false) addBlocked('EMC', evtExitTip);
+          if (fs.liq === false) addBlocked('LIQ', liqTip);
+          if (fs.min_notional === false) addBlocked('MIN', minTip);
+          if (fs.min_exposure === false) addBlocked('MEX', minExpTip);
+          if (fs.fee === false) addBlocked('FEE', feeTip);
+          if (fs.top_n === false) addBlocked('TOP', topTip);
+          if (fs.pre_mc === false) addBlocked('PMC', pmcTip);
+          if (fs.cap === false) addBlocked('CAP', capTip);
+          if (fs.cap_safety === false) addBlocked('SAFE', `${help.SAFE} | safety_mode=${m.safety_mode ? 'on' : 'off'}`);
+          if (fs.cap_positions === false) addBlocked('POS', `${help.POS} | positions=${posTxt}`);
+          if (fs.cap_exposure === false) addBlocked('EXP', `${help.EXP} | exposure=${expTxt}`);
+        }
+
+        let waitReasonHtml = '';
+        if (r.status === 'WAIT') {
+          if (blocked.length) {
+            const tip = escAttr(blockedTips.join(' | '));
+            const txt = escAttr(`BLOCKED: ${blocked.join(', ')}`);
+            waitReasonHtml = `<div class="wait-reason" title="${tip}">${txt}</div>`;
+          } else {
+            const altReason = r.raw.direction_reason || r.raw.mc || r.raw.reason;
+            if (altReason && String(altReason).trim() && altReason !== '-') {
+              const tip = escAttr(String(altReason));
+              const txt = escAttr(`WAIT: ${shortTxt(altReason, 64)}`);
+              waitReasonHtml = `<div class="wait-reason muted" title="${tip}">${txt}</div>`;
+            }
+          }
+        }
+        if ('unified' in fs) badges.push(badge('HYB', fs.unified, hybTip));
+        if ('spread' in fs) badges.push(badge('SPR', fs.spread, sprTip));
+        if ('event_cvar' in fs) badges.push(badge('CV', fs.event_cvar, cvTip));
+        if ('event_exit' in fs) badges.push(badge('EMC', fs.event_exit, evtExitTip));
+        if ('liq' in fs) badges.push(badge('LIQ', fs.liq, liqTip));
+        if ('min_notional' in fs) badges.push(badge('MIN', fs.min_notional, minTip));
+        if ('min_exposure' in fs) badges.push(badge('MEX', fs.min_exposure, minExpTip));
+        if ('fee' in fs) badges.push(badge('FEE', fs.fee, feeTip));
+        if ('top_n' in fs) badges.push(badge('TOP', fs.top_n, topTip));
+        if ('pre_mc' in fs) badges.push(badge('PMC', fs.pre_mc, pmcTip));
+        if ('cap' in fs) badges.push(badge('CAP', fs.cap, capTip));
+        if ('cap_safety' in fs) badges.push(badge('SAFE', fs.cap_safety, `${help.SAFE} | safety_mode=${m.safety_mode ? 'on' : 'off'}`));
+        if ('cap_positions' in fs) badges.push(badge('POS', fs.cap_positions, `${help.POS} | positions=${posTxt}`));
+        if ('cap_exposure' in fs) badges.push(badge('EXP', fs.cap_exposure, `${help.EXP} | exposure=${expTxt}`));
+        const badgeHtml = badges.length ? badges.join(' ') : '<span class="pill muted">-</span>';
+        c[4].innerHTML = waitReasonHtml + badgeHtml;
+
+        c[5].className = 'mono';
+        c[5].textContent = (isNum(r.hybrid_score) ? (Number(r.hybrid_score) * 100).toFixed(4) : '-');
+
+        c[6].className = 'mono';
+        c[6].textContent = (isNum(r.hybrid_score_hold) ? (Number(r.hybrid_score_hold) * 100).toFixed(4) : '-');
+
+        c[7].className = 'mono';
+        c[7].textContent = (isNum(r.hybrid_score_logw) ? Number(r.hybrid_score_logw).toFixed(4) : '-');
+
+        c[8].className = 'mono';
+        c[8].textContent = (r.kelly === null ? '-' : (isNum(r.kelly) ? f2(r.kelly) : r.kelly));
+
+        c[9].className = `mono ${(r.pos_roe >= 0) ? 'up' : 'down'}`;
+        c[9].textContent = (r.pos_roe === null || r.pos_roe === undefined) ? '-' : (isNum(r.pos_roe) ? r.pos_roe.toFixed(2) : r.pos_roe);
+
+        c[10].className = 'mono';
+        const optLev = isNum(r.raw.opt_leverage) ? r.raw.opt_leverage : (r.raw.meta && isNum(r.raw.meta.optimal_leverage) ? r.raw.meta.optimal_leverage : null);
+        const levVal = (r.pos_leverage === null || r.pos_leverage === undefined) ? null : r.pos_leverage;
+        const decLev = isNum(r.decision_leverage) ? r.decision_leverage : null;
+        const dynLev = isNum(r.dyn_leverage) ? r.dyn_leverage : null;
+        const levTxt = (levVal !== null)
+          ? (isNum(levVal) ? levVal.toFixed(2) : levVal)
+          : (decLev !== null)
+            ? decLev.toFixed(2)
+            : (dynLev !== null)
+              ? dynLev.toFixed(2)
+              : (optLev === null ? '-' : (isNum(optLev) ? optLev.toFixed(2) : optLev));
+        c[10].textContent = levTxt;
+        const liqPL = isNum(r.raw.liq_prob_long) ? r.raw.liq_prob_long : (r.raw.meta && isNum(r.raw.meta.liq_prob_long) ? r.raw.meta.liq_prob_long : null);
+        const liqPS = isNum(r.raw.liq_prob_short) ? r.raw.liq_prob_short : (r.raw.meta && isNum(r.raw.meta.liq_prob_short) ? r.raw.meta.liq_prob_short : null);
+        const liqPriceL = isNum(r.raw.liq_price_long) ? r.raw.liq_price_long : (r.raw.meta && isNum(r.raw.meta.liq_price_long) ? r.raw.meta.liq_price_long : null);
+        const liqPriceS = isNum(r.raw.liq_price_short) ? r.raw.liq_price_short : (r.raw.meta && isNum(r.raw.meta.liq_price_short) ? r.raw.meta.liq_price_short : null);
+        const levTips = [];
+        if (decLev !== null) levTips.push(`dec=${decLev.toFixed(2)}x`);
+        if (dynLev !== null) levTips.push(`dyn=${dynLev.toFixed(2)}x`);
+        if (optLev !== null) levTips.push(`opt=${isNum(optLev) ? optLev.toFixed(2) : optLev}`);
+        if (r.lev_source) levTips.push(`src=${r.lev_source}`);
+        if (liqPL !== null || liqPS !== null) {
+          levTips.push(`liqP(L/S)=${liqPL === null ? 'n/a' : fmtPct(liqPL, 2)}/${liqPS === null ? 'n/a' : fmtPct(liqPS, 2)}`);
+        }
+        if (liqPriceL !== null || liqPriceS !== null) {
+          levTips.push(`liqPx(L/S)=${liqPriceL === null ? 'n/a' : f2(liqPriceL)}/${liqPriceS === null ? 'n/a' : f2(liqPriceS)}`);
+        }
+        if (levTips.length) c[10].title = levTips.join(' | ');
+
+        // Rebalance decision badge
+        c[11].className = '';
+        const reb = r.rebalance_decision || null;
+        if (reb === null) { c[11].innerHTML = '<span class="pill muted">-</span>'; }
+        else if (reb === 'HOLD') { c[11].innerHTML = '<span class="pill wait">HOLD</span>'; }
+        else if (reb === 'SWITCH') { c[11].innerHTML = '<span class="pill">SWITCH</span>'; }
+        else { c[11].innerHTML = `<span class="pill muted">${reb}</span>`; }
+
+        // REASON (Direction Policy Reason)
+        c[12].className = 'muted';
+        c[12].style.maxWidth = '120px';
+        c[12].style.overflow = 'hidden';
+        c[12].style.textOverflow = 'ellipsis';
+        const reason = r.raw.direction_reason || '-';
+        c[12].title = reason; // Tooltip for full reason
+        c[12].textContent = reason;
+
+        // LS_SCORE (Long / Short / Threshold)
+        c[13].className = 'mono';
+        const sL = (r.raw.hybrid_score_long !== undefined && r.raw.hybrid_score_long !== null) ? r.raw.hybrid_score_long : r.raw.score_long;
+        const sS = (r.raw.hybrid_score_short !== undefined && r.raw.hybrid_score_short !== null) ? r.raw.hybrid_score_short : r.raw.score_short;
+        const sT = (r.raw.hybrid_entry_floor !== undefined && r.raw.hybrid_entry_floor !== null)
+          ? r.raw.hybrid_entry_floor
+          : (r.raw.meta && r.raw.meta.hybrid_entry_floor !== undefined ? r.raw.meta.hybrid_entry_floor : r.raw.score_threshold);
+        if (isNum(sL) && isNum(sS) && isNum(sT)) {
+          c[13].innerHTML = `<span class="${sL > sT ? 'up' : ''}" title="Hybrid Long Score">${(sL * 100).toFixed(4)}</span> / ` +
+            `<span class="${sS > sT ? 'down' : ''}" title="Hybrid Short Score">${(sS * 100).toFixed(4)}</span> ` +
+            `<small class="muted" title="Threshold">(>${(sT * 100).toFixed(4)})</small>`;
+        } else {
+          c[13].textContent = '-';
+        }
+
+        // ΔH (show as percentage if number)
+        c[14].className = 'mono';
+        c[14].textContent = (r.rebalance_delta_ev === null || r.rebalance_delta_ev === undefined) ? '-' : (isNum(r.rebalance_delta_ev) ? (Number(r.rebalance_delta_ev) * 100).toFixed(2) : r.rebalance_delta_ev);
+
+        // Exec cost (bps) display
+        c[15].className = 'mono';
+        c[15].textContent = (r.rebalance_exec_cost === null || r.rebalance_exec_cost === undefined) ? '-' : (isNum(r.rebalance_exec_cost) ? f2(r.rebalance_exec_cost * 100) : r.rebalance_exec_cost);
+
+        // Joint weight (fraction of leverage allocated)
+        c[16].className = 'mono';
+        c[16].textContent = (r.rebalance_weight === null || r.rebalance_weight === undefined) ? '-' : (isNum(r.rebalance_weight) ? (Number(r.rebalance_weight)).toFixed(4) : r.rebalance_weight);
+
+        frag.appendChild(tr);
+      });
+
+      mktBody.replaceChildren(frag);
+
+      if (!selectedSym && data.length) {
+        selectedSym = data[0].symbol;
+        selSymEl.textContent = selectedSym;
+      }
+    }
+
+    function renderPositions(positions, marketRows, portfolio) {
+      const bySym = new Map((marketRows || []).map(r => [normSym(r.symbol), r]));
+      const balance = (portfolio && portfolio.balance !== undefined) ? Number(portfolio.balance) : null;
+      const exposureCap = (portfolio && portfolio.utilization_cap !== undefined) ? Number(portfolio.utilization_cap) : null;
+
+      posBody.innerHTML = '';
+      (positions || []).forEach(p => {
+        const sym = normSym(p.symbol);
+        const m = bySym.get(sym) || {};
+        const side = p.side || m.status || '-';
+        const entry = p.entry_price ?? p.entry ?? null;
+        const cur = p.current ?? p.price ?? null;
+        const pnl = p.pnl ?? null;
+
+        const lev = p.leverage ?? (m.pos_leverage ?? 1.0);
+        const notional = (p.notional !== undefined && p.notional !== null) ? Number(p.notional) : null;
+        const baseNotional = (notional !== null && lev) ? (notional / (Number(lev) || 1.0)) : null;
+        const pnlPctRaw = (entry && cur) ? ((side === 'LONG' ? (cur - entry) : (entry - cur)) / entry) : null;
+        const roeUnlev = pnlPctRaw === null ? null : pnlPctRaw;
+        let roeLev = (p.roe !== undefined && p.roe !== null) ? Number(p.roe) : null;
+        if (roeLev === null) {
+          roeLev = pnlPctRaw === null ? null : (pnlPctRaw * (lev ?? 1.0));
+        }
+        const pnlPct = (roeLev === null) ? null : (roeLev * 100);
+        const pnlPctUnlev = (roeUnlev === null) ? null : (roeUnlev * 100);
+        const cap = p.cap_frac !== undefined && p.cap_frac !== null ? Number(p.cap_frac) * 100 : null;
+        const age = p.age_sec ?? (p.time ? Math.max(0, (Date.now() - p.time) / 1000) : null);
+        const tEntry = (p.opt_hold_entry_sec !== undefined && p.opt_hold_entry_sec !== null)
+          ? Number(p.opt_hold_entry_sec)
+          : ((p.opt_hold_sec !== undefined && p.opt_hold_sec !== null) ? Number(p.opt_hold_sec) : null);
+        const tNowAbs = (p.opt_hold_curr_sec !== undefined && p.opt_hold_curr_sec !== null)
+          ? Number(p.opt_hold_curr_sec)
+          : ((p.opt_hold_sec !== undefined && p.opt_hold_sec !== null) ? Number(p.opt_hold_sec) : tEntry);
+        let tNowRem = (p.opt_hold_curr_remaining_sec !== undefined && p.opt_hold_curr_remaining_sec !== null)
+          ? Number(p.opt_hold_curr_remaining_sec)
+          : null;
+        if ((tNowRem === null || isNaN(tNowRem)) && tNowAbs !== null && age !== null) {
+          tNowRem = Math.max(0, Number(tNowAbs) - Number(age));
+        }
+        const clampH = (v, maxSec = 3600) => {
+          if (v === null || v === undefined || isNaN(v)) return v;
+          const n = Number(v);
+          return Math.max(0, Math.min(n, maxSec));
+        };
+        const tNowAbsClamped = clampH(tNowAbs, 3600);
+        const tNowRemClamped = clampH(tNowRem, 3600);
+        const tEntryDisp = fmtHMSPrime(clampH(tEntry, 3600), 3600);
+        const tNowDispAbs = fmtHMSPrime(tNowAbsClamped, 3600);
+        const tNowDispRem = fmtHMSPrime(tNowRemClamped, 3600);
+        const tNowDisp = (tNowAbsClamped !== null && tNowAbsClamped !== undefined)
+          ? `${tNowDispAbs} / ${tNowDispRem}`
+          : '-';
+        const tNowTitle = `t*=${fmtHMSPrime(tNowAbsClamped, 3600)} | remaining=${fmtHMSPrime(tNowRemClamped, 3600)} | raw=${isNum(tNowAbs) ? Number(tNowAbs).toFixed(0) : 'n/a'}s`;
+        const holdEvalTs = (p.hold_eval_ts !== undefined && p.hold_eval_ts !== null) ? Number(p.hold_eval_ts) : null;
+        const holdEvalAge = holdEvalTs ? Math.max(0, (Date.now() - holdEvalTs) / 1000) : null;
+        const holdEvalDisp = holdEvalTs ? new Date(holdEvalTs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '-';
+        const holdEvalTip = holdEvalTs ? `ts=${holdEvalTs} | age=${holdEvalAge === null ? 'n/a' : Number(holdEvalAge).toFixed(0)}s` : '';
+        const hPick = (p.hold_eval_h_pick !== undefined && p.hold_eval_h_pick !== null) ? Number(p.hold_eval_h_pick) : null;
+        const hPickDisp = (hPick === null || isNaN(hPick)) ? '-' : fmtHMSPrime(hPick, 3600);
+
+        const cls = (side === 'LONG') ? 'up' : (side === 'SHORT') ? 'down' : 'muted';
+        const pnlCls = (pnl !== null && pnl < 0) ? 'down' : 'up';
+
+        const tr = document.createElement('tr');
+        const roeTip = `roe=${pnlPct === null ? 'n/a' : pnlPct.toFixed(2)}% | base=${baseNotional === null ? 'n/a' : f2(baseNotional)} | notional=${notional === null ? 'n/a' : f2(notional)} | lev=${lev === null ? 'n/a' : lev}`;
+        let capTip = `cap=${cap === null ? 'n/a' : cap.toFixed(1)}%`;
+        if (notional !== null && balance !== null) {
+          capTip += ` | notional=${f2(notional)} | balance=${f2(balance)}`;
+        }
+        if (exposureCap !== null && balance !== null) {
+          capTip += ` | exposure_cap=${f2(balance * exposureCap)}`;
+        }
+        const closePx = isNum(cur) ? Number(cur) : (isNum(entry) ? Number(entry) : null);
+        const closeBtn = `<button class="btn warn mini" onclick="event.stopPropagation(); closeLimit(${JSON.stringify(sym)}, ${closePx === null ? 'null' : closePx});">LMT</button>`;
+        tr.innerHTML = `
+        <td class="mono"><b>${sym}</b></td>
+        <td><span class="pill ${cls}">${side}</span></td>
+        <td class="mono">${entry === null ? '-' : f2(entry)}</td>
+        <td class="mono">${cur === null ? '-' : f2(cur)}</td>
+        <td class="mono ${pnlCls}">${pnl === null ? '-' : f2(pnl)}</td>
+        <td class="mono ${pnlPctUnlev !== null && pnlPctUnlev < 0 ? 'down' : 'up'}" title="${escAttr(roeTip)}">${pnlPctUnlev === null ? '-' : (pnlPctUnlev.toFixed(2) + '%')}</td>
+        <td class="mono ${pnlPct !== null && pnlPct < 0 ? 'down' : 'up'}" title="${escAttr(roeTip)}">${pnlPct === null ? '-' : (pnlPct.toFixed(2) + '%')}</td>
+        <td class="mono">${lev === null ? '-' : lev}</td>
+        <td class="mono" title="${escAttr(capTip)}">${cap === null ? '-' : (cap.toFixed(2) + '%')}</td>
+        <td class="mono">${age === null ? '-' : fmtHMSPrime(age, 0)}</td>
+        <td class="mono">${tEntry === null || isNaN(tEntry) ? '-' : tEntryDisp}</td>
+        <td class="mono" title="${escAttr(tNowTitle)}">${tNowDisp}</td>
+        <td class="mono" title="${escAttr(holdEvalTip)}">${holdEvalDisp}</td>
+        <td class="mono">${hPickDisp}</td>
+        <td class="mono">${closeBtn}</td>
+      `;
+        posBody.appendChild(tr);
+      });
+
+      if (!(positions || []).length) {
+        posBody.innerHTML = `<tr><td class="muted" colspan="15">열려있는 포지션 없음</td></tr>`;
+      }
+
+      if (posWrap) {
+        const rowCount = Math.max(1, posBody.children.length || 1);
+        let headH = 18;
+        let rowH = 12;
+        try {
+          const headEl = posWrap.querySelector('thead');
+          if (headEl) {
+            const h = headEl.getBoundingClientRect().height;
+            if (h && h > 0) headH = h;
+          }
+          const firstRow = posBody.querySelector('tr');
+          if (firstRow) {
+            const r = firstRow.getBoundingClientRect().height;
+            if (r && r > 0) rowH = r;
+          }
+        } catch (e) { }
+        const pad = 4;
+        const totalH = Math.ceil(headH + (rowCount * rowH) + pad);
+        posWrap.style.maxHeight = `${totalH}px`;
+        posWrap.style.height = `${totalH}px`;
+        posWrap.style.minHeight = `${totalH}px`;
+        posWrap.style.overflow = 'visible';
+      }
+    }
+
+    function renderArchivedPositions(outs) {
+      if (!archBody) return;
+      const list = Array.isArray(outs) ? outs.slice() : [];
+      archBody.innerHTML = '';
+      if (!list.length) {
+        archBody.innerHTML = `<tr><td class="muted" colspan="7">아카이브된 포지션 없음</td></tr>`;
+        return;
+      }
+      list.sort((a, b) => (Number(b.archive_ts || 0) - Number(a.archive_ts || 0)));
+      const frag = document.createDocumentFragment();
+      list.forEach(o => {
+        const tr = document.createElement('tr');
+        const t = o.archive_ts ? new Date(Number(o.archive_ts)).toLocaleTimeString() : '-';
+        const sym = o.symbol || '-';
+        const side = o.side || '-';
+        const qty = (o.quantity != null) ? fmtNum(o.quantity, 4) : '-';
+        const entry = (o.entry_price != null) ? f2(o.entry_price) : '-';
+        const notional = (o.notional != null) ? f2(o.notional) : '-';
+        const src = o.archive_source || '-';
+        tr.innerHTML = `
+        <td class="mono">${t}</td>
+        <td>${sym}</td>
+        <td class="${side === 'LONG' ? 'up' : (side === 'SHORT' ? 'down' : 'muted')}">${side}</td>
+        <td class="mono">${qty}</td>
+        <td class="mono">${entry}</td>
+        <td class="mono">${notional}</td>
+        <td class="mono">${src}</td>
+      `;
+        frag.appendChild(tr);
+      });
+      archBody.replaceChildren(frag);
+    }
+
+    function renderTradeTape() {
+      tradeBody.innerHTML = '';
+      tradeTape.slice(-200).reverse().forEach(t => {
+        const sym = t.sym || t.symbol;
+
+        // ✅ TYPE 확정 로직: payload 우선 → 없으면 문자열 파싱 fallback
+        const findType = (txt) => { const m = (txt || '').match(/\\b(ENTER|EXIT|REBAL|REBALANCE|SPREAD|PYRAMID|KILL)\\b/i); return m ? m[1].toUpperCase() : null; };
+        let ttype = (t.action_type || t.ttype || t.type || t.event || '').toString().toUpperCase();
+        if (ttype === 'REBALANCE') ttype = 'REBAL';
+        if (!ttype || ttype === '-') {
+          ttype = findType(t.reason) || findType(t.note) || "-";
+        }
+
+        const side = (t.side || '').toUpperCase();
+        const cls = (side === 'LONG') ? 'up' : (side === 'SHORT') ? 'down' : 'muted';
+
+        const findPnl = (txt) => { const pm = (txt || '').match(/pnl=([-0-9.]+)/i); return pm ? Number(pm[1]) : null; };
+        const findRoe = (txt) => { const rm = (txt || '').match(/roe=([-0-9.]+)/i); return rm ? Number(rm[1]) : null; };
+
+        let pnl = (t.pnl !== undefined) ? t.pnl : null;
+        let roe = (t.roe !== undefined) ? t.roe : null;
+
+        if ((pnl === null || pnl === undefined)) pnl = findPnl(t.note) ?? findPnl(t.reason);
+        if ((roe === null || roe === undefined)) roe = findRoe(t.note) ?? findRoe(t.reason);
+
+        if ((pnl === null || pnl === undefined) && t.realized_r !== undefined && t.notional) {
+          try { pnl = Number(t.realized_r) * Number(t.notional); } catch (e) { }
+        }
+        if ((roe === null || roe === undefined) && t.realized_r !== undefined) {
+          try { roe = Number(t.realized_r); } catch (e) { }
+        }
+
+        const tr = document.createElement('tr');
+        const exitTag = (ttype === 'EXIT') ? exitKeyword(t) : '';
+        tr.innerHTML = `
+        <td class="mono">${t.time || '-'}</td>
+        <td class="mono"><b>${normSym(sym)}</b></td>
+        <td>${tradeTypeBadge(ttype)}</td>
+        <td><span class="pill ${cls}">${side || '-'}</span></td>
+        <td class="mono">${t.price === null || t.price === undefined ? '-' : f2(t.price)}</td>
+        <td class="mono ${(pnl !== null && pnl < 0) ? 'down' : 'up'}">${pnl === null || pnl === undefined ? '-' : f2(pnl)}</td>
+        <td class="mono">${roe === null || roe === undefined ? '-' : (roe * 100).toFixed(2)}</td>
+        <td class="mono">${t.leverage === null || t.leverage === undefined ? '-' : t.leverage}</td>
+        <td>${exitBadge(exitTag)}</td>
+        <td class="muted">${t.tag || ''} ${t.reason || t.note || ''}</td>
+      `;
+        tradeBody.appendChild(tr);
+      });
+
+      if (!tradeTape.length) {
+        tradeBody.innerHTML = `<tr><td class="muted" colspan="10">아직 트레이드 이벤트 없음 (logs에서 ENTER/EXIT가 찍히면 자동으로 들어옴)</td></tr>`;
+      }
+    }
+
+    function updateTradeTapeFromLogs(logs) {
+      (logs || []).forEach(l => {
+        const key = `${l.time}|${l.msg}`;
+        if (seenTradeMsg.has(key)) return;
+        const p = parseTradeMsg(l.msg);
+        if (!p) return;
+        seenTradeMsg.add(key);
+        tradeTape.push({ time: l.time, ...p });
+        if (tradeTape.length > 1000) tradeTape.shift();
+      });
       renderTradeTape();
-    } else {
-      updateTradeTapeFromLogs(d.logs || []);
     }
 
-    renderLogs(d.logs || []);
-    renderAlerts(d.alerts || []);
-  }
-
-  ws.onmessage = (e)=>{
-    try{
-      latestPayload = JSON.parse(e.data);
-    }catch(_){
-      return;
-    }
-    if(!rafScheduled){
-      rafScheduled = true;
-      requestAnimationFrame(()=>{
-        rafScheduled = false;
-        applyUpdate(latestPayload);
+    function renderLogs(logs) {
+      logsEl.innerHTML = '';
+      (logs || []).slice(-250).forEach(l => {
+        const lvl = (l.level || 'INFO').toUpperCase();
+        logsEl.innerHTML += `<div>[${l.time}] <span class="muted">${lvl}</span> ${l.msg}</div>`;
       });
     }
-  };
 
-  // ---------- Top-4 rendering ----------
-  function renderTop4(rows){
-    const out = $('top4Panel');
-    if(!out) return;
-    
-    const data = (rows||[]).map(x=>{
-      const sym = normSym(x.symbol);
-      const unified = (x.unified_score!==undefined && x.unified_score!==null) ? Number(x.unified_score) :
-                      (x.meta && x.meta.unified_score!==undefined && x.meta.unified_score!==null) ? Number(x.meta.unified_score) :
-                      (x.ev!==undefined && x.ev!==null ? Number(x.ev) : 0);
-      const scorep = unified * 100;
-      return {
-        raw:x,
-        symbol:sym,
-        unified_score: unified,
-        scorep: scorep,
-        price: x.price ?? null,
-        status: x.status || 'WAIT',
-        regime: x.regime || '-',
-      };
-    });
-    
-    // Unified score 기준 정렬
-    const byScore = data.slice().sort((a,b)=> (b.unified_score||0) - (a.unified_score||0));
-    const top = byScore.slice(0,4);
-    
-    out.innerHTML = '';
-    if(top.length===0){
-      out.innerHTML = '<div class="muted" style="padding:8px">Top-4: 데이터 없음</div>';
-      return;
+    function renderAlerts(alerts) {
+      alertsEl.innerHTML = '';
+      (alerts || []).slice(-200).reverse().forEach(a => {
+        const sev = (a.severity || 'info').toUpperCase();
+        const ts = a.ts ? new Date(a.ts).toLocaleTimeString() : '-';
+        const msg = a.message || '';
+        const kind = a.kind || '-';
+        const cls = sev === 'CRITICAL' ? 'down' : (sev === 'WARN' ? 'wait' : 'muted');
+        alertsEl.innerHTML += `<div>[${ts}] <span class="pill ${cls}">${sev}</span> <span class="mono">${kind}</span> ${msg}</div>`;
+      });
+      if (!(alerts || []).length) {
+        alertsEl.innerHTML = `<div class="muted">알림 없음</div>`;
+      }
     }
-    
-    top.forEach((t,i)=>{
-      const pct = 25; // 각 25%
-      const card = document.createElement('div');
-      card.style.cssText = 'padding:10px 14px;border:2px solid var(--accent);border-radius:12px;background:linear-gradient(135deg, #fff 0%, #f8fafc 100%);min-width:180px;flex:1';
-      
-      const statusCls = (t.status==='LONG')?'up':(t.status==='SHORT')?'down':'muted';
-      
-      card.innerHTML = `
+
+    // Sorting
+    document.querySelectorAll('#mktTable thead th').forEach(th => {
+      th.addEventListener('click', () => {
+        const k = th.dataset.k;
+        if (!k) return;
+        if (sortKey === k) sortAsc = !sortAsc;
+        else { sortKey = k; sortAsc = true; }
+        if (latestPayload && latestPayload.market) renderMarketTable(latestPayload.market);
+      });
+    });
+
+    searchEl.addEventListener('input', () => {
+      if (latestPayload && latestPayload.market) renderMarketTable(latestPayload.market);
+    });
+
+    function applyUpdate(d) {
+      if (d.type !== 'full_update') return;
+      const eng = d.engine || {};
+
+      // topbar
+      const ksOn = !!(d.kill_switch || (d.engine && d.engine.safety_mode));
+      ksEl.textContent = ksOn ? 'ON' : 'OFF';
+      ksEl.className = `v ${ksOn ? 'on' : 'off'}`;
+      if (clearSafetyBtn) {
+        if (!safetyReqInFlight) {
+          clearSafetyBtn.disabled = !ksOn;
+          clearSafetyBtn.textContent = ksOn ? '안전모드 해제' : '안전모드 OFF';
+          clearSafetyBtn.title = ksOn ? '안전모드 해제 (기준자본 리셋)' : '안전모드 비활성 상태';
+        } else {
+          clearSafetyBtn.disabled = true;
+        }
+      }
+
+      const equity = Number((d.portfolio && d.portfolio.equity) || 0);
+      const liveEquityRaw = d.portfolio ? d.portfolio.live_equity : null;
+      const liveEquityVal = isNum(liveEquityRaw) ? Number(liveEquityRaw) : null;
+      const recordMode = (eng && eng.record_mode) ? String(eng.record_mode).toLowerCase() : '';
+      const useLiveEq = (recordMode === 'live') && (liveEquityVal !== null);
+      const equityDisplay = useLiveEq ? liveEquityVal : equity;
+      smoothSetText(eqEl, equityDisplay, (v) => Number(v).toFixed(2), 260);
+      if (eqEl) {
+        if (useLiveEq) {
+          eqEl.title = `LIVE equity=${equityDisplay.toFixed(2)}`;
+        } else if (liveEquityVal !== null) {
+          const delta = equity - liveEquityVal;
+          eqEl.title = `model=${equity.toFixed(2)} | live=${liveEquityVal.toFixed(2)} | Δ=${delta.toFixed(2)}`;
+        } else {
+          eqEl.title = '';
+        }
+      }
+
+      wsEl.textContent = (eng && eng.ws_clients !== undefined) ? eng.ws_clients : '-';
+      feedEl.textContent = (d.feed && d.feed.connected) ? 'OK' : 'STALE';
+
+      if (mcTimeEl) {
+        const mcMs = eng.mc_last_ms;
+        if (mcMs === null || mcMs === undefined || isNaN(Number(mcMs))) {
+          mcTimeEl.textContent = '-';
+          mcTimeEl.className = 'v muted';
+        } else {
+          const msNum = Number(mcMs);
+          mcTimeEl.textContent = msNum >= 1000 ? `${(msNum / 1000).toFixed(2)}s` : `${Math.round(msNum)}ms`;
+          const st = eng.mc_status || 'ok';
+          mcTimeEl.className = `v ${st === 'ok' ? 'up' : (st === 'timeout' ? 'down' : 'wait')}`;
+        }
+        const ctxs = eng.mc_last_ctxs;
+        const status = eng.mc_status || 'n/a';
+        const ts = eng.mc_last_ts;
+        const tsText = ts ? new Date(ts).toLocaleTimeString() : '-';
+        mcTimeEl.title = `status=${status}` + (ctxs != null ? ` | ctxs=${ctxs}` : '') + ` | ts=${tsText}`;
+      }
+      if (mcDevEl) {
+        const backend = eng.mc_backend;
+        const dev = eng.mc_device;
+        if (!backend && !dev) {
+          mcDevEl.textContent = '-';
+          mcDevEl.className = 'v muted';
+        } else {
+          mcDevEl.textContent = backend ? `${backend}:${dev || '-'}` : (dev || '-');
+          const devLower = String(dev || '').toLowerCase();
+          const isGpu = devLower.includes('cuda') || devLower.includes('mps');
+          mcDevEl.className = `v ${isGpu ? 'up' : (devLower ? 'wait' : 'muted')}`;
+        }
+      }
+
+      const utilVal = (d.portfolio && d.portfolio.utilization !== undefined) ? d.portfolio.utilization : null;
+      const utilCap = d.portfolio ? d.portfolio.utilization_cap : null;
+      utilEl.textContent = utilVal === null ? '-' : (utilVal * 100).toFixed(1) + '%' + (utilCap ? `/${(utilCap * 100).toFixed(0)}%` : '');
+
+      const evalm = d.eval_metrics || {};
+      brierEl.textContent = evalm.brier === null || evalm.brier === undefined ? '-' : evalm.brier.toFixed(4);
+      hitEl.textContent = evalm.hit_rate === null || evalm.hit_rate === undefined ? '-' : (evalm.hit_rate * 100).toFixed(1) + '%';
+
+      // Alpha Hit ML 상태 표시
+      const ah = d.alpha_hit || {};
+      if (alphaHitEl) {
+        const ahOn = ah.enabled === true;
+        alphaHitEl.textContent = ahOn ? `ON (β=${(ah.beta || 1).toFixed(2)})` : 'OFF';
+        alphaHitEl.className = `v ${ahOn ? 'up' : 'muted'}`;
+        const reason = ah.disable_reason ? ` | reason=${ah.disable_reason}` : '';
+        alphaHitEl.title = ahOn ? `min_buffer=${ah.min_buffer || '-'}` : `Alpha Hit ML 비활성화${reason}`;
+      }
+      if (alphaBstEl) {
+        const bstOn = ah.signal_boost === true;
+        alphaBstEl.textContent = bstOn ? `ON (cap=${(ah.mu_alpha_cap || 5).toFixed(0)})` : 'OFF';
+        alphaBstEl.className = `v ${bstOn ? 'up' : 'muted'}`;
+        alphaBstEl.title = bstOn ? `alpha_scaling=${(ah.alpha_scaling_factor || 1).toFixed(1)}x` : 'Signal Boost 비활성화';
+      }
+      if (alphaBufEl) {
+        if (ah.enabled) {
+          let buf = Number(ah.buffer_size ?? 0);
+          if (Number.isNaN(buf)) buf = 0;
+          const minBuf = Number(ah.min_buffer ?? 0);
+          const warmupDone = ah.warmup_done === true || (minBuf > 0 && buf >= minBuf);
+          const totalSamples = Number(ah.total_samples ?? buf);
+          const display = minBuf > 0 ? `${buf}/${minBuf}` : `${buf}`;
+          alphaBufEl.textContent = display;
+          alphaBufEl.title = `buffer=${buf} samples | total=${totalSamples} | warmup=${warmupDone ? 'ready' : 'pending'}`;
+          const state = warmupDone ? 'up' : buf > 0 ? 'wait' : 'muted';
+          alphaBufEl.className = `v ${state}`;
+        } else {
+          alphaBufEl.textContent = '-';
+          alphaBufEl.title = 'Alpha Hit ML 비활성화';
+          alphaBufEl.className = 'v muted';
+        }
+      }
+      if (alphaLossEl) {
+        if (ah.enabled && ah.last_loss != null) {
+          const loss = Number(ah.last_loss);
+          const ema = ah.ema_loss != null ? Number(ah.ema_loss) : null;
+          const lossText = `L=${loss.toFixed(4)}`;
+          const emaText = ema != null ? ` EMA=${ema.toFixed(4)}` : '';
+          alphaLossEl.textContent = `${lossText}${emaText}`;
+          alphaLossEl.title = `train_steps=${ah.total_train_steps || 0}`;
+          alphaLossEl.className = `v ${loss < 0.15 ? 'up' : 'wait'}`;
+        } else if (ah.enabled) {
+          alphaLossEl.textContent = 'pending';
+          alphaLossEl.title = '훈련 대기 중';
+          alphaLossEl.className = 'v wait';
+        } else {
+          alphaLossEl.textContent = '-';
+          alphaLossEl.title = 'Alpha Hit ML 비활성화';
+          alphaLossEl.className = 'v muted';
+        }
+      }
+      if (alphaReplayEl) {
+        if (ah.replay_path) {
+          const exists = ah.replay_exists === true;
+          const sizeKb = ah.replay_size_bytes != null ? `${(Number(ah.replay_size_bytes) / 1024).toFixed(1)}KB` : '??';
+          alphaReplayEl.textContent = exists ? `ok ${sizeKb}` : 'missing';
+          alphaReplayEl.title = `${exists ? 'replay loaded' : 'replay missing'} | ${ah.replay_path} | save_every=${ah.replay_save_every || '-'}`;
+          alphaReplayEl.className = `v ${exists ? 'up' : 'muted'}`;
+        } else {
+          alphaReplayEl.textContent = '-';
+          alphaReplayEl.title = 'Replay path 설정 필요';
+          alphaReplayEl.className = 'v muted';
+        }
+      }
+
+      if (envSrcEl) {
+        const active = eng.env_active;
+        const profile = eng.env_profile;
+        const file = eng.env_file;
+        let text = '-';
+        if (active) {
+          const parts = String(active).split('/');
+          text = parts[parts.length - 1] || active;
+        } else if (profile) {
+          text = `.env.${profile}`;
+        } else if (file) {
+          const parts = String(file).split('/');
+          text = parts[parts.length - 1] || file;
+        }
+        envSrcEl.textContent = text;
+        const srcs = Array.isArray(eng.env_sources) ? eng.env_sources : [];
+        const details = srcs.map(s => `${s.mode}:${s.loaded ? 'OK' : 'MISS'}:${s.path}`).join(' | ');
+        envSrcEl.title = details || 'ENV 정보 없음';
+      }
+
+      selSymEl.textContent = selectedSym || '-';
+
+      if (outsideWarnEl) {
+        const outs = (d.engine && d.engine.outside_universe_positions) ? d.engine.outside_universe_positions : (d.outside_universe_positions || []);
+        if (Array.isArray(outs) && outs.length > 0) {
+          const names = outs.map(o => o.symbol).filter(Boolean);
+          const shortList = names.slice(0, 6);
+          outsideWarnEl.style.display = 'block';
+          outsideWarnEl.textContent = `유니버스 밖 포지션 감지: ${outs.length}개 (${shortList.join(', ')}${names.length > 6 ? ' ...' : ''})`;
+          const tip = outs.map(o => {
+            const qty = (o.quantity != null) ? String(o.quantity) : '-';
+            const side = o.side || '-';
+            const ep = (o.entry_price != null) ? Number(o.entry_price).toFixed(4) : '-';
+            return `${o.symbol} ${side} qty=${qty} entry=${ep}`;
+          }).join(' | ');
+          outsideWarnEl.title = tip || '유니버스 밖 포지션';
+        } else {
+          outsideWarnEl.style.display = 'none';
+          outsideWarnEl.textContent = '';
+          outsideWarnEl.title = '';
+        }
+      }
+
+      // KPIs
+      const bal = Number((d.portfolio && d.portfolio.balance) || 0);
+      smoothSetText(balKpi, bal, (v) => Number(v).toFixed(2), 260);
+      smoothSetText(eqKpi, equityDisplay, (v) => Number(v).toFixed(2), 260);
+
+      // dd
+      const histForDd = useLiveEq ? liveEquityHist : equityHist;
+      const peak = histForDd.reduce((m, p) => Math.max(m, p.equity), equityDisplay);
+      const dd = peak > 0 ? ((equityDisplay - peak) / peak) * 100 : 0;
+      ddKpi.textContent = `${dd.toFixed(2)}%`;
+
+      // live KPIs
+      const liveWalletRaw = d.portfolio ? d.portfolio.live_wallet_balance : null;
+      const liveFreeRaw = d.portfolio ? d.portfolio.live_free_balance : null;
+      const liveImRaw = d.portfolio ? d.portfolio.live_total_initial_margin : null;
+      const liveMmRaw = d.portfolio ? d.portfolio.live_total_maintenance_margin : null;
+      const liveWalletVal = isNum(liveWalletRaw) ? Number(liveWalletRaw) : null;
+      const liveFreeVal = isNum(liveFreeRaw) ? Number(liveFreeRaw) : null;
+      const liveImVal = isNum(liveImRaw) ? Number(liveImRaw) : null;
+      const liveMmVal = isNum(liveMmRaw) ? Number(liveMmRaw) : null;
+
+      if (liveWalletKpi) {
+        if (liveWalletVal === null) liveWalletKpi.textContent = '-';
+        else smoothSetText(liveWalletKpi, liveWalletVal, (v) => Number(v).toFixed(2), 260);
+      }
+      if (liveEqKpi) {
+        if (liveEquityVal === null) liveEqKpi.textContent = '-';
+        else smoothSetText(liveEqKpi, liveEquityVal, (v) => Number(v).toFixed(2), 260);
+      }
+      if (liveFreeKpi) {
+        if (liveFreeVal === null) liveFreeKpi.textContent = '-';
+        else smoothSetText(liveFreeKpi, liveFreeVal, (v) => Number(v).toFixed(2), 260);
+      }
+      if (liveMarginKpi) {
+        if (liveImVal !== null || liveMmVal !== null) {
+          liveMarginKpi.textContent = `${f2(liveImVal)}/${f2(liveMmVal)}`;
+        } else {
+          liveMarginKpi.textContent = '-';
+        }
+      }
+      if (liveSyncKpi) {
+        const syncErr = d.portfolio ? d.portfolio.live_last_sync_err : null;
+        const syncMs = d.portfolio ? d.portfolio.live_last_sync_ms : null;
+        if (syncErr) {
+          liveSyncKpi.textContent = 'ERR';
+          liveSyncKpi.title = String(syncErr);
+        } else if (syncMs) {
+          const age = Math.max(0, (Date.now() - Number(syncMs)) / 1000);
+          liveSyncKpi.textContent = `${age.toFixed(1)}s`;
+          liveSyncKpi.title = new Date(Number(syncMs)).toLocaleTimeString();
+        } else {
+          liveSyncKpi.textContent = '-';
+          liveSyncKpi.title = 'live sync 없음';
+        }
+      }
+
+      // seed history
+      if (!equitySeeded && d.portfolio && Array.isArray(d.portfolio.history) && d.portfolio.history.length) {
+        equityHist.length = 0;
+        d.portfolio.history.forEach(p => {
+          equityHist.push({ t: p.time || p.ts || Date.now(), equity: p.equity });
+        });
+        normalizeHist(equityHist);
+        equitySeeded = true;
+        updateEquityChart(equityHist);
+      }
+
+      if (!liveEquitySeeded && d.portfolio && Array.isArray(d.portfolio.live_history) && d.portfolio.live_history.length) {
+        liveEquityHist.length = 0;
+        d.portfolio.live_history.forEach(p => {
+          liveEquityHist.push({ t: p.time || p.ts || Date.now(), equity: p.equity });
+        });
+        normalizeHist(liveEquityHist);
+        liveEquitySeeded = true;
+        updateLiveEquityChart();
+      }
+
+      const t = d.server_time || Date.now();
+      // Always update model equity curve; update live curve when available.
+      pushEquityPoint(t, equity);
+      if (liveEquityVal !== null && !isNaN(liveEquityVal)) {
+        pushLiveEquityPoint(t, liveEquityVal);
+      }
+
+      // market
+      const rows = d.market || [];
+      rows.forEach(x => {
+        const sym = normSym(x.symbol);
+        const price = Number(x.price || 0);
+        pushSymPoint(sym, t, price);
+      });
+      // render top-4 summary and full market table
+      renderTop4(rows);
+      renderMarketTable(rows);
+
+      // positions
+      const positionsRaw = coercePositions(d.portfolio ? d.portfolio.positions : null);
+      const posCount = (d.portfolio && d.portfolio.positions_count !== undefined && d.portfolio.positions_count !== null)
+        ? Number(d.portfolio.positions_count)
+        : null;
+      let positions = positionsRaw;
+      const nowMs = Date.now();
+      if (positionsRaw && positionsRaw.length) {
+        lastPositions = positionsRaw;
+        lastPositionsTs = nowMs;
+      } else {
+        const keepMs = 5000;
+        if (lastPositions.length && (nowMs - lastPositionsTs) < keepMs) {
+          positions = lastPositions;
+        } else if (posCount && posCount > 0 && lastPositions.length) {
+          positions = lastPositions;
+        }
+      }
+      renderPositions(positions, rows, d.portfolio || {});
+      const outs = (d.engine && d.engine.outside_universe_positions) ? d.engine.outside_universe_positions : (d.outside_universe_positions || []);
+      renderArchivedPositions(outs);
+
+      // trade tape: payload 우선 → logs fallback
+      if (Array.isArray(d.trade_tape) && d.trade_tape.length) {
+        tradeTape.length = 0;
+        d.trade_tape.slice(-500).forEach(t => tradeTape.push(t));
+        renderTradeTape();
+      } else {
+        updateTradeTapeFromLogs(d.logs || []);
+      }
+
+      renderLogs(d.logs || []);
+      renderAlerts(d.alerts || []);
+    }
+
+    ws.onmessage = (e) => {
+      try {
+        latestPayload = JSON.parse(e.data);
+      } catch (_) {
+        return;
+      }
+      if (!rafScheduled) {
+        rafScheduled = true;
+        requestAnimationFrame(() => {
+          rafScheduled = false;
+          applyUpdate(latestPayload);
+        });
+      }
+    };
+
+    // ---------- Top-4 rendering ----------
+    function renderTop4(rows) {
+      const out = $('top4Panel');
+      if (!out) return;
+
+      const data = (rows || []).map(x => {
+        const sym = normSym(x.symbol);
+        const hybrid = (x.hybrid_score !== undefined && x.hybrid_score !== null) ? Number(x.hybrid_score) :
+          (x.meta && x.meta.hybrid_score !== undefined && x.meta.hybrid_score !== null) ? Number(x.meta.hybrid_score) : 0;
+        const scorep = hybrid * 100;
+        return {
+          raw: x,
+          symbol: sym,
+          hybrid_score: hybrid,
+          scorep: scorep,
+          price: x.price ?? null,
+          status: x.status || 'WAIT',
+          regime: x.regime || '-',
+        };
+      });
+
+      // Hybrid score 기준 정렬
+      const byScore = data.slice().sort((a, b) => (b.hybrid_score || 0) - (a.hybrid_score || 0));
+      const top = byScore.slice(0, 4);
+
+      out.innerHTML = '';
+      if (top.length === 0) {
+        out.innerHTML = '<div class="muted" style="padding:8px">Top-4: 데이터 없음</div>';
+        return;
+      }
+
+      top.forEach((t, i) => {
+        const pct = 25; // 각 25%
+        const card = document.createElement('div');
+        card.style.cssText = 'padding:10px 14px;border:2px solid var(--accent);border-radius:12px;background:linear-gradient(135deg, #fff 0%, #f8fafc 100%);min-width:180px;flex:1';
+
+        const statusCls = (t.status === 'LONG') ? 'up' : (t.status === 'SHORT') ? 'down' : 'muted';
+
+        card.innerHTML = `
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-          <div style="font-size:20px;font-weight:900;color:var(--accent)">#${i+1}</div>
+          <div style="font-size:20px;font-weight:900;color:var(--accent)">#${i + 1}</div>
           <div style="font-size:16px;font-weight:700">${t.symbol}</div>
         </div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:4px">자본 배분: <b style="color:var(--accent)">${pct}%</b></div>
         <div style="display:flex;gap:12px;font-size:12px">
-          <div><span style="color:var(--muted)">Score:</span> <b class="${(t.scorep>=0)?'up':'down'}">${t.scorep.toFixed(2)}%</b></div>
+          <div><span style="color:var(--muted)">Hybrid Score:</span> <b class="${(t.scorep >= 0) ? 'up' : 'down'}">${t.scorep.toFixed(4)}%</b></div>
           <div><span style="color:var(--muted)">Status:</span> <span class="pill ${statusCls}" style="font-size:10px;padding:2px 6px">${t.status}</span></div>
         </div>
         <div style="margin-top:4px;font-size:11px;color:var(--muted)">Regime: ${t.regime}</div>
       `;
-      out.appendChild(card);
-    });
-  }
-</script>
+        out.appendChild(card);
+      });
+    }
+  </script>
 </body>
+
 </html>

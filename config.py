@@ -5,24 +5,84 @@ from utils.helpers import _env_bool, _env_int, _env_float, _load_env_file, _load
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Load local `.env` first (developer convenience).
-_load_env_file(str(BASE_DIR / ".env"))
+ENV_SOURCES = []
 
-# bybit api
-API_KEY = "cITWygtNEBO1zxHgXH"
-API_SECRET = "AKnWtmPRF59YU5FhNMPjwcSQZHd05cpaYY6R5"
-# 환경변수로 자동 주입 (기존 코드 호환)
-os.environ["BYBIT_API_KEY"] = API_KEY
-os.environ["BYBIT_API_SECRET"] = API_SECRET
-# Load runtime overrides early so all config values can be controlled from state/bybit.env.
-# NOTE: `state/bybit.env.example` is a template (often with testnet defaults). We only load it when no
-# real env file exists (to avoid accidentally enabling testnet when the project is configured via `.env`).
-if not (BASE_DIR / "state" / "bybit.env").exists():
-    if not (BASE_DIR / ".env").exists():
-        _load_env_file(str(BASE_DIR / "state" / "bybit.env.example"))
-else:
-    # `state/bybit.env` must override `.env` when keys overlap.
-    _load_env_file_override(str(BASE_DIR / "state" / "bybit.env"))
+def _record_env(path: str, mode: str, loaded: bool) -> None:
+    ENV_SOURCES.append({
+        "path": str(path),
+        "mode": str(mode),
+        "loaded": bool(loaded),
+    })
+
+# Load local `.env` first (developer convenience).
+_base_env_path = str(BASE_DIR / ".env")
+_base_loaded = _load_env_file(_base_env_path)
+_record_env(_base_env_path, "base", _base_loaded)
+
+# Optional profile env support (e.g. .env.scalp or .env.midterm).
+# Priority: ENV_FILE (explicit path) > ENV_PROFILE (.env.<profile>) > fallback to .env.scalp if no .env exists.
+_env_file = str(os.environ.get("ENV_FILE", "")).strip()
+_env_profile = str(os.environ.get("ENV_PROFILE", "")).strip()
+if not _env_profile:
+    _env_profile = str(os.environ.get("ENVPROFILE", "")).strip()
+if not _env_profile:
+    _profile_file = BASE_DIR / ".env.profile"
+    try:
+        if _profile_file.exists():
+            _env_profile = _profile_file.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+    except Exception:
+        _env_profile = ""
+if _env_file:
+    _override_loaded = _load_env_file_override(_env_file)
+    _record_env(_env_file, "override_env_file", _override_loaded)
+elif _env_profile:
+    _profile_path = str(BASE_DIR / f".env.{_env_profile}")
+    _profile_loaded = _load_env_file_override(_profile_path)
+    _record_env(_profile_path, "override_env_profile", _profile_loaded)
+elif not (BASE_DIR / ".env").exists():
+    _fallback_path = str(BASE_DIR / ".env.scalp")
+    _fallback_loaded = _load_env_file(_fallback_path)
+    _record_env(_fallback_path, "fallback_scalp", _fallback_loaded)
+
+# bybit api (loaded from env or state/bybit.env)
+def _load_api_keys() -> tuple[str, str]:
+    api_key = os.environ.get("BYBIT_API_KEY") or os.environ.get("API_KEY") or ""
+    api_secret = os.environ.get("BYBIT_API_SECRET") or os.environ.get("API_SECRET") or ""
+    return api_key, api_secret
+
+API_KEY, API_SECRET = _load_api_keys()
+# Load runtime overrides from state/bybit.env only when running with the bybit profile.
+_use_bybit_env = False
+if _env_profile and _env_profile.strip().lower() == "bybit":
+    _use_bybit_env = True
+if _env_file and Path(_env_file).name == ".env.bybit":
+    _use_bybit_env = True
+if str(os.environ.get("USE_BYBIT_ENV", "")).strip().lower() in ("1", "true", "yes", "on"):
+    _use_bybit_env = True
+
+# NOTE: `state/bybit.env.example` is a template (often with testnet defaults).
+if _use_bybit_env:
+    if not (BASE_DIR / "state" / "bybit.env").exists():
+        if not (BASE_DIR / ".env").exists():
+            _bybit_example = str(BASE_DIR / "state" / "bybit.env.example")
+            _bybit_loaded = _load_env_file(_bybit_example)
+            _record_env(_bybit_example, "bybit_example", _bybit_loaded)
+    else:
+        # `state/bybit.env` must override `.env` when keys overlap.
+        _bybit_path = str(BASE_DIR / "state" / "bybit.env")
+        _bybit_loaded = _load_env_file_override(_bybit_path)
+        _record_env(_bybit_path, "bybit_override", _bybit_loaded)
+
+# Refresh API keys after any env override
+API_KEY, API_SECRET = _load_api_keys()
+
+ENV_PROFILE = _env_profile
+ENV_FILE = _env_file
+ENV_ACTIVE = None
+for src in reversed(ENV_SOURCES):
+    if src.get("loaded"):
+        ENV_ACTIVE = src.get("path")
+        break
 
 def _env_symbols(defaults: list[str]) -> list[str]:
     raw = str(os.environ.get("SYMBOLS_CSV", "")).strip()
@@ -50,6 +110,13 @@ DEBUG_MU_SIGMA = _env_bool("DEBUG_MU_SIGMA", False)
 DEBUG_TPSL_META = _env_bool("DEBUG_TPSL_META", False)
 DEBUG_ROW = _env_bool("DEBUG_ROW", False)
 DECISION_LOG_EVERY = _env_int("DECISION_LOG_EVERY", 10)
+MC_STREAMING_MODE = _env_bool("MC_STREAMING_MODE", False)
+MC_STREAMING_BATCH_SIZE = _env_int("MC_STREAMING_BATCH_SIZE", 4)
+MC_STREAMING_BROADCAST = _env_bool("MC_STREAMING_BROADCAST", True)
+MAINT_MARGIN_RATE = _env_float("MAINT_MARGIN_RATE", 0.005)
+LIQUIDATION_BUFFER = _env_float("LIQUIDATION_BUFFER", 0.0025)
+LIQUIDATION_SCORE_PENALTY = _env_float("LIQUIDATION_SCORE_PENALTY", 0.01)
+LIVE_LIQUIDATION_SYNC_SEC = _env_float("LIVE_LIQUIDATION_SYNC_SEC", 10.0)
 
 # ✅ DEV_MODE에서는 n_paths를 줄여서 빠른 피드백 제공
 _DEV_MODE = _env_bool("DEV_MODE", False)
@@ -103,9 +170,18 @@ POSITION_CAP_ENABLED = _env_bool("POSITION_CAP_ENABLED", False)
 EXPOSURE_CAP_ENABLED = _env_bool("EXPOSURE_CAP_ENABLED", True)
 MAX_CONCURRENT_POSITIONS = _env_int("MAX_CONCURRENT_POSITIONS", 99999)
 MAX_NOTIONAL_EXPOSURE = _env_float("MAX_NOTIONAL_EXPOSURE", 10.0)
+RESET_INITIAL_EQUITY_ON_START = _env_bool("RESET_INITIAL_EQUITY_ON_START", False)
+SYNC_POSITIONS_ON_START = _env_bool("SYNC_POSITIONS_ON_START", True)
+SYNC_POSITIONS_ALL = _env_bool("SYNC_POSITIONS_ALL", True)
+SYNC_POSITIONS_POLL = _env_bool("SYNC_POSITIONS_POLL", True)
+SYNC_POSITIONS_POLL_SEC = _env_float("SYNC_POSITIONS_POLL_SEC", 30.0)
+LIVE_PENDING_SYNC_GRACE_SEC = _env_float("LIVE_PENDING_SYNC_GRACE_SEC", 30.0)
+MANAGE_SYNCED_POSITIONS = _env_bool("MANAGE_SYNCED_POSITIONS", True)
 KELLY_COV_LOOKBACK = _env_int("KELLY_COV_LOOKBACK", 100)
 KELLY_COV_ESTIMATOR = str(os.environ.get("KELLY_COV_ESTIMATOR", "ledoit_wolf")).strip().lower()
-REBALANCE_THRESHOLD_FRAC = 0.02
+REBALANCE_THRESHOLD_FRAC = _env_float("REBALANCE_THRESHOLD_FRAC", 0.02)
+REBALANCE_MIN_INTERVAL_SEC = _env_float("REBALANCE_MIN_INTERVAL_SEC", 0.0)
+REBALANCE_MIN_NOTIONAL = _env_float("REBALANCE_MIN_NOTIONAL", 0.0)
 EV_DROP_THRESHOLD = 0.0003
 K_LEV = 2000.0
 EV_EXIT_FLOOR = {"bull": -0.0003, "bear": -0.0003, "chop": -0.0002, "volatile": -0.0002}
@@ -124,6 +200,8 @@ POLICY_SCORE_FLIP_MARGIN = _env_float("POLICY_SCORE_FLIP_MARGIN", 0.001)
 UNIFIED_RISK_LAMBDA = _env_float("UNIFIED_RISK_LAMBDA", 1.0)
 UNIFIED_RHO = _env_float("UNIFIED_RHO", 0.0)
 EVENT_EXIT_SCORE = _env_float("EVENT_EXIT_SCORE", -0.0005)
+EVENT_EXIT_MAX_P_SL = _env_float("EVENT_EXIT_MAX_P_SL", 0.55)
+EVENT_EXIT_MAX_ABS_CVAR = _env_float("EVENT_EXIT_MAX_ABS_CVAR", 0.010)
 
 CONSENSUS_THRESHOLD = 0.0005
 RSI_PERIOD = 14
@@ -134,13 +212,24 @@ SPREAD_Z_ENTRY = 2.0
 SPREAD_Z_EXIT = 0.5
 SPREAD_SIZE_FRAC = 0.02
 SPREAD_HOLD_SEC = 600
-SPREAD_ENABLED = False
+SPREAD_ENABLED = _env_bool("SPREAD_ENABLED", False)
 SPREAD_PAIRS = [
     ("BTC/USDT:USDT", "ETH/USDT:USDT"),
     ("SOL/USDT:USDT", "BNB/USDT:USDT"),
 ]
-SPREAD_PCT_MAX = 0.0005
+SPREAD_PCT_MAX = _env_float("SPREAD_PCT_MAX", 0.0005)
 SPREAD_ENTRY_MAX = _env_float("SPREAD_ENTRY_MAX", 0.0)
+MIN_ENTRY_SCORE = _env_float("MIN_ENTRY_SCORE", 0.0)
+MIN_ENTRY_NOTIONAL = _env_float("MIN_ENTRY_NOTIONAL", 0.0)
+MIN_ENTRY_NOTIONAL_PCT = _env_float("MIN_ENTRY_NOTIONAL_PCT", 0.0)
+MIN_ENTRY_EXPOSURE_PCT = _env_float("MIN_ENTRY_EXPOSURE_PCT", 0.0)
+MIN_LIQ_SCORE = _env_float("MIN_LIQ_SCORE", 0.0)
+PRE_MC_ENABLED = _env_bool("PRE_MC_ENABLED", False)
+PRE_MC_BLOCK_ON_FAIL = _env_bool("PRE_MC_BLOCK_ON_FAIL", True)
+PRE_MC_MIN_EXPECTED_PNL = _env_float("PRE_MC_MIN_EXPECTED_PNL", 0.0)
+PRE_MC_MIN_CVAR = _env_float("PRE_MC_MIN_CVAR", -0.05)
+PRE_MC_MAX_LIQ_PROB = _env_float("PRE_MC_MAX_LIQ_PROB", 0.05)
+PRE_MC_SIZE_SCALE = _env_float("PRE_MC_SIZE_SCALE", 0.5)
 
 BYBIT_TAKER_FEE = 0.0006
 BYBIT_MAKER_FEE = 0.0001

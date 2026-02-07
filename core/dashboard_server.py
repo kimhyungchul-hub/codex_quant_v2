@@ -215,7 +215,12 @@ def _build_payload(orch, rows, include_history, include_trade_tape, *, include_l
             "maker_poll_ms": int(getattr(config, "MAKER_POLL_MS", 200)),
             "exec_stats": _exec_stats_snapshot(orch),
             "pmaker": orch.pmaker.status_dict(),
+            "env_profile": getattr(config, "ENV_PROFILE", None),
+            "env_file": getattr(config, "ENV_FILE", None),
+            "env_active": getattr(config, "ENV_ACTIVE", None),
+            "env_sources": getattr(config, "ENV_SOURCES", None),
         },
+        "alpha_hit": orch.alpha_hit_status(),
         "feed": feed,
         "market": rows,
         "portfolio": {
@@ -537,6 +542,50 @@ async def api_liquidate_all_handler(request):
         dumps=lambda x: json.dumps(x, ensure_ascii=False),
     )
 
+async def api_liquidate_all_safety_handler(request):
+    orch = request.app["orchestrator"]
+    try:
+        orch._log("🛰️ [API] Received liquidate_all_safety request from dashboard.")
+    except Exception:
+        pass
+    live_mode = bool(getattr(orch, "enable_orders", False)) and (not bool(getattr(orch, "paper_trading_enabled", False)))
+    if live_mode and hasattr(orch, "liquidate_all_positions_live"):
+        res = orch.liquidate_all_positions_live()
+        if asyncio.iscoroutine(res):
+            await res
+    elif hasattr(orch, "liquidate_all_positions"):
+        res = orch.liquidate_all_positions()
+        if asyncio.iscoroutine(res):
+            await res
+    elif hasattr(orch, "_liquidate_all_positions"):
+        res = orch._liquidate_all_positions()
+        if asyncio.iscoroutine(res):
+            await res
+    else:
+        try:
+            orch._log_err("❌ [API] LiveOrchestrator has no liquidate_all_positions method!")
+        except Exception:
+            pass
+
+    try:
+        setattr(orch, "safety_mode", True)
+    except Exception:
+        pass
+    try:
+        if hasattr(orch, "_register_anomaly"):
+            orch._register_anomaly("safety_mode", "critical", "dashboard liquidate_all_safety")
+    except Exception:
+        pass
+    try:
+        orch._log_err("[RISK] safety_mode ON via dashboard liquidate_all_safety")
+    except Exception:
+        pass
+
+    return web.json_response(
+        {"ok": True, "paper_trading_enabled": bool(getattr(orch, "paper_trading_enabled", False)), "safety_mode": True},
+        dumps=lambda x: json.dumps(x, ensure_ascii=False),
+    )
+
 class DashboardServer:
     def __init__(self, orchestrator, *, port: int | None = None):
         self.orchestrator = orchestrator
@@ -553,6 +602,7 @@ class DashboardServer:
             web.post("/api/runtime", runtime_post_handler),
             web.post("/api/reset_tape", api_reset_tape_handler),
             web.post("/api/liquidate_all", api_liquidate_all_handler),
+            web.post("/api/liquidate_all_safety", api_liquidate_all_safety_handler),
             web.get('/api/status', handle_api_status),
             web.get('/api/positions', handle_api_positions),
             web.get('/api/score_debug', handle_api_score_debug),

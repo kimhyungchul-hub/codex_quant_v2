@@ -83,6 +83,7 @@ class MonteCarloAlphaHitMixin:
         exit_reason: str,
         tp_level: float = 0.01,
         sl_level: float = 0.01,
+        realized_r: Optional[float] = None,
     ):
         """
         Collect training sample for AlphaHitMLP from realized trade outcomes.
@@ -100,14 +101,27 @@ class MonteCarloAlphaHitMixin:
             y_tp_short = np.zeros(H, dtype=np.float32)
             y_sl_short = np.zeros(H, dtype=np.float32)
 
+            reason = str(exit_reason or "").upper()
+            if reason not in ("TP", "SL"):
+                if realized_r is not None:
+                    try:
+                        rr = float(realized_r)
+                    except Exception:
+                        rr = None
+                    if rr is not None:
+                        if rr >= float(tp_level):
+                            reason = "TP"
+                        elif rr <= -float(sl_level):
+                            reason = "SL"
+
             for i, h in enumerate(policy_horizons):
                 if duration_sec <= h:
-                    if exit_reason == "TP":
+                    if reason == "TP":
                         if direction == 1:
                             y_tp_long[i] = 1.0
                         else:
                             y_tp_short[i] = 1.0
-                    elif exit_reason == "SL":
+                    elif reason == "SL":
                         if direction == 1:
                             y_sl_long[i] = 1.0
                         else:

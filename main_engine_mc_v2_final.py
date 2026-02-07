@@ -3,6 +3,28 @@ from __future__ import annotations
 import os
 import sys
 
+# OpenMP shared-memory failures can abort the process on some systems.
+# Enforce SHM-disabled defaults before any ML libraries import.
+_kmp_shm = os.environ.get("KMP_SHM_DISABLE", "").strip().lower()
+if _kmp_shm not in ("1", "true", "yes", "on"):
+    os.environ["KMP_SHM_DISABLE"] = "1"
+_kmp_use_shm = os.environ.get("KMP_USE_SHM", "").strip().lower()
+if _kmp_use_shm in ("", "1", "true", "yes", "on"):
+    os.environ["KMP_USE_SHM"] = "0"
+os.environ.setdefault("KMP_INIT_AT_FORK", "FALSE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+import multiprocessing as _mp
+try:
+    _mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
 import bootstrap
 
 from pathlib import Path
@@ -25,7 +47,10 @@ import json
 import time
 import math
 import random
+import threading
 import numpy as np
+import sqlite3
+import shutil
 from collections import deque
 from typing import Optional
 from aiohttp import web
@@ -66,8 +91,10 @@ from engines.running_stats import RunningStats
 from engines.kelly_allocator import KellyAllocator
 from core.continuous_opportunity import ContinuousOpportunityChecker
 from core.multi_timeframe_scoring import check_position_switching
+from core.database_manager import DatabaseManager, TradingMode
 
 PORT = 9999
+DASHBOARD_HOST = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1")).strip() or "127.0.0.1"
 
 SYMBOLS = list(config.SYMBOLS)
 
@@ -104,31 +131,76 @@ MAX_INFLIGHT_REQ = 1
 ORDERBOOK_MAX_INFLIGHT_REQ = 5
 
 # ---- Risk / Execution settings
-ENABLE_LIVE_ORDERS = False          # 실제 주문 호출 토글
-DEFAULT_LEVERAGE = 5.0
-MAX_LEVERAGE = 50.0
+ENABLE_LIVE_ORDERS = bool(getattr(config, "ENABLE_LIVE_ORDERS", False))  # 실제 주문 호출 토글
+LIVE_BALANCE_SYNC_SEC = float(getattr(config, "LIVE_BALANCE_SYNC_SEC", os.environ.get("LIVE_BALANCE_SYNC_SEC", 5.0)) or 5.0)
+DEFAULT_LEVERAGE = float(getattr(config, "DEFAULT_LEVERAGE", 5.0) or 5.0)
+MAX_LEVERAGE = float(getattr(config, "MAX_LEVERAGE", 50.0) or 50.0)
+LEVERAGE_MIN = float(os.environ.get("LEVERAGE_MIN", 1.0) or 1.0)
 LOSS_STREAK_LIMIT = 3
 ALERT_THROTTLE_SEC = 30
 ERROR_BURST_LIMIT = 3
 ERROR_BURST_WINDOW_SEC = 120
 DEFAULT_SIZE_FRAC = 0.10            # balance 대비 기본 진입 비중 (더 공격적)
 MAX_POSITION_HOLD_SEC = int(getattr(config, "MAX_POSITION_HOLD_SEC", 600))  # 보유 상한(환경변수 기반)
+POSITION_HOLD_MIN_SEC = int(getattr(config, "POSITION_HOLD_MIN_SEC", 0))  # 최소 보유 시간 (초)
 POSITION_CAP_ENABLED = False        # 포지션 개수 제한 비활성화(무제한 진입)
 EXPOSURE_CAP_ENABLED = True         # 노출 한도 사용
 MAX_CONCURRENT_POSITIONS = 99999
-MAX_NOTIONAL_EXPOSURE = 5.0         # 총 노출을 잔고 대비 500%까지 허용
-REBALANCE_THRESHOLD_FRAC = 0.02     # 목표 노출 대비 2% 이상 차이 나면 리밸런싱(더 잦게)
+MAX_NOTIONAL_EXPOSURE = float(getattr(config, "MAX_NOTIONAL_EXPOSURE", 5.0))  # 총 노출을 잔고 대비 500%까지 허용
+REBALANCE_THRESHOLD_FRAC = float(getattr(config, "REBALANCE_THRESHOLD_FRAC", 0.02))
+REBALANCE_MIN_INTERVAL_SEC = float(getattr(config, "REBALANCE_MIN_INTERVAL_SEC", 0.0) or 0.0)
+REBALANCE_MIN_NOTIONAL = float(getattr(config, "REBALANCE_MIN_NOTIONAL", 0.0) or 0.0)
+
+def _normalize_sym_key(sym: str) -> str:
+    s = str(sym or "").strip()
+    if not s:
+        return s
+    if "/" not in s:
+        return f"{s}/USDT:USDT"
+    if ":USDT" not in s and s.endswith("USDT"):
+        return f"{s}:USDT"
+    return s
+
+def _parse_sym_float_map(env_key: str) -> dict[str, float]:
+    raw = str(os.environ.get(env_key, "")).strip()
+    if not raw:
+        return {}
+    out: dict[str, float] = {}
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    for part in parts:
+        if ":" in part:
+            k, v = part.split(":", 1)
+        elif "=" in part:
+            k, v = part.split("=", 1)
+        else:
+            continue
+        key = _normalize_sym_key(k.strip())
+        try:
+            out[key] = float(v.strip())
+        except Exception:
+            continue
+    return out
+
+REBALANCE_THRESHOLD_MAP = _parse_sym_float_map("REBALANCE_THRESHOLD_MAP")
+REBALANCE_MIN_INTERVAL_MAP = _parse_sym_float_map("REBALANCE_MIN_INTERVAL_MAP")
+REBALANCE_MIN_NOTIONAL_MAP = _parse_sym_float_map("REBALANCE_MIN_NOTIONAL_MAP")
+REBALANCE_ENABLED = str(os.environ.get("REBALANCE_ENABLE", os.environ.get("REBALANCE_ENABLED", "1"))).strip().lower() in ("1", "true", "yes", "on")
 EV_DROP_THRESHOLD = 0.0003          # EV 급락 exit 감지 임계
 K_LEV = float(getattr(config, "K_LEV", 2000.0))  # 레버리지 스케일 (환경변수 기반)
 EV_EXIT_FLOOR = {"bull": -0.0003, "bear": -0.0003, "chop": -0.0002, "volatile": -0.0002}
 EV_DROP = {"bull": 0.0010, "bear": 0.0010, "chop": 0.0008, "volatile": 0.0008}
 PSL_RISE = {"bull": 0.05, "bear": 0.05, "chop": 0.03, "volatile": 0.03}
-MAX_DRAWDOWN_LIMIT = 0.10           # Kill Switch 기준 (10% DD)
+MAX_DRAWDOWN_LIMIT = float(os.environ.get("MAX_DRAWDOWN_LIMIT", 0.10) or 0.10)  # Kill Switch 기준 (10% DD)
 EXECUTION_MODE = "maker_dynamic"   # maker_dynamic | market
 
 # ---- Portfolio Selection (TOP N 종목 선택)
-TOP_N_SYMBOLS = int(getattr(config, "TOP_N_SYMBOLS", 4))  # 상위 N개 종목만 진입
+TOP_N_SYMBOLS = int(getattr(config, "TOP_N_SYMBOLS", 4))  # 상위 N개 종목만 진입 (<=0이면 전체)
 USE_KELLY_ALLOCATION = bool(getattr(config, "USE_KELLY_ALLOCATION", True))
+KELLY_PORTFOLIO_FRAC = float(os.environ.get("KELLY_PORTFOLIO_FRAC", 1.0) or 1.0)
+KELLY_PORTFOLIO_FRAC = max(0.0, min(1.0, KELLY_PORTFOLIO_FRAC))
+
+if TOP_N_SYMBOLS <= 0 or TOP_N_SYMBOLS > len(SYMBOLS):
+    TOP_N_SYMBOLS = len(SYMBOLS)
 USE_CONTINUOUS_OPPORTUNITY = bool(getattr(config, "USE_CONTINUOUS_OPPORTUNITY", True))
 SWITCHING_COST_MULT = float(getattr(config, "SWITCHING_COST_MULT", 2.0))  # 교체 비용 승수 (수수료 × 승수)
 MAKER_TIMEOUT_SEC = 2.0
@@ -144,13 +216,24 @@ SPREAD_Z_ENTRY = 2.0
 SPREAD_Z_EXIT = 0.5
 SPREAD_SIZE_FRAC = 0.02
 SPREAD_HOLD_SEC = 600
-SPREAD_ENABLED = True   # 스프레드 활성화
+SPREAD_ENABLED = False  # 스프레드 비활성화 (Unified Score 전용 모드)
 SPREAD_PAIRS = [
     ("BTC/USDT:USDT", "ETH/USDT:USDT"),
     ("SOL/USDT:USDT", "BNB/USDT:USDT"),
 ]
 # 스프레드 상한 (entry gate)
-SPREAD_PCT_MAX = 0.0005  # 0.05%
+SPREAD_PCT_MAX = float(getattr(config, "SPREAD_PCT_MAX", 0.0005) or 0.0005)  # 0.05%
+MIN_ENTRY_SCORE = float(getattr(config, "MIN_ENTRY_SCORE", 0.0) or 0.0)
+MIN_ENTRY_NOTIONAL = float(getattr(config, "MIN_ENTRY_NOTIONAL", 0.0) or 0.0)
+MIN_ENTRY_NOTIONAL_PCT = float(getattr(config, "MIN_ENTRY_NOTIONAL_PCT", 0.0) or 0.0)
+MIN_ENTRY_EXPOSURE_PCT = float(getattr(config, "MIN_ENTRY_EXPOSURE_PCT", 0.0) or 0.0)
+MIN_LIQ_SCORE = float(getattr(config, "MIN_LIQ_SCORE", 0.0) or 0.0)
+PRE_MC_ENABLED = bool(getattr(config, "PRE_MC_ENABLED", False))
+PRE_MC_BLOCK_ON_FAIL = bool(getattr(config, "PRE_MC_BLOCK_ON_FAIL", True))
+PRE_MC_MIN_EXPECTED_PNL = float(getattr(config, "PRE_MC_MIN_EXPECTED_PNL", 0.0) or 0.0)
+PRE_MC_MIN_CVAR = float(getattr(config, "PRE_MC_MIN_CVAR", -0.05) or -0.05)
+PRE_MC_MAX_LIQ_PROB = float(getattr(config, "PRE_MC_MAX_LIQ_PROB", 0.05) or 0.05)
+PRE_MC_SIZE_SCALE = float(getattr(config, "PRE_MC_SIZE_SCALE", 0.5) or 0.5)
 
 # Bybit USDT-Perp 기본 수수료
 # Maker 주문 우선 사용으로 수수료 절감 (0.12% → 0.02%)
@@ -179,7 +262,7 @@ def now_ms() -> int:
 
 
 class LiveOrchestrator:
-    def __init__(self, exchange):
+    def __init__(self, exchange, data_exchange=None):
         # 환경 변수에 따라 로컬 또는 원격 엔진 허브 선택
         if USE_REMOTE_ENGINE:
             print(f"[LiveOrchestrator] Using RemoteEngineHub @ {ENGINE_SERVER_URL}")
@@ -197,6 +280,7 @@ class LiveOrchestrator:
             self.hub = create_engine_hub(use_remote=False, use_process=use_process, cpu_affinity=cpu_affinity)
             print(f"[LiveOrchestrator] Using {'ProcessEngineHub' if use_process else 'EngineHub'}")
         self.exchange = exchange
+        self.data_exchange = data_exchange or exchange
         self._net_sem = asyncio.Semaphore(MAX_INFLIGHT_REQ)
         self._ob_sem = asyncio.Semaphore(ORDERBOOK_MAX_INFLIGHT_REQ)
         self._last_ok = {"tickers": 0, "ohlcv": {s: 0 for s in SYMBOLS}, "ob": {s: 0 for s in SYMBOLS}}
@@ -216,15 +300,32 @@ class LiveOrchestrator:
 
         self.balance = 10_000.0
         self.positions = {}  # sym -> position dict (demo/paper)
+        self._live_wallet_balance = None
+        self._live_equity = None
+        self._live_free_balance = None
+        self._live_total_initial_margin = None
+        self._live_total_maintenance_margin = None
+        self._last_live_sync_ms = None
+        self._last_live_sync_err = None
+        self._live_equity_history = deque(maxlen=20_000)
+        self._live_balance_key_warned = False
+        self._live_balance_stale_warned = False
+        self._hold_eval_lock = threading.Lock()
+        self._rebalance_on_next_cycle = False
+        self._force_rebalance_cycle = False
+        self._last_positions_sync_ms: int | None = None
         self.leverage = DEFAULT_LEVERAGE
         self.max_leverage = MAX_LEVERAGE
-        self.enable_orders = ENABLE_LIVE_ORDERS
+        self.enable_orders = bool(ENABLE_LIVE_ORDERS)
+        self._trading_mode = TradingMode.LIVE if self.enable_orders else TradingMode.PAPER
         self.max_positions = MAX_CONCURRENT_POSITIONS
         self.max_notional_frac = MAX_NOTIONAL_EXPOSURE
         self.position_cap_enabled = POSITION_CAP_ENABLED
         self.exposure_cap_enabled = EXPOSURE_CAP_ENABLED
         self.default_size_frac = DEFAULT_SIZE_FRAC
         self.safety_mode = False
+        self._emergency_stop_handled = False
+        self._emergency_stop_ts: int | None = None
         self.max_drawdown_limit = MAX_DRAWDOWN_LIMIT
         self.initial_equity = None
         self._is_hedge_mode = False
@@ -237,9 +338,24 @@ class LiveOrchestrator:
         self.fee_mode = "maker" if USE_MAKER_ORDERS else "taker"
         self._decision_log_every = int(getattr(config, "DECISION_LOG_EVERY", 10))
         self._decision_cycle = 0
+        self._last_mc_ms: float | None = None
+        self._last_mc_ts: int | None = None
+        self._last_mc_ctxs: int | None = None
+        self._last_mc_status: str | None = None
+        self._last_mc_backend: str | None = None
+        self._last_mc_device: str | None = None
+        self._cycle_free_balance: float | None = None
+        self._cycle_reserved_margin: float = 0.0
+        self._cycle_reserved_notional: float = 0.0
+        self._cycle_balance_ts: int | None = None
+        self._dashboard_fast = str(os.environ.get("DASHBOARD_FAST_LOOP", "1")).strip().lower() in ("1", "true", "yes", "on")
+        self._dashboard_refresh_sec = float(os.environ.get("DASHBOARD_REFRESH_SEC", 0.5) or 0.5)
+        self._last_decisions: dict[str, dict] = {}
+        self._last_rows: list[dict] = []
         self.spread_pairs = SPREAD_PAIRS
         self.spread_enabled = SPREAD_ENABLED
         self._last_actions = {}
+        self._last_rebalance_ts: dict[str, float] = {}
         self._cooldown_until = {s: 0.0 for s in SYMBOLS}
         self._entry_streak = {s: 0 for s in SYMBOLS}
         self._last_exit_kind = {s: "NONE" for s in SYMBOLS}
@@ -261,17 +377,44 @@ class LiveOrchestrator:
         self._ema_psl: dict[str, tuple[float, int]] = {}
         self._exit_bad_ticks: dict[str, int] = {s: 0 for s in SYMBOLS}
         self._dyn_leverage = {s: self.leverage for s in SYMBOLS}
+        self._last_leverage_sync_ms_by_sym: dict[str, int] = {}
+        self._last_leverage_target_by_sym: dict[str, float] = {}
+        self._leverage_sync_fail_by_sym: dict[str, dict] = {}
+        self._leverage_sync_min_interval_ms = int(os.environ.get("LIVE_LEVERAGE_SYNC_MIN_INTERVAL_MS", 15_000) or 15_000)
+        self._last_close_ts: dict[str, int] = {}
+        self._last_open_ts: dict[str, int] = {}
+        self._last_exchange_pos = {}
+        self._live_missing_pos_counts: dict[str, int] = {s: 0 for s in SYMBOLS}
+        self._outside_universe_positions: dict[str, dict] = {}
+        self._empty_positions_fetches: int = 0
+        self._last_nonempty_pos_fetch_ms: int = 0
+        self._external_close_missing_counts: dict[str, int] = {}
+        self._last_dynamic_universe_ms: int = 0
+        self._runtime_universe = set(SYMBOLS)
+        self._last_universe_refresh_ms = 0
+        self._universe_refresh_sec = float(os.environ.get("UNIVERSE_REFRESH_SEC", 5.0) or 5.0)
+        # Hybrid auto-tuning (entry floor / confidence scale)
+        self._hybrid_entry_floor_dyn: float | None = None
+        self._hybrid_entry_floor_dyn_ts: int = 0
+        self._hybrid_conf_scale_dyn: float | None = None
+        self._hybrid_conf_scale_dyn_ts: int = 0
+        self._last_portfolio_joint_ts = 0.0
+        self._last_portfolio_report = None
+        self._portfolio_joint_task = None
+        self.portfolio_joint_interval_sec = float(os.environ.get("PORTFOLIO_JOINT_INTERVAL_SEC", 180) or 180)
         self.trade_tape = deque(maxlen=20_000)
         self.eval_history = deque(maxlen=5_000)  # 예측 vs 실제 품질 평가용
         event_min_score = float(getattr(config, "EVENT_EXIT_SCORE", -0.0005))
+        event_max_p_sl = float(getattr(config, "EVENT_EXIT_MAX_P_SL", 0.55))
+        event_max_abs_cvar = float(getattr(config, "EVENT_EXIT_MAX_ABS_CVAR", 0.010))
         self.exit_policy = ExitPolicy(
             min_event_score=event_min_score,
-            max_event_p_sl=0.55,
+            max_event_p_sl=event_max_p_sl,
             min_event_p_tp=0.30,
             grace_sec=20,
-            max_hold_sec=600,
+            max_hold_sec=0,
             time_stop_mult=2.2,
-            max_abs_event_cvar_r=0.010,
+            max_abs_event_cvar_r=event_max_abs_cvar,
         )
         self.mc_cache = {}  # (sym, side, regime, price_bucket) -> (ts, meta)
         self.mc_cache_ttl = 2.0  # seconds
@@ -280,6 +423,10 @@ class LiveOrchestrator:
 
         # 1m close buffer (preload로 한 번에 채움)
         self.ohlcv_buffer = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in SYMBOLS}
+        self.ohlcv_open = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in SYMBOLS}
+        self.ohlcv_high = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in SYMBOLS}
+        self.ohlcv_low = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in SYMBOLS}
+        self.ohlcv_volume = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in SYMBOLS}
 
         # orderbook 상태(대시보드 표기용)
         self.orderbook = {s: {"ts": 0, "ready": False, "bids": [], "asks": []} for s in SYMBOLS}
@@ -294,18 +441,31 @@ class LiveOrchestrator:
         # persistence
         self.state_dir = BASE_DIR / "state"
         self.state_dir.mkdir(exist_ok=True)
+        mode_suffix = "live" if self._trading_mode == TradingMode.LIVE else "paper"
         self.state_files = {
-            "equity": self.state_dir / "equity_history.json",
-            "trade": self.state_dir / "trade_tape.json",
-            "eval": self.state_dir / "eval_history.json",
-            "positions": self.state_dir / "positions.json",
-            "balance": self.state_dir / "balance.json",
+            "equity": self.state_dir / f"equity_history_{mode_suffix}.json",
+            "trade": self.state_dir / f"trade_tape_{mode_suffix}.json",
+            "eval": self.state_dir / f"eval_history_{mode_suffix}.json",
+            "positions": self.state_dir / f"positions_{mode_suffix}.json",
+            "balance": self.state_dir / f"balance_{mode_suffix}.json",
         }
         self._last_state_persist_ms = 0
+        self._migrate_legacy_state_files()
         self._load_persistent_state()
-        self._init_initial_equity()
         # 러닝 통계
         self.stats = RunningStats(maxlen=5000)
+        
+        # ---- SQLite Database (JSON 대체) - state/ 고정 + 모드별 DB 파일 분리
+        self.data_dir = self.state_dir
+        self.data_dir.mkdir(exist_ok=True)
+        db_name = "bot_data_live.db" if self._trading_mode == TradingMode.LIVE else "bot_data_paper.db"
+        self._db_path = str(self.data_dir / db_name)
+        self._maybe_migrate_legacy_db()
+        self.db = DatabaseManager(db_path=self._db_path)
+        self._bootstrap_state_from_db_if_empty()
+        self._archive_outside_universe_positions(source="startup")
+        self._init_initial_equity()
+        self._maybe_reset_initial_equity_on_start()
         
         # ---- Portfolio Management (TOP N 선택 + Kelly 배분 + 교체 비용 평가)
         self.kelly_allocator = KellyAllocator(max_leverage=MAX_LEVERAGE, half_kelly=0.5)
@@ -316,6 +476,11 @@ class LiveOrchestrator:
         self._top_n_symbols: list[str] = []         # TOP N 종목 리스트
         self._last_ranking_ts = 0                   # 마지막 순위 갱신 시각
         self._kelly_allocations: dict[str, float] = {}  # sym -> allocation weight
+
+        # Hold-vs-exit evaluation cache
+        self._hold_eval_last_ts: dict[str, int] = {}
+        self._mc_engine_cache = None
+        self._mc_engine_warned = False
         
         # ---- SoA (Structure of Arrays) Pre-allocation for Zero-Copy Batch Ingestion ----
         # CRITICAL: 메모리 재할당 방지 & JAX Static Shape 유지
@@ -341,6 +506,128 @@ class LiveOrchestrator:
         ts = time.strftime("%H:%M:%S")
         self.logs.append({"time": ts, "level": "ERROR", "msg": text})
         print(text, flush=True)
+
+    def _normalize_entry_time_ms(self, entry_time, default: int | None = None) -> int:
+        """Normalize entry_time to ms (handle seconds or microseconds)."""
+        if default is None:
+            default = now_ms()
+        try:
+            t = int(entry_time)
+        except Exception:
+            return int(default)
+        # If value looks like seconds, convert to ms. If it looks like micros, downscale.
+        if t < 1_000_000_000_000:
+            t = t * 1000
+        elif t > 100_000_000_000_000:
+            t = int(t / 1000)
+        return int(t)
+
+    def _is_auto_env(self, value) -> bool:
+        try:
+            return str(value).strip().lower() in ("auto", "dyn", "adaptive")
+        except Exception:
+            return False
+
+    def _get_hybrid_entry_floor(self) -> float:
+        env_val = os.environ.get("HYBRID_ENTRY_FLOOR", os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+        auto_entry = self._is_auto_env(env_val) or str(os.environ.get("HYBRID_AUTO_ENTRY", "0")).strip().lower() in ("1", "true", "yes", "on")
+        if auto_entry and self._hybrid_entry_floor_dyn is not None:
+            return float(self._hybrid_entry_floor_dyn)
+        try:
+            return float(env_val or 0.0)
+        except Exception:
+            try:
+                return float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+            except Exception:
+                return 0.0
+
+    def _get_hybrid_conf_scale(self) -> float:
+        env_val = os.environ.get("HYBRID_CONF_SCALE", "0.01")
+        auto_conf = self._is_auto_env(env_val) or str(os.environ.get("HYBRID_AUTO_CONF", "0")).strip().lower() in ("1", "true", "yes", "on")
+        if auto_conf and self._hybrid_conf_scale_dyn is not None:
+            return float(self._hybrid_conf_scale_dyn)
+        try:
+            return float(env_val or 0.01)
+        except Exception:
+            return 0.01
+
+    def _update_hybrid_auto_tuning(self, scores_arr, ts_ms: int) -> None:
+        try:
+            use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+            hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
+            hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+            try:
+                entry_floor_eff = self._get_hybrid_entry_floor() if hybrid_only else float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+                if MIN_ENTRY_SCORE > 0:
+                    entry_floor_eff = float(max(entry_floor_eff, MIN_ENTRY_SCORE))
+            except Exception:
+                entry_floor_eff = None
+            decision_meta["entry_floor_eff"] = entry_floor_eff
+            decision_meta["min_entry_score"] = MIN_ENTRY_SCORE if MIN_ENTRY_SCORE > 0 else None
+            decision_meta["min_entry_notional"] = MIN_ENTRY_NOTIONAL if MIN_ENTRY_NOTIONAL > 0 else None
+            decision_meta["min_liq_score"] = MIN_LIQ_SCORE if MIN_LIQ_SCORE > 0 else None
+            if not hybrid_only:
+                return
+
+            scores = np.asarray(scores_arr, dtype=float)
+            if scores.size == 0:
+                return
+
+            # --- Entry floor auto-tune ---
+            entry_env = os.environ.get("HYBRID_ENTRY_FLOOR", "")
+            auto_entry = self._is_auto_env(entry_env) or str(os.environ.get("HYBRID_AUTO_ENTRY", "0")).strip().lower() in ("1", "true", "yes", "on")
+            if auto_entry:
+                min_samples = int(os.environ.get("HYBRID_ENTRY_MIN_SAMPLES", 10))
+                if scores.size >= min_samples:
+                    entry_pct = float(os.environ.get("HYBRID_ENTRY_PCT", 75.0))
+                    entry_pct = float(max(50.0, min(99.0, entry_pct)))
+                    raw_thr = float(np.percentile(scores, entry_pct))
+                    half_life = float(os.environ.get("HYBRID_ENTRY_EMA_HALFLIFE_SEC", 600.0))
+                    prev = self._hybrid_entry_floor_dyn
+                    prev_ts = int(self._hybrid_entry_floor_dyn_ts or ts_ms)
+                    dt_sec = max(1.0, (ts_ms - prev_ts) / 1000.0)
+                    if half_life <= 0:
+                        ema = raw_thr
+                    else:
+                        alpha = 1.0 - math.exp(-math.log(2.0) * dt_sec / max(half_life, 1e-6))
+                        ema = raw_thr if prev is None else (alpha * raw_thr + (1.0 - alpha) * float(prev))
+                    self._hybrid_entry_floor_dyn = float(ema)
+                    self._hybrid_entry_floor_dyn_ts = int(ts_ms)
+
+            # --- Confidence scale auto-tune ---
+            conf_env = os.environ.get("HYBRID_CONF_SCALE", "")
+            auto_conf = self._is_auto_env(conf_env) or str(os.environ.get("HYBRID_AUTO_CONF", "0")).strip().lower() in ("1", "true", "yes", "on")
+            if auto_conf:
+                min_samples = int(os.environ.get("HYBRID_CONF_MIN_SAMPLES", 10))
+                if scores.size >= min_samples:
+                    conf_target = float(os.environ.get("HYBRID_CONF_TARGET", 0.8))
+                    conf_target = float(max(0.55, min(0.95, conf_target)))
+                    conf_pct = float(os.environ.get("HYBRID_CONF_SCORE_PCT", 75.0))
+                    conf_pct = float(max(50.0, min(99.0, conf_pct)))
+                    pos_scores = scores[scores > 0.0]
+                    if pos_scores.size >= min_samples:
+                        score_ref = float(np.percentile(pos_scores, conf_pct))
+                    else:
+                        score_ref = float(np.percentile(np.abs(scores), conf_pct))
+                    score_ref = float(max(score_ref, 1e-6))
+                    x = float(max(1e-6, min(0.999, 2.0 * conf_target - 1.0)))
+                    atanh_x = 0.5 * math.log((1.0 + x) / (1.0 - x))
+                    scale_raw = score_ref / max(atanh_x, 1e-6)
+                    scale_min = float(os.environ.get("HYBRID_CONF_SCALE_MIN", 1e-6))
+                    scale_raw = float(max(scale_min, scale_raw))
+                    half_life = float(os.environ.get("HYBRID_CONF_EMA_HALFLIFE_SEC", 600.0))
+                    prev = self._hybrid_conf_scale_dyn
+                    prev_ts = int(self._hybrid_conf_scale_dyn_ts or ts_ms)
+                    dt_sec = max(1.0, (ts_ms - prev_ts) / 1000.0)
+                    if half_life <= 0:
+                        ema = scale_raw
+                    else:
+                        alpha = 1.0 - math.exp(-math.log(2.0) * dt_sec / max(half_life, 1e-6))
+                        ema = scale_raw if prev is None else (alpha * scale_raw + (1.0 - alpha) * float(prev))
+                    self._hybrid_conf_scale_dyn = float(ema)
+                    self._hybrid_conf_scale_dyn_ts = int(ts_ms)
+        except Exception:
+            return
 
     def _should_alert(self, key: str, *, now_ts: float | None = None, throttle_sec: int | float = ALERT_THROTTLE_SEC) -> bool:
         now_ts = time.time() if now_ts is None else float(now_ts)
@@ -421,9 +708,22 @@ class LiveOrchestrator:
         except Exception:
             pass
         await self._sync_position_mode()
-        await self._sync_leverage()
+        try:
+            sync_global = str(os.environ.get("SYNC_GLOBAL_LEVERAGE_ON_START", "0")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            sync_global = False
+        if sync_global:
+            await self._sync_leverage()
+        else:
+            self._log("[EXCHANGE] global leverage sync disabled; per-order leverage only")
 
     async def _sync_position_mode(self):
+        if not self.enable_orders:
+            self._log("[EXCHANGE] live orders disabled; skipping position mode sync")
+            return
+        if not getattr(self.exchange, "apiKey", None) or not getattr(self.exchange, "secret", None):
+            self._log("[EXCHANGE] apiKey/secret missing; skipping position mode sync")
+            return
         if not hasattr(self.exchange, "fetch_position_mode"):
             return
         try:
@@ -447,6 +747,12 @@ class LiveOrchestrator:
             self._log_err(f"[EXCHANGE] fetch_position_mode failed: {e}")
 
     async def _sync_leverage(self):
+        if not self.enable_orders:
+            self._log("[EXCHANGE] live orders disabled; skipping leverage sync")
+            return
+        if not getattr(self.exchange, "apiKey", None) or not getattr(self.exchange, "secret", None):
+            self._log("[EXCHANGE] apiKey/secret missing; skipping leverage sync")
+            return
         if not hasattr(self.exchange, "set_leverage"):
             return
         target = float(self.leverage)
@@ -460,6 +766,162 @@ class LiveOrchestrator:
     # -----------------------------
     # Persistence helpers
     # -----------------------------
+    def _migrate_legacy_state_files(self) -> None:
+        """Migrate legacy JSON state files (non-mode) into mode-specific files if missing."""
+        legacy = {
+            "equity": self.state_dir / "equity_history.json",
+            "trade": self.state_dir / "trade_tape.json",
+            "eval": self.state_dir / "eval_history.json",
+            "positions": self.state_dir / "positions.json",
+            "balance": self.state_dir / "balance.json",
+        }
+        for key, legacy_path in legacy.items():
+            new_path = self.state_files.get(key)
+            if not new_path:
+                continue
+            if new_path.exists():
+                continue
+            if legacy_path.exists():
+                try:
+                    shutil.copy2(legacy_path, new_path)
+                    self._log(f"[STATE_MIGRATE] {legacy_path.name} -> {new_path.name}")
+                except Exception as e:
+                    self._log_err(f"[ERR] migrate state {legacy_path.name}: {e}")
+
+    def _db_has_rows(self, path: Path) -> bool:
+        if not path.exists():
+            return False
+        try:
+            with sqlite3.connect(str(path)) as conn:
+                cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [r[0] for r in cur.fetchall()]
+                for tbl in tables:
+                    if not tbl or tbl.startswith("sqlite_"):
+                        continue
+                    try:
+                        row = conn.execute(f"SELECT 1 FROM {tbl} LIMIT 1").fetchone()
+                        if row is not None:
+                            return True
+                    except Exception:
+                        continue
+        except Exception:
+            return True
+        return False
+
+    def _legacy_db_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        legacy_dir = Path("/tmp/codex_quant_db")
+        if legacy_dir.exists():
+            for name in ("bot_data.db", "bot_data_live.db", "bot_data_paper.db"):
+                p = legacy_dir / name
+                if p.exists():
+                    paths.append(p)
+        return paths
+
+    def _table_has_column(self, conn: sqlite3.Connection, table: str, column: str) -> bool:
+        try:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            return any(r[1] == column for r in cur.fetchall())
+        except Exception:
+            return False
+
+    def _copy_legacy_table(
+        self,
+        dest_conn: sqlite3.Connection,
+        table: str,
+        *,
+        where: str | None = None,
+    ) -> None:
+        cols = []
+        try:
+            cur = dest_conn.execute(f"PRAGMA table_info({table})")
+            cols = [r[1] for r in cur.fetchall()]
+        except Exception:
+            cols = []
+        if not cols:
+            return
+        col_list = ",".join(cols)
+        sql = f"INSERT OR IGNORE INTO {table} ({col_list}) SELECT {col_list} FROM legacy.{table}"
+        if where:
+            sql += f" WHERE {where}"
+        dest_conn.execute(sql)
+
+    def _copy_from_legacy_db(self, legacy_path: Path, live_path: Path, paper_path: Path) -> None:
+        try:
+            legacy_conn = sqlite3.connect(str(legacy_path))
+        except Exception as e:
+            self._log_err(f"[DB_MIGRATE] open legacy failed: {legacy_path} err={e}")
+            return
+        try:
+            cur = legacy_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            legacy_tables = [r[0] for r in cur.fetchall() if r and r[0] and not r[0].startswith("sqlite_")]
+        except Exception:
+            legacy_tables = []
+
+        name = legacy_path.name.lower()
+        if "paper" in name:
+            targets = [("paper", paper_path)]
+        elif "live" in name:
+            targets = [("live", live_path)]
+        else:
+            targets = [("live", live_path), ("paper", paper_path)]
+
+        for mode, dest_path in targets:
+            try:
+                dest_conn = sqlite3.connect(str(dest_path))
+                dest_conn.execute(f"ATTACH DATABASE '{str(legacy_path)}' AS legacy")
+                for tbl in legacy_tables:
+                    has_mode = self._table_has_column(legacy_conn, tbl, "trading_mode")
+                    if not has_mode:
+                        if tbl == "slippage_analysis" and mode != "live":
+                            continue
+                        self._copy_legacy_table(dest_conn, tbl)
+                        continue
+                    # Filter by trading_mode when present
+                    self._copy_legacy_table(dest_conn, tbl, where=f"trading_mode='{mode}'")
+                dest_conn.commit()
+                dest_conn.execute("DETACH DATABASE legacy")
+                dest_conn.close()
+            except Exception as e:
+                self._log_err(f"[DB_MIGRATE] copy failed: {legacy_path} -> {dest_path} err={e}")
+        try:
+            legacy_conn.close()
+        except Exception:
+            pass
+
+    def _maybe_migrate_legacy_db(self) -> None:
+        marker = self.state_dir / "db_migration_v1.done"
+        if marker.exists():
+            return
+        legacy_paths = self._legacy_db_paths()
+        if not legacy_paths:
+            return
+        live_path = self.state_dir / "bot_data_live.db"
+        paper_path = self.state_dir / "bot_data_paper.db"
+
+        force = str(os.environ.get("DB_MIGRATE_FORCE", "0")).strip().lower() in ("1", "true", "yes", "on")
+        live_has = self._db_has_rows(live_path)
+        paper_has = self._db_has_rows(paper_path)
+        if (live_has or paper_has) and not force:
+            return
+
+        # Ensure destination DBs exist with schema
+        try:
+            DatabaseManager(db_path=str(live_path))
+            DatabaseManager(db_path=str(paper_path))
+        except Exception as e:
+            self._log_err(f"[DB_MIGRATE] init dest failed: {e}")
+            return
+
+        for legacy in legacy_paths:
+            self._log(f"[DB_MIGRATE] copying from {legacy} -> state/")
+            self._copy_from_legacy_db(legacy, live_path, paper_path)
+
+        try:
+            marker.write_text(json.dumps({"ts": now_ms(), "legacy": [str(p) for p in legacy_paths]}))
+        except Exception:
+            pass
+
     def _load_json(self, path: Path, default):
         try:
             if path.exists():
@@ -510,7 +972,7 @@ class LiveOrchestrator:
                     p["notional"] = float(p.get("notional", 0.0))
                     p["leverage"] = float(p.get("leverage", self.leverage))
                     p["cap_frac"] = float(p.get("cap_frac", 0.0))
-                    p["entry_time"] = int(p.get("entry_time", now_ms()))
+                    p["entry_time"] = self._normalize_entry_time_ms(p.get("entry_time", now_ms()), default=now_ms())
                     p["hold_limit"] = int(p.get("hold_limit", MAX_POSITION_HOLD_SEC * 1000))
                     self.positions[sym] = p
                 except Exception:
@@ -519,6 +981,65 @@ class LiveOrchestrator:
         # fallback balance from equity history if not loaded and no positions
         if (not balance_loaded) and self._equity_history and not self.positions:
             self.balance = float(self._equity_history[-1]["equity"])
+
+    def _bootstrap_state_from_db_if_empty(self) -> None:
+        if not hasattr(self, "db") or self.db is None:
+            return
+        mode = self._trading_mode if hasattr(self, "_trading_mode") else TradingMode.PAPER
+        # Trade tape
+        if not self.trade_tape:
+            try:
+                limit = int(getattr(self.trade_tape, "maxlen", 20000) or 20000)
+                rows = self.db.get_recent_trades(limit=limit, mode=mode)
+                for row in rows:
+                    rec = None
+                    raw = row.get("raw_data")
+                    if raw:
+                        try:
+                            rec = json.loads(raw)
+                        except Exception:
+                            rec = None
+                    if rec is None:
+                        rec = row
+                    self.trade_tape.append(rec)
+                if rows:
+                    self._log(f"[STATE_LOAD] trade_tape loaded from SQLite: {len(rows)} rows")
+            except Exception as e:
+                self._log_err(f"[ERR] load trade_tape from SQLite: {e}")
+
+        # Equity history
+        if not self._equity_history:
+            try:
+                limit = int(getattr(self._equity_history, "maxlen", 20000) or 20000)
+                rows = self.db.get_equity_history(limit=limit, mode=mode)
+                for row in rows:
+                    ts = row.get("timestamp_ms") or row.get("time") or row.get("ts")
+                    eq = row.get("total_equity")
+                    if eq is None:
+                        eq = row.get("equity")
+                    if eq is None:
+                        eq = row.get("wallet_balance")
+                    if ts is None or eq is None:
+                        continue
+                    try:
+                        self._equity_history.append({"time": int(ts), "equity": float(eq)})
+                    except Exception:
+                        continue
+                if rows:
+                    self._log(f"[STATE_LOAD] equity_history loaded from SQLite: {len(rows)} rows")
+            except Exception as e:
+                self._log_err(f"[ERR] load equity_history from SQLite: {e}")
+
+        # Positions
+        if not self.positions:
+            try:
+                pos_map = self.db.get_all_positions(mode=mode)
+                if pos_map:
+                    for sym, pos in pos_map.items():
+                        self.positions[sym] = pos
+                    self._log(f"[STATE_LOAD] positions loaded from SQLite: {len(pos_map)} symbols")
+            except Exception as e:
+                self._log_err(f"[ERR] load positions from SQLite: {e}")
 
     def _init_initial_equity(self):
         if self.initial_equity is not None:
@@ -531,11 +1052,201 @@ class LiveOrchestrator:
                 pass
         self.initial_equity = float(self.balance)
 
+    def _estimate_current_equity(self) -> float:
+        unreal = 0.0
+        for sym, pos in self.positions.items():
+            try:
+                px = self.market.get(sym, {}).get("price")
+            except Exception:
+                px = None
+            if px is None:
+                continue
+            try:
+                entry = float(pos.get("entry_price", 0.0))
+                qty = float(pos.get("quantity", 0.0))
+                side = str(pos.get("side", "")).upper()
+            except Exception:
+                continue
+            pnl = (px - entry) * qty if side == "LONG" else (entry - px) * qty
+            unreal += float(pnl)
+        try:
+            bal = float(self.balance)
+        except Exception:
+            bal = 0.0
+        return float(bal) + float(unreal)
+
+    def _exposure_cap_balance(self) -> float:
+        """Balance base for exposure cap (total equity = wallet + unrealized)."""
+        try:
+            eq = float(self._estimate_current_equity())
+            if math.isfinite(eq) and eq > 0:
+                return eq
+        except Exception:
+            pass
+        try:
+            return float(self.balance)
+        except Exception:
+            return 0.0
+
+    def _sizing_balance(self) -> float:
+        """Balance used for order sizing (prefer live free balance when available)."""
+        if self.enable_orders:
+            # Guard against stale/missing live balance (avoid over-allocating)
+            try:
+                stale_sec = float(os.environ.get("LIVE_BALANCE_STALE_SEC", 15.0) or 15.0)
+            except Exception:
+                stale_sec = 15.0
+            last_ms = int(self._last_live_sync_ms or 0)
+            if (not last_ms) or (now_ms() - last_ms) > int(stale_sec * 1000):
+                if not self._live_balance_stale_warned:
+                    self._log_err("[LIVE_BAL] balance stale/missing; blocking live sizing")
+                    self._live_balance_stale_warned = True
+                try:
+                    allow_fallback = str(os.environ.get("LIVE_ALLOW_BALANCE_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    allow_fallback = False
+                if not allow_fallback:
+                    return 0.0
+            else:
+                self._live_balance_stale_warned = False
+            try:
+                free = self._live_free_balance
+                if free is not None:
+                    free_val = float(free)
+                    if math.isfinite(free_val) and free_val > 0:
+                        return free_val
+            except Exception:
+                pass
+            try:
+                allow_fallback = str(os.environ.get("LIVE_ALLOW_BALANCE_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                allow_fallback = False
+            if not allow_fallback:
+                return 0.0
+        try:
+            return float(self.balance)
+        except Exception:
+            return 0.0
+
+    def _cycle_available_balance(self) -> float:
+        """Available balance within current decision cycle (free - reserved)."""
+        base = self._cycle_free_balance
+        if base is None:
+            base = self._sizing_balance()
+        try:
+            base_val = float(base or 0.0)
+        except Exception:
+            base_val = 0.0
+        if not self.enable_orders:
+            return base_val
+        try:
+            reserved = float(self._cycle_reserved_margin or 0.0)
+        except Exception:
+            reserved = 0.0
+        return max(0.0, base_val - reserved)
+
+    def _reserve_cycle_margin(self, notional: float, leverage: float) -> None:
+        """Reserve margin in the current decision cycle to avoid oversubscription."""
+        if not self.enable_orders:
+            return
+        try:
+            lev = float(leverage)
+        except Exception:
+            lev = 0.0
+        if lev <= 0:
+            return
+        try:
+            margin = float(notional) / max(lev, 1e-6)
+        except Exception:
+            return
+        if not math.isfinite(margin) or margin <= 0:
+            return
+        try:
+            self._cycle_reserved_margin = float(self._cycle_reserved_margin or 0.0) + margin
+            self._cycle_reserved_notional = float(self._cycle_reserved_notional or 0.0) + float(notional)
+        except Exception:
+            pass
+
+    def _maybe_reset_initial_equity_on_start(self) -> None:
+        if not bool(getattr(config, "RESET_INITIAL_EQUITY_ON_START", False)):
+            return
+        equity = self._estimate_current_equity()
+        if equity <= 0:
+            try:
+                equity = float(self.balance)
+            except Exception:
+                equity = 1.0
+        self.initial_equity = float(equity)
+        try:
+            self.risk_manager.initial_equity = float(equity)
+            self.risk_manager._emergency_stop_triggered = False
+            self.risk_manager._dd_stop_triggered = False
+        except Exception:
+            pass
+        self.safety_mode = False
+        self._emergency_stop_handled = False
+        self._emergency_stop_ts = None
+        try:
+            self._log(f"[RISK] initial_equity reset on start: {equity:.2f}")
+        except Exception:
+            pass
+
+    def clear_safety_mode(self, *, reset_equity: bool = False) -> dict:
+        # Manual override from dashboard.
+        try:
+            self.safety_mode = False
+            self._emergency_stop_handled = False
+            self._emergency_stop_ts = None
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "risk_manager") and self.risk_manager is not None:
+                self.risk_manager._emergency_stop_triggered = False
+                self.risk_manager._dd_stop_triggered = False
+        except Exception:
+            pass
+
+        reset_val = None
+        if reset_equity:
+            try:
+                equity = float(self._estimate_current_equity())
+            except Exception:
+                equity = 0.0
+            if equity <= 0:
+                try:
+                    equity = float(self.balance)
+                except Exception:
+                    equity = 1.0
+            if equity <= 0:
+                equity = 1.0
+            try:
+                self.initial_equity = float(equity)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "risk_manager") and self.risk_manager is not None:
+                    self.risk_manager.initial_equity = float(equity)
+            except Exception:
+                pass
+            reset_val = float(equity)
+
+        try:
+            self._log(f"[RISK] safety_mode cleared by dashboard reset_equity={reset_equity} equity={reset_val if reset_equity else 'n/a'}")
+        except Exception:
+            pass
+        return {
+            "safety_mode": bool(getattr(self, "safety_mode", False)),
+            "reset_equity": bool(reset_equity),
+            "equity": reset_val,
+        }
+
     def _persist_state(self, force: bool = False):
         now = now_ms()
         if not force and (now - self._last_state_persist_ms < 10_000):
             return
         self._last_state_persist_ms = now
+        
+        # ---- JSON 저장 (기존 호환성 유지)
         try:
             with self.state_files["equity"].open("w", encoding="utf-8") as f:
                 json.dump(list(self._equity_history), f, ensure_ascii=False)
@@ -548,7 +1259,31 @@ class LiveOrchestrator:
             with self.state_files["balance"].open("w", encoding="utf-8") as f:
                 json.dump(self.balance, f, ensure_ascii=False)
         except Exception as e:
-            self._log_err(f"[ERR] persist state: {e}")
+            self._log_err(f"[ERR] persist state (JSON): {e}")
+        
+        # ---- SQLite 저장 (비동기)
+        try:
+            # Equity 저장
+            total_unrealized = sum(
+                float(p.get("pnl", 0) or 0) for p in self.positions.values()
+            )
+            equity_data = {
+                "timestamp_ms": now,
+                "total_equity": float(self.balance) + total_unrealized,
+                "wallet_balance": float(self.balance),
+                "unrealized_pnl": total_unrealized,
+                "position_count": len(self.positions),
+                "total_notional": sum(
+                    float(p.get("notional", 0) or 0) for p in self.positions.values()
+                ),
+            }
+            self.db.log_equity_background(equity_data, mode=self._trading_mode)
+            
+            # Positions 저장
+            for sym, pos in self.positions.items():
+                self.db.save_position_background(sym, pos, mode=self._trading_mode)
+        except Exception as e:
+            self._log_err(f"[ERR] persist state (SQLite): {e}")
 
     def _compute_returns_and_vol(self, prices):
         if prices is None or len(prices) < 10:
@@ -587,12 +1322,19 @@ class LiveOrchestrator:
         """decision 객체에서 filter_states 추출 (여러 위치에서 찾기)"""
         # 기본값: 모든 필터 통과 (회색 표시)
         default_filter_states = {
-            "napv": True,
-            "ev": True,
-            "winrate": True,
-            "cvar": True,
-            "event_cvar": True,
-            "direction": True,
+            "unified": None,
+            "spread": None,
+            "event_cvar": None,
+            "event_exit": None,
+            "liq": None,
+            "min_notional": None,
+            "min_exposure": None,
+            "top_n": None,
+            "pre_mc": None,
+            "cap": None,
+            "cap_safety": None,
+            "cap_positions": None,
+            "cap_exposure": None,
         }
         
         if not decision:
@@ -617,7 +1359,7 @@ class LiveOrchestrator:
         
         # 아무것도 찾지 못하면 기본값 반환
         return default_filter_states
-    def _row(self, sym, price, ts, decision, candles, ctx=None):
+    def _row(self, sym, price, ts, decision, candles, ctx=None, *, log_filters: bool = True):
         status = "WAIT"
         ai = "-"
         mc = "-"
@@ -679,9 +1421,51 @@ class LiveOrchestrator:
             except Exception:
                 return None
 
+        hybrid_score = _opt_float(meta.get("hybrid_score"))
+        if hybrid_score is None:
+            hybrid_score = _opt_float(mc_meta.get("hybrid_score") if mc_meta else None)
+        hybrid_score_logw = _opt_float(meta.get("hybrid_score_logw"))
+        if hybrid_score_logw is None:
+            hybrid_score_logw = _opt_float(mc_meta.get("hybrid_score_logw") if mc_meta else None)
+        hybrid_score_hold = _opt_float(meta.get("hybrid_score_hold"))
+        if hybrid_score_hold is None:
+            hybrid_score_hold = _opt_float(mc_meta.get("hybrid_score_hold") if mc_meta else None)
+        hybrid_score_long = _opt_float(meta.get("hybrid_score_long"))
+        if hybrid_score_long is None:
+            hybrid_score_long = _opt_float(mc_meta.get("hybrid_score_long") if mc_meta else None)
+        hybrid_score_short = _opt_float(meta.get("hybrid_score_short"))
+        if hybrid_score_short is None:
+            hybrid_score_short = _opt_float(mc_meta.get("hybrid_score_short") if mc_meta else None)
+        hybrid_entry_floor = _opt_float(meta.get("hybrid_entry_floor"))
+        if hybrid_entry_floor is None:
+            hybrid_entry_floor = _opt_float(mc_meta.get("hybrid_entry_floor") if mc_meta else None)
+
+        opt_leverage = _opt_float(meta.get("optimal_leverage"))
+        if opt_leverage is None and decision:
+            opt_leverage = _opt_float(decision.get("optimal_leverage") or decision.get("leverage"))
+        decision_leverage = _opt_float(decision.get("leverage") if decision else None)
+        if decision_leverage is None:
+            decision_leverage = _opt_float(meta.get("lev"))
+        dyn_leverage = _opt_float(self._dyn_leverage.get(sym))
+        lev_source = meta.get("lev_source")
+        liq_prob_long = _opt_float(meta.get("liq_prob_long"))
+        if liq_prob_long is None and decision:
+            liq_prob_long = _opt_float(decision.get("liq_prob_long"))
+        liq_prob_short = _opt_float(meta.get("liq_prob_short"))
+        if liq_prob_short is None and decision:
+            liq_prob_short = _opt_float(decision.get("liq_prob_short"))
+        liq_price_long = _opt_float(meta.get("liq_price_long"))
+        if liq_price_long is None and decision:
+            liq_price_long = _opt_float(decision.get("liq_price_long"))
+        liq_price_short = _opt_float(meta.get("liq_price_short"))
+        if liq_price_short is None and decision:
+            liq_price_short = _opt_float(decision.get("liq_price_short"))
+
         unified_score = _opt_float(decision.get("unified_score") if decision else None)
         if unified_score is None:
             unified_score = _opt_float(meta.get("unified_score"))
+        if unified_score is None and hybrid_score is not None:
+            unified_score = hybrid_score
         unified_score_hold = _opt_float(decision.get("unified_score_hold") if decision else None)
         if unified_score_hold is None:
             unified_score_hold = _opt_float(meta.get("unified_score_hold"))
@@ -691,6 +1475,7 @@ class LiveOrchestrator:
         if unified_t_star is None:
             unified_t_star = _opt_float(mc_meta.get("unified_t_star") if mc_meta else None)
         event_p_tp = _opt_float(meta.get("event_p_tp"))
+        event_p_sl = _opt_float(meta.get("event_p_sl"))
         event_p_timeout = _opt_float(meta.get("event_p_timeout"))
         event_t_median = _opt_float(meta.get("event_t_median"))
         event_ev_r = _opt_float(meta.get("event_ev_r"))
@@ -698,11 +1483,33 @@ class LiveOrchestrator:
         event_ev_pct = _opt_float(meta.get("event_ev_pct"))
         event_cvar_pct = _opt_float(meta.get("event_cvar_pct"))
         event_unified_score = _opt_float(meta.get("event_unified_score"))
+        event_exit_score = _opt_float(meta.get("event_exit_score"))
+        event_exit_min_score = _opt_float(meta.get("event_exit_min_score"))
+        event_exit_max_cvar = _opt_float(meta.get("event_exit_max_cvar"))
+        event_exit_max_p_sl = _opt_float(meta.get("event_exit_max_p_sl"))
         horizon_weights = meta.get("horizon_weights")
         ev_by_h = meta.get("ev_by_horizon")
         win_by_h = meta.get("win_by_horizon")
         cvar_by_h = meta.get("cvar_by_horizon")
         horizon_seq = meta.get("horizon_seq")
+        
+        # WAIT 결정 디버그용
+        mc_meta_final = meta if meta.get("policy_direction_reason") else (mc_meta or {})
+        direction_reason = mc_meta_final.get("policy_direction_reason")
+        
+        # TP 게이트 정보 추가 (진입 차단 주원인)
+        tp_v = mc_meta_final.get("policy_tp_5m_long") if status != "SHORT" else mc_meta_final.get("policy_tp_5m_short")
+        tp_blocked = mc_meta_final.get("policy_tp_gate_block_long") if status != "SHORT" else mc_meta_final.get("policy_tp_gate_block_short")
+        
+        if direction_reason:
+            if tp_blocked:
+                direction_reason += f" | TP_GATED({(tp_v*100):.1f}%)"
+            elif tp_v is not None:
+                direction_reason += f" | TP:{(tp_v*100):.1f}%"
+        
+        score_long = _opt_float(mc_meta_final.get("hybrid_score_long") or mc_meta_final.get("policy_ev_score_long"))
+        score_short = _opt_float(mc_meta_final.get("hybrid_score_short") or mc_meta_final.get("policy_ev_score_short"))
+        score_threshold = _opt_float(mc_meta_final.get("policy_score_threshold_eff"))
 
         row = {
             "symbol": sym,
@@ -716,11 +1523,18 @@ class LiveOrchestrator:
             "regime": regime,
             "mode": mode,
             "action_type": action_type,
+            "hybrid_score": hybrid_score,
+            "hybrid_score_logw": hybrid_score_logw,
+            "hybrid_score_hold": hybrid_score_hold,
+            "hybrid_score_long": hybrid_score_long,
+            "hybrid_score_short": hybrid_score_short,
+            "hybrid_entry_floor": hybrid_entry_floor,
             "unified_score": unified_score if unified_score is not None else ev,
             "unified_score_hold": unified_score_hold,
             "unified_t_star": unified_t_star,
             "candles": candles,
             "event_p_tp": event_p_tp,
+            "event_p_sl": event_p_sl,
             "event_p_timeout": event_p_timeout,
             "event_t_median": event_t_median,
             "event_ev_r": event_ev_r,
@@ -728,6 +1542,10 @@ class LiveOrchestrator:
             "event_ev_pct": event_ev_pct,
             "event_cvar_pct": event_cvar_pct,
             "event_unified_score": event_unified_score,
+            "event_exit_score": event_exit_score,
+            "event_exit_min_score": event_exit_min_score,
+            "event_exit_max_cvar": event_exit_max_cvar,
+            "event_exit_max_p_sl": event_exit_max_p_sl,
             "horizon_weights": horizon_weights,
             "ev_by_horizon": ev_by_h,
             "win_by_horizon": win_by_h,
@@ -747,6 +1565,14 @@ class LiveOrchestrator:
             "pos_leverage": pos_lev,
             "pos_size_frac": pos_sf,
             "pos_cap_frac": pos_cap_frac,
+            "opt_leverage": opt_leverage,
+            "decision_leverage": decision_leverage,
+            "dyn_leverage": dyn_leverage,
+            "lev_source": lev_source,
+            "liq_prob_long": liq_prob_long,
+            "liq_prob_short": liq_prob_short,
+            "liq_price_long": liq_price_long,
+            "liq_price_short": liq_price_short,
 
             # MC diagnostics
             "mc_h_desc": mc_meta.get("best_horizon_desc") or mc_meta.get("best_horizon") or "-",
@@ -761,92 +1587,597 @@ class LiveOrchestrator:
             
             # ✅ 진입 필터 상태 (신호등 표시용)
             "filter_states": self._extract_filter_states(decision),
+
+            # ✅ 필터 툴팁용 메타
+            "entry_floor_eff": _opt_float(meta.get("entry_floor_eff")),
+            "min_entry_score": _opt_float(meta.get("min_entry_score")),
+            "spread_pct": _opt_float(meta.get("spread_pct")),
+            "spread_cap": _opt_float(meta.get("spread_cap")),
+            "cvar_floor": _opt_float(meta.get("cvar_floor")),
+            "liq_score": _opt_float(meta.get("liq_score")),
+            "min_liq_score": _opt_float(meta.get("min_liq_score")),
+            "est_notional": _opt_float(meta.get("est_notional")),
+            "min_entry_notional": _opt_float(meta.get("min_entry_notional")),
+            "top_n_active": meta.get("top_n_active"),
+            "top_n_rank": meta.get("top_n_rank"),
+            "top_n_limit": meta.get("top_n_limit"),
+            "top_n_ok": meta.get("top_n_ok"),
+            "pre_mc_active": meta.get("pre_mc_active"),
+            "pre_mc_ok": meta.get("pre_mc_ok"),
+            "pre_mc_reason": meta.get("pre_mc_reason"),
+            "pre_mc_expected_pnl": _opt_float(meta.get("pre_mc_expected_pnl")),
+            "pre_mc_expected_pnl_source": meta.get("pre_mc_expected_pnl_source"),
+            "pre_mc_cvar": _opt_float(meta.get("pre_mc_cvar")),
+            "pre_mc_prob_liq": _opt_float(meta.get("pre_mc_prob_liq")),
+            "pre_mc_prob_liq_source": meta.get("pre_mc_prob_liq_source"),
+            "pre_mc_min_expected_pnl": _opt_float(meta.get("pre_mc_min_expected_pnl")),
+            "pre_mc_min_cvar": _opt_float(meta.get("pre_mc_min_cvar")),
+            "pre_mc_max_liq_prob": _opt_float(meta.get("pre_mc_max_liq_prob")),
+            "pre_mc_blocked": meta.get("pre_mc_blocked"),
+            "pre_mc_scaled": meta.get("pre_mc_scaled"),
+            "pre_mc_scale": _opt_float(meta.get("pre_mc_scale")),
+            "pre_mc_block_on_fail": meta.get("pre_mc_block_on_fail"),
+            "total_open_notional": _opt_float(meta.get("total_open_notional")),
+            "exposure_cap_limit": _opt_float(meta.get("exposure_cap_limit")),
+            "positions_count": meta.get("positions_count"),
+            "max_positions": meta.get("max_positions"),
+            "safety_mode": meta.get("safety_mode"),
+            "hybrid_only": meta.get("hybrid_only"),
+            
+            # ✅ WAIT 결정 디버그용
+            "direction_reason": direction_reason,
+            "score_long": score_long,
+            "score_short": score_short,
+            "score_threshold": score_threshold,
         }
         
-        # 디버깅: filter_states 확인 (항상 로그 출력)
-        fs = self._extract_filter_states(decision)
-        if fs:
-            blocked = [k for k, v in fs.items() if v == False]
-            if blocked:
-                self._log(f"[FILTER] {sym} blocked: {blocked}")
+        # 디버깅: filter_states 확인 (옵션 로그)
+        if log_filters:
+            fs = self._extract_filter_states(decision)
+            if fs:
+                blocked = [k for k, v in fs.items() if v == False]
+                if blocked:
+                    try:
+                        use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+                        hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
+                        hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        hybrid_only = False
+                    if hybrid_only:
+                        blocked = ["hybrid" if k == "unified" else k for k in blocked]
+                if blocked:
+                    self._log(f"[FILTER] {sym} blocked: {blocked}")
+                else:
+                    # all_pass일 때 Action과 점수 정보 추가 (None-safe)
+                    try:
+                        best_ev_long = _opt_float(mc_meta_final.get("policy_best_ev_long")) if mc_meta_final else None
+                        best_ev_short = _opt_float(mc_meta_final.get("policy_best_ev_short")) if mc_meta_final else None
+                        ev_best = None
+                        if status == "LONG":
+                            ev_best = best_ev_long
+                        elif status == "SHORT":
+                            ev_best = best_ev_short
+                        else:
+                            ev_best = max(best_ev_long or 0.0, best_ev_short or 0.0)
+                    except Exception:
+                        ev_best = None
+                    ev_best_txt = f"{(ev_best or 0.0):.5f}" if ev_best is not None else "-"
+                    try:
+                        use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+                        hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
+                        hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        hybrid_only = False
+                    score_label = "HYB" if hybrid_only else "UNI"
+                    score_val = hybrid_score if (hybrid_only and hybrid_score is not None) else (unified_score or 0.0)
+                    floor_val = hybrid_entry_floor if hybrid_only else float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+                    floor_txt = f"{(floor_val or 0.0):.5f}" if floor_val is not None else "-"
+                    self._log(
+                        f"[FILTER] {sym} all_pass | Action:{status} | {score_label}:{(score_val or 0.0):.5f} | FLOOR:{floor_txt} | EV_best:{ev_best_txt} | EV_sum:{(ev or 0.0):.5f}"
+                    )
             else:
-                self._log(f"[FILTER] {sym} all_pass: {list(fs.keys())}")
-        else:
-            self._log(f"[FILTER] {sym} NO filter_states extracted!")
+                self._log(f"[FILTER] {sym} NO filter_states extracted!")
         
         return row
 
     def _total_open_notional(self) -> float:
         return sum(float(pos.get("notional", 0.0)) for pos in self.positions.values())
 
+    def _is_managed_position(self, pos: dict | None) -> bool:
+        if not pos:
+            return True
+        if pos.get("managed") is False:
+            return False
+        try:
+            manage_synced = bool(getattr(config, "MANAGE_SYNCED_POSITIONS", True))
+        except Exception:
+            manage_synced = True
+        if not manage_synced:
+            src = str(pos.get("pos_source") or "").lower()
+            if src in ("exchange_sync", "exchange", "sync"):
+                return False
+        return True
+
+    def _top_n_status(self, sym: str) -> dict:
+        active = bool(TOP_N_SYMBOLS < len(SYMBOLS))
+        rank = self._symbol_ranks.get(sym)
+        ok = None
+        if active and rank is not None:
+            try:
+                ok = int(rank) <= int(TOP_N_SYMBOLS)
+            except Exception:
+                ok = None
+        return {"active": active, "rank": rank, "limit": int(TOP_N_SYMBOLS), "ok": ok}
+
+    def _pre_mc_status(self) -> dict:
+        def _maybe_float(val):
+            try:
+                if val is None:
+                    return None
+                return float(val)
+            except Exception:
+                return None
+
+        status = {
+            "active": bool(PRE_MC_ENABLED),
+            "ok": None,
+            "expected_pnl": None,
+            "expected_pnl_source": None,
+            "cvar": None,
+            "prob_liq": None,
+            "prob_liq_source": None,
+            "min_expected_pnl": float(PRE_MC_MIN_EXPECTED_PNL),
+            "min_cvar": float(PRE_MC_MIN_CVAR),
+            "max_liq_prob": float(PRE_MC_MAX_LIQ_PROB),
+            "reason": None,
+        }
+
+        if not status["active"]:
+            status["reason"] = "disabled"
+            return status
+
+        report = self._last_portfolio_report
+        if not report:
+            status["reason"] = "report_missing"
+            return status
+
+        exp_pnl = report.get("rebalance_expected_portfolio_pnl")
+        exp_src = "rebalance"
+        if exp_pnl is None:
+            exp_pnl = report.get("expected_portfolio_pnl")
+            exp_src = "base"
+        cvar = report.get("cvar")
+        liq_prob = report.get("rebalance_prob_account_liq_proxy")
+        liq_src = "rebalance"
+        if liq_prob is None:
+            liq_prob = report.get("prob_account_liquidation_proxy")
+            liq_src = "base"
+
+        exp_pnl = _maybe_float(exp_pnl)
+        cvar = _maybe_float(cvar)
+        liq_prob = _maybe_float(liq_prob)
+
+        status["expected_pnl"] = exp_pnl
+        status["expected_pnl_source"] = exp_src if exp_pnl is not None else None
+        status["cvar"] = cvar
+        status["prob_liq"] = liq_prob
+        status["prob_liq_source"] = liq_src if liq_prob is not None else None
+
+        metrics_present = any(m is not None for m in (exp_pnl, cvar, liq_prob))
+        if not metrics_present:
+            status["reason"] = "metrics_missing"
+            return status
+
+        ok = True
+        reasons = []
+        if exp_pnl is not None and exp_pnl < float(PRE_MC_MIN_EXPECTED_PNL):
+            ok = False
+            reasons.append("expected_pnl")
+        if cvar is not None and cvar < float(PRE_MC_MIN_CVAR):
+            ok = False
+            reasons.append("cvar")
+        if liq_prob is not None and liq_prob > float(PRE_MC_MAX_LIQ_PROB):
+            ok = False
+            reasons.append("liq_prob")
+
+        status["ok"] = ok
+        status["reason"] = "ok" if ok else ",".join(reasons)
+        return status
+
     def _can_enter_position(self, notional: float) -> tuple[bool, str]:
         if self.safety_mode:
             return False, "safety mode"
         if self.position_cap_enabled and len(self.positions) >= self.max_positions:
             return False, "max positions reached"
-        if self.exposure_cap_enabled and (self._total_open_notional() + notional) > (self.balance * self.max_notional_frac):
+        if self.exposure_cap_enabled and (self._total_open_notional() + notional) > (self._exposure_cap_balance() * self.max_notional_frac):
             return False, "exposure capped"
         return True, ""
 
-    def _entry_permit(self, sym: str, decision: dict, ts_ms: int) -> tuple[bool, str]:
-        now_sec = time.time()
-        if now_sec < self._cooldown_until.get(sym, 0):
-            self._entry_streak[sym] = 0
-            return False, "cooldown"
+    def _min_filter_states(self, sym: str, decision: dict, ts_ms: int) -> dict:
         meta = (decision.get("meta") or {}) if decision else {}
-        ev = float(decision.get("ev", 0.0) or 0.0)
-        win = float(decision.get("confidence", 0.0) or 0.0)
-        ev_thr = float(meta.get("ev_entry_threshold", 0.0) or 0.0)
-        # win_thr: 0.55 -> 0.50으로 완화 (EV가 합리적 수준으로 내려가면 50% 승률도 의미 있음)
-        win_thr = float(meta.get("win_entry_threshold", 0.50) or 0.50)
-        ev_thr_dyn = meta.get("ev_entry_threshold_dyn")
-        if ev_thr_dyn is not None:
+        regime = str(meta.get("regime") or "chop")
+        try:
+            pos_now = self.positions.get(sym) or {}
+            pos_qty_now = float(pos_now.get("quantity", pos_now.get("qty", 0.0)) or 0.0)
+        except Exception:
+            pos_qty_now = 0.0
+        has_pos = pos_qty_now != 0.0
+        is_entry = bool(decision and decision.get("action") in ("LONG", "SHORT") and (not has_pos))
+        spread_pct = meta.get("spread_pct")
+        event_cvar_r = meta.get("event_cvar_r")
+        event_exit_score = meta.get("event_exit_score")
+        event_cvar_pct = meta.get("event_cvar_pct")
+        event_p_sl = meta.get("event_p_sl")
+        use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+        hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
+        hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+        unified_score = None
+        if hybrid_only:
+            unified_score = decision.get("hybrid_score") if decision else None
+            if unified_score is None:
+                unified_score = meta.get("hybrid_score")
+        if unified_score is None:
+            unified_score = decision.get("unified_score") if decision else None
+        if unified_score is None:
+            unified_score = meta.get("unified_score")
+        if unified_score is None:
+            unified_score = decision.get("ev", 0.0) if decision else 0.0
+
+        # Thresholds
+        if hybrid_only:
+            unified_floor = self._get_hybrid_entry_floor()
+        else:
+            unified_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+        if MIN_ENTRY_SCORE > 0:
+            unified_floor = float(max(unified_floor, MIN_ENTRY_SCORE))
+        spread_cap_map = {"bull": 0.0020, "bear": 0.0020, "chop": 0.0012, "volatile": 0.0008}
+        spread_cap = spread_cap_map.get(regime, SPREAD_PCT_MAX)
+        cvar_floor_map = {"bull": -1.2, "bear": -1.2, "chop": -1.0, "volatile": -0.8}
+        cvar_floor_regime = cvar_floor_map.get(regime, -1.0)
+
+        unified_ok = float(unified_score or 0.0) >= unified_floor
+        spread_enabled = spread_pct is not None
+        spread_ok = (float(spread_pct) <= float(spread_cap)) if spread_enabled else None
+        if hybrid_only:
+            event_cvar_ok = None
+        else:
+            event_cvar_ok = True if event_cvar_r is None else float(event_cvar_r) >= float(cvar_floor_regime)
+        event_exit_ok = None
+        try:
+            if event_exit_score is not None or event_cvar_pct is not None or event_p_sl is not None:
+                event_exit_ok = True
+                if event_exit_score is not None and float(event_exit_score) <= float(self.exit_policy.min_event_score):
+                    event_exit_ok = False
+                if event_cvar_pct is not None and abs(float(event_cvar_pct)) >= float(self.exit_policy.max_abs_event_cvar_r):
+                    event_exit_ok = False
+                if event_p_sl is not None and float(event_p_sl) >= float(self.exit_policy.max_event_p_sl):
+                    event_exit_ok = False
+        except Exception:
+            event_exit_ok = None
+        liq_ok = None
+        if MIN_LIQ_SCORE > 0:
             try:
-                ev_thr = max(ev_thr, float(ev_thr_dyn))
+                ob = self.orderbook.get(sym)
+                if not ob or not ob.get("ready"):
+                    liq_ok = None
+                else:
+                    liq_ok = float(self._liquidity_score(sym)) >= float(MIN_LIQ_SCORE)
+            except Exception:
+                liq_ok = None
+        min_notional_ok = None
+        min_exposure_ok = None
+        fee_ok = None
+        fee_cost = None
+        fee_ev = None
+        fee_roundtrip = None
+        fee_mult = None
+        # Entry capacity/safety gate (exposure cap / max positions / safety mode)
+        cap_safety_ok = not bool(self.safety_mode)
+        cap_positions_ok = None
+        if self.position_cap_enabled:
+            cap_positions_ok = len(self.positions) < self.max_positions
+        cap_exposure_ok = None
+        try:
+            lev_val = decision.get("leverage") or meta.get("leverage") or self._dyn_leverage.get(sym) or self.leverage
+            lev_val = float(lev_val) if lev_val else float(self.leverage)
+        except Exception:
+            lev_val = float(self.leverage)
+        try:
+            min_lev = float(LEVERAGE_MIN)
+        except Exception:
+            min_lev = 1.0
+        try:
+            max_lev = float(self.max_leverage or lev_val)
+        except Exception:
+            max_lev = lev_val
+        if min_lev > 0:
+            lev_val = max(min_lev, lev_val)
+        if max_lev > 0:
+            lev_val = min(max_lev, lev_val)
+        try:
+            _, est_notional, _ = self._calc_position_size(decision, 1.0, lev_val, symbol=sym, use_cycle_reserve=is_entry)
+        except Exception:
+            try:
+                size_frac = decision.get("size_frac") or meta.get("size_fraction") or self.default_size_frac
+                size_frac = float(size_frac or 0.0)
+            except Exception:
+                size_frac = float(self.default_size_frac or 0.0)
+            est_notional = max(0.0, float(self.balance) * float(size_frac) * float(lev_val))
+        eff_balance = self._sizing_balance()
+        # Exposure cap should be based on total equity (wallet + unrealized).
+        try:
+            cap_balance = float(self._exposure_cap_balance())
+        except Exception:
+            cap_balance = float(self.balance) if self.balance is not None else float(eff_balance or 0.0)
+        min_notional_floor = float(MIN_ENTRY_NOTIONAL) if MIN_ENTRY_NOTIONAL > 0 else 0.0
+        if MIN_ENTRY_NOTIONAL_PCT > 0:
+            try:
+                min_notional_floor = max(min_notional_floor, float(eff_balance) * float(MIN_ENTRY_NOTIONAL_PCT))
             except Exception:
                 pass
-        ev_mid = meta.get("ev_mid")
-        win_mid = meta.get("win_mid")
+        if min_notional_floor > 0:
+            try:
+                min_notional_ok = float(est_notional) >= float(min_notional_floor)
+            except Exception:
+                min_notional_ok = None
+        min_exposure_floor = float(MIN_ENTRY_EXPOSURE_PCT) if MIN_ENTRY_EXPOSURE_PCT > 0 else 0.0
+        if min_exposure_floor > 0:
+            try:
+                min_exposure_ok = float(est_notional) >= (float(cap_balance) * float(min_exposure_floor))
+            except Exception:
+                min_exposure_ok = None
+        if self.exposure_cap_enabled:
+            try:
+                cap_exposure_ok = (self._total_open_notional() + float(est_notional)) <= (float(cap_balance) * float(self.max_notional_frac))
+            except Exception:
+                cap_exposure_ok = None
+        # Fee/EV gate for short-term trading (optional)
+        if is_entry:
+            try:
+                fee_filter_on = str(os.environ.get("FEE_FILTER_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                fee_filter_on = False
+            if fee_filter_on:
+                try:
+                    base_fee = float(os.environ.get("HYBRID_BASE_FEE_RATE", 0.0002) or 0.0002)
+                except Exception:
+                    base_fee = 0.0002
+                try:
+                    slippage_bps = float(os.environ.get("HYBRID_SLIPPAGE_BPS", 0.0) or 0.0)
+                except Exception:
+                    slippage_bps = 0.0
+                fee_roundtrip = float(2.0 * (base_fee + slippage_bps * 1e-4))
+                try:
+                    fee_mult = float(os.environ.get("FEE_FILTER_MULT", 1.0) or 1.0)
+                except Exception:
+                    fee_mult = 1.0
+                try:
+                    fee_extra = float(os.environ.get("FEE_FILTER_EXTRA", 0.0) or 0.0)
+                except Exception:
+                    fee_extra = 0.0
+                fee_cost = float(fee_roundtrip) * float(fee_mult) + float(fee_extra)
+                try:
+                    fee_ev = float(meta.get("event_ev_pct")) if meta.get("event_ev_pct") is not None else None
+                except Exception:
+                    fee_ev = None
+                if fee_ev is not None:
+                    fee_ev_eff = fee_ev
+                    try:
+                        use_lev = str(os.environ.get("FEE_FILTER_USE_LEVERAGE", "1")).strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        use_lev = True
+                    lev_for_fee = None
+                    if use_lev:
+                        try:
+                            lev_for_fee = float(decision.get("leverage") or meta.get("leverage") or meta.get("lev") or self._dyn_leverage.get(sym) or self.leverage)
+                        except Exception:
+                            lev_for_fee = None
+                        try:
+                            lev_cap = float(os.environ.get("FEE_FILTER_LEV_CAP", 0.0) or 0.0)
+                        except Exception:
+                            lev_cap = 0.0
+                        if lev_for_fee is not None and lev_cap > 0:
+                            lev_for_fee = float(min(lev_for_fee, lev_cap))
+                        if lev_for_fee is not None:
+                            try:
+                                fee_ev_eff = float(fee_ev) * float(max(lev_for_fee, 1e-6))
+                            except Exception:
+                                fee_ev_eff = fee_ev
+                    try:
+                        fee_ok = float(fee_ev_eff) >= float(fee_cost)
+                    except Exception:
+                        fee_ok = None
+                # expose fee filter fields for dashboard/tooltips
+                try:
+                    if decision is not None and isinstance(meta, dict):
+                        meta["fee_filter_enabled"] = True
+                        meta["fee_filter_cost"] = fee_cost
+                        meta["fee_filter_ev"] = fee_ev
+                        meta["fee_filter_ev_eff"] = fee_ev_eff if fee_ev is not None else None
+                        meta["fee_filter_lev"] = lev_for_fee
+                        meta["fee_filter_mult"] = fee_mult
+                        meta["fee_filter_base"] = fee_roundtrip
+                        decision["meta"] = meta
+                except Exception:
+                    pass
+        cap_ok = cap_safety_ok
+        if cap_positions_ok is False:
+            cap_ok = False
+        if cap_exposure_ok is False:
+            cap_ok = False
+        out = {
+            "unified": unified_ok,
+            "spread": spread_ok,
+            "event_cvar": event_cvar_ok,
+            "event_exit": event_exit_ok,
+            "liq": liq_ok,
+            "min_notional": min_notional_ok,
+            "min_exposure": min_exposure_ok,
+            "fee": fee_ok,
+            "top_n": None,
+            "pre_mc": None,
+            "cap": cap_ok,
+            "cap_safety": cap_safety_ok,
+            "cap_positions": cap_positions_ok,
+            "cap_exposure": cap_exposure_ok,
+        }
+        if not is_entry:
+            # Entry-only filters shouldn't show as blocked for non-entry decisions.
+            for k in ("unified", "spread", "event_cvar", "event_exit", "liq", "min_notional", "min_exposure", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
+                out[k] = None
+        return out
 
-        # 중기 필터: EV_mid가 음수이거나 win_mid<0.50인 경우만 차단(완화)
-        if ev_mid is not None and ev_mid < 0:
-            self._entry_streak[sym] = 0
-            return False, "mid_ev_neg"
-        if win_mid is not None and win_mid < 0.50:
-            self._entry_streak[sym] = 0
-            return False, "mid_win_low"
+    def _normalize_filter_overrides(self, overrides) -> set[str]:
+        if overrides is None:
+            return set()
+        if isinstance(overrides, str):
+            parts = [p.strip().lower() for p in overrides.replace(";", ",").split(",")]
+            return {p for p in parts if p}
+        if isinstance(overrides, (list, tuple, set)):
+            out = set()
+            for item in overrides:
+                if item is None:
+                    continue
+                if isinstance(item, str):
+                    val = item.strip().lower()
+                else:
+                    try:
+                        val = str(item).strip().lower()
+                    except Exception:
+                        val = ""
+                if val:
+                    out.add(val)
+            return {p for p in out if p}
+        try:
+            val = str(overrides).strip().lower()
+            return {val} if val else set()
+        except Exception:
+            return set()
 
-        # EV/Win 충족 여부
-        if ev >= ev_thr and win >= win_thr:
-            strong = ev >= ev_thr * 1.5
-            needed = 1 if strong else ENTRY_STREAK_MIN
-            self._entry_streak[sym] = self._entry_streak.get(sym, 0) + 1
-            if self._entry_streak[sym] < needed:
-                return False, "streak"
-        else:
-            self._entry_streak[sym] = 0
-            return False, "threshold"
+    def _extract_entry_overrides(self, decision: dict | None) -> set[str]:
+        if not decision:
+            return set()
+        raw = decision.get("entry_override_filters")
+        if raw is None:
+            meta = decision.get("meta") or {}
+            raw = meta.get("entry_override_filters") or meta.get("override_filters") or meta.get("override_filters_entry")
+        return self._normalize_filter_overrides(raw)
+
+    def _entry_permit(self, sym: str, decision: dict, ts_ms: int) -> tuple[bool, str]:
+        fs = None
+        if decision:
+            if isinstance(decision.get("filter_states"), dict):
+                fs = decision.get("filter_states")
+            else:
+                meta = decision.get("meta") or {}
+                if isinstance(meta.get("filter_states"), dict):
+                    fs = meta.get("filter_states")
+        if fs is None:
+            fs = self._min_filter_states(sym, decision, ts_ms)
+        overrides = self._extract_entry_overrides(decision)
+        if overrides and decision:
+            meta = dict(decision.get("meta") or {})
+            meta["entry_override_filters"] = sorted(overrides)
+            decision["meta"] = meta
+        if fs.get("top_n") is None and "top_n" not in overrides:
+            top_n = self._top_n_status(sym)
+            if top_n.get("ok") is not None:
+                fs = dict(fs)
+                fs["top_n"] = top_n.get("ok")
+        if fs.get("pre_mc") is None and "pre_mc" not in overrides:
+            pre_mc = self._pre_mc_status()
+            if pre_mc.get("ok") is not None:
+                fs = dict(fs)
+                fs["pre_mc"] = pre_mc.get("ok")
+        if overrides:
+            fs = dict(fs)
+            for key in overrides:
+                if key in fs and fs.get(key) is False:
+                    fs[key] = None
+        if decision and fs is not decision.get("filter_states"):
+            decision["filter_states"] = fs
+            meta = dict(decision.get("meta") or {})
+            meta["filter_states"] = fs
+            decision["meta"] = meta
+        if fs.get("spread") is False and "spread" not in overrides:
+            return False, "spread_cap"
+        if fs.get("event_cvar") is False and "event_cvar" not in overrides:
+            return False, "event_cvar_floor"
+        if fs.get("event_exit") is False and "event_exit" not in overrides:
+            return False, "event_mc_exit"
+        if fs.get("unified") is False and "unified" not in overrides:
+            return False, "unified_floor"
+        if fs.get("liq") is False and "liq" not in overrides:
+            return False, "liquidity"
+        if fs.get("min_notional") is False and "min_notional" not in overrides:
+            return False, "min_notional"
+        if fs.get("min_exposure") is False and "min_exposure" not in overrides:
+            return False, "min_exposure"
+        if fs.get("fee") is False and "fee" not in overrides:
+            return False, "fee"
+        if fs.get("top_n") is False and "top_n" not in overrides:
+            return False, "top_n"
+        if fs.get("pre_mc") is False and "pre_mc" not in overrides:
+            return False, "pre_mc"
+        if fs.get("cap") is False and "cap" not in overrides:
+            return False, "cap"
         return True, ""
 
-    def _calc_position_size(self, decision: dict, price: float, leverage: float, size_frac_override: float | None = None, symbol: str | None = None) -> tuple[float, float, float]:
+    def _calc_position_size(self, decision: dict, price: float, leverage: float, size_frac_override: float | None = None, symbol: str | None = None, use_cycle_reserve: bool = False, ignore_caps: bool = False) -> tuple[float, float, float]:
         meta = (decision or {}).get("meta", {}) or {}
         size_frac = size_frac_override if size_frac_override is not None else decision.get("size_frac") or meta.get("size_fraction") or self.default_size_frac
-        cap_frac = meta.get("regime_cap_frac")
-        if cap_frac is not None:
-            try:
-                size_frac = min(size_frac, float(cap_frac))
-            except Exception:
-                pass
-        
-        # ---- Kelly 배분 적용 (TOP N 선택된 심볼에 대해) ----
+        base_balance = self._cycle_available_balance() if use_cycle_reserve else self._sizing_balance()
+
+        # ---- Kelly 배분 적용 (psi/kelly 우선, 종목당 cap 미적용) ----
         if USE_KELLY_ALLOCATION and symbol and symbol in self._kelly_allocations:
-            kelly_frac = self._kelly_allocations[symbol]
-            # Kelly 비중을 size_frac에 곱해서 적용 (전체 자본 중 해당 심볼 할당 비율)
-            size_frac = size_frac * kelly_frac
+            try:
+                total_cap = float(os.environ.get("KELLY_TOTAL_EXPOSURE", self.max_notional_frac or 1.0))
+            except Exception:
+                total_cap = float(self.max_notional_frac or 1.0)
+            lev_safe = float(leverage) if leverage and float(leverage) > 0 else 1.0
+            kelly_frac = float(self._kelly_allocations[symbol])
+            # Total notional cap (e.g., 5.0 = 500%) distributed purely by Kelly weights.
+            size_frac = max(0.0, kelly_frac * total_cap / max(lev_safe, 1e-6))
+        else:
+            cap_frac = meta.get("regime_cap_frac")
+            if cap_frac is not None:
+                try:
+                    size_frac = min(size_frac, float(cap_frac))
+                except Exception:
+                    pass
         
         # 상한 제거: 신호가 강하면 엔진이 제시한 비중을 그대로 사용
         size_frac = float(max(0.0, size_frac))
-        notional = float(max(0.0, self.balance * size_frac * leverage))
+        # Cap-aware sizing for new entries: scale to remaining exposure capacity
+        if self.exposure_cap_enabled and use_cycle_reserve and (not ignore_caps):
+            try:
+                total_cap = float(os.environ.get("KELLY_TOTAL_EXPOSURE", self.max_notional_frac or 1.0))
+            except Exception:
+                total_cap = float(self.max_notional_frac or 1.0)
+            try:
+                eff_cap = float(min(total_cap, float(self.max_notional_frac or total_cap)))
+            except Exception:
+                eff_cap = float(total_cap)
+            try:
+                cap_balance = float(self._exposure_cap_balance())
+            except Exception:
+                cap_balance = 0.0
+            if cap_balance > 0 and eff_cap > 0:
+                try:
+                    open_notional = float(self._total_open_notional() or 0.0)
+                except Exception:
+                    open_notional = 0.0
+                remaining_frac = max(0.0, eff_cap - (open_notional / max(cap_balance, 1e-9)))
+                cap_size_frac = remaining_frac / max(float(leverage or 1.0), 1e-6)
+                if cap_size_frac < size_frac:
+                    size_frac = max(0.0, cap_size_frac)
+        # Order sizing uses available balance (live_free_balance) when live, with a safety haircut.
+        try:
+            sizing_pad = float(os.environ.get("LIVE_ORDER_SAFETY_PAD", 0.98) or 0.98)
+        except Exception:
+            sizing_pad = 0.98
+        sizing_pad = min(max(sizing_pad, 0.1), 1.0)
+        notional = float(max(0.0, base_balance * sizing_pad * size_frac * leverage))
         qty = float(notional / price) if price and notional > 0 else 0.0
         return size_frac, notional, qty
 
@@ -1018,6 +2349,93 @@ class LiveOrchestrator:
             )
         )
 
+    def _handle_entry_order_failure(self, symbol: str, side: str, quantity: float, err_text: str):
+        pos = self.positions.get(symbol)
+        if not pos:
+            return
+        try:
+            pos["order_status"] = "failed"
+            pos["order_error"] = err_text
+            pos["order_error_ts"] = now_ms()
+        except Exception:
+            pass
+        fee_entry = 0.0
+        try:
+            fee_entry = float(pos.get("fee_paid", 0.0) or 0.0)
+        except Exception:
+            fee_entry = 0.0
+        if fee_entry:
+            try:
+                self.balance += float(fee_entry)
+            except Exception:
+                pass
+        self.positions.pop(symbol, None)
+        try:
+            price = float(pos.get("entry_price") or 0.0)
+        except Exception:
+            price = 0.0
+        try:
+            self._record_trade(
+                "ORDER_REJECT",
+                symbol,
+                side,
+                price,
+                float(quantity),
+                pos,
+                pnl=0.0,
+                fee=-fee_entry if fee_entry else None,
+                reason=f"order_reject:{err_text}",
+            )
+        except Exception:
+            pass
+        self._register_anomaly("order_reject", "warn", f"{symbol} order rejected: {err_text}")
+
+    async def _submit_limit_close(self, symbol: str, price: float) -> dict:
+        """Place a reduce-only limit close for an open position."""
+        pos = self.positions.get(symbol)
+        if not pos:
+            return {"ok": False, "error": "position_not_found"}
+        try:
+            qty = float(pos.get("quantity", 0.0))
+        except Exception:
+            qty = 0.0
+        if qty <= 0:
+            return {"ok": False, "error": "no_quantity"}
+        side = str(pos.get("side") or "LONG").upper()
+        order_side = "sell" if side == "LONG" else "buy"
+        if not self.enable_orders:
+            try:
+                self._close_position(symbol, float(price), "manual_limit_close", exit_kind="MANUAL", skip_order=True)
+            except Exception as e:
+                return {"ok": False, "error": str(e)}
+            return {"ok": True, "mode": "paper"}
+        params = {
+            "reduceOnly": True,
+            "positionIdx": self._position_idx_for_side(side),
+        }
+        try:
+            order = await self._ccxt_call(
+                "limit_close",
+                self.exchange.create_order,
+                symbol,
+                "limit",
+                order_side,
+                qty,
+                float(price),
+                params,
+            )
+            try:
+                pos["order_status"] = "closing"
+                pos["close_order_px"] = float(price)
+                pos["close_order_ts"] = now_ms()
+            except Exception:
+                pass
+            self._log(f"[ORDER] limit close {symbol} {order_side} qty={qty:.6f} px={float(price):.4f}")
+            return {"ok": True, "order": order}
+        except Exception as e:
+            self._log_err(f"[ERR] limit close {symbol}: {e}")
+            return {"ok": False, "error": str(e)}
+
     async def _execute_order(
         self,
         symbol: str,
@@ -1038,6 +2456,28 @@ class LiveOrchestrator:
             "positionIdx": self._position_idx_for_side(pos_side),
         }
         try:
+            if not reduce_only:
+                try:
+                    target_lev = None
+                    pos = self.positions.get(symbol)
+                    if pos is not None:
+                        target_lev = pos.get("leverage")
+                    if target_lev is None:
+                        target_lev = self._dyn_leverage.get(symbol, self.leverage)
+                    if target_lev is not None:
+                        lev_ok = await self._sync_symbol_leverage(symbol, float(target_lev))
+                        if not lev_ok:
+                            try:
+                                block_on_fail = str(os.environ.get("BLOCK_ENTRY_ON_LEVERAGE_SYNC_FAIL", "1")).strip().lower() in ("1", "true", "yes", "on")
+                            except Exception:
+                                block_on_fail = True
+                            if block_on_fail:
+                                err = self._leverage_sync_fail_by_sym.get(symbol, {}).get("err", "set_leverage_failed")
+                                self._log_err(f"[ORDER] leverage sync failed; entry blocked: {symbol} err={err}")
+                                self._handle_entry_order_failure(symbol, side, quantity, f"leverage_sync_failed:{err}")
+                                return
+                except Exception:
+                    pass
             if exec_type == "maker_dynamic" and not self._should_force_market(symbol):
                 ob = self.orderbook.get(symbol)
                 bids = ob.get("bids") if ob else []
@@ -1062,6 +2502,11 @@ class LiveOrchestrator:
                             status = "unknown"
                         if status.lower() == "closed" or remaining <= 0:
                             self._log(f"[ORDER] maker filled: {symbol} {order_side} id={order_id}")
+                            if not reduce_only:
+                                pos = self.positions.get(symbol)
+                                if pos is not None:
+                                    pos["order_status"] = "ack"
+                                    pos["order_ack_ts"] = now_ms()
                             return
                         try:
                             await self.exchange.cancel_order(order_id, symbol)
@@ -1070,11 +2515,67 @@ class LiveOrchestrator:
                         if remaining > 0:
                             await self.exchange.create_order(symbol, "market", order_side, remaining, None, params)
                             self._log(f"[ORDER] taker fallback: {symbol} {order_side} qty={remaining:.6f} reduce_only={reduce_only}")
+                            if not reduce_only:
+                                pos = self.positions.get(symbol)
+                                if pos is not None:
+                                    pos["order_status"] = "ack"
+                                    pos["order_ack_ts"] = now_ms()
                             return
             await self.exchange.create_order(symbol, "market", order_side, quantity, None, params)
             self._log(f"[ORDER] {symbol} {order_side} {quantity:.6f} reduce_only={reduce_only}")
+            if not reduce_only:
+                pos = self.positions.get(symbol)
+                if pos is not None:
+                    pos["order_status"] = "ack"
+                    pos["order_ack_ts"] = now_ms()
         except Exception as e:
             self._log_err(f"[ERR] order {symbol} {order_side}: {e}")
+            if not reduce_only:
+                self._handle_entry_order_failure(symbol, side, quantity, str(e))
+
+    async def _sync_symbol_leverage(self, symbol: str, target: float, force: bool = False) -> bool:
+        if not self.enable_orders:
+            return True
+        if not getattr(self.exchange, "apiKey", None) or not getattr(self.exchange, "secret", None):
+            return True
+        if not hasattr(self.exchange, "set_leverage"):
+            return True
+        try:
+            lev = float(target)
+        except Exception:
+            return False
+        if lev <= 0:
+            return False
+        now = now_ms()
+        last_ts = int(self._last_leverage_sync_ms_by_sym.get(symbol, 0) or 0)
+        last_target = float(self._last_leverage_target_by_sym.get(symbol, 0.0) or 0.0)
+        if not force:
+            if (now - last_ts) < int(self._leverage_sync_min_interval_ms) and abs(lev - last_target) < 1e-6:
+                return True
+        try:
+            await self._ccxt_call("set_leverage", self.exchange.set_leverage, int(lev), symbol)
+            self._last_leverage_sync_ms_by_sym[symbol] = now
+            self._last_leverage_target_by_sym[symbol] = float(lev)
+            self._leverage_sync_fail_by_sym.pop(symbol, None)
+            try:
+                self._log(f"[EXCHANGE] leverage synced: {symbol} -> {lev:.1f}x (per-order)")
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            err_text = str(e)
+            if "110043" in err_text or "leverage not modified" in err_text:
+                self._last_leverage_sync_ms_by_sym[symbol] = now
+                self._last_leverage_target_by_sym[symbol] = float(lev)
+                self._leverage_sync_fail_by_sym.pop(symbol, None)
+                return True
+            self._leverage_sync_fail_by_sym[symbol] = {
+                "ts": now,
+                "target": float(lev),
+                "err": err_text,
+            }
+            self._log_err(f"[EXCHANGE] set_leverage failed: {symbol} target={lev:.1f}x err={e}")
+            return False
 
     def _enter_position(
         self,
@@ -1091,26 +2592,70 @@ class LiveOrchestrator:
         leverage_override: float | None = None,
     ):
         lev = leverage_override if leverage_override is not None else self.leverage
-        size_frac, notional, qty = self._calc_position_size(decision, price, lev, size_frac_override=size_frac_override, symbol=sym)
+        override_filters = self._extract_entry_overrides(decision)
+        ignore_caps = bool({"cap", "cap_exposure", "cap_positions"} & set(override_filters))
+        size_frac, notional, qty = self._calc_position_size(
+            decision,
+            price,
+            lev,
+            size_frac_override=size_frac_override,
+            symbol=sym,
+            use_cycle_reserve=True,
+            ignore_caps=ignore_caps,
+        )
         can_enter, reason = self._can_enter_position(notional)
+        if (not can_enter) and ignore_caps and reason == "exposure capped":
+            can_enter = True
+            reason = ""
         if not can_enter or qty <= 0:
             self._log(f"[{sym}] skip entry ({reason})")
             return
 
+        # Reserve margin for this cycle to avoid oversubscription on live orders.
+        self._reserve_cycle_margin(notional, lev)
+
         ctx = ctx or {}
 
         meta = (decision.get("meta") or {}) if decision else {}
-        horizon = int(meta.get("best_horizon_steps") or MAX_POSITION_HOLD_SEC)
-        hold_limit = min(max(horizon, 120), MAX_POSITION_HOLD_SEC)
-        if hold_limit_override is not None:
-            hold_limit = hold_limit_override
-        hold_ms = hold_limit * 1000
+        entry_score = None
+        entry_hold_score = None
+        entry_floor = None
+        opt_hold_sec = None
+        opt_hold_src = None
+        if decision:
+            entry_score = decision.get("unified_score")
+            if entry_score is None:
+                entry_score = meta.get("unified_score")
+            if entry_score is None:
+                entry_score = meta.get("hybrid_score")
+            entry_hold_score = meta.get("unified_score_hold")
+            if entry_hold_score is None:
+                entry_hold_score = meta.get("hybrid_score_hold")
+            entry_floor = meta.get("entry_floor_eff")
+            if entry_floor is None:
+                entry_floor = meta.get("hybrid_entry_floor")
+            if entry_floor is None:
+                entry_floor = meta.get("score_threshold")
+            opt_hold_sec = meta.get("opt_hold_sec")
+            if opt_hold_sec is None:
+                opt_hold_sec = meta.get("unified_t_star")
+            if opt_hold_sec is None:
+                opt_hold_sec = meta.get("policy_horizon_eff_sec") or meta.get("best_h")
+            try:
+                if opt_hold_sec is not None:
+                    opt_hold_sec = float(opt_hold_sec)
+                    if not math.isfinite(opt_hold_sec) or opt_hold_sec <= 0:
+                        opt_hold_sec = None
+            except Exception:
+                opt_hold_sec = None
+            if opt_hold_sec is not None:
+                opt_hold_src = "entry_meta"
+        opt_hold_entry_sec = int(round(opt_hold_sec)) if opt_hold_sec is not None else None
         pos = {
             "symbol": sym,
             "side": side,
             "entry_price": float(price),
             "entry_time": ts,
-            "hold_limit": hold_ms,
             "quantity": qty,
             "notional": notional,
             "size_frac": size_frac,
@@ -1118,6 +2663,8 @@ class LiveOrchestrator:
             "leverage": lev,
             "cap_frac": float(notional / self.balance) if self.balance else 0.0,
             "fee_paid": notional * (self.fee_taker if self.fee_mode == "taker" else self.fee_maker),
+            "order_status": "submitted" if self.enable_orders else "paper",
+            "order_submit_ts": now_ms(),
             "regime": (ctx or {}).get("regime") or (decision.get("meta") or {}).get("regime"),
             "session": (ctx or {}).get("session") or (decision.get("meta") or {}).get("session"),
             # 예측 스냅샷
@@ -1127,19 +2674,34 @@ class LiveOrchestrator:
             "pred_event_p_tp": (decision.get("meta") or {}).get("event_p_tp") if decision else None,
             "pred_event_p_sl": (decision.get("meta") or {}).get("event_p_sl") if decision else None,
             "consensus_used": self._consensus_used_flag(decision),
+            "entry_score": entry_score,
+            "entry_score_hold": entry_hold_score,
+            "entry_floor": entry_floor,
+            "opt_hold_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
+            "opt_hold_src": opt_hold_src,
+            "opt_hold_entry_sec": opt_hold_entry_sec,
+            "opt_hold_entry_src": opt_hold_src,
+            "opt_hold_curr_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
+            "opt_hold_curr_remaining_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
+            "opt_hold_curr_src": opt_hold_src,
         }
         # 진입 수수료 선반영
         fee_entry = pos["fee_paid"]
         self.balance -= fee_entry
         self.positions[sym] = pos
+        self._rebalance_on_next_cycle = True
         self._log(f"[{sym}] ENTER {side} qty={qty:.4f} notional={notional:.2f} fee={fee_entry:.4f} size={size_frac:.2%} tag={tag or '-'}")
         self._last_actions[sym] = "ENTER"
+        try:
+            self._last_open_ts[sym] = int(ts)
+        except Exception:
+            pass
         self._maybe_place_order(sym, side, qty, reduce_only=False, position_side=side)
         entry_type = "SPREAD" if tag == "spread" else "ENTER"
         self._record_trade(entry_type, sym, side, price, qty, pos, fee=fee_entry)
         self._persist_state(force=True)
 
-    def _close_position(self, sym: str, price: float, reason: str, exit_kind: str = "MANUAL"):
+    def _close_position(self, sym: str, price: float, reason: str, exit_kind: str = "MANUAL", *, skip_order: bool = False):
         pos = self.positions.pop(sym, None)
         if not pos or price is None:
             return
@@ -1154,7 +2716,8 @@ class LiveOrchestrator:
         self._log(f"[{sym}] EXIT {side} qty={qty:.4f} pnl={pnl_net:.2f} fee={fee_exit:.4f} ({reason})")
         self._last_actions[sym] = "EXIT"
         exit_side = "SHORT" if side == "LONG" else "LONG"
-        self._maybe_place_order(sym, exit_side, qty, reduce_only=True, position_side=side)
+        if not skip_order:
+            self._maybe_place_order(sym, exit_side, qty, reduce_only=True, position_side=side)
         realized_r = pnl_net / notional_entry if notional_entry else 0.0
         hit = 1 if pnl > 0 else 0
         self._record_trade(
@@ -1173,6 +2736,10 @@ class LiveOrchestrator:
         )
         # 재진입 쿨다운 (종류별)
         self._mark_exit_and_cooldown(sym, exit_kind=exit_kind, ts_ms=now_ms())
+        try:
+            self._last_close_ts[sym] = int(now_ms())
+        except Exception:
+            pass
         # 예측 vs 실제 기록
         pred_win = pos.get("pred_win")
         pred_ev = pos.get("pred_ev")
@@ -1210,6 +2777,35 @@ class LiveOrchestrator:
             pass
         self._persist_state(force=True)
 
+    def _record_external_close(self, sym: str, price: float, reason: str = "exchange_manual_close"):
+        """Record external/manual close without touching wallet balance."""
+        pos = self.positions.pop(sym, None)
+        if not pos or price is None:
+            return
+        try:
+            qty = float(pos.get("quantity", 0.0))
+        except Exception:
+            qty = 0.0
+        if qty <= 0:
+            return
+        try:
+            entry = float(pos.get("entry_price", price))
+        except Exception:
+            entry = float(price)
+        side = str(pos.get("side") or "LONG")
+        pnl = (price - entry) * qty if side == "LONG" else (entry - price) * qty
+        try:
+            pos["age_sec"] = max(0.0, (now_ms() - pos.get("entry_time", now_ms())) / 1000.0)
+        except Exception:
+            pass
+        self._record_trade("EXIT", sym, side, price, qty, pos, pnl=float(pnl), fee=0.0, reason=reason, exit_kind="EXTERNAL")
+        try:
+            self._last_actions[sym] = "SYNC_CLOSE"
+            self._last_close_ts[sym] = now_ms()
+        except Exception:
+            pass
+        self._persist_state(force=True)
+
     def _liquidate_all_positions(self):
         if not self.positions:
             return
@@ -1230,6 +2826,8 @@ class LiveOrchestrator:
         기존 포지션이 있을 때 목표 비중과 현 포지션이 크게 다르면 수량/노출을 조정한다.
         실제 주문은 ENABLE_LIVE_ORDERS에 따라 별도 처리.
         """
+        if not REBALANCE_ENABLED:
+            return
         pos = self.positions.get(sym)
         if not pos or price is None:
             return
@@ -1238,13 +2836,52 @@ class LiveOrchestrator:
         if target_notional <= 0:
             # 목표 노출이 0이면 전량 청산
             self._close_position(sym, price, "rebalance to zero")
+            self._last_rebalance_ts[sym] = time.time()
             return
         curr_notional = float(pos.get("notional", 0.0))
-        delta = abs(target_notional - curr_notional) / curr_notional if curr_notional else 1.0
+        now = time.time()
+        # Enforce total exposure cap during rebalances as well
+        if self.exposure_cap_enabled:
+            try:
+                cap_balance = float(self._exposure_cap_balance())
+            except Exception:
+                cap_balance = float(self.balance or 0.0)
+            try:
+                cap_total = float(cap_balance) * float(self.max_notional_frac)
+            except Exception:
+                cap_total = float(cap_balance) * float(self.max_notional_frac or 0.0)
+            try:
+                open_notional = float(self._total_open_notional() or 0.0)
+            except Exception:
+                open_notional = 0.0
+            # Allow this position to use remaining capacity (remove its current notional first).
+            cap_remaining = cap_total - max(0.0, (open_notional - curr_notional))
+            if cap_remaining < 0:
+                cap_remaining = 0.0
+            if target_notional > cap_remaining:
+                target_notional = float(cap_remaining)
+                target_qty = float(target_notional / price) if price and target_notional > 0 else 0.0
+                try:
+                    base_balance = float(self._sizing_balance())
+                except Exception:
+                    base_balance = float(self.balance or 0.0)
+                if base_balance > 0 and lev:
+                    target_size_frac = float(target_notional) / max(base_balance * max(float(lev), 1e-6), 1e-6)
+        sym_thr = float(REBALANCE_THRESHOLD_MAP.get(sym, REBALANCE_THRESHOLD_FRAC))
+        sym_min_interval = float(REBALANCE_MIN_INTERVAL_MAP.get(sym, REBALANCE_MIN_INTERVAL_SEC) or 0.0)
+        sym_min_notional = float(REBALANCE_MIN_NOTIONAL_MAP.get(sym, REBALANCE_MIN_NOTIONAL) or 0.0)
+        last_ts = self._last_rebalance_ts.get(sym)
+        if sym_min_interval > 0 and last_ts is not None:
+            if (now - float(last_ts)) < float(sym_min_interval):
+                return
+        abs_delta = abs(target_notional - curr_notional)
+        if sym_min_notional > 0 and abs_delta < float(sym_min_notional):
+            return
+        delta = abs_delta / curr_notional if curr_notional else 1.0
         # 항상 레버리지/메타 업데이트
         if leverage_override is not None:
             pos["leverage"] = leverage_override
-        if delta < REBALANCE_THRESHOLD_FRAC:
+        if delta < sym_thr:
             return
         entry = float(pos.get("entry_price", price))
         side = pos.get("side")
@@ -1255,6 +2892,8 @@ class LiveOrchestrator:
             reduce_ratio = 1.0 - (target_notional / curr_notional)
             close_qty = curr_qty * reduce_ratio
             close_notional = curr_notional * reduce_ratio
+            entry_fee_total = float(pos.get("fee_paid", 0.0) or 0.0)
+            entry_fee_alloc = entry_fee_total * (close_notional / curr_notional) if curr_notional > 0 else 0.0
             pnl_realized = (price - entry) * close_qty if side == "LONG" else (entry - price) * close_qty
             fee_partial = close_notional * (self.fee_taker if self.fee_mode == "taker" else self.fee_maker)
             pnl_realized_net = pnl_realized - fee_partial
@@ -1265,16 +2904,20 @@ class LiveOrchestrator:
             pos["notional"] = max(target_notional, 0.0)
             pos["size_frac"] = target_size_frac
             pos["cap_frac"] = float(pos["notional"] / self.balance) if self.balance else 0.0
+            if entry_fee_total:
+                pos["fee_paid"] = max(0.0, entry_fee_total - entry_fee_alloc)
 
             # 부분 청산 기록
             close_pos = dict(pos)
             close_pos["notional"] = close_notional
             close_pos["quantity"] = close_qty
             close_pos["leverage"] = lev
+            close_pos["fee_paid"] = entry_fee_alloc
             self._log(f"[{sym}] PARTIAL EXIT by REBAL qty={close_qty:.4f} pnl={pnl_realized_net:.2f} fee={fee_partial:.4f}")
             self._last_actions[sym] = "REBAL_EXIT"
             self._record_trade("REBAL_EXIT", sym, side, price, close_qty, close_pos, pnl=pnl_realized_net, fee=fee_partial, reason="rebalance partial")
-            self._cooldown_until[sym] = time.time() + COOLDOWN_SEC
+            self._cooldown_until[sym] = 0
+            self._last_rebalance_ts[sym] = now
         else:
             # 노출 확대/동일: 포지션만 갱신
             pos["notional"] = target_notional
@@ -1286,6 +2929,7 @@ class LiveOrchestrator:
             # 기록용 스냅샷
             pnl_now = (price - entry) * target_qty if side == "LONG" else (entry - price) * target_qty
             self._record_trade("REBAL", sym, side, price, target_qty, pos, pnl=pnl_now, reason="rebalance")
+            self._last_rebalance_ts[sym] = now
 
         # 실제 리밸런싱 주문 경로 (옵션)
         adj_qty = max(0.0, target_qty - float(pos.get("quantity", 0.0)))
@@ -1293,12 +2937,28 @@ class LiveOrchestrator:
             self._maybe_place_order(sym, pos["side"], adj_qty, reduce_only=False, position_side=pos["side"])
         self._persist_state(force=True)
 
-    def _maybe_exit_position(self, sym: str, price: float, decision: dict, ts: int):
+    def _maybe_exit_position(self, sym: str, price: float, decision: dict, ts: int, *, allow_extra_exits: bool = True):
         pos = self.positions.get(sym)
         if not pos or price is None:
             return
+        try:
+            hold_only = str(os.environ.get("HOLD_EVAL_ONLY", "0")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            hold_only = False
+        if hold_only:
+            action = (decision or {}).get("action") or "WAIT"
+            if action == "EXIT":
+                meta = (decision or {}).get("meta") or {}
+                reason = str((decision or {}).get("reason") or "")
+                if meta.get("switch_to") or reason.startswith("SWITCH_TO_"):
+                    self._close_position(sym, price, reason or "switch_exit")
+            return
         action = (decision or {}).get("action") or "WAIT"
-        hold_limit_ms = pos.get("hold_limit", MAX_POSITION_HOLD_SEC * 1000)
+        if action == "EXIT":
+            self._close_position(sym, price, "hybrid_exit")
+            return
+        if not allow_extra_exits:
+            return
         age_ms = ts - pos.get("entry_time", ts)
         entry = float(pos.get("entry_price", price))
         qty = float(pos.get("quantity", 0.0))
@@ -1327,17 +2987,50 @@ class LiveOrchestrator:
         unified_score_rev = float(unified_score_rev) if unified_score_rev is not None else None
 
         exit_reasons = []
+        try:
+            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+        except Exception:
+            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        min_hold_ms = max(0.0, float(min_hold_sec) * 1000.0)
+        hold_ok = (age_ms >= min_hold_ms) if min_hold_ms > 0 else True
         if action in ("LONG", "SHORT") and action != pos["side"]:
-            if unified_score_hold is None or unified_score_rev is None or unified_score_rev > unified_score_hold:
+            if hold_ok and (unified_score_hold is None or unified_score_rev is None or unified_score_rev > unified_score_hold):
                 exit_reasons.append("unified_flip")
         elif action == "WAIT":
-            if unified_score_hold is not None and unified_score_hold <= 0.0:
-                exit_reasons.append("unified_cash")
-        if age_ms >= hold_limit_ms:
-            exit_reasons.append("hold timeout")
+            if unified_score_hold is not None:
+                if hold_ok:
+                    cash_exit_enabled = bool(getattr(mc_config, "policy_cash_exit_enabled", False))
+                    cash_exit_score = float(getattr(mc_config, "policy_cash_exit_score", 0.0))
+                    entry_floor = pos.get("entry_floor")
+                    entry_score = pos.get("entry_score_hold")
+                    if entry_score is None:
+                        entry_score = pos.get("entry_score")
+                    score_drop = float(os.environ.get("EXIT_SCORE_DROP", 0.0) or 0.0)
+                    should_exit = False
+                    if cash_exit_enabled and unified_score_hold <= cash_exit_score:
+                        should_exit = True
+                    if entry_floor is not None:
+                        try:
+                            if unified_score_hold <= float(entry_floor):
+                                should_exit = True
+                        except Exception:
+                            pass
+                    if score_drop > 0 and entry_score is not None:
+                        try:
+                            if unified_score_hold <= float(entry_score) - float(score_drop):
+                                should_exit = True
+                        except Exception:
+                            pass
+                    if should_exit:
+                        exit_reasons.append("unified_cash")
         # 공격적 손실 컷 (미실현 ROE 기준)
-        if roe_unreal <= -0.02:
-            exit_reasons.append("unrealized_dd")
+        if hold_ok:
+            try:
+                dd_floor = float(os.environ.get("UNREALIZED_DD_EXIT_ROE", -0.02) or -0.02)
+            except Exception:
+                dd_floor = -0.02
+            if roe_unreal <= dd_floor:
+                exit_reasons.append("unrealized_dd")
         if exit_reasons:
             self._close_position(sym, price, ", ".join(exit_reasons))
 
@@ -1374,6 +3067,22 @@ class LiveOrchestrator:
                 roe_val = pnl_val / base_notional
             except Exception:
                 roe_val = None
+        # For exit-type records, adjust PnL to include entry fee allocation
+        exit_types = {"EXIT", "REBAL_EXIT", "KILL", "MANUAL", "EXTERNAL"}
+        entry_fee_alloc = None
+        pnl_total = pnl_val
+        if ttype and str(ttype).upper() in exit_types and pnl_val is not None:
+            try:
+                entry_fee_alloc = float(pos.get("fee_paid", 0.0) or 0.0)
+            except Exception:
+                entry_fee_alloc = None
+            if entry_fee_alloc is not None:
+                pnl_total = float(pnl_val) - float(entry_fee_alloc)
+                if base_notional:
+                    try:
+                        roe_val = pnl_total / base_notional
+                    except Exception:
+                        pass
 
         entry = {
             "time": ts,
@@ -1383,7 +3092,9 @@ class LiveOrchestrator:
             "side": side,
             "price": float(price),
             "qty": float(qty),
-            "pnl": pnl_val,
+            "pnl": pnl_total,
+            "pnl_gross": pnl_val,
+            "entry_fee_alloc": entry_fee_alloc,
             "roe": roe_val,
             "notional": notional,
             "leverage": lev,
@@ -1397,10 +3108,33 @@ class LiveOrchestrator:
             "pred_event_p_tp": pos.get("pred_event_p_tp"),
             "pred_event_p_sl": pos.get("pred_event_p_sl"),
             "consensus_used": pos.get("consensus_used"),
-            "realized_r": float(realized_r) if realized_r is not None else (pnl_val / base_notional if (pnl_val is not None and base_notional) else None),
+            "realized_r": float(realized_r) if realized_r is not None else (pnl_total / base_notional if (pnl_total is not None and base_notional) else None),
             "hit": int(hit) if hit is not None else None,
         }
         self.trade_tape.append(entry)
+        
+        # ---- SQLite 저장 (비동기)
+        try:
+            trade_data = {
+                "symbol": sym,
+                "side": side,
+                "action": ttype,  # "ENTRY" or "EXIT"
+                "fill_price": float(price),
+                "qty": float(qty),
+                "notional": notional,
+                "timestamp_ms": int(time.time() * 1000),
+                "fee": float(fee) if fee else None,
+                "realized_pnl": pnl_val,
+                "roe": roe_val,
+                "hold_duration_sec": pos.get("age_sec"),
+                "entry_ev": pos.get("pred_ev"),
+                "entry_kelly": pos.get("kelly"),
+                "entry_reason": reason,
+            }
+            self.db.log_trade_background(trade_data, mode=self._trading_mode)
+        except Exception as e:
+            self._log_err(f"[DB] log_trade failed: {e}")
+        
         if ttype == "EXIT" and pnl_val is not None:
             if pnl_val < 0:
                 self._loss_streak += 1
@@ -1642,6 +3376,10 @@ class LiveOrchestrator:
         """
         price = self.market[sym]["price"]
         closes = list(self.ohlcv_buffer[sym])
+        opens = list(self.ohlcv_open[sym])
+        highs = list(self.ohlcv_high[sym])
+        lows = list(self.ohlcv_low[sym])
+        volumes = list(self.ohlcv_volume[sym])
         candles = len(closes)
 
         if price is None:
@@ -1677,6 +3415,23 @@ class LiveOrchestrator:
             sigma = float(max(1e-6, (1.0 - w) * float(sigma) + w * float(sig_tab)))
 
         ofi_score = float(self._compute_ofi_score(sym))
+        impulse = self._compute_impulse_features(closes, opens, highs, lows, volumes)
+        rt_breakout = self._compute_realtime_breakout_features(float(price), highs, lows, volumes)
+        pos = self.positions.get(sym, {})
+        pos_size_frac = pos.get("size_frac") if pos else None
+        if pos_size_frac is None:
+            pos_size_frac = self._kelly_allocations.get(sym, self.default_size_frac)
+        try:
+            pos_size_frac = float(pos_size_frac)
+        except Exception:
+            pos_size_frac = float(self.default_size_frac)
+        pos_leverage = pos.get("leverage") if pos else None
+        if pos_leverage is None:
+            pos_leverage = self._dyn_leverage.get(sym, self.leverage)
+        try:
+            pos_leverage = float(pos_leverage)
+        except Exception:
+            pos_leverage = float(self.leverage)
         tuner = getattr(self, "tuner", None)
         regime_params = None
         if tuner and hasattr(tuner, "get_params"):
@@ -1696,17 +3451,23 @@ class LiveOrchestrator:
 
         is_dev_mode = bool(getattr(config, "DEV_MODE", False))
 
-        return {
+        ctx_out = {
             "symbol": sym,
             "price": float(price),
             "bar_seconds": 60.0,
             "closes": closes,
+            "opens": opens,
+            "highs": highs,
+            "lows": lows,
+            "volumes": volumes,
             "candles": candles,
             "direction": self._direction_bias(closes),
             "regime": regime,
             "ofi_score": float(ofi_score),
             "liquidity_score": self._liquidity_score(sym),
             "leverage": None,
+            "size_frac": pos_size_frac,
+            "leverage": pos_leverage,
             "mu_base": float(mu_base),
             "sigma": float(max(sigma, 0.0)),
             "regime_params": regime_params,
@@ -1720,7 +3481,15 @@ class LiveOrchestrator:
             "student_t_df": 6.0,
             "bootstrap_returns": bootstrap_returns,
             "ev": None,
+            "equity": float(self.balance),
+            "hybrid_entry_floor_dyn": float(self._hybrid_entry_floor_dyn) if self._hybrid_entry_floor_dyn is not None else None,
+            "hybrid_conf_scale_dyn": float(self._hybrid_conf_scale_dyn) if self._hybrid_conf_scale_dyn is not None else None,
         }
+        if impulse:
+            ctx_out.update(impulse)
+        if rt_breakout:
+            ctx_out.update(rt_breakout)
+        return ctx_out
 
     def _build_batch_context_soa(self, ts: int) -> tuple[list[dict], np.ndarray]:
         """
@@ -1751,6 +3520,10 @@ class LiveOrchestrator:
                 continue
             
             closes = list(self.ohlcv_buffer[sym])
+            opens = list(self.ohlcv_open[sym])
+            highs = list(self.ohlcv_high[sym])
+            lows = list(self.ohlcv_low[sym])
+            volumes = list(self.ohlcv_volume[sym])
             candles = len(closes)
             
             # Compute mu/sigma directly into pre-allocated arrays
@@ -1771,6 +3544,8 @@ class LiveOrchestrator:
                 sigma = float(max(1e-6, (1.0 - w) * float(sigma) + w * float(sig_tab)))
             
             ofi_score = float(self._compute_ofi_score(sym))
+            impulse = self._compute_impulse_features(closes, opens, highs, lows, volumes)
+            rt_breakout = self._compute_realtime_breakout_features(float(price), highs, lows, volumes)
             pos = self.positions.get(sym, {})
             pos_qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
             pos_side_val = 0
@@ -1780,6 +3555,20 @@ class LiveOrchestrator:
                     pos_side_val = 1
                 elif side == "SHORT":
                     pos_side_val = -1
+            pos_size_frac = pos.get("size_frac") if pos else None
+            if pos_size_frac is None:
+                pos_size_frac = self._kelly_allocations.get(sym, self.default_size_frac)
+            try:
+                pos_size_frac = float(pos_size_frac)
+            except Exception:
+                pos_size_frac = float(self.default_size_frac)
+            pos_leverage = pos.get("leverage") if pos else None
+            if pos_leverage is None:
+                pos_leverage = self._dyn_leverage.get(sym, self.leverage)
+            try:
+                pos_leverage = float(pos_leverage)
+            except Exception:
+                pos_leverage = float(self.leverage)
             
             # Fill pre-allocated arrays (Zero-Copy style)
             self._batch_prices[idx] = float(price)
@@ -1798,14 +3587,20 @@ class LiveOrchestrator:
                 "price": float(price),
                 "bar_seconds": 60.0,
                 "closes": closes,
+                "opens": opens,
+                "highs": highs,
+                "lows": lows,
+                "volumes": volumes,
                 "candles": candles,
                 "direction": self._direction_bias(closes),
                 "regime": regime,
                 "ofi_score": ofi_score,
                 "liquidity_score": self._liquidity_score(sym),
-                "leverage": None,
+                "leverage": pos_leverage,
+                "size_frac": pos_size_frac,
                 "mu_base": float(mu_base),
                 "sigma": float(max(sigma, 0.0)),
+                "equity": float(self.balance),
                 "session": session,
                 "use_torch": True,
                 "use_jax": False,
@@ -1814,6 +3609,14 @@ class LiveOrchestrator:
                 "has_position": bool(pos_qty != 0.0),
                 "_soa_idx": idx,  # SoA 배열 인덱스 참조
             }
+            if impulse:
+                ctx.update(impulse)
+            if rt_breakout:
+                ctx.update(rt_breakout)
+            if self._hybrid_entry_floor_dyn is not None:
+                ctx["hybrid_entry_floor_dyn"] = float(self._hybrid_entry_floor_dyn)
+            if self._hybrid_conf_scale_dyn is not None:
+                ctx["hybrid_conf_scale_dyn"] = float(self._hybrid_conf_scale_dyn)
             ctx_list.append(ctx)
         
         return ctx_list, np.array(valid_indices, dtype=np.int32)
@@ -1904,19 +3707,78 @@ class LiveOrchestrator:
             ofi_res = ofi_score - ofi_mean
             self.stats.push("ofi_res", (regime, session), ofi_res)
 
-            # Dynamic leverage
+            # Dynamic leverage (force optimal leverage if present, else risk-based fallback)
+            try:
+                if decision is not None and isinstance(decision.get("meta"), dict):
+                    opt_lev = decision.get("meta", {}).get("optimal_leverage")
+                    if opt_lev is not None and decision.get("leverage") is None:
+                        decision["leverage"] = float(opt_lev)
+                        meta_tmp = dict(decision.get("meta") or {})
+                        if meta_tmp.get("lev_source") is None:
+                            meta_tmp["lev_source"] = "optimal_leverage"
+                        decision["meta"] = meta_tmp
+            except Exception:
+                pass
+            # If still no leverage, compute dynamic leverage from risk
+            try:
+                meta_tmp = decision.get("meta") or {}
+                if decision is not None and decision.get("leverage") is None and meta_tmp.get("lev") is None:
+                    dyn = self._dynamic_leverage_risk(decision, ctx)
+                    if dyn is not None:
+                        decision["leverage"] = float(dyn)
+                        meta_tmp = dict(decision.get("meta") or {})
+                        meta_tmp["lev"] = float(dyn)
+                        if meta_tmp.get("lev_source") is None:
+                            meta_tmp["lev_source"] = "dynamic_risk"
+                        decision["meta"] = meta_tmp
+            except Exception:
+                pass
+            try:
+                meta_tmp = dict(decision.get("meta") or {})
+                if meta_tmp.get("lev_source") is None:
+                    if decision.get("leverage") is not None:
+                        meta_tmp["lev_source"] = "decision"
+                    elif meta_tmp.get("lev") is not None:
+                        meta_tmp["lev_source"] = "meta"
+                    decision["meta"] = meta_tmp
+            except Exception:
+                pass
             dyn_leverage = float(decision.get("leverage") or decision.get("meta", {}).get("lev") or self.leverage)
+            try:
+                min_lev = float(LEVERAGE_MIN)
+            except Exception:
+                min_lev = 1.0
+            try:
+                max_lev = float(self.max_leverage or self.leverage or dyn_leverage)
+            except Exception:
+                max_lev = dyn_leverage
+            if min_lev > 0:
+                if dyn_leverage < min_lev:
+                    meta_tmp = dict(decision.get("meta") or {})
+                    meta_tmp["lev_min_applied"] = float(min_lev)
+                    decision["meta"] = meta_tmp
+                dyn_leverage = max(min_lev, dyn_leverage)
+            if max_lev > 0:
+                dyn_leverage = min(max_lev, dyn_leverage)
             ctx["leverage"] = dyn_leverage
 
-            # Regime size cap
-            cap_map = {"bull": 0.25, "bear": 0.25, "chop": 0.10, "volatile": 0.08}
-            cap_frac_regime = cap_map.get(regime, 0.10)
+            # Regime size cap (Kelly 모드에서는 개별 종목 상한을 제거)
             decision = dict(decision)
             decision_meta = dict(decision.get("meta") or {})
+            if USE_KELLY_ALLOCATION:
+                cap_frac_regime = 1.0
+                sz = KELLY_PORTFOLIO_FRAC
+            else:
+                cap_map = {"bull": 0.25, "bear": 0.25, "chop": 0.10, "volatile": 0.08}
+                cap_frac_regime = cap_map.get(regime, 0.10)
+                sz = decision.get("size_frac") or decision_meta.get("size_fraction") or self.default_size_frac
             decision_meta["regime_cap_frac"] = cap_frac_regime
             decision["meta"] = decision_meta
-            sz = decision.get("size_frac") or decision_meta.get("size_fraction") or self.default_size_frac
             decision["size_frac"] = float(min(max(0.0, sz), cap_frac_regime))
+
+            use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+            hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
+            hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
 
             # Hard gates: spread_pct, event_cvar_r
             spread_pct_now = decision_meta.get("spread_pct", ctx.get("spread_pct"))
@@ -1929,7 +3791,7 @@ class LiveOrchestrator:
 
             cvar_floor_map = {"bull": -1.2, "bear": -1.2, "chop": -1.0, "volatile": -0.8}
             cvar_floor_regime = cvar_floor_map.get(regime, -1.0)
-            if ev_cvar_r is not None and ev_cvar_r < cvar_floor_regime:
+            if (not hybrid_only) and ev_cvar_r is not None and ev_cvar_r < cvar_floor_regime:
                 decision["action"] = "WAIT"
                 decision["reason"] = f"{decision.get('reason', '')} | event_cvar_floor"
 
@@ -1988,14 +3850,215 @@ class LiveOrchestrator:
                 })
                 decision["size_frac"] = decision.get("size_frac") or decision.get("meta", {}).get("size_fraction") or self.default_size_frac
 
+            # Entry filters + TOP-N / pre-MC status (after consensus)
+            decision_meta = dict(decision.get("meta") or {})
+            pos_now = self.positions.get(sym) or {}
+            try:
+                pos_qty_now = float(pos_now.get("quantity", pos_now.get("qty", 0.0)) or 0.0)
+            except Exception:
+                pos_qty_now = 0.0
+            has_pos = pos_qty_now != 0.0
+            is_entry = (decision.get("action") in ("LONG", "SHORT")) and (not has_pos)
+
+            top_n_status = self._top_n_status(sym)
+            pre_mc_status = self._pre_mc_status()
+
+            pre_mc_scaled = False
+            if is_entry and pre_mc_status.get("ok") is False:
+                try:
+                    size_before = float(decision.get("size_frac") or decision_meta.get("size_fraction") or self.default_size_frac)
+                except Exception:
+                    size_before = float(self.default_size_frac or 0.0)
+                size_after = float(max(0.0, size_before * float(PRE_MC_SIZE_SCALE)))
+                decision["size_frac"] = size_after
+                decision_meta["pre_mc_size_before"] = size_before
+                decision_meta["pre_mc_size_after"] = size_after
+                decision_meta["pre_mc_scale"] = float(PRE_MC_SIZE_SCALE)
+                pre_mc_scaled = True
+
+            if decision:
+                # Pre-entry event MC filter (same thresholds as event_mc_exit)
+                try:
+                    event_entry_filter = str(os.environ.get("EVENT_ENTRY_FILTER", "1")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    event_entry_filter = True
+                if is_entry and event_entry_filter:
+                    try:
+                        evt_meta = self._compute_event_entry_metrics(sym, decision, ctx, float(price))
+                        if isinstance(evt_meta, dict):
+                            decision_meta.update(evt_meta)
+                            decision["meta"] = decision_meta
+                    except Exception as e:
+                        self._log_err(f"[ERR] event_entry_metrics {sym}: {e}")
+                fs = self._min_filter_states(sym, decision, ts)
+                if top_n_status.get("ok") is not None:
+                    fs["top_n"] = bool(top_n_status.get("ok"))
+                else:
+                    fs["top_n"] = None
+                if pre_mc_status.get("ok") is not None:
+                    fs["pre_mc"] = bool(pre_mc_status.get("ok"))
+                else:
+                    fs["pre_mc"] = None
+                decision["filter_states"] = fs
+                decision_meta["filter_states"] = fs
+                decision_meta["entry_filter_eval"] = bool(is_entry)
+
+            if hybrid_only:
+                entry_floor = self._get_hybrid_entry_floor()
+            else:
+                entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+            entry_floor_eff = float(max(entry_floor, MIN_ENTRY_SCORE)) if MIN_ENTRY_SCORE > 0 else float(entry_floor)
+
+            decision_meta["unified_entry_floor"] = float(entry_floor)
+            decision_meta["entry_floor_eff"] = entry_floor_eff
+            decision_meta["min_entry_score"] = float(MIN_ENTRY_SCORE)
+            decision_meta["hybrid_only"] = bool(hybrid_only)
+
+            try:
+                decision_meta["spread_pct"] = float(spread_pct_now) if spread_pct_now is not None else None
+            except Exception:
+                decision_meta["spread_pct"] = None
+            try:
+                decision_meta["spread_cap"] = float(spread_cap) if spread_cap is not None else None
+            except Exception:
+                decision_meta["spread_cap"] = None
+            try:
+                decision_meta["event_cvar_r"] = float(ev_cvar_r) if ev_cvar_r is not None else None
+            except Exception:
+                decision_meta["event_cvar_r"] = None
+            decision_meta["cvar_floor"] = None if hybrid_only else float(cvar_floor_regime)
+
+            liq_score = None
+            try:
+                ob = self.orderbook.get(sym)
+                if ob and ob.get("ready"):
+                    liq_score = float(self._liquidity_score(sym))
+            except Exception:
+                liq_score = None
+            decision_meta["liq_score"] = liq_score
+            decision_meta["min_liq_score"] = float(MIN_LIQ_SCORE) if MIN_LIQ_SCORE > 0 else None
+
+            est_notional = None
+            try:
+                lev_val = decision.get("leverage") or decision_meta.get("leverage") or decision_meta.get("lev") or self._dyn_leverage.get(sym) or self.leverage
+                lev_val = float(lev_val) if lev_val else float(self.leverage)
+                _, est_notional, _ = self._calc_position_size(decision, 1.0, lev_val, symbol=sym, use_cycle_reserve=is_entry)
+            except Exception:
+                est_notional = None
+            decision_meta["est_notional"] = float(est_notional) if est_notional is not None else None
+            min_notional_floor = float(MIN_ENTRY_NOTIONAL) if MIN_ENTRY_NOTIONAL > 0 else 0.0
+            if MIN_ENTRY_NOTIONAL_PCT > 0:
+                try:
+                    min_notional_floor = max(min_notional_floor, float(self.balance) * float(MIN_ENTRY_NOTIONAL_PCT))
+                except Exception:
+                    pass
+            decision_meta["min_entry_notional"] = float(min_notional_floor) if min_notional_floor > 0 else None
+            decision_meta["min_entry_notional_pct"] = float(MIN_ENTRY_NOTIONAL_PCT) if MIN_ENTRY_NOTIONAL_PCT > 0 else None
+            min_exposure_floor = float(MIN_ENTRY_EXPOSURE_PCT) if MIN_ENTRY_EXPOSURE_PCT > 0 else 0.0
+            decision_meta["min_entry_exposure_pct"] = float(MIN_ENTRY_EXPOSURE_PCT) if MIN_ENTRY_EXPOSURE_PCT > 0 else None
+            if min_exposure_floor > 0:
+                try:
+                    cap_balance = float(self._exposure_cap_balance())
+                except Exception:
+                    cap_balance = float(self.balance or 0.0)
+                decision_meta["min_entry_exposure_notional"] = float(cap_balance) * float(min_exposure_floor)
+            else:
+                decision_meta["min_entry_exposure_notional"] = None
+
+            decision_meta["safety_mode"] = bool(self.safety_mode)
+            decision_meta["positions_count"] = int(len(self.positions))
+            decision_meta["max_positions"] = int(self.max_positions) if self.position_cap_enabled else None
+            try:
+                decision_meta["total_open_notional"] = float(self._total_open_notional())
+            except Exception:
+                decision_meta["total_open_notional"] = None
+            if self.exposure_cap_enabled:
+                try:
+                    decision_meta["exposure_cap_limit"] = float(self._exposure_cap_balance()) * float(self.max_notional_frac)
+                except Exception:
+                    decision_meta["exposure_cap_limit"] = None
+            else:
+                decision_meta["exposure_cap_limit"] = None
+
+            decision_meta["top_n_active"] = bool(top_n_status.get("active"))
+            decision_meta["top_n_rank"] = top_n_status.get("rank")
+            decision_meta["top_n_limit"] = top_n_status.get("limit")
+            decision_meta["top_n_ok"] = top_n_status.get("ok")
+
+            decision_meta["pre_mc_active"] = bool(pre_mc_status.get("active"))
+            decision_meta["pre_mc_ok"] = pre_mc_status.get("ok")
+            decision_meta["pre_mc_reason"] = pre_mc_status.get("reason")
+            decision_meta["pre_mc_expected_pnl"] = pre_mc_status.get("expected_pnl")
+            decision_meta["pre_mc_expected_pnl_source"] = pre_mc_status.get("expected_pnl_source")
+            decision_meta["pre_mc_cvar"] = pre_mc_status.get("cvar")
+            decision_meta["pre_mc_prob_liq"] = pre_mc_status.get("prob_liq")
+            decision_meta["pre_mc_prob_liq_source"] = pre_mc_status.get("prob_liq_source")
+            decision_meta["pre_mc_min_expected_pnl"] = float(PRE_MC_MIN_EXPECTED_PNL)
+            decision_meta["pre_mc_min_cvar"] = float(PRE_MC_MIN_CVAR)
+            decision_meta["pre_mc_max_liq_prob"] = float(PRE_MC_MAX_LIQ_PROB)
+            decision_meta["pre_mc_scaled"] = bool(pre_mc_scaled)
+            decision_meta["pre_mc_block_on_fail"] = bool(PRE_MC_BLOCK_ON_FAIL)
+            decision_meta["pre_mc_blocked"] = False
+
+            if is_entry and decision.get("action") in ("LONG", "SHORT") and decision.get("filter_states"):
+                fs = decision.get("filter_states") or {}
+                blocked = []
+                if fs.get("spread") is False:
+                    blocked.append("spread")
+                if fs.get("event_cvar") is False:
+                    blocked.append("event_cvar")
+                if fs.get("event_exit") is False:
+                    blocked.append("event_mc_exit")
+                if fs.get("unified") is False:
+                    blocked.append("unified")
+                if fs.get("liq") is False:
+                    blocked.append("liquidity")
+                if fs.get("min_notional") is False:
+                    blocked.append("min_notional")
+                if fs.get("min_exposure") is False:
+                    blocked.append("min_exposure")
+                if fs.get("top_n") is False:
+                    blocked.append("top_n")
+                if fs.get("cap") is False:
+                    blocked.append("cap")
+                if PRE_MC_BLOCK_ON_FAIL and fs.get("pre_mc") is False:
+                    blocked.append("pre_mc")
+                decision_meta["pre_mc_blocked"] = bool(PRE_MC_BLOCK_ON_FAIL and fs.get("pre_mc") is False)
+                if blocked:
+                    decision["action"] = "WAIT"
+                    reason = decision.get("reason", "")
+                    suffix = f"filter_block:{','.join(blocked)}"
+                    decision["reason"] = f"{reason} | {suffix}" if reason else suffix
+                    decision_meta["entry_blocked_filters"] = blocked
+                else:
+                    decision_meta["entry_blocked_filters"] = []
+            elif decision:
+                # Not an entry attempt; keep explicit marker for UI consistency
+                decision_meta.setdefault("entry_blocked_filters", [])
+
+            decision["meta"] = decision_meta
+
             # HOLD/EXIT using event MC
             exited_by_event = False
             pos = self.positions.get(sym)
+            pos_managed = self._is_managed_position(pos)
+            try:
+                hold_only = str(os.environ.get("HOLD_EVAL_ONLY", "0")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                hold_only = False
             if pos and decision and ctx.get("mu_base") is not None and ctx.get("sigma", 0.0) > 0:
-                exited_by_event = self._evaluate_event_exit(sym, pos, decision, ctx, ts, price)
+                if pos_managed and not hold_only:
+                    exited_by_event = self._evaluate_event_exit(sym, pos, decision, ctx, ts, price)
+
+            # Hold-vs-exit using entry-eval t* (align hold/exit with entry logic)
+            if (not exited_by_event) and sym in self.positions and decision:
+                pos = self.positions.get(sym) or {}
+                eval_only = not pos_managed
+                if self._check_hold_vs_exit(sym, pos, decision, ctx, ts, price, eval_only=eval_only):
+                    exited_by_event = True
 
             # Policy-based event MC exit
-            if (not exited_by_event) and sym in self.positions and decision:
+            if (not exited_by_event) and pos_managed and sym in self.positions and decision and (not hold_only):
                 pos = self.positions.get(sym) or {}
                 meta = decision.get("meta") or {}
                 age_sec = (ts - int(pos.get("entry_time", ts))) / 1000.0
@@ -2006,18 +4069,21 @@ class LiveOrchestrator:
                 else:
                     exited_by_event = self._check_ema_ev_exit(sym, decision, regime, price, ts)
 
-            self._maybe_exit_position(sym, float(price), decision, ts)
+            if pos_managed:
+                self._maybe_exit_position(sym, float(price), decision, ts, allow_extra_exits=True)
 
             # Update leverage on open positions
-            if sym in self.positions:
+            if sym in self.positions and pos_managed:
                 self.positions[sym]["leverage"] = dyn_leverage
+            self._dyn_leverage[sym] = dyn_leverage
 
             if not exited_by_event:
-                if decision.get("action") in ("LONG", "SHORT") and sym in self.positions:
-                    self._rebalance_position(sym, float(price), decision, leverage_override=dyn_leverage)
+                if pos_managed and REBALANCE_ENABLED and sym in self.positions:
+                    if decision.get("action") in ("LONG", "SHORT") or bool(getattr(self, "_force_rebalance_cycle", False)):
+                        self._rebalance_position(sym, float(price), decision, leverage_override=dyn_leverage)
 
                 # EV drop exit
-                if sym in self.positions:
+                if pos_managed and sym in self.positions:
                     exited_by_event = self._check_ev_drop_exit(sym, decision, regime, price, ts)
 
                 if decision.get("action") in ("LONG", "SHORT") and sym not in self.positions:
@@ -2038,6 +4104,8 @@ class LiveOrchestrator:
                     f"reason={decision.get('reason', '')}"
                 )
 
+            if decision:
+                self._last_decisions[sym] = decision
             return self._row(sym, float(price), ts, decision, candles)
 
         except Exception as e:
@@ -2049,21 +4117,100 @@ class LiveOrchestrator:
 
     def _evaluate_event_exit(self, sym: str, pos: dict, decision: dict, ctx: dict, ts: int, price: float) -> bool:
         """Event-based MC exit evaluation. Returns True if exited."""
+        try:
+            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+        except Exception:
+            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        try:
+            entry_ts = int(pos.get("entry_time") or 0)
+        except Exception:
+            entry_ts = 0
+        if entry_ts and min_hold_sec > 0:
+            age_sec = (ts - entry_ts) / 1000.0
+            if age_sec < float(min_hold_sec):
+                return False
         mu_evt, sigma_evt = adjust_mu_sigma(
             float(ctx.get("mu_base", 0.0)),
             float(ctx.get("sigma", 0.0)),
             str(ctx.get("regime", "chop")),
         )
-        seed_evt = int(time.time()) ^ hash(sym)
-        entry = float(pos.get("entry_price", price))
-        price_now = float(price)
-
         meta = decision.get("meta") or {}
         if not meta:
             for d in decision.get("details", []):
                 if d.get("_engine") in ("mc_barrier", "mc_engine", "mc"):
                     meta = d.get("meta") or {}
                     break
+        try:
+            bar_sec = float(ctx.get("bar_seconds", 60.0) or 60.0)
+        except Exception:
+            bar_sec = 60.0
+        try:
+            step_sec = float(os.environ.get("EVENT_MC_STEP_SEC", bar_sec) or bar_sec)
+        except Exception:
+            step_sec = bar_sec
+        if step_sec <= 0:
+            step_sec = bar_sec if bar_sec > 0 else 60.0
+        max_horizon_sec = None
+        try:
+            horizon_seq = meta.get("horizon_seq")
+            if isinstance(horizon_seq, (list, tuple)) and horizon_seq:
+                max_horizon_sec = max(float(h) for h in horizon_seq if h is not None)
+        except Exception:
+            max_horizon_sec = None
+        try:
+            env_max_h = float(os.environ.get("EVENT_MC_MAX_HORIZON_SEC", 0) or 0)
+        except Exception:
+            env_max_h = 0.0
+        if env_max_h > 0:
+            max_horizon_sec = env_max_h
+        # If available, align event MC horizon to optimal hold (t*)
+        try:
+            use_tstar = str(os.environ.get("EVENT_MC_USE_TSTAR", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            use_tstar = True
+        hold_target_sec = None
+        if use_tstar:
+            try:
+                hold_target_sec = float(
+                    pos.get("opt_hold_curr_sec")
+                    or pos.get("opt_hold_sec")
+                    or pos.get("opt_hold_entry_sec")
+                    or 0.0
+                )
+            except Exception:
+                hold_target_sec = 0.0
+            if not hold_target_sec:
+                try:
+                    hold_target_sec = float(
+                        meta.get("opt_hold_sec")
+                        or meta.get("unified_t_star")
+                        or meta.get("policy_horizon_eff_sec")
+                        or meta.get("best_h")
+                        or 0.0
+                    )
+                except Exception:
+                    hold_target_sec = 0.0
+            if hold_target_sec and entry_ts:
+                try:
+                    age_sec = (ts - entry_ts) / 1000.0
+                except Exception:
+                    age_sec = 0.0
+                remaining_sec = max(1.0, float(hold_target_sec) - float(age_sec))
+                max_horizon_sec = float(remaining_sec)
+                meta["event_hold_target_sec"] = float(hold_target_sec)
+                meta["event_hold_remaining_sec"] = float(remaining_sec)
+        if max_horizon_sec and step_sec > 0:
+            max_steps_evt = max(1, int(round(float(max_horizon_sec) / float(step_sec))))
+        else:
+            try:
+                max_steps_evt = int(os.environ.get("EVENT_MC_MAX_STEPS", 600) or 600)
+            except Exception:
+                max_steps_evt = 600
+        dt_evt = float(step_sec) / 31536000.0
+        seed_evt = int(time.time()) ^ hash(sym)
+        entry = float(pos.get("entry_price", price))
+        price_now = float(price)
+
         params_meta = meta.get("params") or {}
         tp_pct = decision.get("mc_tp") or meta.get("mc_tp") or params_meta.get("profit_target") or 0.001
         sl_pct = decision.get("mc_sl") or meta.get("mc_sl") or (tp_pct * 0.8)
@@ -2079,8 +4226,8 @@ class LiveOrchestrator:
             sl_pct=sl_rem,
             mu=mu_evt,
             sigma=sigma_evt,
-            dt=1.0,
-            max_steps=240,
+            dt=dt_evt,
+            max_steps=int(max_steps_evt),
             n_paths=int(decision.get("n_paths", meta.get("params", {}).get("n_paths", 2048))),
             seed=seed_evt,
             dist=ctx.get("tail_model", "student_t"),
@@ -2095,7 +4242,8 @@ class LiveOrchestrator:
             ev_pct_evt = ev_r_evt * sl_rem
             cvar_pct_evt = cvar_r_evt * sl_rem
             t_med_evt = float(m_evt.get("event_t_median", 0.0) or 0.0)
-            tau_evt = float(max(1.0, t_med_evt if t_med_evt > 0 else 1.0))
+            t_med_evt_sec = float(t_med_evt) * float(step_sec) if t_med_evt > 0 else 0.0
+            tau_evt = float(max(1.0, t_med_evt_sec if t_med_evt_sec > 0 else 1.0))
             lambda_evt = float(getattr(mc_config, "unified_risk_lambda", 1.0))
             rho_evt = float(getattr(mc_config, "unified_rho", 0.0))
             event_score = float(ev_pct_evt - lambda_evt * abs(cvar_pct_evt) - rho_evt * tau_evt)
@@ -2108,6 +4256,62 @@ class LiveOrchestrator:
             or (abs(cvar_pct_evt) >= float(self.exit_policy.max_abs_event_cvar_r))
             or (p_sl_evt >= float(self.exit_policy.max_event_p_sl))
         ):
+            allow_flip = str(os.environ.get("EVENT_MC_ALLOW_FLIP", "1")).strip().lower() in ("1", "true", "yes", "on")
+            if allow_flip:
+                def _maybe_float(val):
+                    try:
+                        if val is None:
+                            return None
+                        return float(val)
+                    except Exception:
+                        return None
+
+                side = str(pos.get("side") or decision.get("action") or "").upper()
+                if side in ("LONG", "SHORT"):
+                    opp_side = "SHORT" if side == "LONG" else "LONG"
+                    score_long = _maybe_float(meta.get("hybrid_score_long") or meta.get("unified_score_long") or meta.get("policy_ev_score_long"))
+                    score_short = _maybe_float(meta.get("hybrid_score_short") or meta.get("unified_score_short") or meta.get("policy_ev_score_short"))
+                    cur_score = score_long if side == "LONG" else score_short
+                    opp_score = score_short if side == "LONG" else score_long
+                    try:
+                        flip_min_score = float(os.environ.get("EVENT_MC_FLIP_MIN_SCORE", 0.0) or 0.0)
+                    except Exception:
+                        flip_min_score = 0.0
+                    try:
+                        flip_margin = float(os.environ.get("EVENT_MC_FLIP_MARGIN", 0.0) or 0.0)
+                    except Exception:
+                        flip_margin = 0.0
+                    if opp_score is not None and opp_score >= flip_min_score and (cur_score is None or opp_score >= (cur_score + flip_margin)):
+                        override_raw = os.environ.get("EVENT_MC_FLIP_OVERRIDE_FILTERS", "top_n,cap")
+                        override_filters = self._normalize_filter_overrides(override_raw)
+                        meta_for_flip = dict(meta or {})
+                        meta_for_flip["entry_override_filters"] = sorted(override_filters) if override_filters else []
+                        meta_for_flip.setdefault("hybrid_score", opp_score)
+                        meta_for_flip.setdefault("unified_score", opp_score)
+                        meta_for_flip["event_mc_flip"] = True
+                        lev_val = float(decision.get("leverage") or decision.get("optimal_leverage") or pos.get("leverage") or self.leverage or 1.0)
+                        flip_decision = {
+                            "action": opp_side,
+                            "ev": float(opp_score),
+                            "confidence": float(decision.get("confidence", 0.0) or 0.0),
+                            "unified_score": float(opp_score),
+                            "hybrid_score": float(opp_score),
+                            "leverage": lev_val,
+                            "reason": "event_mc_exit_flip",
+                            "meta": meta_for_flip,
+                        }
+                        self._log(
+                            f"[{sym}] EXIT+FLIP by MC "
+                            f"(Score={event_score*100:.4f}%, EV%={ev_pct_evt*100:.2f}%, CVaR%={cvar_pct_evt*100:.2f}%, "
+                            f"P_SL={p_sl_evt:.2f}, {side}->{opp_side}, score={opp_score:.4f})"
+                        )
+                        self._close_position(sym, price_now, "event_mc_exit_flip", exit_kind="RISK")
+                        permit, deny = self._entry_permit(sym, flip_decision, ts)
+                        if permit:
+                            self._enter_position(sym, opp_side, price_now, flip_decision, ts, ctx=ctx, leverage_override=lev_val)
+                        else:
+                            self._log(f"[{sym}] event_mc_exit flip blocked: {deny}")
+                        return True
             self._log(
                 f"[{sym}] EXIT by MC "
                 f"(Score={event_score*100:.4f}%, "
@@ -2119,8 +4323,162 @@ class LiveOrchestrator:
             return True
         return False
 
+    def _compute_event_entry_metrics(self, sym: str, decision: dict, ctx: dict, price: float) -> dict:
+        """Pre-entry event MC metrics using the same thresholds as event_mc_exit."""
+        mu_evt, sigma_evt = adjust_mu_sigma(
+            float(ctx.get("mu_base", 0.0)),
+            float(ctx.get("sigma", 0.0)),
+            str(ctx.get("regime", "chop")),
+        )
+        meta = decision.get("meta") or {}
+        if not meta:
+            for d in decision.get("details", []):
+                if d.get("_engine") in ("mc_barrier", "mc_engine", "mc"):
+                    meta = d.get("meta") or {}
+                    break
+        try:
+            bar_sec = float(ctx.get("bar_seconds", 60.0) or 60.0)
+        except Exception:
+            bar_sec = 60.0
+        try:
+            step_sec = float(os.environ.get("EVENT_MC_STEP_SEC", bar_sec) or bar_sec)
+        except Exception:
+            step_sec = bar_sec
+        if step_sec <= 0:
+            step_sec = bar_sec if bar_sec > 0 else 60.0
+        max_horizon_sec = None
+        try:
+            horizon_seq = meta.get("horizon_seq")
+            if isinstance(horizon_seq, (list, tuple)) and horizon_seq:
+                max_horizon_sec = max(float(h) for h in horizon_seq if h is not None)
+        except Exception:
+            max_horizon_sec = None
+        try:
+            env_max_h = float(os.environ.get("EVENT_MC_MAX_HORIZON_SEC", 0) or 0)
+        except Exception:
+            env_max_h = 0.0
+        if env_max_h > 0:
+            max_horizon_sec = env_max_h
+        try:
+            use_tstar = str(os.environ.get("EVENT_MC_USE_TSTAR", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            use_tstar = True
+        if use_tstar:
+            try:
+                tstar = float(
+                    meta.get("opt_hold_sec")
+                    or meta.get("unified_t_star")
+                    or meta.get("policy_horizon_eff_sec")
+                    or meta.get("best_h")
+                    or 0.0
+                )
+            except Exception:
+                tstar = 0.0
+            if tstar and tstar > 0:
+                max_horizon_sec = float(tstar)
+        if max_horizon_sec and step_sec > 0:
+            max_steps_evt = max(1, int(round(float(max_horizon_sec) / float(step_sec))))
+        else:
+            try:
+                max_steps_evt = int(os.environ.get("EVENT_MC_MAX_STEPS", 600) or 600)
+            except Exception:
+                max_steps_evt = 600
+        dt_evt = float(step_sec) / 31536000.0
+        seed_evt = int(time.time()) ^ hash(sym)
+        params_meta = meta.get("params") or {}
+        tp_pct = decision.get("mc_tp") or meta.get("mc_tp") or params_meta.get("profit_target") or 0.001
+        sl_pct = decision.get("mc_sl") or meta.get("mc_sl") or (tp_pct * 0.8)
+        tp_pct = float(max(tp_pct, 1e-6))
+        sl_pct = float(max(sl_pct, 1e-6))
+
+        # Entry at current price => remaining TP/SL equals configured TP/SL.
+        tp_rem = float(tp_pct)
+        sl_rem = float(sl_pct)
+
+        ev_r_evt = meta.get("event_ev_r")
+        cvar_r_evt = meta.get("event_cvar_r")
+        p_sl_evt = meta.get("event_p_sl")
+        t_med_evt = meta.get("event_t_median")
+
+        if ev_r_evt is None or cvar_r_evt is None or p_sl_evt is None:
+            m_evt = mc_first_passage_tp_sl_jax(
+                s0=float(price),
+                tp_pct=tp_rem,
+                sl_pct=sl_rem,
+                mu=mu_evt,
+                sigma=sigma_evt,
+                dt=dt_evt,
+                max_steps=int(max_steps_evt),
+                n_paths=int(decision.get("n_paths", meta.get("params", {}).get("n_paths", 2048))),
+                seed=seed_evt,
+                dist=ctx.get("tail_model", "student_t"),
+                df=ctx.get("tail_df", 6.0),
+                boot_rets=ctx.get("bootstrap_returns"),
+            )
+            if m_evt:
+                ev_r_evt = float(m_evt.get("event_ev_r", 0.0) or 0.0)
+                cvar_r_evt = float(m_evt.get("event_cvar_r", 0.0) or 0.0)
+                p_sl_evt = float(m_evt.get("event_p_sl", 0.0) or 0.0)
+                t_med_evt = float(m_evt.get("event_t_median", 0.0) or 0.0)
+                t_med_evt = float(t_med_evt) * float(step_sec) if t_med_evt > 0 else 0.0
+            else:
+                ev_r_evt, cvar_r_evt, p_sl_evt, t_med_evt = 0.0, 0.0, 0.0, 0.0
+        else:
+            ev_r_evt = float(ev_r_evt or 0.0)
+            cvar_r_evt = float(cvar_r_evt or 0.0)
+            p_sl_evt = float(p_sl_evt or 0.0)
+            t_med_evt = float(t_med_evt or 0.0)
+
+        ev_pct_evt = float(ev_r_evt) * float(sl_rem)
+        cvar_pct_evt = float(cvar_r_evt) * float(sl_rem)
+        tau_evt = float(max(1.0, float(t_med_evt) if t_med_evt else 1.0))
+        lambda_evt = float(getattr(mc_config, "unified_risk_lambda", 1.0))
+        rho_evt = float(getattr(mc_config, "unified_rho", 0.0))
+        event_score = float(ev_pct_evt - lambda_evt * abs(cvar_pct_evt) - rho_evt * tau_evt)
+
+        min_score = float(self.exit_policy.min_event_score)
+        max_cvar = float(self.exit_policy.max_abs_event_cvar_r)
+        max_p_sl = float(self.exit_policy.max_event_p_sl)
+        event_exit_ok = True
+        if event_score <= min_score:
+            event_exit_ok = False
+        if abs(cvar_pct_evt) >= max_cvar:
+            event_exit_ok = False
+        if p_sl_evt >= max_p_sl:
+            event_exit_ok = False
+
+        return {
+            "event_ev_r": float(ev_r_evt),
+            "event_cvar_r": float(cvar_r_evt),
+            "event_p_sl": float(p_sl_evt),
+            "event_ev_pct": float(ev_pct_evt),
+            "event_cvar_pct": float(cvar_pct_evt),
+            "event_exit_score": float(event_score),
+            "event_exit_min_score": float(min_score),
+            "event_exit_max_cvar": float(max_cvar),
+            "event_exit_max_p_sl": float(max_p_sl),
+            "event_exit_ok": bool(event_exit_ok),
+            "event_tp_pct": float(tp_pct),
+            "event_sl_pct": float(sl_pct),
+            "event_t_median": float(t_med_evt) if t_med_evt is not None else None,
+        }
+
     def _check_ema_ev_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
         """EMA-based EV/PSL deterioration exit. Returns True if exited."""
+        try:
+            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+        except Exception:
+            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        if min_hold_sec > 0:
+            pos = self.positions.get(sym) or {}
+            try:
+                entry_ts = int(pos.get("entry_time") or 0)
+            except Exception:
+                entry_ts = 0
+            if entry_ts:
+                age_sec = (ts - entry_ts) / 1000.0
+                if age_sec < float(min_hold_sec):
+                    return False
         meta = decision.get("meta") or {}
         ev_now = float(decision.get("unified_score", decision.get("ev", 0.0)) or 0.0)
         p_sl_now = float(meta.get("event_p_sl", 0.0) or 0.0)
@@ -2145,6 +4503,20 @@ class LiveOrchestrator:
 
     def _check_ev_drop_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
         """EV drop exit logic. Returns True if exited."""
+        try:
+            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+        except Exception:
+            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        if min_hold_sec > 0:
+            pos = self.positions.get(sym) or {}
+            try:
+                entry_ts = int(pos.get("entry_time") or 0)
+            except Exception:
+                entry_ts = 0
+            if entry_ts:
+                age_sec = (ts - entry_ts) / 1000.0
+                if age_sec < float(min_hold_sec):
+                    return False
         ev_now = float(decision.get("unified_score", decision.get("ev", 0.0)) or 0.0)
         meta_now = decision.get("meta") or {}
         ev_floor = float(meta_now.get("ev_entry_threshold_dyn") or meta_now.get("ev_entry_threshold") or 0.0)
@@ -2356,9 +4728,14 @@ class LiveOrchestrator:
         return decisionF
 
     async def fetch_prices_loop(self):
+        try:
+            interval = float(os.environ.get("PRICE_REFRESH_SEC", 1.0) or 1.0)
+        except Exception:
+            interval = 1.0
+        interval = max(0.2, interval)
         while True:
             try:
-                tickers = await self._ccxt_call("fetch_tickers", self.exchange.fetch_tickers, SYMBOLS)
+                tickers = await self._ccxt_call("fetch_tickers", self.data_exchange.fetch_tickers, SYMBOLS)
                 ts = now_ms()
                 ok_any = False
                 for s in SYMBOLS:
@@ -2371,7 +4748,7 @@ class LiveOrchestrator:
                     self._last_feed_ok_ms = ts
             except Exception as e:
                 self._log_err(f"[ERR] fetch_tickers: {e}")
-            await asyncio.sleep(1.0)  # ✅ 너무 촘촘하면 Bybit timeout 잦음
+            await asyncio.sleep(interval)  # ✅ too tight can hit Bybit limits
 
     async def preload_all_ohlcv(self, limit: int = OHLCV_PRELOAD_LIMIT):
         """
@@ -2379,14 +4756,26 @@ class LiveOrchestrator:
         """
         for sym in SYMBOLS:
             try:
-                ohlcv = await self.exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=limit)
+                ohlcv = await self.data_exchange.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=limit)
                 if not ohlcv:
                     continue
                 self.ohlcv_buffer[sym].clear()
+                self.ohlcv_open[sym].clear()
+                self.ohlcv_high[sym].clear()
+                self.ohlcv_low[sym].clear()
+                self.ohlcv_volume[sym].clear()
                 last_ts = 0
                 for c in ohlcv:
                     ts_ms = int(c[0])
+                    open_price = float(c[1])
+                    high_price = float(c[2])
+                    low_price = float(c[3])
                     close_price = float(c[4])
+                    vol_val = float(c[5]) if len(c) > 5 else 0.0
+                    self.ohlcv_open[sym].append(open_price)
+                    self.ohlcv_high[sym].append(high_price)
+                    self.ohlcv_low[sym].append(low_price)
+                    self.ohlcv_volume[sym].append(vol_val)
                     self.ohlcv_buffer[sym].append(close_price)
                     last_ts = ts_ms
                 self._last_kline_ts[sym] = last_ts
@@ -2408,16 +4797,24 @@ class LiveOrchestrator:
                     try:
                         ohlcv = await self._ccxt_call(
                             f"fetch_ohlcv {sym}",
-                            self.exchange.fetch_ohlcv,
+                            self.data_exchange.fetch_ohlcv,
                             sym, timeframe=TIMEFRAME, limit=OHLCV_REFRESH_LIMIT
                         )
                         if not ohlcv:
                             continue
                         last = ohlcv[-1]
                         ts_ms = int(last[0])
+                        open_price = float(last[1])
+                        high_price = float(last[2])
+                        low_price = float(last[3])
                         close_price = float(last[4])
+                        vol_val = float(last[5]) if len(last) > 5 else 0.0
 
                         if ts_ms != self._last_kline_ts[sym]:
+                            self.ohlcv_open[sym].append(open_price)
+                            self.ohlcv_high[sym].append(high_price)
+                            self.ohlcv_low[sym].append(low_price)
+                            self.ohlcv_volume[sym].append(vol_val)
                             self.ohlcv_buffer[sym].append(close_price)
                             self._last_kline_ts[sym] = ts_ms
                             self._last_kline_ok_ms[sym] = now_ms()
@@ -2441,7 +4838,7 @@ class LiveOrchestrator:
             tasks = [
                 self._ccxt_call(
                     f"fetch_orderbook {sym}",
-                    self.exchange.fetch_order_book,
+                    self.data_exchange.fetch_order_book,
                     sym, limit=ORDERBOOK_DEPTH,
                     semaphore=self._ob_sem,
                 )
@@ -2482,28 +4879,1164 @@ class LiveOrchestrator:
             sleep_left = max(0.0, ORDERBOOK_SLEEP_SEC - elapsed)
             await asyncio.sleep(sleep_left)
 
+    def _normalize_exchange_positions(self, raw_positions: list[dict]) -> dict[str, dict]:
+        out = {}
+        for p in raw_positions or []:
+            try:
+                sym = p.get("symbol") or p.get("info", {}).get("symbol")
+            except Exception:
+                sym = None
+            if not sym:
+                continue
+            sym = _normalize_sym_key(sym)
+            size = None
+            for key in ("contracts", "positionAmt", "size"):
+                if size is None:
+                    try:
+                        size = p.get(key)
+                    except Exception:
+                        size = None
+            if size is None:
+                try:
+                    size = p.get("info", {}).get("size")
+                except Exception:
+                    size = None
+            try:
+                size_f = float(size or 0.0)
+            except Exception:
+                size_f = 0.0
+            p["size_f"] = size_f
+            out[str(sym)] = p
+        return out
+
+    def _ensure_symbol_state(self, sym: str) -> None:
+        if sym not in self.market:
+            self.market[sym] = {"price": None, "ts": 0}
+        if sym not in self.ohlcv_buffer:
+            self.ohlcv_buffer[sym] = deque(maxlen=OHLCV_PRELOAD_LIMIT)
+        if sym not in self.ohlcv_open:
+            self.ohlcv_open[sym] = deque(maxlen=OHLCV_PRELOAD_LIMIT)
+        if sym not in self.ohlcv_high:
+            self.ohlcv_high[sym] = deque(maxlen=OHLCV_PRELOAD_LIMIT)
+        if sym not in self.ohlcv_low:
+            self.ohlcv_low[sym] = deque(maxlen=OHLCV_PRELOAD_LIMIT)
+        if sym not in self.ohlcv_volume:
+            self.ohlcv_volume[sym] = deque(maxlen=OHLCV_PRELOAD_LIMIT)
+        if sym not in self.orderbook:
+            self.orderbook[sym] = {"ts": 0, "ready": False, "bids": [], "asks": []}
+        if sym not in self._last_kline_ts:
+            self._last_kline_ts[sym] = 0
+        if sym not in self._last_kline_ok_ms:
+            self._last_kline_ok_ms[sym] = 0
+        if sym not in self._preloaded:
+            self._preloaded[sym] = False
+        if sym not in self._cooldown_until:
+            self._cooldown_until[sym] = 0.0
+        if sym not in self._entry_streak:
+            self._entry_streak[sym] = 0
+        if sym not in self._last_exit_kind:
+            self._last_exit_kind[sym] = "NONE"
+        if sym not in self._streak:
+            self._streak[sym] = 0
+        if sym not in self._ev_tune_hist:
+            self._ev_tune_hist[sym] = deque(maxlen=2000)
+        if sym not in self._ev_hist:
+            self._ev_hist[sym] = deque(maxlen=400)
+        if sym not in self._cvar_hist:
+            self._cvar_hist[sym] = deque(maxlen=400)
+        if sym not in self._ev_drop_state:
+            self._ev_drop_state[sym] = {"prev": None, "streak": 0}
+        if sym not in self._exit_bad_ticks:
+            self._exit_bad_ticks[sym] = 0
+        if sym not in self._dyn_leverage:
+            self._dyn_leverage[sym] = float(self.leverage)
+        if sym not in self._live_missing_pos_counts:
+            self._live_missing_pos_counts[sym] = 0
+        if sym not in self._last_ok.get("ohlcv", {}):
+            self._last_ok.setdefault("ohlcv", {})[sym] = 0
+        if sym not in self._last_ok.get("ob", {}):
+            self._last_ok.setdefault("ob", {})[sym] = 0
+
+    def _extract_ticker_volume(self, t: dict) -> float | None:
+        def _f(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+        if not isinstance(t, dict):
+            return None
+        v = _f(t.get("quoteVolume"))
+        if v is None:
+            info = t.get("info") or {}
+            v = _f(info.get("turnover24h")) or _f(info.get("turnover24hUSDT")) or _f(info.get("volume24h"))
+        if v is None:
+            base = _f(t.get("baseVolume"))
+            last = _f(t.get("last"))
+            if base is not None and last is not None:
+                v = float(base) * float(last)
+        return v
+
+    def _apply_dynamic_universe(self, new_syms: list[str], *, reason: str = "top_volume") -> None:
+        global SYMBOLS, TOP_N_SYMBOLS
+        # keep order, remove duplicates
+        seen = set()
+        cleaned = []
+        for s in new_syms:
+            if not s or s in seen:
+                continue
+            cleaned.append(s)
+            seen.add(s)
+        if not cleaned:
+            return
+        if cleaned == SYMBOLS:
+            return
+        old_syms = list(SYMBOLS)
+        old_set = set(old_syms)
+        new_set = set(cleaned)
+        add = [s for s in cleaned if s not in old_set]
+
+        # ensure state for new symbols
+        for sym in add:
+            self._ensure_symbol_state(sym)
+
+        # archive positions outside new universe
+        self._runtime_universe = new_set
+        try:
+            self._archive_outside_universe_positions(universe=new_set, source=reason)
+        except Exception:
+            pass
+
+        SYMBOLS = cleaned
+        # update TOP_N limit to avoid out-of-range
+        if TOP_N_SYMBOLS <= 0 or TOP_N_SYMBOLS > len(SYMBOLS):
+            TOP_N_SYMBOLS = len(SYMBOLS)
+        # refresh index map for SoA
+        try:
+            self._sym_to_idx = {s: i for i, s in enumerate(SYMBOLS)}
+        except Exception:
+            pass
+        if len(SYMBOLS) > int(self._batch_max_symbols):
+            self._log_err(f"[UNIVERSE] dynamic symbols={len(SYMBOLS)} exceed batch_max={self._batch_max_symbols}")
+
+        self._log(f"[UNIVERSE] dynamic update: {len(old_set)} -> {len(new_set)} ({reason})")
+
+    def _allow_empty_position_sync(self, now_ts: int) -> bool:
+        try:
+            confirm_count = int(os.environ.get("SYNC_EMPTY_CONFIRM_COUNT", 2) or 2)
+        except Exception:
+            confirm_count = 2
+        try:
+            grace_sec = float(os.environ.get("SYNC_EMPTY_GRACE_SEC", 30.0) or 30.0)
+        except Exception:
+            grace_sec = 30.0
+        confirm_count = max(1, confirm_count)
+        grace_ms = int(max(0.0, grace_sec) * 1000.0)
+        last_ok = int(self._last_nonempty_pos_fetch_ms or 0)
+        if last_ok and (now_ts - last_ok) < grace_ms:
+            return False
+        return self._empty_positions_fetches >= confirm_count
+
+    async def _sync_positions_from_exchange(
+        self,
+        *,
+        overwrite: bool = True,
+        reason: str = "startup",
+        raw_positions: list[dict] | None = None,
+        keep_pending: bool = False,
+        include_all: bool | None = None,
+    ) -> None:
+        if not self.enable_orders:
+            return
+        if not getattr(self.exchange, "apiKey", None) or not getattr(self.exchange, "secret", None):
+            self._log_err("[SYNC_POS] apiKey/secret missing; skip exchange position sync")
+            return
+        if include_all is None:
+            include_all = bool(getattr(config, "SYNC_POSITIONS_ALL", True))
+        try:
+            raw = raw_positions
+            if raw is None:
+                try:
+                    if include_all:
+                        raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions)
+                    else:
+                        raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions, SYMBOLS)
+                except Exception as e:
+                    msg = str(e)
+                    if "fetchPositions() does not accept an array" in msg or "does not accept an array" in msg:
+                        raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions)
+                    else:
+                        raise
+            pos_map = self._normalize_exchange_positions(raw if isinstance(raw, list) else [])
+        except Exception as e:
+            self._log_err(f"[SYNC_POS] fetch_positions failed: {e}")
+            return
+
+        now_ts = now_ms()
+        new_positions: dict[str, dict] = {}
+        for sym, ex in pos_map.items():
+            try:
+                size = float(ex.get("size_f", 0.0) or 0.0)
+            except Exception:
+                size = 0.0
+            if abs(size) < 1e-9:
+                continue
+            info = ex.get("info") or {}
+            side_raw = ex.get("side") or info.get("side")
+            side = None
+            if side_raw:
+                s = str(side_raw).lower()
+                if "long" in s or "buy" in s:
+                    side = "LONG"
+                elif "short" in s or "sell" in s:
+                    side = "SHORT"
+            if side is None:
+                side = "SHORT" if size < 0 else "LONG"
+            qty = abs(size)
+            def _pick(*vals):
+                for v in vals:
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    if math.isfinite(fv) and fv > 0:
+                        return fv
+                return None
+            entry_px = _pick(ex.get("entryPrice"), ex.get("entry_price"), info.get("entryPrice"), info.get("avgPrice"))
+            mark_px = _pick(ex.get("markPrice"), ex.get("lastPrice"), info.get("markPrice"), info.get("lastPrice"))
+            if entry_px is None:
+                entry_px = mark_px
+            notional = _pick(ex.get("notional"), info.get("positionValue"))
+            if notional is None and entry_px is not None:
+                notional = abs(qty * entry_px)
+            if notional is None and mark_px is not None:
+                notional = abs(qty * mark_px)
+            leverage = _pick(ex.get("leverage"), info.get("leverage")) or float(self.leverage)
+            margin = _pick(ex.get("initialMargin"), info.get("positionIM"), info.get("positionMargin"))
+            entry_time = None
+            try:
+                entry_time = int(info.get("createdTime") or info.get("createdTimeMs") or info.get("updateTime") or info.get("updatedTime"))
+            except Exception:
+                entry_time = None
+            if entry_time is None:
+                entry_time = now_ts
+            entry_time = self._normalize_entry_time_ms(entry_time, default=now_ts)
+            cap_frac = float(notional / self.balance) if (self.balance and notional) else 0.0
+            size_frac = 0.0
+            try:
+                size_frac = float(notional or 0.0) / max(float(self.balance) * max(float(leverage), 1e-6), 1e-6)
+            except Exception:
+                size_frac = 0.0
+
+            pos = {
+                "symbol": sym,
+                "side": side,
+                "entry_price": float(entry_px or 0.0),
+                "entry_time": int(entry_time),
+                "quantity": float(qty),
+                "notional": float(notional or 0.0),
+                "size_frac": float(size_frac),
+                "tag": None,
+                "leverage": float(leverage),
+                "cap_frac": float(cap_frac),
+                "fee_paid": 0.0,
+                "order_status": "ack",
+                "order_ack_ts": int(now_ts),
+                "pos_source": "exchange_sync",
+                "margin": float(margin) if margin is not None else None,
+                "current_price": float(mark_px) if mark_px is not None else None,
+                "managed": bool(getattr(config, "MANAGE_SYNCED_POSITIONS", True)),
+            }
+            # Preserve hold-eval metadata across exchange syncs (avoid wiping t* fields)
+            try:
+                prior = self.positions.get(sym) or {}
+                for key in (
+                    "opt_hold_entry_sec",
+                    "opt_hold_entry_src",
+                    "opt_hold_curr_sec",
+                    "opt_hold_curr_src",
+                    "opt_hold_curr_remaining_sec",
+                    "opt_hold_sec",
+                    "opt_hold_src",
+                    "hold_ev_tstar",
+                    "hold_ev_raw_tstar",
+                    "hold_eval_ts",
+                    "hold_eval_h_pick",
+                    "entry_score",
+                    "entry_score_hold",
+                    "entry_floor",
+                    "pred_ev",
+                    "pred_event_ev_r",
+                ):
+                    if key in prior and prior.get(key) is not None:
+                        pos[key] = prior.get(key)
+            except Exception:
+                pass
+            new_positions[sym] = pos
+
+        if keep_pending and self.positions:
+            try:
+                grace_sec = float(getattr(config, "LIVE_PENDING_SYNC_GRACE_SEC", 30.0) or 30.0)
+            except Exception:
+                grace_sec = 30.0
+            for sym, pos in list(self.positions.items()):
+                if sym in new_positions:
+                    continue
+                try:
+                    status = str(pos.get("order_status") or "")
+                    submit_ts = int(pos.get("order_submit_ts") or 0)
+                except Exception:
+                    status = ""
+                    submit_ts = 0
+                if status and status != "ack":
+                    if submit_ts and (now_ts - submit_ts) < int(grace_sec * 1000):
+                        new_positions[sym] = pos
+
+        if overwrite and (not new_positions) and self.positions:
+            if not self._allow_empty_position_sync(int(now_ts)):
+                self._log("[SYNC_POS] skip empty overwrite (guard)")
+                return
+        if overwrite:
+            self.positions = new_positions
+        else:
+            self.positions.update(new_positions)
+        try:
+            for sym in new_positions.keys():
+                self._external_close_missing_counts.pop(sym, None)
+        except Exception:
+            pass
+        for sym in new_positions.keys():
+            self._last_actions[sym] = "SYNC"
+            self._last_open_ts[sym] = int(now_ts)
+        try:
+            self._archive_outside_universe_positions(source=f"exchange_sync:{reason}")
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "db") and self.db is not None and overwrite:
+                try:
+                    self.db.delete_positions_by_mode(self._trading_mode)
+                except Exception:
+                    pass
+                for sym, pos in self.positions.items():
+                    self.db.save_position_background(sym, pos, mode=self._trading_mode)
+        except Exception:
+            pass
+        try:
+            self._persist_state(force=True)
+        except Exception:
+            pass
+        self._last_positions_sync_ms = int(now_ts)
+        self._log(f"[SYNC_POS] exchange positions synced ({reason}) count={len(new_positions)} overwrite={overwrite}")
+
+    def _extract_usdt_wallet_equity_from_balance(self, bal):
+        wallet = None
+        equity = None
+        free = None
+        try:
+            if isinstance(bal, dict):
+                usdt = bal.get("USDT")
+                if isinstance(usdt, dict):
+                    try:
+                        free = float(usdt.get("free")) if usdt.get("free") is not None else None
+                    except Exception:
+                        free = None
+                    try:
+                        equity = float(usdt.get("total")) if usdt.get("total") is not None else None
+                    except Exception:
+                        equity = None
+                info = bal.get("info")
+                if isinstance(info, dict):
+                    res = info.get("result")
+                    if isinstance(res, dict):
+                        lst = res.get("list")
+                        if isinstance(lst, list) and lst:
+                            item = lst[0]
+                            if isinstance(item, dict):
+                                try:
+                                    if item.get("totalWalletBalance") is not None:
+                                        wallet = float(item.get("totalWalletBalance"))
+                                except Exception:
+                                    pass
+                                try:
+                                    if item.get("totalEquity") is not None:
+                                        equity = float(item.get("totalEquity"))
+                                except Exception:
+                                    pass
+                                try:
+                                    if item.get("totalAvailableBalance") is not None:
+                                        free = float(item.get("totalAvailableBalance"))
+                                    elif item.get("availableBalance") is not None:
+                                        free = float(item.get("availableBalance"))
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+        return wallet, equity, free
+
+    def _extract_margin_metrics_from_balance(self, bal):
+        im = None
+        mm = None
+        try:
+            if isinstance(bal, dict):
+                info = bal.get("info")
+                if isinstance(info, dict):
+                    res = info.get("result")
+                    if isinstance(res, dict):
+                        lst = res.get("list")
+                        if isinstance(lst, list) and lst:
+                            item = lst[0]
+                            if isinstance(item, dict):
+                                try:
+                                    if item.get("totalInitialMargin") is not None:
+                                        im = float(item.get("totalInitialMargin"))
+                                except Exception:
+                                    im = None
+                                try:
+                                    if item.get("totalMaintenanceMargin") is not None:
+                                        mm = float(item.get("totalMaintenanceMargin"))
+                                except Exception:
+                                    mm = None
+        except Exception:
+            pass
+        return im, mm
+
+    async def fetch_balance_loop(self):
+        interval = float(LIVE_BALANCE_SYNC_SEC) if LIVE_BALANCE_SYNC_SEC else 5.0
+        interval = max(1.0, interval)
+        while True:
+            if not self.enable_orders:
+                await asyncio.sleep(interval)
+                continue
+            if not getattr(self.exchange, "apiKey", None) or not getattr(self.exchange, "secret", None):
+                if not self._live_balance_key_warned:
+                    self._log("[LIVE_BAL] apiKey/secret missing; skipping live balance sync")
+                    self._live_balance_key_warned = True
+                await asyncio.sleep(interval)
+                continue
+            self._live_balance_key_warned = False
+            try:
+                bal = await self._ccxt_call("fetch_balance(live)", self.exchange.fetch_balance)
+                wallet, equity, free = self._extract_usdt_wallet_equity_from_balance(bal)
+                im, mm = self._extract_margin_metrics_from_balance(bal)
+                equity_val = equity if equity is not None else wallet
+                if wallet is not None:
+                    self.balance = float(wallet)
+                elif equity_val is not None:
+                    self.balance = float(equity_val)
+                self._live_wallet_balance = wallet
+                self._live_equity = equity_val
+                self._live_free_balance = free
+                self._live_total_initial_margin = im
+                self._live_total_maintenance_margin = mm
+                ts_ms = now_ms()
+                self._last_live_sync_ms = ts_ms
+                self._last_live_sync_err = None
+                try:
+                    self.risk_manager.update_account_summary(
+                        wallet_balance=wallet,
+                        total_equity=equity,
+                        free_balance=free,
+                        total_initial_margin=im,
+                        total_maintenance_margin=mm,
+                    )
+                except Exception:
+                    pass
+                try:
+                    eq_val = equity_val if equity_val is not None else (wallet if wallet is not None else self.balance)
+                    eq_val = float(eq_val)
+                    if math.isfinite(eq_val):
+                        self._live_equity_history.append({"time": ts_ms, "equity": eq_val})
+                except Exception:
+                    pass
+            except Exception as e:
+                self._last_live_sync_err = str(e)
+                self._log_err(f"[ERR] fetch_balance_loop: {e}")
+                self._note_runtime_error("fetch_balance_loop", str(e))
+            await asyncio.sleep(interval)
+
+    async def fetch_positions_loop(self):
+        if not self.enable_orders:
+            while True:
+                await asyncio.sleep(float(getattr(config, "LIVE_LIQUIDATION_SYNC_SEC", 10.0) or 10.0))
+        while True:
+            try:
+                interval = float(getattr(config, "LIVE_LIQUIDATION_SYNC_SEC", 10.0) or 10.0)
+            except Exception:
+                interval = 10.0
+            try:
+                try:
+                    raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS)
+                except Exception as e:
+                    msg = str(e)
+                    # Bybit: fetchPositions does not accept an array with more than one symbol.
+                    if "fetchPositions() does not accept an array" in msg or "does not accept an array" in msg:
+                        raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions)
+                    else:
+                        raise
+                pos_map = self._normalize_exchange_positions(raw if isinstance(raw, list) else [])
+                now_ts = now_ms()
+                if pos_map:
+                    self._empty_positions_fetches = 0
+                    self._last_nonempty_pos_fetch_ms = int(now_ts)
+                elif self.positions:
+                    self._empty_positions_fetches += 1
+                    if not self._allow_empty_position_sync(int(now_ts)):
+                        await asyncio.sleep(interval)
+                        continue
+                # Record external/manual closes before sync overwrites local state.
+                try:
+                    for sym, pos in list(self.positions.items()):
+                        try:
+                            qty = float(pos.get("quantity", 0.0))
+                        except Exception:
+                            qty = 0.0
+                        if qty == 0.0:
+                            continue
+                        try:
+                            status = str(pos.get("order_status") or "")
+                            submit_ts = int(pos.get("order_submit_ts") or 0)
+                        except Exception:
+                            status = ""
+                            submit_ts = 0
+                        if status and status != "ack":
+                            # skip pending entries
+                            if submit_ts and (now_ts - submit_ts) < 30_000:
+                                continue
+                        ex = pos_map.get(sym)
+                        ex_size = 0.0
+                        if ex is not None:
+                            try:
+                                ex_size = float(ex.get("size_f", 0.0))
+                            except Exception:
+                                ex_size = 0.0
+                        if ex is not None and abs(ex_size) >= 1e-9:
+                            try:
+                                self._external_close_missing_counts.pop(sym, None)
+                            except Exception:
+                                pass
+                            continue
+                        if ex is None or abs(ex_size) < 1e-9:
+                            try:
+                                confirm_cnt = int(os.environ.get("EXTERNAL_CLOSE_CONFIRM_COUNT", 2) or 2)
+                            except Exception:
+                                confirm_cnt = 2
+                            confirm_cnt = max(1, confirm_cnt)
+                            miss_cnt = int(self._external_close_missing_counts.get(sym, 0) or 0) + 1
+                            self._external_close_missing_counts[sym] = miss_cnt
+                            if miss_cnt < confirm_cnt:
+                                continue
+                            try:
+                                entry_ts = int(pos.get("entry_time") or 0)
+                            except Exception:
+                                entry_ts = 0
+                            try:
+                                grace_sec = float(os.environ.get("EXTERNAL_CLOSE_GRACE_SEC", 10.0) or 10.0)
+                            except Exception:
+                                grace_sec = 10.0
+                            if entry_ts and (now_ts - entry_ts) < int(grace_sec * 1000):
+                                continue
+                            px = self.market.get(sym, {}).get("price") or pos.get("current_price") or pos.get("entry_price")
+                            if px is None:
+                                continue
+                            self._record_external_close(sym, float(px), reason="exchange_manual_close")
+                            try:
+                                self._external_close_missing_counts.pop(sym, None)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    if bool(getattr(config, "SYNC_POSITIONS_POLL", True)):
+                        poll_sec = float(getattr(config, "SYNC_POSITIONS_POLL_SEC", 30.0) or 30.0)
+                        last_sync = int(self._last_positions_sync_ms or 0)
+                        current_ms = now_ms()
+                        if (not last_sync) or (current_ms - last_sync) >= int(poll_sec * 1000):
+                            try:
+                                overwrite_poll = str(os.environ.get("SYNC_POSITIONS_OVERWRITE", "0")).strip().lower() in ("1", "true", "yes", "on")
+                            except Exception:
+                                overwrite_poll = False
+                            try:
+                                keep_pending = str(os.environ.get("SYNC_POSITIONS_KEEP_PENDING", "1")).strip().lower() in ("1", "true", "yes", "on")
+                            except Exception:
+                                keep_pending = True
+                            include_all = bool(getattr(config, "SYNC_POSITIONS_ALL", True))
+                            await self._sync_positions_from_exchange(
+                                overwrite=overwrite_poll,
+                                reason="poll",
+                                raw_positions=None if include_all else (raw if isinstance(raw, list) else None),
+                                keep_pending=keep_pending,
+                                include_all=include_all,
+                            )
+                except Exception:
+                    pass
+                now_ts = now_ms()
+                # detect unexpected exchange-side closes (possible liquidation)
+                for sym, pos in list(self.positions.items()):
+                    try:
+                        qty = float(pos.get("quantity", 0.0))
+                    except Exception:
+                        qty = 0.0
+                    if qty == 0.0:
+                        continue
+                    # Skip liquidation check for pending entry orders (not yet acknowledged)
+                    try:
+                        status = str(pos.get("order_status") or "")
+                        submit_ts = int(pos.get("order_submit_ts") or 0)
+                    except Exception:
+                        status = ""
+                        submit_ts = 0
+                    if status and status != "ack":
+                        if submit_ts and (now_ts - submit_ts) < 30_000:
+                            continue
+                    ex = pos_map.get(sym)
+                    ex_size = 0.0
+                    if ex is not None:
+                        try:
+                            ex_size = float(ex.get("size_f", 0.0))
+                        except Exception:
+                            ex_size = 0.0
+                    # reset missing counter if exchange position exists
+                    if ex is not None and abs(ex_size) > 1e-9:
+                        self._live_missing_pos_counts[sym] = 0
+                        continue
+                    # if exchange reports no position but we think it's open
+                    if ex is None or abs(ex_size) < 1e-9:
+                        last_close = int(self._last_close_ts.get(sym, 0) or 0)
+                        # ignore if we just closed locally
+                        if last_close and (now_ts - last_close) < 10_000:
+                            continue
+                        # grace period after entry (avoid false liquidation)
+                        try:
+                            entry_ts = int(pos.get("entry_time") or 0)
+                        except Exception:
+                            entry_ts = 0
+                        try:
+                            grace_sec = float(os.environ.get("LIVE_LIQUIDATION_GRACE_SEC", 15.0) or 15.0)
+                        except Exception:
+                            grace_sec = 15.0
+                        if entry_ts and (now_ts - entry_ts) < int(grace_sec * 1000):
+                            continue
+                        # require multiple consecutive misses before marking liquidation
+                        try:
+                            miss_need = int(os.environ.get("LIVE_LIQUIDATION_MISS_COUNT", 2) or 2)
+                        except Exception:
+                            miss_need = 2
+                        miss_need = max(1, miss_need)
+                        miss_cnt = int(self._live_missing_pos_counts.get(sym, 0) or 0) + 1
+                        self._live_missing_pos_counts[sym] = miss_cnt
+                        if miss_cnt < miss_need:
+                            continue
+                        px = self.market.get(sym, {}).get("price")
+                        self._log_err(f"[LIVE_LIQ] {sym} exchange position missing (size=0). Marking as liquidation.")
+                        self._register_anomaly("exchange_liquidation", "critical", f"{sym} exchange position closed (liq?)")
+                        if not bool(getattr(self, "safety_mode", False)):
+                            self.safety_mode = True
+                            self._register_anomaly("safety_mode", "critical", f"exchange liquidation -> safety mode ({sym})")
+                            self._log_err(f"[RISK] safety_mode ON due to exchange liquidation: {sym}")
+                        if px is None:
+                            try:
+                                px = float(pos.get("entry_price") or 0.0)
+                            except Exception:
+                                px = None
+                        if px is None:
+                            self.positions.pop(sym, None)
+                        else:
+                            self._close_position(sym, float(px), "exchange_liquidation", exit_kind="KILL", skip_order=True)
+            except Exception as e:
+                self._log_err(f"[ERR] fetch_positions_loop: {e}")
+                self._note_runtime_error("fetch_positions_loop", str(e))
+            await asyncio.sleep(interval)
+
+    async def refresh_top_volume_universe_loop(self):
+        while True:
+            try:
+                enabled = str(os.environ.get("DYNAMIC_UNIVERSE_TOP_VOLUME", "0")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                enabled = False
+            if not enabled:
+                await asyncio.sleep(5.0)
+                continue
+            try:
+                refresh_sec = float(os.environ.get("TOP_VOLUME_REFRESH_SEC", 1800.0) or 1800.0)
+            except Exception:
+                refresh_sec = 1800.0
+            refresh_sec = max(60.0, refresh_sec)
+            try:
+                top_n = int(os.environ.get("TOP_VOLUME_COUNT", 30) or 30)
+            except Exception:
+                top_n = 30
+            top_n = max(1, top_n)
+            try:
+                suffix = str(os.environ.get("TOP_VOLUME_SYMBOL_SUFFIX", ":USDT") or ":USDT").strip()
+            except Exception:
+                suffix = ":USDT"
+            try:
+                min_quote = float(os.environ.get("TOP_VOLUME_MIN_QUOTE", 0.0) or 0.0)
+            except Exception:
+                min_quote = 0.0
+
+            try:
+                tickers = await self._ccxt_call("fetch_tickers(universe)", self.data_exchange.fetch_tickers)
+                if not isinstance(tickers, dict):
+                    tickers = {}
+                candidates = []
+                for sym, t in tickers.items():
+                    if not sym:
+                        continue
+                    if suffix and (suffix not in sym):
+                        continue
+                    vol = self._extract_ticker_volume(t)
+                    if vol is None:
+                        continue
+                    if min_quote > 0 and float(vol) < float(min_quote):
+                        continue
+                    candidates.append((float(vol), str(sym)))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    new_syms = [s for _, s in candidates[:top_n]]
+                    # If a symbol drops from top volume but still has an open position,
+                    # delay replacement until that position is closed.
+                    try:
+                        active_syms = []
+                        for sym, pos in (self.positions or {}).items():
+                            try:
+                                qty = float(pos.get("quantity", 0.0) or 0.0)
+                            except Exception:
+                                qty = 0.0
+                            if abs(qty) > 1e-9:
+                                active_syms.append(sym)
+                        if active_syms:
+                            outside_active = [s for s in active_syms if s not in new_syms]
+                            if outside_active:
+                                keep_n = max(0, len(new_syms) - len(outside_active))
+                                if keep_n < len(new_syms):
+                                    new_syms = new_syms[:keep_n]
+                                for s in outside_active:
+                                    if s not in new_syms:
+                                        new_syms.append(s)
+                    except Exception:
+                        pass
+                    self._apply_dynamic_universe(new_syms, reason="top_volume")
+            except Exception as e:
+                self._log_err(f"[UNIVERSE] top_volume update failed: {e}")
+
+            await asyncio.sleep(refresh_sec)
+
+    async def hold_eval_loop(self):
+        """Background hold-eval refresh for open positions (async, eval-only)."""
+        while True:
+            try:
+                enabled = str(os.environ.get("HOLD_EVAL_ASYNC_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                enabled = True
+            if not enabled:
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                interval = float(os.environ.get("HOLD_EVAL_ASYNC_INTERVAL_SEC", 0) or 0.0)
+            except Exception:
+                interval = 0.0
+            if interval <= 0:
+                try:
+                    interval = float(os.environ.get("HOLD_EVAL_INTERVAL_SEC", 30.0) or 30.0)
+                except Exception:
+                    interval = 30.0
+            try:
+                positions = list((self.positions or {}).items())
+            except Exception:
+                positions = []
+            if not positions:
+                await asyncio.sleep(max(1.0, interval))
+                continue
+            ts = now_ms()
+            for sym, pos in positions:
+                try:
+                    if not pos:
+                        continue
+                    ctx = None
+                    try:
+                        ctx = self._build_decision_context(sym, ts)
+                    except Exception:
+                        ctx = None
+                    if not ctx:
+                        continue
+                    price = ctx.get("price") or self.market.get(sym, {}).get("price") or pos.get("entry_price")
+                    if price is None:
+                        continue
+                    eval_only = not self._is_managed_position(pos)
+                    await asyncio.to_thread(
+                        self._check_hold_vs_exit,
+                        sym,
+                        pos,
+                        {},
+                        ctx,
+                        ts,
+                        float(price),
+                        eval_only=eval_only,
+                    )
+                except Exception as e:
+                    self._log_err(f"[HOLD_EVAL_ASYNC] {sym} error: {e}")
+            await asyncio.sleep(max(1.0, interval))
+
     def _mark_exit_and_cooldown(self, sym: str, exit_kind: str, ts_ms: int):
         """
         exit_kind: "TP" | "TIMEOUT" | "SL" | "KILL" | "MANUAL"
         """
         k = (exit_kind or "MANUAL").upper()
         self._last_exit_kind[sym] = k
-        if k in ("SL", "KILL"):
-            self._cooldown_until[sym] = ts_ms + int(COOLDOWN_RISK_SEC * 1000)
-        else:
-            self._cooldown_until[sym] = ts_ms + int(COOLDOWN_TP_SEC * 1000)
+        # cooldown rule disabled
+        self._cooldown_until[sym] = 0
         self._streak[sym] = 0
+
+    def _archive_outside_universe_positions(self, *, universe: set[str] | None = None, source: str = "runtime") -> int:
+        """Archive and remove positions that are not in the given universe (or default SYMBOLS)."""
+        uni = universe if universe is not None else set(SYMBOLS)
+        outside = [s for s in self.positions.keys() if s not in uni]
+        if not outside:
+            return 0
+        archived = 0
+        for sym in outside:
+            pos = self.positions.get(sym) or {}
+            snap = dict(pos)
+            snap["archive_reason"] = "outside_universe"
+            snap["archive_source"] = source
+            snap["archive_ts"] = now_ms()
+            # Track for dashboard warning
+            self._outside_universe_positions[sym] = {
+                "symbol": sym,
+                "side": snap.get("side"),
+                "quantity": snap.get("quantity") or snap.get("size"),
+                "entry_price": snap.get("entry_price"),
+                "notional": snap.get("notional"),
+                "archive_ts": snap.get("archive_ts"),
+                "archive_source": source,
+            }
+            # Persist archive event
+            try:
+                if self.db is not None:
+                    self.db.log_position_event(sym, "archive_outside_universe", snap, mode=self._trading_mode)
+                    self.db.delete_position(sym)
+            except Exception as e:
+                self._log_err(f"[ERR] archive_outside_universe DB: {sym} err={e}")
+            # Remove from in-memory positions
+            try:
+                self.positions.pop(sym, None)
+            except Exception:
+                pass
+            self._last_close_ts[sym] = now_ms()
+            self._register_anomaly("outside_universe_position", "warning", f"{sym} archived (outside universe)")
+            archived += 1
+        if archived:
+            self._log(f"[ARCHIVE] outside universe positions: {outside}")
+        return archived
+
+    def _compute_momentum_z(self, closes: list[float]) -> float:
+        if not closes or len(closes) < 6:
+            return 0.0
+        try:
+            rets = np.diff(np.log(np.asarray(closes, dtype=np.float64)))
+            if rets.size < 5:
+                return 0.0
+            window = int(min(20, rets.size))
+            subset = rets[-window:]
+            mean_r = float(subset.mean())
+            std_r = float(subset.std())
+            if std_r <= 1e-9:
+                return 0.0
+            return float((subset[-1] - mean_r) / std_r)
+        except Exception:
+            return 0.0
+
+    def _compute_impulse_features(
+        self,
+        closes: list[float],
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        volumes: list[float],
+    ) -> dict:
+        try:
+            lookback = int(os.environ.get("IMPULSE_LOOKBACK", 20) or 20)
+        except Exception:
+            lookback = 20
+        lookback = max(5, lookback)
+        try:
+            body_thr = float(os.environ.get("IMPULSE_BODY_PCT", 0.003) or 0.003)
+        except Exception:
+            body_thr = 0.003
+        try:
+            vol_mult = float(os.environ.get("IMPULSE_VOL_MULT", 2.0) or 2.0)
+        except Exception:
+            vol_mult = 2.0
+        try:
+            score_min = float(os.environ.get("IMPULSE_SCORE_MIN", 0.66) or 0.66)
+        except Exception:
+            score_min = 0.66
+
+        if not closes or not opens or not highs or not lows or not volumes:
+            return {
+                "momentum_z": 0.0,
+                "impulse_score": 0.0,
+                "impulse_dir": 0,
+                "impulse_active": False,
+                "impulse_body_pct": None,
+                "impulse_vol_ratio": None,
+            }
+
+        n = min(len(closes), len(opens), len(highs), len(lows), len(volumes))
+        if n < lookback + 2:
+            return {
+                "momentum_z": self._compute_momentum_z(closes),
+                "impulse_score": 0.0,
+                "impulse_dir": 0,
+                "impulse_active": False,
+                "impulse_body_pct": None,
+                "impulse_vol_ratio": None,
+            }
+
+        closes = closes[-n:]
+        opens = opens[-n:]
+        highs = highs[-n:]
+        lows = lows[-n:]
+        volumes = volumes[-n:]
+
+        curr_close = float(closes[-1])
+        curr_open = float(opens[-1])
+        curr_vol = float(volumes[-1])
+        prev_high = float(max(highs[-(lookback + 1):-1]))
+        prev_low = float(min(lows[-(lookback + 1):-1]))
+
+        body_pct = 0.0
+        if curr_open > 0:
+            body_pct = float((curr_close - curr_open) / curr_open)
+
+        vol_mean = float(np.mean(volumes[-(lookback + 1):-1])) if volumes[-(lookback + 1):-1] else 0.0
+        vol_ratio = float(curr_vol / vol_mean) if vol_mean > 0 else 0.0
+
+        breakout_long = curr_close > prev_high
+        breakout_short = curr_close < prev_low
+        body_long = body_pct >= body_thr
+        body_short = body_pct <= -body_thr
+        vol_ok = vol_ratio >= vol_mult if vol_mult > 0 else True
+
+        breakout_score = 1.0 if (breakout_long or breakout_short) else 0.0
+        body_score = 0.0
+        if body_thr > 0:
+            body_score = min(1.0, abs(body_pct) / body_thr)
+        vol_score = 0.0
+        if vol_mult > 0:
+            vol_score = min(1.0, vol_ratio / vol_mult) if vol_ratio > 0 else 0.0
+        impulse_score = float((breakout_score + body_score + vol_score) / 3.0)
+
+        impulse_dir = 0
+        if breakout_long and body_long and vol_ok:
+            impulse_dir = 1
+        elif breakout_short and body_short and vol_ok:
+            impulse_dir = -1
+        impulse_active = bool(impulse_dir != 0 and impulse_score >= score_min)
+
+        return {
+            "momentum_z": self._compute_momentum_z(closes),
+            "impulse_score": float(impulse_score),
+            "impulse_dir": int(impulse_dir),
+            "impulse_active": bool(impulse_active),
+            "impulse_body_pct": float(body_pct),
+            "impulse_vol_ratio": float(vol_ratio),
+        }
+
+    def _compute_realtime_breakout_features(
+        self,
+        price: float,
+        highs: list[float],
+        lows: list[float],
+        volumes: list[float],
+    ) -> dict:
+        try:
+            enabled = str(os.environ.get("REALTIME_BREAKOUT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            enabled = True
+        if not enabled or price is None or price <= 0:
+            return {
+                "rt_breakout_active": False,
+                "rt_breakout_dir": 0,
+                "rt_breakout_score": 0.0,
+                "rt_breakout_strength": None,
+                "rt_breakout_level": None,
+                "rt_breakout_vol_ratio": None,
+            }
+        try:
+            lookback = int(os.environ.get("REALTIME_BREAKOUT_LOOKBACK", 20) or 20)
+        except Exception:
+            lookback = 20
+        lookback = max(5, lookback)
+        try:
+            buffer_pct = float(os.environ.get("REALTIME_BREAKOUT_BUFFER_PCT", 0.0005) or 0.0005)
+        except Exception:
+            buffer_pct = 0.0005
+        try:
+            score_min = float(os.environ.get("REALTIME_BREAKOUT_SCORE_MIN", 0.66) or 0.66)
+        except Exception:
+            score_min = 0.66
+        try:
+            vol_mult = float(os.environ.get("REALTIME_BREAKOUT_VOL_MULT", 1.5) or 1.5)
+        except Exception:
+            vol_mult = 1.5
+
+        if not highs or not lows:
+            return {
+                "rt_breakout_active": False,
+                "rt_breakout_dir": 0,
+                "rt_breakout_score": 0.0,
+                "rt_breakout_strength": None,
+                "rt_breakout_level": None,
+                "rt_breakout_vol_ratio": None,
+            }
+        n = min(len(highs), len(lows), len(volumes) if volumes else len(highs))
+        if n < lookback + 2:
+            return {
+                "rt_breakout_active": False,
+                "rt_breakout_dir": 0,
+                "rt_breakout_score": 0.0,
+                "rt_breakout_strength": None,
+                "rt_breakout_level": None,
+                "rt_breakout_vol_ratio": None,
+            }
+        highs = highs[-n:]
+        lows = lows[-n:]
+        vols = volumes[-n:] if volumes else [0.0] * n
+
+        prev_high = float(max(highs[-(lookback + 1):-1]))
+        prev_low = float(min(lows[-(lookback + 1):-1]))
+        level_long = float(prev_high * (1.0 + buffer_pct))
+        level_short = float(prev_low * (1.0 - buffer_pct))
+
+        breakout_long = price >= level_long
+        breakout_short = price <= level_short
+        dir_val = 1 if breakout_long else (-1 if breakout_short else 0)
+
+        strength = None
+        if dir_val == 1 and level_long > 0:
+            strength = float((price - level_long) / level_long)
+        elif dir_val == -1 and level_short > 0:
+            strength = float((level_short - price) / level_short)
+
+        vol_ratio = None
+        try:
+            if vols and len(vols) > lookback:
+                vol_mean = float(np.mean(vols[-(lookback + 1):-1]))
+                vol_last = float(vols[-1])
+                if vol_mean > 0:
+                    vol_ratio = float(vol_last / vol_mean)
+        except Exception:
+            vol_ratio = None
+
+        vol_ok = True
+        if vol_mult > 0 and vol_ratio is not None:
+            vol_ok = vol_ratio >= vol_mult
+
+        breakout_score = 1.0 if dir_val != 0 else 0.0
+        strength_score = 0.0
+        if strength is not None:
+            strength_score = min(1.0, abs(float(strength)) / max(1e-9, float(buffer_pct) * 2.0))
+        vol_score = 0.0
+        if vol_ratio is not None and vol_mult > 0:
+            vol_score = min(1.0, float(vol_ratio) / float(vol_mult))
+        rt_score = float((breakout_score + strength_score + vol_score) / 3.0)
+
+        active = bool(dir_val != 0 and rt_score >= score_min and vol_ok)
+        level = level_long if dir_val == 1 else (level_short if dir_val == -1 else None)
+
+        return {
+            "rt_breakout_active": bool(active),
+            "rt_breakout_dir": int(dir_val),
+            "rt_breakout_score": float(rt_score),
+            "rt_breakout_strength": float(strength) if strength is not None else None,
+            "rt_breakout_level": float(level) if level is not None else None,
+            "rt_breakout_vol_ratio": float(vol_ratio) if vol_ratio is not None else None,
+        }
+
+    def _read_symbols_csv_from_file(self, path: Path) -> list[str]:
+        try:
+            if not path.exists():
+                return []
+            raw = path.read_text(encoding="utf-8")
+        except Exception:
+            return []
+        val = ""
+        for line in raw.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("SYMBOLS_CSV="):
+                val = s.split("=", 1)[1].strip()
+        if not val:
+            return []
+        parts = [p.strip() for p in val.split(",")]
+        return [p for p in parts if p]
+
+    def _refresh_runtime_universe(self) -> None:
+        now = now_ms()
+        if (now - int(self._last_universe_refresh_ms or 0)) < int(self._universe_refresh_sec * 1000):
+            return
+        self._last_universe_refresh_ms = now
+
+        # Prefer runtime overrides from state/bybit.env when running with bybit profile
+        candidates = []
+        use_bybit_env = False
+        try:
+            if str(getattr(config, "ENV_PROFILE", "")).strip().lower() == "bybit":
+                use_bybit_env = True
+            elif str(getattr(config, "ENV_ACTIVE", "")).endswith(".env.bybit"):
+                use_bybit_env = True
+        except Exception:
+            use_bybit_env = False
+        if use_bybit_env:
+            bybit_env = self.state_dir / "bybit.env"
+            candidates.append(bybit_env)
+        if getattr(config, "ENV_ACTIVE", None):
+            try:
+                candidates.append(Path(str(config.ENV_ACTIVE)))
+            except Exception:
+                pass
+
+        new_syms: list[str] = []
+        for path in candidates:
+            new_syms = self._read_symbols_csv_from_file(path)
+            if new_syms:
+                break
+        if not new_syms:
+            return
+
+        new_set = set(new_syms)
+        if not new_set or new_set == self._runtime_universe:
+            return
+
+        self._runtime_universe = new_set
+        self._log(f"[UNIVERSE] runtime update: {len(new_set)} symbols")
+        self._register_anomaly("universe_change", "info", f"runtime universe updated: {len(new_set)} symbols")
+        self._archive_outside_universe_positions(universe=new_set, source="universe_change")
 
     def _compute_portfolio(self):
         unreal = 0.0
         total_notional = 0.0
         pos_list = []
         for sym, pos in self.positions.items():
-            px = self.market[sym]["price"]
+            px = None
+            try:
+                px = self.market.get(sym, {}).get("price")
+            except Exception:
+                px = None
+            if px is None:
+                try:
+                    px = float(pos.get("entry_price") or 0.0)
+                except Exception:
+                    px = None
             if px is None:
                 continue
-            entry = float(pos["entry_price"])
-            side = pos["side"]
+            entry = float(pos.get("entry_price", px))
+            side = str(pos.get("side") or "")
             qty = float(pos.get("quantity", 0.0))
             notional = float(pos.get("notional", 0.0))
             pnl = ((px - entry) * qty) if side == "LONG" else ((entry - px) * qty)
@@ -2511,6 +6044,15 @@ class LiveOrchestrator:
             total_notional += notional
             lev = float(pos.get("leverage", self.leverage))
             base_notional = notional / max(lev, 1e-6)
+            age_sec = max(0.0, (now_ms() - pos.get("entry_time", now_ms())) / 1000.0)
+            opt_hold_entry = pos.get("opt_hold_entry_sec") or pos.get("opt_hold_sec")
+            opt_hold_curr = pos.get("opt_hold_curr_sec") or pos.get("opt_hold_sec") or opt_hold_entry
+            opt_hold_rem = pos.get("opt_hold_curr_remaining_sec")
+            if opt_hold_rem is None and opt_hold_curr is not None:
+                try:
+                    opt_hold_rem = max(0.0, float(opt_hold_curr) - float(age_sec))
+                except Exception:
+                    opt_hold_rem = None
             pos_list.append({
                 "symbol": sym,
                 "side": side,
@@ -2524,7 +6066,11 @@ class LiveOrchestrator:
                 "cap_frac": float(notional / self.balance) if self.balance else 0.0,
                 "size_frac": pos.get("size_frac"),
                 "tag": pos.get("tag"),
-                "age_sec": max(0.0, (now_ms() - pos.get("entry_time", now_ms())) / 1000.0),
+                "age_sec": age_sec,
+                "opt_hold_entry_sec": opt_hold_entry,
+                "opt_hold_curr_sec": opt_hold_curr,
+                "opt_hold_curr_remaining_sec": opt_hold_rem,
+                "hold_eval_ts": pos.get("hold_eval_ts"),
             })
         equity = float(self.balance) + float(unreal)
         self._equity_history.append({"time": now_ms(), "equity": equity})
@@ -2565,6 +6111,492 @@ class LiveOrchestrator:
             "avg_event_ev_r": float(np.mean(evr)) if evr else None,
         }
 
+    def _run_portfolio_joint_sync(self, symbols: list[str], ai_scores: dict[str, float]) -> dict | None:
+        if not symbols:
+            return None
+        try:
+            from engines.mc.portfolio_joint_sim import PortfolioJointSimEngine, PortfolioConfig
+        except Exception as e:
+            self._log_err(f"[PORTFOLIO_JOINT] import failed: {e}")
+            return None
+
+        ohlcv_map: dict[str, list[tuple]] = {}
+        for sym in symbols:
+            candles = self.ohlcv_buffer.get(sym, [])
+            if not candles:
+                continue
+            try:
+                if isinstance(candles[0], dict):
+                    ohlcv_map[sym] = [
+                        (
+                            float(c.get("open")),
+                            float(c.get("high")),
+                            float(c.get("low")),
+                            float(c.get("close")),
+                            float(c.get("volume")),
+                        )
+                        for c in candles
+                    ]
+                else:
+                    ohlcv_map[sym] = [
+                        (
+                            float(c[1]),
+                            float(c[2]),
+                            float(c[3]),
+                            float(c[4]),
+                            float(c[5]) if len(c) > 5 else float(c[4]),
+                        )
+                        for c in candles
+                    ]
+            except Exception:
+                continue
+
+        if not ohlcv_map:
+            return None
+
+        try:
+            cfg = PortfolioConfig(
+                days=int(getattr(mc_config, "portfolio_days", 3)),
+                simulations=int(getattr(mc_config, "portfolio_simulations", 12000)),
+                batch_size=int(getattr(mc_config, "portfolio_batch_size", 4000)),
+                block_size=int(getattr(mc_config, "portfolio_block_size", 12)),
+                min_history=int(getattr(mc_config, "portfolio_min_history", 180)),
+                drift_k=float(getattr(mc_config, "portfolio_drift_k", 0.35)),
+                score_clip=float(getattr(mc_config, "portfolio_score_clip", 1.0)),
+                tilt_strength=float(getattr(mc_config, "portfolio_tilt_strength", 0.6)),
+                use_jumps=bool(getattr(mc_config, "portfolio_use_jumps", True)),
+                p_jump_market=float(getattr(mc_config, "portfolio_p_jump_market", 0.005)),
+                p_jump_idio=float(getattr(mc_config, "portfolio_p_jump_idio", 0.007)),
+                target_leverage=float(getattr(mc_config, "portfolio_target_leverage", 10.0)),
+                individual_cap=float(getattr(mc_config, "portfolio_individual_cap", 3.0)),
+                risk_aversion=float(getattr(mc_config, "portfolio_risk_aversion", 0.5)),
+                var_alpha=float(getattr(mc_config, "portfolio_var_alpha", 0.05)),
+                market_factor_scale=float(getattr(mc_config, "portfolio_market_factor_scale", 1.0)),
+                residual_scale=float(getattr(mc_config, "portfolio_residual_scale", 1.0)),
+                leverage=float(self.max_leverage),
+                rebalance_sim_enabled=bool(getattr(mc_config, "portfolio_rebalance_sim_enabled", False)),
+                rebalance_interval=int(getattr(mc_config, "portfolio_rebalance_interval", 1)),
+                rebalance_fee_bps=float(getattr(mc_config, "portfolio_rebalance_fee_bps", 6.0)),
+                rebalance_slippage_bps=float(getattr(mc_config, "portfolio_rebalance_slip_bps", 4.0)),
+                rebalance_score_noise=float(getattr(mc_config, "portfolio_rebalance_score_noise", 0.0)),
+                rebalance_min_score=float(getattr(mc_config, "portfolio_rebalance_min_score", 0.0)),
+                seed=None,
+            )
+
+            engine = PortfolioJointSimEngine(ohlcv_map, ai_scores, cfg)
+            weights, report = engine.build_portfolio(symbols)
+            report = dict(report)
+            report["weights"] = weights
+            report["target_leverage"] = float(cfg.target_leverage)
+            return report
+        except Exception as e:
+            import traceback
+
+            self._log_err(f"[PORTFOLIO_JOINT] run failed: {e}")
+            try:
+                self._log_err(traceback.format_exc())
+            except Exception:
+                pass
+            return None
+
+    async def _maybe_portfolio_joint(self, symbols: list[str], ai_scores: dict[str, float]) -> dict | None:
+        now = time.time()
+        if (now - float(self._last_portfolio_joint_ts)) < float(self.portfolio_joint_interval_sec):
+            return self._last_portfolio_report
+        report = await asyncio.to_thread(self._run_portfolio_joint_sync, symbols, ai_scores)
+        if report:
+            self._last_portfolio_joint_ts = now
+            self._last_portfolio_report = report
+        return report
+
+    def _alpha_hit_status(self) -> dict:
+        """Collect AlphaHit trainer/runtime metrics for the dashboard."""
+        status = {
+            "enabled": False,
+            "disable_reason": None,
+            "signal_boost": bool(getattr(mc_config, "alpha_signal_boost", False)),
+            "alpha_scaling_factor": float(getattr(mc_config, "alpha_scaling_factor", 1.0)),
+            "mu_alpha_cap": float(getattr(mc_config, "mu_alpha_cap", 5.0)),
+            "beta": float(getattr(mc_config, "alpha_hit_beta", 1.0)),
+            "min_buffer": int(getattr(mc_config, "alpha_hit_min_buffer", 1024)),
+            "warmup_samples": int(getattr(mc_config, "alpha_hit_warmup_samples", 512)),
+            "max_buffer": int(getattr(mc_config, "alpha_hit_max_buffer", 200000)),
+            "buffer_size": 0,
+            "total_samples": 0,
+            "total_train_steps": 0,
+            "last_loss": None,
+            "ema_loss": None,
+            "warmup_done": False,
+            "trainer_device": None,
+            "trainer_name": None,
+            "replay_path": str(getattr(mc_config, "alpha_hit_replay_path", "") or ""),
+            "replay_save_every": int(getattr(mc_config, "alpha_hit_replay_save_every", 2000)),
+            "replay_exists": False,
+            "replay_size_bytes": None,
+        }
+
+        replay_path = status["replay_path"]
+        if replay_path:
+            rp = Path(replay_path)
+            status["replay_exists"] = rp.exists()
+            if status["replay_exists"]:
+                try:
+                    status["replay_size_bytes"] = int(rp.stat().st_size)
+                except Exception:
+                    status["replay_size_bytes"] = None
+
+        for eng in getattr(self.hub, "engines", []):
+            if not getattr(eng, "alpha_hit_enabled", False):
+                if status["disable_reason"] is None:
+                    status["disable_reason"] = getattr(eng, "alpha_hit_disable_reason", None)
+                continue
+            status["enabled"] = True
+            status["beta"] = float(getattr(eng, "alpha_hit_beta", status["beta"]))
+            status["trainer_name"] = getattr(eng, "name", status["trainer_name"])
+            trainer = getattr(eng, "alpha_hit_trainer", None)
+            if trainer is not None:
+                try:
+                    status["buffer_size"] = int(getattr(trainer, "buffer_size", status["buffer_size"]))
+                except Exception:
+                    status["buffer_size"] = status["buffer_size"]
+                cfg_obj = getattr(trainer, "cfg", None)
+                if cfg_obj is not None:
+                    status["warmup_samples"] = int(getattr(cfg_obj, "warmup_samples", status["warmup_samples"]))
+                    status["replay_save_every"] = int(getattr(cfg_obj, "replay_save_every", status["replay_save_every"]))
+                status["warmup_done"] = bool(getattr(trainer, "is_warmed_up", status["warmup_done"]))
+                status["total_samples"] = int(getattr(trainer, "_total_samples", status["total_samples"]))
+                status["total_train_steps"] = int(getattr(trainer, "_total_train_steps", status["total_train_steps"]))
+                status["last_loss"] = getattr(trainer, "last_loss", status["last_loss"])
+                status["ema_loss"] = getattr(trainer, "ema_loss", status["ema_loss"])
+                dev = getattr(trainer, "device", status["trainer_device"])
+                status["trainer_device"] = str(dev) if dev is not None else None
+            status["warmup_done"] = status["warmup_done"] or (
+                status["warmup_samples"] > 0 and status["buffer_size"] >= status["warmup_samples"]
+            )
+            break
+
+        if not status["enabled"] and status["disable_reason"] is None:
+            if not bool(getattr(mc_config, "alpha_hit_enable", True)):
+                status["disable_reason"] = "ALPHA_HIT_ENABLE=0"
+            else:
+                use_torch_env = str(os.environ.get("MC_USE_TORCH", "1")).strip().lower()
+                if use_torch_env in ("0", "false", "no", "off"):
+                    status["disable_reason"] = "MC_USE_TORCH=0"
+
+        if status["min_buffer"] <= 0:
+            status["warmup_done"] = True
+
+        return status
+
+    def _get_local_mc_engine(self):
+        """Return local MC engine if available (not process/remote)."""
+        if self._mc_engine_cache is not None:
+            return self._mc_engine_cache
+        hub = getattr(self, "hub", None)
+        engines = getattr(hub, "engines", None)
+        if not engines:
+            if not self._mc_engine_warned:
+                self._log("[HOLD_EVAL] local EngineHub not available (process/remote). Hold-vs-exit skipped.")
+                self._mc_engine_warned = True
+            return None
+        for eng in engines:
+            if hasattr(eng, "evaluate_entry_metrics") and hasattr(eng, "_get_params"):
+                self._mc_engine_cache = eng
+                return eng
+        if not self._mc_engine_warned:
+            self._log("[HOLD_EVAL] MC engine not found in hub.")
+            self._mc_engine_warned = True
+        return None
+
+    def _check_hold_vs_exit(
+        self,
+        sym: str,
+        pos: dict,
+        decision: dict,
+        ctx: dict,
+        ts: int,
+        price: float,
+        *,
+        eval_only: bool = False,
+    ) -> bool:
+        """Re-run entry-eval for open positions and compare hold vs exit at t*."""
+        try:
+            enabled = str(os.environ.get("HOLD_EXIT_EVAL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            enabled = False
+        if not enabled:
+            return False
+        if not pos or not ctx:
+            return False
+
+        try:
+            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+        except Exception:
+            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        try:
+            entry_ts = int(pos.get("entry_time") or 0)
+        except Exception:
+            entry_ts = 0
+        age_sec = 0.0
+        if entry_ts:
+            age_sec = (ts - entry_ts) / 1000.0
+        allow_exit = True
+        if entry_ts and min_hold_sec > 0 and age_sec < float(min_hold_sec):
+            allow_exit = False
+
+        try:
+            interval_sec = float(os.environ.get("HOLD_EVAL_INTERVAL_SEC", 30.0) or 30.0)
+        except Exception:
+            interval_sec = 30.0
+        last_ts = int(self._hold_eval_last_ts.get(sym, 0) or 0)
+        if last_ts and (ts - last_ts) < int(max(1.0, interval_sec) * 1000.0):
+            return False
+        self._hold_eval_last_ts[sym] = int(ts)
+
+        mc_engine = self._get_local_mc_engine()
+        if mc_engine is None:
+            return False
+
+        side = str(pos.get("side") or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return False
+
+        try:
+            ctx_eval = dict(ctx)
+            ctx_eval["symbol"] = sym
+            ctx_eval["price"] = float(price)
+            ctx_eval["direction"] = 1 if side == "LONG" else -1
+            try:
+                ctx_eval["leverage"] = float(pos.get("leverage", self.leverage) or self.leverage)
+            except Exception:
+                ctx_eval["leverage"] = float(self.leverage)
+            # Avoid side effects on alpha/EMA updates during auxiliary eval
+            ctx_eval["_mu_alpha_ema_skip_update"] = True
+            # Optional faster evaluation
+            try:
+                n_paths = int(os.environ.get("HOLD_EVAL_N_PATHS", 0) or 0)
+            except Exception:
+                n_paths = 0
+            if n_paths > 0:
+                ctx_eval["n_paths"] = int(n_paths)
+
+            regime_ctx = str(ctx_eval.get("regime", "chop"))
+            params = mc_engine._get_params(regime_ctx, ctx_eval)
+            # deterministic seed (same 5s window as engine)
+            seed_window = int(ts // 5000)
+            seed = int((hash(sym) ^ seed_window) & 0xFFFFFFFF)
+            metrics = mc_engine.evaluate_entry_metrics(ctx_eval, params, seed=seed)
+        except Exception as e:
+            self._log_err(f"[HOLD_EVAL] {sym} eval error: {e}")
+            return False
+
+        if not isinstance(metrics, dict):
+            return False
+
+        meta = metrics.get("meta") if isinstance(metrics.get("meta"), dict) else {}
+        h_list = (
+            metrics.get("horizon_seq")
+            or meta.get("horizon_seq")
+            or metrics.get("policy_horizons")
+            or meta.get("policy_horizons")
+        )
+        if not h_list:
+            return False
+
+        ev_long_vec = metrics.get("ev_by_horizon_long") or meta.get("ev_by_horizon_long")
+        ev_short_vec = metrics.get("ev_by_horizon_short") or meta.get("ev_by_horizon_short")
+        if not ev_long_vec or not ev_short_vec:
+            return False
+
+        def _pick_tstar_for(side_label: str):
+            if side_label == "LONG":
+                t_val = metrics.get("unified_t_star_long") or meta.get("unified_t_star_long")
+            else:
+                t_val = metrics.get("unified_t_star_short") or meta.get("unified_t_star_short")
+            if t_val is None:
+                t_val = metrics.get("unified_t_star") or meta.get("unified_t_star")
+            if t_val is None:
+                t_val = metrics.get("policy_horizon_eff_sec") or meta.get("policy_horizon_eff_sec")
+            if t_val is None:
+                t_val = metrics.get("best_h") or meta.get("best_h")
+            try:
+                t_val = float(t_val) if t_val is not None else None
+            except Exception:
+                t_val = None
+            return t_val
+
+        tstar_cur = _pick_tstar_for(side)
+        if tstar_cur is None or tstar_cur <= 0:
+            return False
+        try:
+            t_min = float(os.environ.get("HOLD_EVAL_MIN_HORIZON_SEC", 0.0) or 0.0)
+        except Exception:
+            t_min = 0.0
+        try:
+            t_max = float(os.environ.get("HOLD_EVAL_MAX_HORIZON_SEC", 0.0) or 0.0)
+        except Exception:
+            t_max = 0.0
+        if t_min > 0:
+            tstar_cur = max(tstar_cur, t_min)
+        if t_max > 0:
+            tstar_cur = min(tstar_cur, t_max)
+
+        # Pick EV at t* (nearest horizon)
+        try:
+            h_list_f = [float(h) for h in h_list]
+            idx_cur = min(range(len(h_list_f)), key=lambda i: abs(h_list_f[i] - float(tstar_cur)))
+            ev_cur_at_t = float(ev_long_vec[idx_cur] if side == "LONG" else ev_short_vec[idx_cur])
+            h_pick = float(h_list_f[idx_cur])
+        except Exception:
+            return False
+
+        # Adjust EV to remove entry cost (hold already paid entry fee)
+        try:
+            add_entry = str(os.environ.get("HOLD_EVAL_ADD_ENTRY_COST", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            add_entry = True
+        cost_base = metrics.get("fee_roundtrip_total")
+        if cost_base is None:
+            cost_base = metrics.get("execution_cost") or meta.get("execution_cost") or meta.get("fee_roundtrip_total")
+        try:
+            lev_val = float(ctx_eval.get("leverage") or 1.0)
+        except Exception:
+            lev_val = 1.0
+        try:
+            cost_entry_roe = float(cost_base or 0.0) * float(lev_val) / 2.0
+        except Exception:
+            cost_entry_roe = 0.0
+        cost_exit_roe = float(cost_entry_roe)
+        hold_ev = float(ev_cur_at_t) + (cost_entry_roe if add_entry else 0.0)
+        exit_now_ev = -float(cost_exit_roe)
+
+        try:
+            margin = float(os.environ.get("HOLD_EVAL_EXIT_MARGIN", 0.0) or 0.0)
+        except Exception:
+            margin = 0.0
+
+        # Persist hold horizon on position for later event MC alignment
+        try:
+            if pos.get("opt_hold_entry_sec") is None:
+                pos["opt_hold_entry_sec"] = int(round(float(tstar_cur)))
+                pos["opt_hold_entry_src"] = pos.get("opt_hold_src") or "hold_eval"
+            pos["opt_hold_sec"] = int(round(float(tstar_cur)))
+            pos["opt_hold_src"] = "hold_eval"
+            pos["opt_hold_curr_sec"] = int(round(float(tstar_cur)))
+            pos["opt_hold_curr_src"] = "hold_eval"
+            pos["opt_hold_curr_remaining_sec"] = (
+                int(round(max(0.0, float(tstar_cur) - float(age_sec))))
+                if age_sec is not None
+                else None
+            )
+            pos["hold_ev_tstar"] = float(hold_ev)
+            pos["hold_ev_raw_tstar"] = float(ev_cur_at_t)
+            pos["hold_eval_ts"] = int(ts)
+            pos["hold_eval_h_pick"] = int(round(h_pick))
+        except Exception:
+            pass
+
+        if eval_only:
+            return False
+
+        # Optional flip: if opposite side has stronger EV at its own t*
+        try:
+            allow_flip = str(os.environ.get("HOLD_EVAL_ALLOW_FLIP", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            allow_flip = True
+        if allow_exit and allow_flip:
+            opp_side = "SHORT" if side == "LONG" else "LONG"
+            tstar_opp = _pick_tstar_for(opp_side)
+            if tstar_opp is not None:
+                if t_min > 0:
+                    tstar_opp = max(tstar_opp, t_min)
+                if t_max > 0:
+                    tstar_opp = min(tstar_opp, t_max)
+            ev_opp_at_t = None
+            if tstar_opp is not None and tstar_opp > 0:
+                try:
+                    idx_opp = min(range(len(h_list_f)), key=lambda i: abs(h_list_f[i] - float(tstar_opp)))
+                    ev_opp_at_t = float(ev_short_vec[idx_opp] if opp_side == "SHORT" else ev_long_vec[idx_opp])
+                except Exception:
+                    ev_opp_at_t = None
+            try:
+                flip_margin = float(os.environ.get("HOLD_EVAL_FLIP_MARGIN", 0.0) or 0.0)
+            except Exception:
+                flip_margin = 0.0
+            try:
+                flip_min_ev = float(os.environ.get("HOLD_EVAL_FLIP_MIN_EV", 0.0) or 0.0)
+            except Exception:
+                flip_min_ev = 0.0
+            if ev_opp_at_t is not None and ev_opp_at_t > flip_min_ev:
+                # Opp EV is net-of-entry cost; subtract exit cost to flip
+                flip_ev = float(ev_opp_at_t) - float(cost_exit_roe)
+                if flip_ev > (hold_ev + flip_margin):
+                    meta_for_flip = dict(meta)
+                    score_long = metrics.get("unified_score_long") or meta.get("unified_score_long")
+                    score_short = metrics.get("unified_score_short") or meta.get("unified_score_short")
+                    flip_score = score_short if opp_side == "SHORT" else score_long
+                    if flip_score is None:
+                        flip_score = float(ev_opp_at_t)
+                    meta_for_flip.setdefault("hybrid_score", flip_score)
+                    meta_for_flip.setdefault("unified_score", flip_score)
+                    meta_for_flip.setdefault("regime", ctx_eval.get("regime", meta_for_flip.get("regime")))
+                    flip_decision = {
+                        "action": opp_side,
+                        "ev": float(ev_opp_at_t),
+                        "confidence": float(metrics.get("confidence", 0.0) or 0.0),
+                        "unified_score": float(flip_score) if flip_score is not None else float(ev_opp_at_t),
+                        "hybrid_score": float(flip_score) if flip_score is not None else float(ev_opp_at_t),
+                        "leverage": float(ctx_eval.get("leverage") or lev_val),
+                        "meta": meta_for_flip,
+                    }
+                    self._log(
+                        f"[{sym}] EXIT+FLIP by HOLD_EVAL "
+                        f"(cur={side} t*={int(round(tstar_cur))}s ev@t*={hold_ev*100:.4f}% -> "
+                        f"{opp_side} t*={int(round(tstar_opp)) if tstar_opp else '-'}s ev@t*={float(ev_opp_at_t)*100:.4f}%)"
+                    )
+                    self._close_position(sym, float(price), "hold_vs_exit_flip", exit_kind="RISK")
+                    permit, _deny = self._entry_permit(sym, flip_decision, ts)
+                    if permit:
+                        self._enter_position(sym, opp_side, float(price), flip_decision, ts, ctx=ctx, leverage_override=lev_val)
+                    return True
+
+        if allow_exit and hold_ev <= (exit_now_ev + margin):
+            self._log(
+                f"[{sym}] EXIT by HOLD_EVAL "
+                f"(t*={int(round(tstar_cur))}s, ev@t*={hold_ev*100:.4f}%, exit_now={exit_now_ev*100:.4f}%)"
+            )
+            self._close_position(sym, float(price), "hold_vs_exit", exit_kind="RISK")
+            return True
+
+        return False
+
+    def _refresh_mc_device_info(self) -> None:
+        """Refresh MC backend/device info for dashboard display."""
+        if USE_REMOTE_ENGINE:
+            self._last_mc_backend = "remote"
+            self._last_mc_device = "remote"
+            return
+        use_torch_env = str(os.environ.get("MC_USE_TORCH", "1")).strip().lower()
+        use_torch = use_torch_env in ("1", "true", "yes", "on")
+        if not use_torch:
+            self._last_mc_backend = "numpy"
+            self._last_mc_device = "cpu"
+            return
+        try:
+            from engines.mc.torch_backend import _TORCH_OK, get_torch_device, torch
+            if not _TORCH_OK:
+                self._last_mc_backend = "numpy"
+                self._last_mc_device = "cpu"
+                return
+            dev = get_torch_device()
+            dev_type = getattr(dev, "type", None) or "cpu"
+            self._last_mc_backend = "torch"
+            self._last_mc_device = str(dev_type)
+            # Best-effort warm cache: no extra info needed for dashboard
+        except Exception:
+            self._last_mc_backend = None
+            self._last_mc_device = None
+
     async def broadcast(self, rows):
         try:
             # DEBUG: rows 개수 확인
@@ -2572,12 +6604,18 @@ class LiveOrchestrator:
                 self._log("[WARN] broadcast: rows empty!")
             
             equity, unreal, util, pos_list = self._compute_portfolio()
-            if self.risk_manager.check_emergency_stop(equity):
-                self._register_anomaly("kill_switch", "critical", f"DD stop triggered equity={equity:.2f}")
-                self._liquidate_all_positions()
-                sys.exit(0)
-            eval_metrics = self._compute_eval_metrics()
             ts = now_ms()
+            if self.risk_manager.check_emergency_stop(equity):
+                if not self._emergency_stop_handled:
+                    self._register_anomaly("kill_switch", "critical", f"DD stop triggered equity={equity:.2f}")
+                    self._liquidate_all_positions()
+                    self.safety_mode = True
+                    self._emergency_stop_handled = True
+                    self._emergency_stop_ts = ts
+                    self._log_err("[RISK] Emergency stop engaged: trading halted, dashboard stays online")
+                else:
+                    self.safety_mode = True
+            eval_metrics = self._compute_eval_metrics()
 
             feed_connected = (self._last_feed_ok_ms > 0) and (ts - self._last_feed_ok_ms < 10_000)
             feed = {
@@ -2613,7 +6651,23 @@ class LiveOrchestrator:
                     "ws_clients": len(self.clients),
                     "loop_ms": None,
                     "safety_mode": bool(self.safety_mode),
+                    "emergency_stop_ts": self._emergency_stop_ts,
+                    "env_profile": getattr(config, "ENV_PROFILE", None),
+                    "env_file": getattr(config, "ENV_FILE", None),
+                    "env_active": getattr(config, "ENV_ACTIVE", None),
+                    "env_sources": getattr(config, "ENV_SOURCES", None),
+                    "record_mode": getattr(self._trading_mode, "value", None),
+                    "record_db": getattr(self, "_db_path", None),
+                    "outside_universe_positions": list(self._outside_universe_positions.values()),
+                    "mc_last_ms": self._last_mc_ms,
+                    "mc_last_ts": self._last_mc_ts,
+                    "mc_last_ctxs": self._last_mc_ctxs,
+                    "mc_status": self._last_mc_status,
+                    "mc_backend": self._last_mc_backend,
+                    "mc_device": self._last_mc_device,
                 },
+                # Alpha Hit ML 및 Signal Boost 상태
+                "alpha_hit": self._alpha_hit_status(),
                 "feed": feed,
                 "market": rows,
                 "portfolio": {
@@ -2622,14 +6676,40 @@ class LiveOrchestrator:
                     "unrealized_pnl": float(unreal),
                     "utilization": util,
                     "utilization_cap": MAX_NOTIONAL_EXPOSURE if self.exposure_cap_enabled else None,
+                    "positions_count": int(len(self.positions)),
                     "positions": pos_list,
                     "history": list(self._equity_history),
+                    "live_wallet_balance": self._live_wallet_balance,
+                    "live_equity": self._live_equity,
+                    "live_free_balance": self._live_free_balance,
+                    "live_total_initial_margin": self._live_total_initial_margin,
+                    "live_total_maintenance_margin": self._live_total_maintenance_margin,
+                    "live_last_sync_ms": self._last_live_sync_ms,
+                    "live_last_sync_err": self._last_live_sync_err,
+                    "live_history": list(self._live_equity_history),
+                    "pre_mc": None,
                 },
                 "eval_metrics": eval_metrics,
                 "logs": list(self.logs),
                 "trade_tape": list(self.trade_tape),
                 "alerts": list(self.anomalies),
             }
+
+            # Attach compact portfolio pre-MC summary (if available)
+            try:
+                if self._last_portfolio_report:
+                    r = self._last_portfolio_report
+                    payload["portfolio"]["pre_mc"] = {
+                        "expected_pnl": r.get("expected_portfolio_pnl"),
+                        "cvar": r.get("cvar"),
+                        "prob_account_liq": r.get("prob_account_liquidation_proxy"),
+                        "rebalance_expected_pnl": r.get("rebalance_expected_portfolio_pnl"),
+                        "rebalance_turnover_mean": r.get("rebalance_turnover_mean"),
+                        "rebalance_turnover_p95": r.get("rebalance_turnover_p95"),
+                        "rebalance_cost_mean": r.get("rebalance_cost_mean"),
+                    }
+            except Exception:
+                pass
 
             msg = json.dumps(payload, ensure_ascii=False)
             # 캐시: 새로 연결되는 클라이언트에 즉시 전송하기 위해 마지막 페이로드 보관
@@ -2657,6 +6737,12 @@ class LiveOrchestrator:
                             "rebalance_exec_cost": r.get("rebalance_exec_cost"),
                             "rebalance_target_leverage": r.get("rebalance_target_leverage"),
                             "rebalance_allow_trade": r.get("rebalance_allow_trade"),
+                            "status": r.get("status"),
+                            "unified": r.get("unified_score"),
+                            "reason": r.get("direction_reason"),
+                            "sL": r.get("score_long"),
+                            "sS": r.get("score_short"),
+                            "sT": r.get("score_threshold"),
                         }
                         for r in rows
                     ],
@@ -2683,6 +6769,39 @@ class LiveOrchestrator:
             self._log_err(f"[ERR] broadcast: {err_text}")
             self._note_runtime_error("broadcast", err_text)
 
+    async def dashboard_loop(self):
+        """Fast UI refresh loop using latest decisions + market data."""
+        try:
+            interval = float(self._dashboard_refresh_sec)
+        except Exception:
+            interval = 0.5
+        interval = max(0.1, interval)
+        while True:
+            try:
+                if not self._dashboard_fast:
+                    await asyncio.sleep(1.0)
+                    continue
+                if len(self.clients) == 0:
+                    await asyncio.sleep(interval)
+                    continue
+                ts = now_ms()
+                rows = []
+                for sym in SYMBOLS:
+                    price = self.market[sym]["price"]
+                    if price is None:
+                        continue
+                    decision = self._last_decisions.get(sym)
+                    candles = len(self.ohlcv_buffer[sym])
+                    row = self._row(sym, float(price), ts, decision, candles, ctx=None, log_filters=False)
+                    rows.append(row)
+                if rows:
+                    self._last_rows = rows
+                    await self.broadcast(rows)
+            except Exception as e:
+                self._log_err(f"[ERR] dashboard_loop: {e}")
+                self._note_runtime_error("dashboard_loop", str(e))
+            await asyncio.sleep(interval)
+
     async def decision_loop(self):
         """
         [REFACTORED] 3-Stage Decision Pipeline:
@@ -2694,8 +6813,24 @@ class LiveOrchestrator:
             try:
                 rows = []
                 ts = now_ms()
+                try:
+                    self._force_rebalance_cycle = bool(self._rebalance_on_next_cycle)
+                    self._rebalance_on_next_cycle = False
+                except Exception:
+                    self._force_rebalance_cycle = False
+                try:
+                    self._cycle_free_balance = self._sizing_balance()
+                    self._cycle_reserved_margin = 0.0
+                    self._cycle_reserved_notional = 0.0
+                    self._cycle_balance_ts = ts
+                except Exception:
+                    pass
                 self._decision_cycle = (self._decision_cycle + 1) % self._decision_log_every
                 log_this_cycle = (self._decision_cycle == 0)
+                try:
+                    self._refresh_runtime_universe()
+                except Exception as e:
+                    self._log_err(f"[ERR] refresh_universe: {e}")
 
                 # ====== Stage 1: Context Collection (SoA Optimized) ======
                 # [OPTIMIZATION] _build_batch_context_soa: Pre-allocated arrays + minimal dict creation
@@ -2739,61 +6874,295 @@ class LiveOrchestrator:
                 # ====== Stage 2: Batch Decision Execution (GPU in separate thread) ======
                 batch_decisions = []
                 if ctx_list:
-                    try:
-                        # Lightweight cycle log for debugging latency and ctx size
+                    streaming = bool(getattr(config, "MC_STREAMING_MODE", False))
+                    stream_batch = int(getattr(config, "MC_STREAMING_BATCH_SIZE", 4) or 4)
+                    if stream_batch <= 0:
+                        stream_batch = 1
+                    stream_broadcast = bool(getattr(config, "MC_STREAMING_BROADCAST", True))
+
+                    async def _run_decide_batch(ctx_subset: list[dict]) -> tuple[list[dict], str, float]:
+                        if not ctx_subset:
+                            return [], "empty", 0.0
+                        t0_mc = time.perf_counter()
+                        mc_status = "ok"
+                        decisions: list[dict] = []
                         try:
-                            self._log(f"[CYCLE] cycle={self._decision_cycle} ts={ts} ctx_count={len(ctx_list)} valid_indices={len(valid_indices) if valid_indices is not None else 'N/A'}")
+                            # 우선 비동기 프로세스 허브가 있으면 polling 방식으로 사용
+                            if hasattr(self.hub, "decide_batch_async") and asyncio.iscoroutinefunction(getattr(self.hub, "decide_batch_async")):
+                                try:
+                                    decisions = await asyncio.wait_for(
+                                        self.hub.decide_batch_async(ctx_subset, timeout=DECIDE_BATCH_TIMEOUT_SEC),
+                                        timeout=DECIDE_BATCH_TIMEOUT_SEC,
+                                    )
+                                except asyncio.TimeoutError:
+                                    mc_status = "timeout"
+                                    self._log_err(f"[ERR] decide_batch: timeout after {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                    self._note_runtime_error("decide_batch", f"timeout {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                    decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_timeout"} for _ in ctx_subset]
+                            else:
+                                # GPU 연산을 별도 스레드에서 실행하여 asyncio 블로킹 방지
+                                loop = asyncio.get_event_loop()
+                                try:
+                                    decisions = await asyncio.wait_for(
+                                        loop.run_in_executor(
+                                            GPU_EXECUTOR,
+                                            self.hub.decide_batch,
+                                            ctx_subset,
+                                        ),
+                                        timeout=DECIDE_BATCH_TIMEOUT_SEC,
+                                    )
+                                except asyncio.TimeoutError:
+                                    mc_status = "timeout"
+                                    self._log_err(f"[ERR] decide_batch: timeout after {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                    self._note_runtime_error("decide_batch", f"timeout {DECIDE_BATCH_TIMEOUT_SEC}s")
+                                    decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_timeout"} for _ in ctx_subset]
+                        except Exception as e:
+                            import traceback
+                            mc_status = "error"
+                            self._log_err(f"[ERR] decide_batch: {e} {traceback.format_exc()}")
+                            self._note_runtime_error("decide_batch", str(e))
+                            decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_error"} for _ in ctx_subset]
+                        elapsed_ms = (time.perf_counter() - t0_mc) * 1000.0
+                        return decisions, mc_status, elapsed_ms
+
+                    # Lightweight cycle log for debugging latency and ctx size
+                    try:
+                        self._log(f"[CYCLE] cycle={self._decision_cycle} ts={ts} ctx_count={len(ctx_list)} valid_indices={len(valid_indices) if valid_indices is not None else 'N/A'} streaming={streaming} batch={stream_batch}")
+                    except Exception:
+                        pass
+
+                    if streaming:
+                        batch_decisions = [None for _ in ctx_list]
+
+                        # Prepare row cache for streaming UI updates
+                        rows_cache: dict[str, dict] = {}
+                        try:
+                            if getattr(self, "_last_rows", None):
+                                for r in self._last_rows:
+                                    if isinstance(r, dict) and r.get("symbol"):
+                                        rows_cache[r["symbol"]] = r
                         except Exception:
                             pass
-                        # 우선 비동기 프로세스 허브가 있으면 polling 방식으로 사용
-                        if hasattr(self.hub, "decide_batch_async") and asyncio.iscoroutinefunction(getattr(self.hub, "decide_batch_async")):
+                        for r in rows:
+                            if isinstance(r, dict) and r.get("symbol"):
+                                rows_cache[r["symbol"]] = r
+
+                        def _rows_from_cache() -> list[dict]:
+                            out = []
+                            for s in SYMBOLS:
+                                row = rows_cache.get(s)
+                                if row is None:
+                                    try:
+                                        candles = len(self.ohlcv_buffer[s])
+                                    except Exception:
+                                        candles = 0
+                                    row = self._row(s, None, ts, None, candles, log_filters=False)
+                                out.append(row)
+                            return out
+
+                        mc_total_ms = 0.0
+                        mc_status_final = "ok"
+                        processed = 0
+
+                        for start in range(0, len(ctx_list), stream_batch):
+                            chunk = ctx_list[start:start + stream_batch]
+                            decisions, mc_status, elapsed_ms = await _run_decide_batch(chunk)
+
+                            # Update MC timing/progress for streaming
+                            mc_total_ms += float(elapsed_ms or 0.0)
+                            processed += len(chunk)
                             try:
-                                batch_decisions = await asyncio.wait_for(
-                                    self.hub.decide_batch_async(ctx_list, timeout=DECIDE_BATCH_TIMEOUT_SEC),
-                                    timeout=DECIDE_BATCH_TIMEOUT_SEC,
-                                )
-                            except asyncio.TimeoutError:
-                                self._log_err(f"[ERR] decide_batch: timeout after {DECIDE_BATCH_TIMEOUT_SEC}s")
-                                self._note_runtime_error("decide_batch", f"timeout {DECIDE_BATCH_TIMEOUT_SEC}s")
-                                batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_timeout"} for _ in ctx_list]
-                        else:
-                            # GPU 연산을 별도 스레드에서 실행하여 asyncio 블로킹 방지
-                            loop = asyncio.get_event_loop()
-                            try:
-                                batch_decisions = await asyncio.wait_for(
-                                    loop.run_in_executor(
-                                        GPU_EXECUTOR,
-                                        self.hub.decide_batch,
-                                        ctx_list,
-                                    ),
-                                    timeout=DECIDE_BATCH_TIMEOUT_SEC,
-                                )
-                            except asyncio.TimeoutError:
-                                self._log_err(f"[ERR] decide_batch: timeout after {DECIDE_BATCH_TIMEOUT_SEC}s")
-                                self._note_runtime_error("decide_batch", f"timeout {DECIDE_BATCH_TIMEOUT_SEC}s")
-                                batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_timeout"} for _ in ctx_list]
-                    except Exception as e:
-                        import traceback
-                        self._log_err(f"[ERR] decide_batch: {e} {traceback.format_exc()}")
-                        self._note_runtime_error("decide_batch", str(e))
-                        # Fallback: create empty decisions
-                        batch_decisions = [{"action": "WAIT", "ev": 0.0, "reason": "batch_error"} for _ in ctx_list]
+                                self._last_mc_ms = mc_total_ms
+                                self._last_mc_ts = ts
+                                self._last_mc_ctxs = processed
+                                if mc_status == "error":
+                                    mc_status_final = "error"
+                                elif mc_status == "timeout" and mc_status_final != "error":
+                                    mc_status_final = "timeout"
+                                self._last_mc_status = "partial" if processed < len(ctx_list) else mc_status_final
+                            except Exception:
+                                pass
+
+                            # If chunk failed, reuse last good decisions to avoid all-zero UI
+                            if decisions:
+                                try:
+                                    for i, dec in enumerate(decisions):
+                                        reason = str(dec.get("reason", ""))
+                                        if reason in ("batch_timeout", "batch_error"):
+                                            sym = chunk[i]["symbol"]
+                                            cached = self._last_decisions.get(sym)
+                                            if cached:
+                                                decisions[i] = cached
+                                except Exception:
+                                    pass
+
+                            # Cache decisions + update streaming rows
+                            for i, dec in enumerate(decisions):
+                                idx = start + i
+                                if idx >= len(batch_decisions):
+                                    continue
+                                batch_decisions[idx] = dec
+                                sym = chunk[i]["symbol"]
+                                try:
+                                    row = self._row(sym, chunk[i].get("price"), ts, dec, chunk[i].get("candles", 0), ctx=chunk[i], log_filters=False)
+                                except Exception:
+                                    row = self._row(sym, chunk[i].get("price"), ts, None, chunk[i].get("candles", 0), ctx=chunk[i], log_filters=False)
+                                rows_cache[sym] = row
+
+                            if stream_broadcast and not self._dashboard_fast:
+                                try:
+                                    await self.broadcast(_rows_from_cache())
+                                except Exception as e:
+                                    self._log_err(f"[ERR] broadcast(stream): {e}")
+                                    self._note_runtime_error("broadcast_stream", str(e))
+
+                        # Final MC status after streaming chunks
+                        try:
+                            self._last_mc_ms = mc_total_ms
+                            self._last_mc_ts = ts
+                            self._last_mc_ctxs = len(ctx_list)
+                            self._last_mc_status = mc_status_final
+                            self._refresh_mc_device_info()
+                        except Exception:
+                            pass
+
+                        # Fill missing decisions (if any)
+                        for i, dec in enumerate(batch_decisions):
+                            if dec is None:
+                                batch_decisions[i] = {"action": "WAIT", "ev": 0.0, "reason": "batch_missing"}
+                    else:
+                        decisions, mc_status, elapsed_ms = await _run_decide_batch(ctx_list)
+                        batch_decisions = decisions
+                        try:
+                            self._last_mc_ms = float(elapsed_ms or 0.0)
+                            self._last_mc_ts = ts
+                            self._last_mc_ctxs = len(ctx_list)
+                            self._last_mc_status = mc_status
+                            self._refresh_mc_device_info()
+                        except Exception:
+                            pass
+
+                # If batch failed, reuse last good decisions to avoid all-zero UI
+                if batch_decisions:
+                    try:
+                        for i, dec in enumerate(batch_decisions):
+                            reason = str(dec.get("reason", ""))
+                            if reason in ("batch_timeout", "batch_error"):
+                                sym = ctx_list[i]["symbol"]
+                                cached = self._last_decisions.get(sym)
+                                if cached:
+                                    batch_decisions[i] = cached
+                    except Exception:
+                        pass
 
                 # ====== Stage 2.5: Portfolio Ranking & TOP N Selection + Kelly Allocation ======
+                
+                # ✅ UnifiedScore 분포 통계 및 필터 분석 (항상 실행)
+                if batch_decisions:
+                    # Always update auto-tuning from latest scores (log throttling handled separately)
+                    use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+                    hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
+                    hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+
+                    def _pick_score(dec: dict, keys: list[str]) -> float:
+                        for k in keys:
+                            v = dec.get(k)
+                            if v is not None:
+                                return float(v)
+                        meta = dec.get("meta") or {}
+                        for k in keys:
+                            v = meta.get(k)
+                            if v is not None:
+                                return float(v)
+                        for d in dec.get("details", []):
+                            m = d.get("meta") or {}
+                            for k in keys:
+                                v = m.get(k)
+                                if v is not None:
+                                    return float(v)
+                        return float(dec.get("ev", 0.0) or 0.0)
+
+                    scores_list = []
+                    for i, dec in enumerate(batch_decisions):
+                        if hybrid_only:
+                            score = _pick_score(dec, ["hybrid_score", "unified_score"])
+                        else:
+                            score = _pick_score(dec, ["unified_score"])
+                        scores_list.append(score)
+                    if scores_list:
+                        scores_arr = np.asarray(scores_list, dtype=float)
+                        self._update_hybrid_auto_tuning(scores_arr, now_ms())
+
+                    # 10분마다 통계 출력
+                    if not hasattr(self, '_last_score_stats_log_ms'):
+                        self._last_score_stats_log_ms = 0 # 즉시 출력 유도
+                    
+                    now = now_ms()
+                    if (now - self._last_score_stats_log_ms) >= 600_000:  # 10분
+                        self._last_score_stats_log_ms = now
+
+                        sym_ev_map = {}
+                        for i, dec in enumerate(batch_decisions):
+                            score = float(dec.get("unified_score", dec.get("ev", 0.0)) or 0.0)
+                            sym_ev_map[ctx_list[i]["symbol"]] = (dec.get("action", "WAIT"), score, dec.get("ev", 0.0))
+                            
+                        if scores_list:
+                            scores_arr = np.asarray(scores_list, dtype=float)
+                            
+                            # 필터 차단 통계
+                            filter_stats = {"unified": 0, "spread": 0, "event_cvar": 0, "event_exit": 0, "liq": 0, "min_notional": 0, "min_exposure": 0, "fee": 0, "top_n": 0, "pre_mc": 0, "cap": 0}
+                            for i, dec in enumerate(batch_decisions):
+                                fs = dec.get("filter_states", {})
+                                if not isinstance(fs, dict):
+                                    meta = dec.get("meta", {})
+                                    fs = meta.get("filter_states", {})
+                                for key in filter_stats:
+                                    if fs.get(key) is False:
+                                        filter_stats[key] += 1
+
+                            self._log(f"[SCORE_STATS] Distribution (n={len(scores_arr)}): Mean={scores_arr.mean():.6f} | Median={np.median(scores_arr):.6f} | Max={scores_arr.max():.6f}")
+                            
+                            # 현재 threshold 통과율
+                            if hybrid_only:
+                                entry_floor = self._get_hybrid_entry_floor()
+                                label = "HYBRID_ENTRY_FLOOR"
+                            else:
+                                entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+                                label = "UNIFIED_ENTRY_FLOOR"
+                            pass_count = (scores_arr >= entry_floor).sum()
+                            pass_rate = (pass_count / len(scores_arr)) * 100
+                            self._log(f"  Current {label}={entry_floor:.6f}: {pass_count}/{len(scores_arr)} ({pass_rate:.1f}% pass)")
+                            # Auto-tune debug
+                            if hybrid_only and (self._hybrid_entry_floor_dyn is not None or self._hybrid_conf_scale_dyn is not None):
+                                self._log(f"  HYBRID_AUTO entry_floor={self._hybrid_entry_floor_dyn} conf_scale={self._hybrid_conf_scale_dyn}")
+                            
+                            # 상세 디버깅 (상위 3개 심볼 상태)
+                            sorted_by_score = sorted(sym_ev_map.items(), key=lambda x: x[1][1], reverse=True)[:3]
+                            top_debug = [f"{s}:Act={v[0]}/Score={v[1]:.5f}/EV={v[2]:.5f}" for s, v in sorted_by_score]
+                            self._log(f"  Top Symbols: {top_debug}")
+
                 if batch_decisions and USE_KELLY_ALLOCATION:
                     try:
                         # 2.5.1 — 모든 심볼의 UnifiedScore 수집
                         sym_score_map: dict[str, float] = {}
                         sym_hold_map: dict[str, float] = {}
                         
+                        if hybrid_only:
+                            entry_floor = self._get_hybrid_entry_floor()
+                        else:
+                            entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
                         for i, dec in enumerate(batch_decisions):
                             sym = ctx_list[i]["symbol"]
-                            score_val = float(dec.get("unified_score", dec.get("ev", 0.0)) or 0.0)
+                            if hybrid_only:
+                                score_val = _pick_score(dec, ["hybrid_score", "unified_score"])
+                            else:
+                                score_val = _pick_score(dec, ["unified_score"])
                             sym_score_map[sym] = score_val
-                            hold_val = dec.get("unified_score_hold")
-                            if hold_val is None:
-                                hold_val = score_val
-                            sym_hold_map[sym] = float(hold_val)
+                            if hybrid_only:
+                                hold_val = _pick_score(dec, ["hybrid_score_hold", "unified_score_hold", "hybrid_score", "unified_score"])
+                            else:
+                                hold_val = _pick_score(dec, ["unified_score_hold", "unified_score"])
+                            sym_hold_map[sym] = float(hold_val if hold_val is not None else score_val)
                         
                         # 2.5.2 — UnifiedScore 기준 순위 정렬 및 TOP N 선택
                         sorted_syms = sorted(sym_score_map.keys(), key=lambda s: sym_score_map[s], reverse=True)
@@ -2806,20 +7175,70 @@ class LiveOrchestrator:
                         top_info = [(s, f"{sym_score_map[s]:.4f}") for s in self._top_n_symbols]
                         self._log(f"[PORTFOLIO] TOP {TOP_N_SYMBOLS}: {top_info}")
                         
+                        # (Logging block moved to pre-check)
+
+                        
                         # 2.5.3 — Kelly 배분 계산 (UnifiedScore 비례 배분)
                         if self._top_n_symbols:
-                            import numpy as np
                             n_top = len(self._top_n_symbols)
                             
                             scores = np.array([sym_score_map[s] for s in self._top_n_symbols])
                             self._log(f"[KELLY_DEBUG] Scores for TOP {n_top}: {dict(zip(self._top_n_symbols, scores.tolist()))}")
                             
-                            # UnifiedScore 비례 배분 (음수는 0으로 처리)
-                            scores_positive = np.clip(scores, 0, None)
-                            total_score = scores_positive.sum()
+                            # UnifiedScore 비례 배분 (entry_floor 기준 양수만 반영)
+                            scores_adj = scores - float(entry_floor)
+                            scores_positive = np.clip(scores_adj, 0, None)
+                            # Kelly score transform to amplify relative differences
+                            try:
+                                mode = str(os.environ.get("KELLY_SCORE_TRANSFORM", "linear")).strip().lower()
+                                pos_only = str(os.environ.get("KELLY_SCORE_POSITIVE_ONLY", "1")).strip().lower() in ("1", "true", "yes", "on")
+                                hyb_sens = 1.0
+                                if hybrid_only:
+                                    try:
+                                        hyb_sens = float(os.environ.get("KELLY_HYB_SENSITIVITY", 1.0) or 1.0)
+                                    except Exception:
+                                        hyb_sens = 1.0
+                                    hyb_sens = max(0.25, min(hyb_sens, 5.0))
+                                base = scores_positive if pos_only else scores_adj.copy()
+                                if mode == "power_norm":
+                                    gamma = float(os.environ.get("KELLY_SCORE_GAMMA", 2.0) or 2.0) * hyb_sens
+                                    max_pos = float(np.max(base)) if base is not None and base.size > 0 else 0.0
+                                    if max_pos > 0:
+                                        base = (base / max_pos) ** gamma
+                                elif mode in ("softmax", "zscore_softmax"):
+                                    if pos_only:
+                                        mask = base > 0
+                                    else:
+                                        mask = np.ones_like(base, dtype=bool)
+                                    if np.any(mask):
+                                        if mode == "zscore_softmax":
+                                            std_floor = float(os.environ.get("KELLY_SCORE_STD_FLOOR", 1e-8) or 1e-8)
+                                            mu = float(np.mean(base[mask]))
+                                            std = float(np.std(base[mask]))
+                                            std = max(std, std_floor)
+                                            z = (base - mu) / std
+                                        else:
+                                            z = base
+                                        if hyb_sens != 1.0:
+                                            z = z * hyb_sens
+                                        temp = float(os.environ.get("KELLY_SCORE_TEMP", 1.0) or 1.0)
+                                        z = np.clip(z, -20.0, 20.0)
+                                        w = np.exp(z / max(temp, 1e-6))
+                                        if pos_only:
+                                            w = w * mask
+                                        base = w
+                                else:
+                                    base = scores_positive
+                                if base is None:
+                                    base = scores_positive
+                            except Exception:
+                                base = scores_positive
+
+                            base = np.where(np.isfinite(base), base, 0.0)
+                            total_score = float(np.sum(base))
                             
                             if total_score > 0:
-                                kelly_norm = scores_positive / total_score
+                                kelly_norm = base / total_score
                             else:
                                 # 점수가 모두 0이거나 음수면 균등 배분
                                 kelly_norm = np.ones(n_top) / n_top
@@ -2843,6 +7262,17 @@ class LiveOrchestrator:
                                     dec["reason"] = f"NOT_IN_TOP_{TOP_N_SYMBOLS}"
                                     # Always log blocked symbols (critical for debugging)
                                     self._log(f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT (not in TOP {TOP_N_SYMBOLS})")
+
+                        # Optional: portfolio joint + rebalance pre-sim (background)
+                        try:
+                            if bool(getattr(mc_config, "portfolio_enabled", False)):
+                                if (self._portfolio_joint_task is None) or self._portfolio_joint_task.done():
+                                    symbols_for_sim = self._top_n_symbols or list(sym_score_map.keys())
+                                    self._portfolio_joint_task = asyncio.create_task(
+                                        self._maybe_portfolio_joint(symbols_for_sim, sym_score_map)
+                                    )
+                        except Exception:
+                            pass
                         
                     except Exception as e:
                         import traceback
@@ -2852,35 +7282,95 @@ class LiveOrchestrator:
                 # ====== Stage 2.6: Continuous Opportunity Evaluation (Switching Cost) ======
                 if batch_decisions and USE_CONTINUOUS_OPPORTUNITY:
                     try:
-                        # 현재 포지션 보유 심볼과 TOP N 비교
-                        current_positions = [s for s, p in self.positions.items() if p.get("qty", 0) != 0]
-                        
-                        for held_sym in current_positions:
-                            if held_sym in self._top_n_symbols:
-                                continue  # 이미 TOP N에 포함 → 유지
-                            
-                            # 가장 높은 EV를 가진 진입 후보와 비교
-                            best_candidate = self._top_n_symbols[0] if self._top_n_symbols else None
-                            if not best_candidate:
+                        dec_by_sym = {ctx_list[i]["symbol"]: dec for i, dec in enumerate(batch_decisions)}
+                        held_syms = []
+                        for s, p in self.positions.items():
+                            qty = p.get("quantity")
+                            if qty is None:
+                                qty = p.get("qty")
+                            try:
+                                qty = float(qty or 0.0)
+                            except Exception:
+                                qty = 0.0
+                            if abs(qty) > 0:
+                                held_syms.append(s)
+
+                        # Candidates: not held, actionable, and not blocked by entry filters
+                        candidates = []
+                        for sym, dec in dec_by_sym.items():
+                            if sym in self.positions:
                                 continue
-                            
-                            held_score = self._symbol_hold_scores.get(held_sym, self._symbol_scores.get(held_sym, 0.0))
-                            cand_score = self._symbol_scores.get(best_candidate, 0.0)
-                            
-                            # 교체 조건: UnifiedScore(New) > UnifiedScore(Hold)
-                            if cand_score > held_score:
-                                if log_this_cycle:
-                                    self._log(f"[SWITCH] {held_sym}(hold={held_score:.4f}) → {best_candidate}(new={cand_score:.4f})")
-                                # 청산 시그널 발생 (기존 포지션)
-                                for i, dec in enumerate(batch_decisions):
-                                    if ctx_list[i]["symbol"] == held_sym:
-                                        dec["action"] = "CLOSE"
-                                        dec["reason"] = f"SWITCH_TO_{best_candidate}"
-                                        break
+                            action = dec.get("action")
+                            if action not in ("LONG", "SHORT"):
+                                continue
+                            meta = dec.get("meta") or {}
+                            blocked = meta.get("entry_blocked_filters") or []
+                            if blocked:
+                                continue
+                            if hybrid_only:
+                                score = _pick_score(dec, ["hybrid_score", "unified_score"])
                             else:
-                                if log_this_cycle:
-                                    self._log(f"[HOLD] {held_sym}(hold={held_score:.4f}) kept vs {best_candidate}(new={cand_score:.4f})")
-                                    
+                                score = _pick_score(dec, ["unified_score"])
+                            candidates.append((float(score), sym))
+
+                        if not candidates or not held_syms:
+                            pass
+                        else:
+                            candidates.sort(key=lambda x: x[0], reverse=True)
+                            best_score, best_sym = candidates[0]
+
+                            # Find worst current position by expected value proxy
+                            worst_sym = None
+                            worst_score = None
+                            for held_sym in held_syms:
+                                pos = self.positions.get(held_sym) or {}
+                                if not self._is_managed_position(pos):
+                                    continue
+                                hold_score = pos.get("hold_ev_tstar")
+                                if hold_score is None:
+                                    dec = dec_by_sym.get(held_sym) or {}
+                                    if hybrid_only:
+                                        hold_score = _pick_score(dec, ["hybrid_score_hold", "unified_score_hold", "hybrid_score", "unified_score"])
+                                    else:
+                                        hold_score = _pick_score(dec, ["unified_score_hold", "unified_score"])
+                                if hold_score is None:
+                                    hold_score = pos.get("pred_ev", 0.0) or 0.0
+                                try:
+                                    hold_score = float(hold_score)
+                                except Exception:
+                                    hold_score = 0.0
+                                if (worst_score is None) or (hold_score < worst_score):
+                                    worst_score = hold_score
+                                    worst_sym = held_sym
+
+                            if worst_sym is not None:
+                                try:
+                                    switch_margin = float(os.environ.get("SWITCH_EV_MARGIN", 0.0) or 0.0)
+                                except Exception:
+                                    switch_margin = 0.0
+                                if best_score > (worst_score + switch_margin):
+                                    if log_this_cycle:
+                                        self._log(
+                                            f"[SWITCH] {worst_sym}(hold={worst_score:.5f}) → "
+                                            f"{best_sym}(new={best_score:.5f}) margin={switch_margin:.5f}"
+                                        )
+                                    # close worst
+                                    for i, dec in enumerate(batch_decisions):
+                                        if ctx_list[i]["symbol"] == worst_sym:
+                                            dec["action"] = "EXIT"
+                                            dec["reason"] = f"SWITCH_TO_{best_sym}"
+                                            dec.setdefault("meta", {})["switch_to"] = best_sym
+                                            break
+                                    # annotate candidate (entry will proceed via normal flow)
+                                    cand_dec = dec_by_sym.get(best_sym)
+                                    if isinstance(cand_dec, dict):
+                                        cand_dec.setdefault("meta", {})["switch_from"] = worst_sym
+                                else:
+                                    if log_this_cycle:
+                                        self._log(
+                                            f"[HOLD] {worst_sym}(hold={worst_score:.5f}) kept vs "
+                                            f"{best_sym}(new={best_score:.5f})"
+                                        )
                     except Exception as e:
                         import traceback
                         self._log_err(f"[ERR] opportunity_eval: {e} {traceback.format_exc()}")
@@ -2906,14 +7396,20 @@ class LiveOrchestrator:
                 except Exception as e:
                     self._log_err(f"[ERR] manage_spreads: {e}")
                     self._note_runtime_error("manage_spreads", str(e))
+                # Reset cycle rebalance flag
+                try:
+                    self._force_rebalance_cycle = False
+                except Exception:
+                    pass
                 
                 try:
+                    self._last_rows = rows
+                    if not self._dashboard_fast:
                         await self.broadcast(rows)
                 except Exception as e:
                     import traceback
                     self._log_err(f"[ERR] broadcast: {e} {traceback.format_exc()}")
                     self._note_runtime_error("broadcast", str(e))
-
                     await asyncio.sleep(0.1)
 
                 # Cycle debug dump: record last cycle info for offline inspection
@@ -2994,11 +7490,131 @@ async def ws_handler(request):
     return ws
 
 
+async def liquidate_all_handler(request):
+    orch = request.app.get("orchestrator")
+    if orch is None or not hasattr(orch, "_liquidate_all_positions"):
+        return web.json_response({"ok": False, "error": "orchestrator_not_ready"}, status=503)
+    try:
+        orch._liquidate_all_positions()
+        pos_count = len(getattr(orch, "positions", {}) or {})
+        return web.json_response({"ok": True, "positions": pos_count})
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+async def liquidate_all_safety_handler(request):
+    orch = request.app.get("orchestrator")
+    if orch is None:
+        return web.json_response({"ok": False, "error": "orchestrator_not_ready"}, status=503)
+    try:
+        if hasattr(orch, "_liquidate_all_positions"):
+            orch._liquidate_all_positions()
+        # Ensure safety mode even if no positions
+        if hasattr(orch, "safety_mode"):
+            orch.safety_mode = True
+        try:
+            if hasattr(orch, "_register_anomaly"):
+                orch._register_anomaly("safety_mode", "critical", "dashboard liquidate_all_safety")
+        except Exception:
+            pass
+        try:
+            if hasattr(orch, "_log_err"):
+                orch._log_err("[RISK] safety_mode ON via dashboard liquidate_all_safety")
+        except Exception:
+            pass
+        pos_count = len(getattr(orch, "positions", {}) or {})
+        return web.json_response({"ok": True, "positions": pos_count})
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+async def close_limit_handler(request):
+    orch = request.app.get("orchestrator")
+    if orch is None:
+        return web.json_response({"ok": False, "error": "orchestrator_not_ready"}, status=503)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    sym = (payload.get("symbol") or "").strip()
+    price = payload.get("price")
+    if not sym or price is None:
+        return web.json_response({"ok": False, "error": "symbol_or_price_missing"}, status=400)
+    try:
+        price_f = float(price)
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_price"}, status=400)
+    if price_f <= 0:
+        return web.json_response({"ok": False, "error": "invalid_price"}, status=400)
+    result = await orch._submit_limit_close(sym, price_f)
+    status = 200 if result.get("ok") else 400
+    return web.json_response(result, status=status)
+
+
+async def safety_mode_handler(request):
+    orch = request.app.get("orchestrator")
+    if orch is None or not hasattr(orch, "clear_safety_mode"):
+        return web.json_response({"ok": False, "error": "orchestrator_not_ready"}, status=503)
+
+    def _as_bool(v):
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return None
+        s = str(v).strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off"):
+            return False
+        return None
+
+    data = {}
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data:
+        try:
+            data = dict(request.rel_url.query)
+        except Exception:
+            data = {}
+
+    action = str(data.get("action") or "").strip().lower()
+    enabled = _as_bool(data.get("enabled"))
+    if enabled is True or action in ("on", "enable", "true"):
+        return web.json_response({"ok": False, "error": "enable_not_supported"}, status=400)
+
+    reset_equity = _as_bool(data.get("reset_equity"))
+    reset_equity = bool(reset_equity) if reset_equity is not None else False
+    try:
+        result = orch.clear_safety_mode(reset_equity=reset_equity)
+        payload = {"ok": True}
+        if isinstance(result, dict):
+            payload.update(result)
+        return web.json_response(payload)
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
 async def main():
-    exchange = ccxt.bybit({
+    ex_cfg = {
         "enableRateLimit": True,
         "timeout": CCXT_TIMEOUT_MS,
-    })
+    }
+    live_enabled = bool(getattr(config, "ENABLE_LIVE_ORDERS", False))
+    trade_cfg = dict(ex_cfg)
+    if live_enabled:
+        trade_cfg.update({
+            "apiKey": getattr(config, "API_KEY", "") or "",
+            "secret": getattr(config, "API_SECRET", "") or "",
+        })
+    exchange = ccxt.bybit(trade_cfg)
+    data_exchange = ccxt.bybit(ex_cfg)
+    if bool(getattr(config, "BYBIT_TESTNET", False)):
+        exchange.set_sandbox_mode(True)
+        data_exchange.set_sandbox_mode(True)
     # Create a lightweight stub orchestrator so the web server (WS) can accept
     # connections immediately. The real LiveOrchestrator will be created in
     # background and replace `app["orchestrator"]`.
@@ -3012,14 +7628,21 @@ async def main():
         # Start the web server immediately so the dashboard can connect quickly.
         app = web.Application()
         app["orchestrator"] = orchestrator
-        app.add_routes([web.get("/", index_handler), web.get("/ws", ws_handler)])
+        app.add_routes([
+            web.get("/", index_handler),
+            web.get("/ws", ws_handler),
+            web.post("/api/liquidate_all", liquidate_all_handler),
+            web.post("/api/liquidate_all_safety", liquidate_all_safety_handler),
+            web.post("/api/close_limit", close_limit_handler),
+            web.post("/api/safety_mode", safety_mode_handler),
+        ])
 
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        site = web.TCPSite(runner, DASHBOARD_HOST, PORT)
         await site.start()
 
-        print(f"🚀 Dashboard: http://localhost:{PORT}")
+        print(f"🚀 Dashboard: http://{DASHBOARD_HOST}:{PORT}")
         print(f"📄 Serving: {DASHBOARD_FILE.name}")
 
         # Perform long-running initialization in background so server is responsive.
@@ -3030,7 +7653,7 @@ async def main():
                 # in-process EngineHub where possible to avoid startup failures.
                 if not bool(getattr(config, "USE_PROCESS_ENGINE_SET", False)):
                     config.USE_PROCESS_ENGINE = False
-                real_orch = LiveOrchestrator(exchange)
+                real_orch = LiveOrchestrator(exchange, data_exchange=data_exchange)
 
                 # Transfer any connected WS clients from the stub to the real orchestrator
                 try:
@@ -3043,6 +7666,14 @@ async def main():
 
                 # Perform heavy initialization (exchange settings, OHLCV preload)
                 await real_orch.init_exchange_settings()
+                try:
+                    if bool(getattr(config, "SYNC_POSITIONS_ON_START", False)):
+                        await real_orch._sync_positions_from_exchange(overwrite=True, reason="startup")
+                except Exception as e:
+                    try:
+                        real_orch._log_err(f"[SYNC_POS] startup sync failed: {e}")
+                    except Exception:
+                        pass
                 await real_orch.preload_all_ohlcv(limit=OHLCV_PRELOAD_LIMIT)
                 real_orch._persist_state(force=True)
 
@@ -3050,7 +7681,12 @@ async def main():
                 asyncio.create_task(real_orch.fetch_prices_loop())
                 asyncio.create_task(real_orch.fetch_ohlcv_loop())
                 asyncio.create_task(real_orch.fetch_orderbook_loop())
+                asyncio.create_task(real_orch.fetch_balance_loop())
+                asyncio.create_task(real_orch.fetch_positions_loop())
+                asyncio.create_task(real_orch.refresh_top_volume_universe_loop())
+                asyncio.create_task(real_orch.hold_eval_loop())
                 asyncio.create_task(real_orch.decision_loop())
+                asyncio.create_task(real_orch.dashboard_loop())
 
                 print("✅ Background init completed: fetch/decision loops started")
             except Exception as e:
@@ -3068,6 +7704,8 @@ async def main():
     finally:
         try:
             await exchange.close()
+            if data_exchange is not exchange:
+                await data_exchange.close()
         except Exception:
             pass
         if site is not None:

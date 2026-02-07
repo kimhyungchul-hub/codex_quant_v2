@@ -806,6 +806,7 @@ class MonteCarloEntryEvaluationMixin:
         # [D] AlphaHitMLP: Predict horizon-specific TP/SL probabilities using OnlineAlphaTrainer
         alpha_hit = None
         features_np = None
+        alpha_hit_features_np = None
         alpha_hit_buffer_n = 0
         alpha_hit_loss = None
         alpha_hit_beta_eff = 0.0
@@ -824,22 +825,28 @@ class MonteCarloEntryEvaluationMixin:
                 )
                 if features is not None:
                     features_np = features[0].detach().cpu().numpy()  # [F]
+                    alpha_hit_features_np = features_np
                     # Use trainer's predict method
                     pred = self.alpha_hit_trainer.predict(features_np)
-                    # Convert to expected format (arrays aligned with horizons)
+                    # Convert to 1D arrays aligned with horizons (avoid [1, H] len==1 bug)
                     alpha_hit = {
-                        "p_tp_long": pred["p_tp_long"],
-                        "p_sl_long": pred["p_sl_long"],
-                        "p_tp_short": pred["p_tp_short"],
-                        "p_sl_short": pred["p_sl_short"],
+                        "p_tp_long": pred["p_tp_long"].detach().cpu().numpy().reshape(-1),
+                        "p_sl_long": pred["p_sl_long"].detach().cpu().numpy().reshape(-1),
+                        "p_tp_short": pred["p_tp_short"].detach().cpu().numpy().reshape(-1),
+                        "p_sl_short": pred["p_sl_short"].detach().cpu().numpy().reshape(-1),
                     }
                     # Train on previous samples (async, non-blocking)
                     try:
                         train_stats = self.alpha_hit_trainer.train_tick()
                         try:
-                            alpha_hit_buffer_n = int(train_stats.get("buffer_n", 0) or 0)
+                            alpha_hit_buffer_n = int(getattr(self.alpha_hit_trainer, "buffer_size", 0))
                         except Exception:
                             alpha_hit_buffer_n = 0
+                        if alpha_hit_buffer_n <= 0:
+                            try:
+                                alpha_hit_buffer_n = int(train_stats.get("buffer_n", train_stats.get("n_samples", 0)) or 0)
+                            except Exception:
+                                alpha_hit_buffer_n = 0
                         alpha_hit_loss = train_stats.get("loss")
                         if alpha_hit_loss is not None:
                             logger.debug(f"[ALPHA_HIT] Training loss: {alpha_hit_loss:.6f}, buffer: {alpha_hit_buffer_n}")
@@ -854,10 +861,10 @@ class MonteCarloEntryEvaluationMixin:
                         base_beta = 1.0
                     base_beta = float(np.clip(base_beta, 0.0, 1.0))
                     warm = 1.0
+                    max_loss = config.alpha_hit_max_loss
                     if min_buf > 0:
                         warm = min(1.0, float(alpha_hit_buffer_n) / float(min_buf))
-                        max_loss = config.alpha_hit_max_loss
-                    if alpha_hit_loss is None or (not math.isfinite(float(alpha_hit_loss))) or float(alpha_hit_loss) > max_loss:
+                    if alpha_hit_loss is None or (not math.isfinite(float(alpha_hit_loss))) or float(alpha_hit_loss) > float(max_loss):
                         warm = 0.0
                     alpha_hit_beta_eff = float(base_beta * warm)
             except Exception as e:
@@ -3197,6 +3204,11 @@ class MonteCarloEntryEvaluationMixin:
             "policy_ev_per_h_long": [float(x) for x in ev_long_h] if 'ev_long_h' in locals() else [],
             "policy_ev_per_h_short": [float(x) for x in ev_short_h] if 'ev_short_h' in locals() else [],
         }
+        if alpha_hit_features_np is not None:
+            try:
+                meta["alpha_hit_features"] = [float(x) for x in alpha_hit_features_np.tolist()]
+            except Exception:
+                meta["alpha_hit_features"] = None
 
         # ✅ Payload Splitting: Core vs Detail
         meta_core = {

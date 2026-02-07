@@ -752,6 +752,7 @@ class MonteCarloEntryEvaluationMixin:
         t_start = time.perf_counter()
         step_sec = int(getattr(self, "time_step_sec", 1) or 1)
         step_sec = int(max(1, step_sec))
+        n_paths = int(getattr(params, "n_paths", config.n_paths_live))
         
         # [A] Price paths generation (1st call)
         max_h_sec = int(max(horizons_for_sim)) if horizons_for_sim else 0
@@ -762,7 +763,7 @@ class MonteCarloEntryEvaluationMixin:
             s0=float(price),
             mu=float(mu_adj),
             sigma=float(sigma),
-            n_paths=int(params.n_paths),
+            n_paths=n_paths,
             n_steps=max_steps,
             dt=float(self.dt),
             return_torch=True,
@@ -924,6 +925,7 @@ class MonteCarloEntryEvaluationMixin:
         # [D] AlphaHitMLP: Predict horizon-specific TP/SL probabilities using OnlineAlphaTrainer
         alpha_hit = None
         features_np = None
+        alpha_hit_features_np = None
         alpha_hit_buffer_n = 0
         alpha_hit_loss = None
         alpha_hit_beta_eff = 0.0
@@ -942,22 +944,28 @@ class MonteCarloEntryEvaluationMixin:
                 )
                 if features is not None:
                     features_np = features[0].detach().cpu().numpy()  # [F]
+                    alpha_hit_features_np = features_np
                     # Use trainer's predict method
                     pred = self.alpha_hit_trainer.predict(features_np)
-                    # Convert to expected format (arrays aligned with horizons)
+                    # Convert to 1D arrays aligned with horizons (avoid [1, H] len==1 bug)
                     alpha_hit = {
-                        "p_tp_long": pred["p_tp_long"],
-                        "p_sl_long": pred["p_sl_long"],
-                        "p_tp_short": pred["p_tp_short"],
-                        "p_sl_short": pred["p_sl_short"],
+                        "p_tp_long": pred["p_tp_long"].detach().cpu().numpy().reshape(-1),
+                        "p_sl_long": pred["p_sl_long"].detach().cpu().numpy().reshape(-1),
+                        "p_tp_short": pred["p_tp_short"].detach().cpu().numpy().reshape(-1),
+                        "p_sl_short": pred["p_sl_short"].detach().cpu().numpy().reshape(-1),
                     }
                     # Train on previous samples (async, non-blocking)
                     try:
                         train_stats = self.alpha_hit_trainer.train_tick()
                         try:
-                            alpha_hit_buffer_n = int(train_stats.get("buffer_n", 0) or 0)
+                            alpha_hit_buffer_n = int(getattr(self.alpha_hit_trainer, "buffer_size", 0))
                         except Exception:
                             alpha_hit_buffer_n = 0
+                        if alpha_hit_buffer_n <= 0:
+                            try:
+                                alpha_hit_buffer_n = int(train_stats.get("buffer_n", train_stats.get("n_samples", 0)) or 0)
+                            except Exception:
+                                alpha_hit_buffer_n = 0
                         alpha_hit_loss = train_stats.get("loss")
                         if alpha_hit_loss is not None:
                             logger.debug(f"[ALPHA_HIT] Training loss: {alpha_hit_loss:.6f}, buffer: {alpha_hit_buffer_n}")
@@ -972,10 +980,10 @@ class MonteCarloEntryEvaluationMixin:
                         base_beta = 1.0
                     base_beta = float(np.clip(base_beta, 0.0, 1.0))
                     warm = 1.0
+                    max_loss = config.alpha_hit_max_loss
                     if min_buf > 0:
                         warm = min(1.0, float(alpha_hit_buffer_n) / float(min_buf))
-                        max_loss = config.alpha_hit_max_loss
-                    if alpha_hit_loss is None or (not math.isfinite(float(alpha_hit_loss))) or float(alpha_hit_loss) > max_loss:
+                    if alpha_hit_loss is None or (not math.isfinite(float(alpha_hit_loss))) or float(alpha_hit_loss) > float(max_loss):
                         warm = 0.0
                     alpha_hit_beta_eff = float(base_beta * warm)
             except Exception as e:
@@ -1282,33 +1290,98 @@ class MonteCarloEntryEvaluationMixin:
         cvar_long_h = np.array(cvar_long_h)
         cvar_short_h = np.array(cvar_short_h)
 
+        # AlphaHit blending (EV recompute using blended TP/SL probabilities)
+        if alpha_hit is not None:
+            try:
+                tp_targets_clean = [float(x) for x in tp_targets_clean]
+                sl_targets_clean = [float(x) for x in sl_targets_clean]
+                H = len(policy_horizons)
+                ev_long_h_new = np.asarray(ev_long_h, dtype=np.float64).copy()
+                ev_short_h_new = np.asarray(ev_short_h, dtype=np.float64).copy()
+                ppos_long_h_new = np.asarray(ppos_long_h, dtype=np.float64).copy()
+                ppos_short_h_new = np.asarray(ppos_short_h, dtype=np.float64).copy()
+
+                for i in range(H):
+                    tp_r = float(tp_targets_clean[i]) if i < len(tp_targets_clean) else 0.0
+                    sl_r_raw = float(sl_targets_clean[i]) if i < len(sl_targets_clean) else 0.0
+                    sl_r = -abs(sl_r_raw) if sl_r_raw >= 0 else float(sl_r_raw)
+
+                    # MC probs from clean evaluator
+                    p_tp_L_mc = float(mc_p_tp_long[i]) if i < len(mc_p_tp_long) else 0.0
+                    p_sl_L_mc = float(mc_p_sl_long[i]) if i < len(mc_p_sl_long) else 0.0
+                    p_tp_S_mc = float(mc_p_tp_short[i]) if i < len(mc_p_tp_short) else 0.0
+                    p_sl_S_mc = float(mc_p_sl_short[i]) if i < len(mc_p_sl_short) else 0.0
+
+                    # AlphaHit probs
+                    tp_pL_pred = float(alpha_hit["p_tp_long"][i]) if i < len(alpha_hit["p_tp_long"]) else 0.0
+                    sl_pL_pred = float(alpha_hit["p_sl_long"][i]) if i < len(alpha_hit["p_sl_long"]) else 0.0
+                    tp_pS_pred = float(alpha_hit["p_tp_short"][i]) if i < len(alpha_hit["p_tp_short"]) else 0.0
+                    sl_pS_pred = float(alpha_hit["p_sl_short"][i]) if i < len(alpha_hit["p_sl_short"]) else 0.0
+
+                    # Normalize
+                    tp_pL_pred, sl_pL_pred, _ = _normalize_tp_sl(tp_pL_pred, sl_pL_pred)
+                    tp_pS_pred, sl_pS_pred, _ = _normalize_tp_sl(tp_pS_pred, sl_pS_pred)
+                    p_tp_L_mc, p_sl_L_mc, _ = _normalize_tp_sl(p_tp_L_mc, p_sl_L_mc)
+                    p_tp_S_mc, p_sl_S_mc, _ = _normalize_tp_sl(p_tp_S_mc, p_sl_S_mc)
+
+                    beta_eff = float(alpha_hit_beta_eff) if alpha_hit_beta_eff is not None else 0.0
+                    beta_eff = float(np.clip(beta_eff, 0.0, 1.0))
+                    conf_L = float(self.alpha_hit_confidence(tp_pL_pred, sl_pL_pred))
+                    conf_S = float(self.alpha_hit_confidence(tp_pS_pred, sl_pS_pred))
+                    beta_eff_L = float(np.clip(beta_eff * conf_L, 0.0, 1.0))
+                    beta_eff_S = float(np.clip(beta_eff * conf_S, 0.0, 1.0))
+
+                    tp_pL_val = beta_eff_L * tp_pL_pred + (1.0 - beta_eff_L) * p_tp_L_mc
+                    sl_pL_val = beta_eff_L * sl_pL_pred + (1.0 - beta_eff_L) * p_sl_L_mc
+                    tp_pS_val = beta_eff_S * tp_pS_pred + (1.0 - beta_eff_S) * p_tp_S_mc
+                    sl_pS_val = beta_eff_S * sl_pS_pred + (1.0 - beta_eff_S) * p_sl_S_mc
+
+                    tp_pL_val, sl_pL_val, p_other_L = _normalize_tp_sl(tp_pL_val, sl_pL_val)
+                    tp_pS_val, sl_pS_val, p_other_S = _normalize_tp_sl(tp_pS_val, sl_pS_val)
+
+                    # Implied other_r from MC mean (net of entry cost)
+                    evL = float(ev_long_h[i]) if i < len(ev_long_h) else 0.0
+                    evS = float(ev_short_h[i]) if i < len(ev_short_h) else 0.0
+                    denom_L = max(1e-12, p_other_L)
+                    denom_S = max(1e-12, p_other_S)
+                    other_r_L = (evL + float(cost_entry_roe) - (tp_pL_val * tp_r + sl_pL_val * sl_r)) / denom_L
+                    other_r_S = (evS + float(cost_entry_roe) - (tp_pS_val * tp_r + sl_pS_val * sl_r)) / denom_S
+
+                    ev_long_h_new[i] = tp_pL_val * tp_r + sl_pL_val * sl_r + p_other_L * other_r_L - float(cost_entry_roe)
+                    ev_short_h_new[i] = tp_pS_val * tp_r + sl_pS_val * sl_r + p_other_S * other_r_S - float(cost_entry_roe)
+                    ppos_long_h_new[i] = tp_pL_val
+                    ppos_short_h_new[i] = tp_pS_val
+
+                ev_long_h = ev_long_h_new
+                ev_short_h = ev_short_h_new
+                ppos_long_h = ppos_long_h_new
+                ppos_short_h = ppos_short_h_new
+            except Exception as e:
+                logger.warning(f"[ALPHA_HIT] Blend failed: {e}")
+
         # Mock per_h_long/short to prevent NaNs in downstream calculations
         # (Since current CleanEvaluator does not calculate variance/liquidation yet)
         mock_metrics = {'var_exit_policy': 0.0, 'p_liq_exit_policy': 0.0, 'dd_min_exit_policy': 0.0, 'profit_cost_exit_policy': 999.0}
         per_h_long = [mock_metrics.copy() for _ in policy_horizons]
         per_h_short = [mock_metrics.copy() for _ in policy_horizons]
         
+        # Always refresh legacy helpers with CleanEvaluator outputs (needed for unified scoring + hold stats)
+        evs_long = ev_long_h
+        evs_short = ev_short_h
+        pps_long = ppos_long_h
+        pps_short = ppos_short_h
+        cvars_long = cvar_long_h
+        cvars_short = cvar_short_h
+        dbg_L = (ev_long_h.tolist(), ppos_long_h.tolist(), cvar_long_h.tolist(), policy_horizons)
+        dbg_S = (ev_short_h.tolist(), ppos_short_h.tolist(), cvar_short_h.tolist(), policy_horizons)
+        net_by_h_long_base = [None] * len(policy_horizons)
+        net_by_h_short_base = [None] * len(policy_horizons)
+        net_by_h_long = [None] * len(policy_horizons)
+        net_by_h_short = [None] * len(policy_horizons)
+
         if MC_VERBOSE_PRINT:
             print(f"[CLEAN_EVAL] {symbol} | Processed {len(policy_horizons)} horizons successfully")
             print(f"[CLEAN_EVAL] {symbol} | ev_long_h shape: {ev_long_h.shape}, values: {ev_long_h}")
-
-            # Bridge Clean Evaluator results to legacy variables
-            evs_long = ev_long_h
-            evs_short = ev_short_h
-            pps_long = ppos_long_h
-            pps_short = ppos_short_h
-            cvars_long = cvar_long_h
-            cvars_short = cvar_short_h
-
-            # Mock dbg_L/S using clean results (mapped to legacy lists)
-            dbg_L = (evs_long, pps_long, cvars_long, policy_horizons)
-            dbg_S = (evs_short, pps_short, cvars_short, policy_horizons)
-            
-            # Legacy base vars mocking
-            net_by_h_long_base = [None] * len(policy_horizons)
-            net_by_h_short_base = [None] * len(policy_horizons)
-            net_by_h_long = [None] * len(policy_horizons)
-            net_by_h_short = [None] * len(policy_horizons)
 
 
         if self.alpha_hit_enabled and self.alpha_hit_trainer is not None and features_np is not None:
@@ -1993,6 +2066,16 @@ class MonteCarloEntryEvaluationMixin:
         tp_mult_long, tp_ok_long = _tp_gate(tp_long_5m)
         tp_mult_short, tp_ok_short = _tp_gate(tp_short_5m)
 
+        # ✅ [DEBUG] 진입 결정 분기 직전 상태 로깅
+        if MC_VERBOSE_PRINT or _throttled_log(symbol, "ENTRY_DECISION_DEBUG", 30_000):
+            logger.info(
+                f"[ENTRY_DECISION] {symbol} | "
+                f"scoreL={score_long:.6f} scoreS={score_short:.6f} threshold={score_threshold_eff:.6f} | "
+                f"tp_okL={tp_ok_long} tp_okS={tp_ok_short} tp_multL={tp_mult_long:.2f} tp_multS={tp_mult_short:.2f} | "
+                f"tp_5m_L={tp_long_5m} tp_5m_S={tp_short_5m} | "
+                f"score_tp_entry_min={tp_entry_min:.4f} score_tp_entry_hard={tp_entry_hard:.4f}"
+            )
+
         score_long_valid = (
             tp_ok_long
             and math.isfinite(float(score_long))
@@ -2003,6 +2086,15 @@ class MonteCarloEntryEvaluationMixin:
             and math.isfinite(float(score_short))
             and float(score_short) > (score_threshold_eff * tp_mult_short)
         )
+        
+        # ✅ [DEBUG] 진입 결정 결과 로깅
+        if MC_VERBOSE_PRINT or _throttled_log(symbol, "ENTRY_VALID_DEBUG", 30_000):
+            logger.info(
+                f"[ENTRY_VALID] {symbol} | "
+                f"score_long_valid={score_long_valid} score_short_valid={score_short_valid} | "
+                f"scoreL({score_long:.6f}) > threshold({score_threshold_eff * tp_mult_long:.6f})? {score_long > (score_threshold_eff * tp_mult_long)} | "
+                f"scoreS({score_short:.6f}) > threshold({score_threshold_eff * tp_mult_short:.6f})? {score_short > (score_threshold_eff * tp_mult_short)}"
+            )
         
         if not score_long_valid and not score_short_valid:
             # 둘 다 임계값 미달 → WAIT
@@ -2149,6 +2241,7 @@ class MonteCarloEntryEvaluationMixin:
         meta["policy_profit_cost_by_h_short"] = profit_cost_short_h.tolist()
         meta["policy_direction"] = direction_policy
         meta["policy_direction_reason"] = str(policy_direction_reason) if policy_direction_reason else None
+        meta["policy_score_threshold_eff"] = float(score_threshold_eff)
         meta["policy_min_ev_gap"] = min_gap_eff
         meta["policy_best_ev_gap"] = float(best_ev_gap)
         meta["policy_ev_gap"] = float(ev_gap)
@@ -3052,6 +3145,11 @@ class MonteCarloEntryEvaluationMixin:
             "policy_ev_per_h_long": [float(x) for x in ev_long_h] if 'ev_long_h' in locals() else [],
             "policy_ev_per_h_short": [float(x) for x in ev_short_h] if 'ev_short_h' in locals() else [],
         }
+        if alpha_hit_features_np is not None:
+            try:
+                meta["alpha_hit_features"] = [float(x) for x in alpha_hit_features_np.tolist()]
+            except Exception:
+                meta["alpha_hit_features"] = None
 
         # ✅ Payload Splitting: Core vs Detail
         meta_core = {
@@ -3114,9 +3212,11 @@ class MonteCarloEntryEvaluationMixin:
         mus = []
         sigmas = []
         leverages_list = [] # Renamed to avoid conflict with numpy array later
+        alpha_hit_preds = [None for _ in range(num_symbols)]
+        alpha_hit_features_list = [None for _ in range(num_symbols)]
         from regime import adjust_mu_sigma
-        
-        for t in tasks:
+
+        for idx, t in enumerate(tasks):
             ctx, params = t["ctx"], t["params"]
             sym = ctx.get("symbol", "UNKNOWN")
             closes = ctx.get("closes", [])
@@ -3143,7 +3243,97 @@ class MonteCarloEntryEvaluationMixin:
             mus.append(mu_adj)
             sigmas.append(sigma_adj)
             leverages_list.append(params.leverage if hasattr(params, "leverage") else 1.0)
-            
+
+            # AlphaHit features/prediction (batch path)
+            if self.alpha_hit_enabled and self.alpha_hit_trainer is not None:
+                try:
+                    ctx["mu_alpha"] = float(mu_alpha)
+                    momentum_z = 0.0
+                    if closes is not None and len(closes) >= 6:
+                        rets = np.diff(np.log(np.asarray(closes, dtype=np.float64)))
+                        if rets.size >= 5:
+                            window = int(min(20, rets.size))
+                            subset = rets[-window:]
+                            mean_r = float(subset.mean())
+                            std_r = float(subset.std())
+                            if std_r > 1e-9:
+                                momentum_z = float((subset[-1] - mean_r) / std_r)
+
+                    ofi_z = 0.0
+                    try:
+                        key = (str(regime), str(ctx.get("session", "OFF")))
+                        hist = self._ofi_hist.setdefault(key, [])
+                        hist.append(ofi_score)
+                        if len(hist) > 500:
+                            hist.pop(0)
+                        if len(hist) >= 5:
+                            arr = np.asarray(hist, dtype=np.float64)
+                            mean = float(arr.mean())
+                            std = float(arr.std())
+                            std = std if std > 1e-6 else 0.05
+                            ofi_z = float((ofi_score - mean) / std) if std > 1e-9 else 0.0
+                    except Exception:
+                        ofi_z = 0.0
+
+                    leverage_val = float(ctx.get("leverage") or 1.0)
+                    features = self._extract_alpha_hit_features(
+                        symbol=str(sym),
+                        price=float(ctx.get("price") or 0.0),
+                        mu=float(mu_adj),
+                        sigma=float(sigma_adj),
+                        momentum_z=float(momentum_z),
+                        ofi_z=float(ofi_z),
+                        regime=str(regime),
+                        leverage=float(leverage_val),
+                        ctx=ctx,
+                    )
+                    if features is not None:
+                        features_np = features[0].detach().cpu().numpy().astype(np.float32)
+                        alpha_hit_features_list[idx] = features_np
+                        pred = self.alpha_hit_trainer.predict(features_np)
+                        alpha_hit_preds[idx] = {
+                            "p_tp_long": pred["p_tp_long"].detach().cpu().numpy().reshape(-1),
+                            "p_sl_long": pred["p_sl_long"].detach().cpu().numpy().reshape(-1),
+                            "p_tp_short": pred["p_tp_short"].detach().cpu().numpy().reshape(-1),
+                            "p_sl_short": pred["p_sl_short"].detach().cpu().numpy().reshape(-1),
+                        }
+                except Exception:
+                    alpha_hit_preds[idx] = None
+
+        # AlphaHit warmup/beta scaling (batch-level)
+        alpha_hit_beta_eff = 0.0
+        alpha_hit_buffer_n = 0
+        alpha_hit_loss = None
+        if self.alpha_hit_enabled and self.alpha_hit_trainer is not None:
+            train_stats = {}
+            try:
+                train_stats = self.alpha_hit_trainer.train_tick()
+                alpha_hit_loss = train_stats.get("loss")
+            except Exception:
+                alpha_hit_loss = None
+            try:
+                alpha_hit_buffer_n = int(getattr(self.alpha_hit_trainer, "buffer_size", 0))
+            except Exception:
+                alpha_hit_buffer_n = 0
+            if alpha_hit_buffer_n <= 0:
+                try:
+                    alpha_hit_buffer_n = int(train_stats.get("buffer_n", train_stats.get("n_samples", 0)) or 0)
+                except Exception:
+                    alpha_hit_buffer_n = 0
+            try:
+                base_beta = float(getattr(self, "alpha_hit_beta", 1.0))
+            except Exception:
+                base_beta = 1.0
+            base_beta = float(np.clip(base_beta, 0.0, 1.0))
+            warm = 1.0
+            min_buf = int(getattr(config, "alpha_hit_min_buffer", 0))
+            if min_buf > 0:
+                warm = min(1.0, float(alpha_hit_buffer_n) / float(min_buf))
+                max_loss = float(getattr(config, "alpha_hit_max_loss", 2.0))
+                if alpha_hit_loss is None or (not math.isfinite(float(alpha_hit_loss))) or float(alpha_hit_loss) > max_loss:
+                    warm = 0.0
+            alpha_hit_beta_eff = float(base_beta * warm)
+
         # Prepare padded inputs for JAX
         num_symbols = len(tasks)
         pad_size = self.JAX_STATIC_BATCH_SIZE
@@ -3180,6 +3370,8 @@ class MonteCarloEntryEvaluationMixin:
         dt = float(step_sec) / float(SECONDS_PER_YEAR)  # step_sec seconds per step, annualized
         max_h_sec = int(max(getattr(self, "horizons", (3600,))))
         max_steps = int(math.ceil(max_h_sec / float(step_sec))) if max_h_sec > 0 else 0
+        # Ensure policy_horizons_all is always defined (avoid NameError on batch path)
+        policy_horizons_all = list(getattr(self, "POLICY_MULTI_HORIZONS_SEC", (60, 300, 600, 1800, 3600)))
         
         # Horizons summary inputs (seconds)
         from engines.mc.constants import HORIZON_SUMMARY_DEFAULT
@@ -3191,6 +3383,8 @@ class MonteCarloEntryEvaluationMixin:
             [min(int(max_steps), int(math.ceil(int(h) / float(step_sec)))) for h in h_cols],
             dtype=np.int32,
         )
+        # Exit Policy horizons (shared across batch to keep shapes static)
+        policy_horizons_all = list(getattr(self, "POLICY_MULTI_HORIZONS_SEC", h_cols)) or list(h_cols)
 
         t_prep1 = time.perf_counter()
 
@@ -3235,6 +3429,10 @@ class MonteCarloEntryEvaluationMixin:
             t_sum1 = time.perf_counter()
             print(f"[BATCH_TIMING] numpy sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
 
+        # No explicit GPU->CPU transfer stage in this path; keep perf keys stable.
+        t_xfer0 = t_sum1
+        t_xfer1 = t_sum1
+
         # Optional control variate adjustment for EV (variance reduction)
         use_cv = str(os.environ.get("MC_USE_CONTROL_VARIATE", "1")).strip().lower() in ("1", "true", "yes", "on")
         if use_cv:
@@ -3273,6 +3471,8 @@ class MonteCarloEntryEvaluationMixin:
         t_exit0 = time.perf_counter()
         t_exit1 = t_exit0  # default
         exit_policy_results = None
+        tp_targets_by_sym = [None for _ in range(pad_size)]
+        sl_targets_by_sym = [None for _ in range(pad_size)]
         
         if SKIP_EXIT_POLICY:
             # Skip Exit Policy - use simplified EV from summary_cpu
@@ -3292,6 +3492,19 @@ class MonteCarloEntryEvaluationMixin:
             h_list = list(h_cols)
             directions = [1, -1]
             for i in range(pad_size):
+                # Precompute TP/SL targets (for optional AlphaHit blending)
+                if i < num_symbols:
+                    sigma_val = float(sigmas_jax[i])
+                    leverage = float(leverages_jax[i])
+                    tp_targets = []
+                    sl_targets = []
+                    for h in h_list:
+                        for _d in directions:
+                            tp_r, sl_r = self.tp_sl_targets_for_horizon(float(h), sigma_val)
+                            tp_targets.append(float(tp_r) * leverage)
+                            sl_targets.append(float(sl_r) * leverage)
+                    tp_targets_by_sym[i] = np.array(tp_targets, dtype=np.float32)
+                    sl_targets_by_sym[i] = np.array(sl_targets, dtype=np.float32)
                 slot_results = []
                 for h_idx, h_val in enumerate(h_list):
                     for d in directions:
@@ -3300,7 +3513,30 @@ class MonteCarloEntryEvaluationMixin:
                             ev_val = float(summary_cpu["ev_long"][i, h_idx]) if i < num_symbols else 0.0
                         else:
                             ev_val = float(summary_cpu["ev_short"][i, h_idx]) if i < num_symbols else 0.0
-                        slot_results.append({"ev_exit_policy": ev_val})
+                        res = {"ev_exit_policy": ev_val}
+                        # Approximate TP/SL hit probs using barrier formula (for AlphaHit blend)
+                        if i < num_symbols:
+                            try:
+                                from engines.probability_methods import _prob_max_geq, _prob_min_leq
+                                mu_ps = float(mus_jax[i]) / float(SECONDS_PER_YEAR)
+                                sigma_ps = float(sigmas_jax[i]) / math.sqrt(float(SECONDS_PER_YEAR))
+                                lev = float(leverages_jax[i]) if float(leverages_jax[i]) > 0 else 1.0
+                                tp_arr = tp_targets_by_sym[i]
+                                sl_arr = sl_targets_by_sym[i]
+                                idx = (h_idx * 2) + (0 if d == 1 else 1)
+                                tp_under = float(tp_arr[idx]) / lev if tp_arr is not None and idx < len(tp_arr) else 0.0
+                                sl_under = float(sl_arr[idx]) / lev if sl_arr is not None and idx < len(sl_arr) else 0.0
+                                if d == 1:
+                                    p_tp = _prob_max_geq(mu_ps, sigma_ps, float(h_val), float(tp_under))
+                                    p_sl = _prob_min_leq(mu_ps, sigma_ps, float(h_val), float(-sl_under))
+                                else:
+                                    p_tp = _prob_min_leq(mu_ps, sigma_ps, float(h_val), float(-tp_under))
+                                    p_sl = _prob_max_geq(mu_ps, sigma_ps, float(h_val), float(sl_under))
+                                res["p_tp"] = float(p_tp)
+                                res["p_sl"] = float(p_sl)
+                            except Exception:
+                                pass
+                        slot_results.append(res)
                 exit_policy_results.append(slot_results)
             t_exit_prep1 = time.perf_counter()
             t_exit1 = t_exit_prep1
@@ -3336,6 +3572,8 @@ class MonteCarloEntryEvaluationMixin:
                         sl_targets.append(float(sl_r) * leverage)
                     tp_targets_arr = np.array(tp_targets, dtype=np.float32)
                     sl_targets_arr = np.array(sl_targets, dtype=np.float32)
+                    tp_targets_by_sym[i] = tp_targets_arr
+                    sl_targets_by_sym[i] = sl_targets_arr
                     arg = {
                         "symbol": t["ctx"].get("symbol"),
                         "price": s0s_jax[i],
@@ -3363,6 +3601,8 @@ class MonteCarloEntryEvaluationMixin:
                         sl_targets.append(float(sl_r))
                     tp_targets_arr = np.array(tp_targets, dtype=np.float32)
                     sl_targets_arr = np.array(sl_targets, dtype=np.float32)
+                    tp_targets_by_sym[i] = tp_targets_arr
+                    sl_targets_by_sym[i] = sl_targets_arr
                     arg = {
                         "symbol": "PAD",
                         "price": 100.0,
@@ -3403,37 +3643,153 @@ class MonteCarloEntryEvaluationMixin:
             # Aggregate stats from Exit Policy results
             # horizons = [60, 300, 600, 1800, 3600], directions = [1, -1]
             h_list_exit = list(policy_horizons_all)
+            n_h = len(h_list_exit)
+            ev_long_h = np.zeros(n_h, dtype=np.float64)
+            ev_short_h = np.zeros(n_h, dtype=np.float64)
+            cvar_long_h = np.zeros(n_h, dtype=np.float64)
+            cvar_short_h = np.zeros(n_h, dtype=np.float64)
+            ppos_long_h = np.zeros(n_h, dtype=np.float64)
+            ppos_short_h = np.zeros(n_h, dtype=np.float64)
+            mc_p_tp_long = np.zeros(n_h, dtype=np.float64)
+            mc_p_sl_long = np.zeros(n_h, dtype=np.float64)
+            mc_p_tp_short = np.zeros(n_h, dtype=np.float64)
+            mc_p_sl_short = np.zeros(n_h, dtype=np.float64)
 
             best_ev_long = -999.0
-            best_h_long = 300
+            best_h_long = h_list_exit[0] if n_h > 0 else 0
             best_ev_short = -999.0
-            best_h_short = 300
+            best_h_short = h_list_exit[0] if n_h > 0 else 0
 
-            # Parse JAX results
+            # Parse exit policy results into per-horizon vectors
             for j, res in enumerate(sym_results):
                 direction = 1 if (j % 2 == 0) else -1
                 h_idx = j // 2
+                if h_idx >= n_h:
+                    continue
                 h_val = h_list_exit[h_idx]
-                ev = float(res.get("ev_exit_policy", 0.0))
-
-                if math.isnan(ev):
-                    ev = 0.0
+                ev_val = float(res.get("ev_exit_policy", 0.0))
+                if math.isnan(ev_val):
+                    ev_val = 0.0
+                cvar_val = res.get("cvar_exit_policy")
+                p_pos_val = res.get("p_pos_exit_policy")
+                p_tp_val = res.get("p_tp")
+                p_sl_val = res.get("p_sl")
 
                 if direction == 1:
-                    if ev > best_ev_long:
-                        best_ev_long = ev
+                    ev_long_h[h_idx] = ev_val
+                    if cvar_val is not None:
+                        cvar_long_h[h_idx] = float(cvar_val)
+                    if p_pos_val is not None:
+                        ppos_long_h[h_idx] = float(p_pos_val)
+                    if p_tp_val is not None:
+                        mc_p_tp_long[h_idx] = float(p_tp_val)
+                    if p_sl_val is not None:
+                        mc_p_sl_long[h_idx] = float(p_sl_val)
+                    if ev_val > best_ev_long:
+                        best_ev_long = ev_val
                         best_h_long = h_val
                 else:
-                    if ev > best_ev_short:
-                        best_ev_short = ev
+                    ev_short_h[h_idx] = ev_val
+                    if cvar_val is not None:
+                        cvar_short_h[h_idx] = float(cvar_val)
+                    if p_pos_val is not None:
+                        ppos_short_h[h_idx] = float(p_pos_val)
+                    if p_tp_val is not None:
+                        mc_p_tp_short[h_idx] = float(p_tp_val)
+                    if p_sl_val is not None:
+                        mc_p_sl_short[h_idx] = float(p_sl_val)
+                    if ev_val > best_ev_short:
+                        best_ev_short = ev_val
                         best_h_short = h_val
 
+            # Fallback CVaR from summary (if exit policy didn't populate)
+            try:
+                if summary_cpu is not None:
+                    if not np.any(np.isfinite(cvar_long_h)) or np.all(cvar_long_h == 0.0):
+                        cvar_long_h = np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64)
+                    if not np.any(np.isfinite(cvar_short_h)) or np.all(cvar_short_h == 0.0):
+                        cvar_short_h = np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64)
+            except Exception:
+                pass
+
+            # Per-horizon TP/SL targets (for AlphaHit blending)
+            tp_targets_arr = tp_targets_by_sym[i] if i < len(tp_targets_by_sym) else None
+            sl_targets_arr = sl_targets_by_sym[i] if i < len(sl_targets_by_sym) else None
+
+            lev_val = float(leverages_jax[i])
+            cost_base = float(fees_jax[i])
+            cost_roe = float(cost_base * lev_val)
+            cost_entry_roe = float(cost_roe / 2.0)
+            rho_val = float(tasks[i]["ctx"].get("rho", config.unified_rho))
+            lambda_val = float(tasks[i]["ctx"].get("unified_lambda", config.unified_risk_lambda))
+
+            # AlphaHit blending (batch)
+            alpha_pred = alpha_hit_preds[i] if i < len(alpha_hit_preds) else None
+            if alpha_pred is not None and tp_targets_arr is not None and sl_targets_arr is not None and alpha_hit_beta_eff > 0.0:
+                def _normalize_tp_sl(p_tp: float, p_sl: float) -> tuple[float, float, float]:
+                    tp = float(np.clip(float(p_tp), 0.0, 1.0))
+                    sl = float(np.clip(float(p_sl), 0.0, 1.0))
+                    s = tp + sl
+                    if s > 1.0:
+                        tp = tp / s
+                        sl = sl / s
+                        s = 1.0
+                    other = float(max(0.0, 1.0 - s))
+                    return tp, sl, other
+
+                have_mc_probs = bool(np.any(mc_p_tp_long) or np.any(mc_p_sl_long) or np.any(mc_p_tp_short) or np.any(mc_p_sl_short))
+                if have_mc_probs:
+                    for h_idx in range(n_h):
+                        tp_r = float(tp_targets_arr[2 * h_idx]) if (2 * h_idx) < len(tp_targets_arr) else 0.0
+                        sl_r_raw = float(sl_targets_arr[2 * h_idx]) if (2 * h_idx) < len(sl_targets_arr) else 0.0
+                        sl_r = -abs(sl_r_raw) if sl_r_raw >= 0 else float(sl_r_raw)
+
+                        p_tp_L_mc = float(mc_p_tp_long[h_idx])
+                        p_sl_L_mc = float(mc_p_sl_long[h_idx])
+                        p_tp_S_mc = float(mc_p_tp_short[h_idx])
+                        p_sl_S_mc = float(mc_p_sl_short[h_idx])
+
+                        tp_pL_pred = float(alpha_pred["p_tp_long"][h_idx]) if h_idx < len(alpha_pred["p_tp_long"]) else 0.0
+                        sl_pL_pred = float(alpha_pred["p_sl_long"][h_idx]) if h_idx < len(alpha_pred["p_sl_long"]) else 0.0
+                        tp_pS_pred = float(alpha_pred["p_tp_short"][h_idx]) if h_idx < len(alpha_pred["p_tp_short"]) else 0.0
+                        sl_pS_pred = float(alpha_pred["p_sl_short"][h_idx]) if h_idx < len(alpha_pred["p_sl_short"]) else 0.0
+
+                        tp_pL_pred, sl_pL_pred, _ = _normalize_tp_sl(tp_pL_pred, sl_pL_pred)
+                        tp_pS_pred, sl_pS_pred, _ = _normalize_tp_sl(tp_pS_pred, sl_pS_pred)
+                        p_tp_L_mc, p_sl_L_mc, _ = _normalize_tp_sl(p_tp_L_mc, p_sl_L_mc)
+                        p_tp_S_mc, p_sl_S_mc, _ = _normalize_tp_sl(p_tp_S_mc, p_sl_S_mc)
+
+                        conf_L = float(self.alpha_hit_confidence(tp_pL_pred, sl_pL_pred))
+                        conf_S = float(self.alpha_hit_confidence(tp_pS_pred, sl_pS_pred))
+                        beta_eff_L = float(np.clip(alpha_hit_beta_eff * conf_L, 0.0, 1.0))
+                        beta_eff_S = float(np.clip(alpha_hit_beta_eff * conf_S, 0.0, 1.0))
+
+                        tp_pL_val = beta_eff_L * tp_pL_pred + (1.0 - beta_eff_L) * p_tp_L_mc
+                        sl_pL_val = beta_eff_L * sl_pL_pred + (1.0 - beta_eff_L) * p_sl_L_mc
+                        tp_pS_val = beta_eff_S * tp_pS_pred + (1.0 - beta_eff_S) * p_tp_S_mc
+                        sl_pS_val = beta_eff_S * sl_pS_pred + (1.0 - beta_eff_S) * p_sl_S_mc
+
+                        tp_pL_val, sl_pL_val, p_other_L = _normalize_tp_sl(tp_pL_val, sl_pL_val)
+                        tp_pS_val, sl_pS_val, p_other_S = _normalize_tp_sl(tp_pS_val, sl_pS_val)
+
+                        evL = float(ev_long_h[h_idx])
+                        evS = float(ev_short_h[h_idx])
+                        denom_L = max(1e-12, p_other_L)
+                        denom_S = max(1e-12, p_other_S)
+                        other_r_L = (evL + cost_entry_roe - (tp_pL_val * tp_r + sl_pL_val * sl_r)) / denom_L
+                        other_r_S = (evS + cost_entry_roe - (tp_pS_val * tp_r + sl_pS_val * sl_r)) / denom_S
+
+                        ev_long_h[h_idx] = tp_pL_val * tp_r + sl_pL_val * sl_r + p_other_L * other_r_L - cost_entry_roe
+                        ev_short_h[h_idx] = tp_pS_val * tp_r + sl_pS_val * sl_r + p_other_S * other_r_S - cost_entry_roe
+                        ppos_long_h[h_idx] = tp_pL_val
+                        ppos_short_h[h_idx] = tp_pS_val
+
             # Unified score (Psi) from cumulative EV/CVaR vectors
-            h_list = list(h_cols)
-            ev_long_vec = np.asarray(summary_cpu["ev_long"][i], dtype=np.float64)
-            ev_short_vec = np.asarray(summary_cpu["ev_short"][i], dtype=np.float64)
-            cvar_long_vec = np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64)
-            cvar_short_vec = np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64)
+            h_list = list(h_list_exit)
+            ev_long_vec = np.asarray(ev_long_h, dtype=np.float64)
+            ev_short_vec = np.asarray(ev_short_h, dtype=np.float64)
+            cvar_long_vec = np.asarray(cvar_long_h, dtype=np.float64)
+            cvar_short_vec = np.asarray(cvar_short_h, dtype=np.float64)
             if "var_long" in summary_cpu:
                 var_long_vec = np.asarray(summary_cpu["var_long"][i], dtype=np.float64)
             else:
@@ -3442,12 +3798,6 @@ class MonteCarloEntryEvaluationMixin:
                 var_short_vec = np.asarray(summary_cpu["var_short"][i], dtype=np.float64)
             else:
                 var_short_vec = np.zeros_like(ev_short_vec, dtype=np.float64)
-
-            lev_val = float(leverages_jax[i])
-            cost_base = float(fees_jax[i])
-            cost_roe = float(cost_base * lev_val)
-            rho_val = float(tasks[i]["ctx"].get("rho", config.unified_rho))
-            lambda_val = float(tasks[i]["ctx"].get("unified_lambda", config.unified_risk_lambda))
 
             # Convert net cumulative vectors to gross (remove one-time cost)
             ev_long_gross = ev_long_vec + cost_roe
@@ -3465,17 +3815,40 @@ class MonteCarloEntryEvaluationMixin:
             )
 
             if score_long >= score_short:
-                policy_ev_mix = float(score_long)
                 direction_best = 1
+                policy_score = float(score_long)
                 best_h = int(t_long) if t_long > 0 else int(best_h_long)
             else:
-                policy_ev_mix = float(score_short)
                 direction_best = -1
+                policy_score = float(score_short)
                 best_h = int(t_short) if t_short > 0 else int(best_h_short)
 
             ev_vec = ev_long_vec if direction_best == 1 else ev_short_vec
             cvar_vec = cvar_long_vec if direction_best == 1 else cvar_short_vec
             var_vec = var_long_vec if direction_best == 1 else var_short_vec
+
+            # Use EV at the chosen horizon (or max EV) as the policy EV signal.
+            def _ev_at_h(ev_arr: np.ndarray, h_list: list[int], h_target: int, fallback: float) -> float:
+                try:
+                    if h_target in h_list:
+                        return float(ev_arr[h_list.index(h_target)])
+                except Exception:
+                    pass
+                try:
+                    # fallback to nearest horizon
+                    if h_list:
+                        idx = int(np.argmin(np.abs(np.asarray(h_list, dtype=np.float64) - float(h_target))))
+                        return float(ev_arr[idx])
+                except Exception:
+                    pass
+                return float(fallback)
+
+            policy_ev_mix_long = float(best_ev_long)
+            policy_ev_mix_short = float(best_ev_short)
+            if direction_best == 1:
+                policy_ev_mix = _ev_at_h(ev_long_vec, h_list, best_h, fallback=policy_ev_mix_long)
+            else:
+                policy_ev_mix = _ev_at_h(ev_short_vec, h_list, best_h, fallback=policy_ev_mix_short)
 
             # Confidence-interval (LCB) gate for entry validity
             ci_enabled = str(os.environ.get("ENTRY_CI_GATE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
@@ -3496,10 +3869,16 @@ class MonteCarloEntryEvaluationMixin:
             # [Sizing] Kelly calculation similar to sequential path
             if direction_best == 1:
                 win_val = float(summary_cpu["win_long"][i].max())
-                cvar_val = float(np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64).mean())
+                try:
+                    cvar_val = float(np.asarray(cvar_long_vec, dtype=np.float64).mean())
+                except Exception:
+                    cvar_val = float(np.asarray(summary_cpu["cvar_long"][i], dtype=np.float64).mean())
             else:
                 win_val = float(summary_cpu["win_short"][i].max())
-                cvar_val = float(np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64).mean())
+                try:
+                    cvar_val = float(np.asarray(cvar_short_vec, dtype=np.float64).mean())
+                except Exception:
+                    cvar_val = float(np.asarray(summary_cpu["cvar_short"][i], dtype=np.float64).mean())
             sigma_val = float(sigmas[i])
 
             variance_proxy = float(sigma_val * sigma_val)
@@ -3527,10 +3906,11 @@ class MonteCarloEntryEvaluationMixin:
                 can_enter_ci = (ci_lcb is not None) and (float(ci_lcb) >= float(ci_floor))
             can_enter = bool(can_enter_score and can_enter_ci)
 
+            mu_alpha_val = tasks[i]["ctx"].get("mu_alpha", mus[i])
             out = {
                 "ok": True,
                 "ev": float(policy_ev_mix),
-                "score": float(policy_ev_mix),
+                "score": float(policy_score),
                 "win": float(win_val),
                 "cvar": float(cvar_val),
                 "can_enter": can_enter,
@@ -3538,7 +3918,7 @@ class MonteCarloEntryEvaluationMixin:
                 "direction": int(direction_best),
                 "kelly": float(kelly),
                 "size_frac": float(size_frac),
-                "unified_score": float(policy_ev_mix),
+                "unified_score": float(policy_score),
                 "unified_score_long": float(score_long),
                 "unified_score_short": float(score_short),
                 "unified_t_star": float(best_h),
@@ -3557,7 +3937,7 @@ class MonteCarloEntryEvaluationMixin:
                     "direction": int(direction_best),
                     "kelly": float(kelly),
                     "size_frac": float(size_frac),
-                    "unified_score": float(policy_ev_mix),
+                    "unified_score": float(policy_score),
                     "unified_score_long": float(score_long),
                     "unified_score_short": float(score_short),
                     "unified_t_star": float(best_h),
@@ -3576,12 +3956,17 @@ class MonteCarloEntryEvaluationMixin:
                     "cvar_by_horizon_long": [float(x) for x in cvar_long_vec.tolist()],
                     "cvar_by_horizon_short": [float(x) for x in cvar_short_vec.tolist()],
                     "horizon_seq": [int(h) for h in h_list],
-                    "policy_ev_score_long": float(best_ev_long),
-                    "policy_ev_score_short": float(best_ev_short),
+                    "policy_ev_score_long": float(score_long),
+                    "policy_ev_score_short": float(score_short),
                     "policy_best_h_long": int(best_h_long),
                     "policy_best_h_short": int(best_h_short),
+                    "policy_best_ev_long": float(best_ev_long),
+                    "policy_best_ev_short": float(best_ev_short),
                     "policy_horizon_eff_sec": int(best_h),
-                    "mu_alpha": float(mus[i]),
+                    "mu_alpha": float(mu_alpha_val),
+                    "policy_ev_mix": float(policy_ev_mix),
+                    "policy_ev_mix_long": float(policy_ev_mix_long),
+                    "policy_ev_mix_short": float(policy_ev_mix_short),
                     "policy_signal_strength": float(policy_ev_mix),
                     "ci_enabled": bool(ci_enabled),
                     "ci_alpha": float(ci_alpha),
@@ -3592,6 +3977,11 @@ class MonteCarloEntryEvaluationMixin:
                     "perf": perf,
                 },
             }
+            if alpha_hit_features_list[i] is not None:
+                try:
+                    out["meta"]["alpha_hit_features"] = [float(x) for x in alpha_hit_features_list[i].tolist()]
+                except Exception:
+                    out["meta"]["alpha_hit_features"] = None
             final_outputs.append(out)
 
         t_asm1 = time.perf_counter()
@@ -3615,4 +4005,42 @@ class MonteCarloEntryEvaluationMixin:
 
         t_end = time.perf_counter()
         logger.info(f"🚀 [GLOBAL_VMAP] Processed {num_symbols} symbols in {(t_end - t_start)*1000:.1f}ms")
+
+        # ============================================================================
+        # MEMORY CLEANUP: 대형 배열 명시적 해제 (RAM 2-3GB 제한 목표)
+        # ============================================================================
+        try:
+            # 1. Exit policy args에서 price_paths 참조 해제
+            if exit_policy_results is not None:
+                del exit_policy_results
+            if 'exit_policy_args' in locals():
+                del exit_policy_args
+            
+            # 2. Summary arrays 해제
+            if summary_cpu is not None:
+                del summary_cpu
+            
+            # 3. 대형 텐서 price_paths_batch 해제
+            if price_paths_batch is not None:
+                del price_paths_batch
+            
+            # 4. Padded input arrays 해제
+            del seeds_jax, s0s_jax, mus_jax, sigmas_jax, leverages_jax, fees_jax
+            
+            # 5. 강제 가비지 컬렉션
+            import gc
+            gc.collect()
+            
+            # 6. PyTorch MPS/CUDA 메모리 캐시 정리 (GPU 메모리 반환)
+            if jax_backend._TORCH_OK and jax_backend.torch is not None:
+                try:
+                    if hasattr(jax_backend.torch, 'mps') and hasattr(jax_backend.torch.mps, 'empty_cache'):
+                        jax_backend.torch.mps.empty_cache()
+                    elif hasattr(jax_backend.torch, 'cuda') and jax_backend.torch.cuda.is_available():
+                        jax_backend.torch.cuda.empty_cache()
+                except Exception:
+                    pass
+        except Exception as mem_err:
+            logger.warning(f"[MEM_CLEANUP] Warning during cleanup: {mem_err}")
+
         return final_outputs

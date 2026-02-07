@@ -53,6 +53,8 @@ def simulate_exit_policy_rollforward(
     p_tp_floor_hold: float = 0.12,
     score_margin: float = 0.0001,
     soft_floor: float = -0.001,
+    cash_exit_score: Optional[float] = None,
+    max_hold_sec: Optional[int] = None,
     *,
     side_now: int = 1,
     enable_dd_stop: bool = False,
@@ -175,6 +177,20 @@ def simulate_exit_policy_rollforward(
 
     mgn = float(max(0.0, score_margin))
     soft_floor_f = float(soft_floor)
+    cash_exit_score_f = None
+    if cash_exit_score is not None:
+        try:
+            cash_exit_score_f = float(cash_exit_score)
+        except Exception:
+            cash_exit_score_f = None
+    max_hold_sec_f = None
+    if max_hold_sec is not None:
+        try:
+            max_hold_sec_f = int(max_hold_sec)
+            if max_hold_sec_f <= 0:
+                max_hold_sec_f = None
+        except Exception:
+            max_hold_sec_f = None
 
     grace_sec = min(60.0, 0.25 * max(0.0, float(min_hold_sec)))
 
@@ -243,6 +259,23 @@ def simulate_exit_policy_rollforward(
 
         score_alt = float(score_alt_raw) - (float(switch_cost) / float(tau_safe))
         gap_eff = float(score_cur - score_alt)
+
+        if max_hold_sec_f is not None and age >= int(max_hold_sec_f):
+            mask = ~decided
+            exit_t[mask] = age
+            exit_reason[mask] = "max_hold"
+            decided[mask] = True
+            if np.all(decided):
+                break
+
+        if cash_exit_score_f is not None and age >= int(min_hold_sec):
+            if float(score_cur) <= float(cash_exit_score_f):
+                mask = ~decided
+                exit_t[mask] = age
+                exit_reason[mask] = "unified_cash"
+                decided[mask] = True
+                if np.all(decided):
+                    break
 
         alt_value_after_cost = float(score_alt_raw) - (float(exec_oneway) / float(tau_safe))
         flip_ok = bool(

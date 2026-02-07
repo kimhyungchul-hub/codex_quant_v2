@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import random
 import time
 from collections import deque
@@ -446,6 +447,84 @@ class LiveOrchestrator:
             "exec_mode": str(getattr(config, "EXEC_MODE", "maker_then_market")).strip().lower(),
         }
 
+    def alpha_hit_status(self) -> Dict[str, Any]:
+        """Collect AlphaHit trainer/runtime metrics for the dashboard."""
+        status: Dict[str, Any] = {
+            "enabled": False,
+            "disable_reason": None,
+            "signal_boost": bool(getattr(mc_config, "alpha_signal_boost", False)),
+            "alpha_scaling_factor": float(getattr(mc_config, "alpha_scaling_factor", 1.0)),
+            "mu_alpha_cap": float(getattr(mc_config, "mu_alpha_cap", 5.0)),
+            "beta": float(getattr(mc_config, "alpha_hit_beta", 1.0)),
+            "min_buffer": int(getattr(mc_config, "alpha_hit_min_buffer", 1024)),
+            "warmup_samples": int(getattr(mc_config, "alpha_hit_warmup_samples", 512)),
+            "max_buffer": int(getattr(mc_config, "alpha_hit_max_buffer", 200000)),
+            "buffer_size": 0,
+            "total_samples": 0,
+            "total_train_steps": 0,
+            "last_loss": None,
+            "ema_loss": None,
+            "warmup_done": False,
+            "trainer_device": None,
+            "trainer_name": None,
+            "replay_path": str(getattr(mc_config, "alpha_hit_replay_path", "") or ""),
+            "replay_save_every": int(getattr(mc_config, "alpha_hit_replay_save_every", 2000)),
+            "replay_exists": False,
+            "replay_size_bytes": None,
+        }
+
+        replay_path = status["replay_path"]
+        if replay_path:
+            rp = Path(replay_path)
+            status["replay_exists"] = rp.exists()
+            if status["replay_exists"]:
+                try:
+                    status["replay_size_bytes"] = int(rp.stat().st_size)
+                except Exception:
+                    status["replay_size_bytes"] = None
+
+        for eng in getattr(self.hub, "engines", []):
+            if not getattr(eng, "alpha_hit_enabled", False):
+                if status["disable_reason"] is None:
+                    status["disable_reason"] = getattr(eng, "alpha_hit_disable_reason", None)
+                continue
+            status["enabled"] = True
+            status["beta"] = float(getattr(eng, "alpha_hit_beta", status["beta"]))
+            status["trainer_name"] = getattr(eng, "name", status["trainer_name"])
+            trainer = getattr(eng, "alpha_hit_trainer", None)
+            if trainer is not None:
+                try:
+                    status["buffer_size"] = int(getattr(trainer, "buffer_size", status["buffer_size"]))
+                except Exception:
+                    status["buffer_size"] = status["buffer_size"]
+                cfg_obj = getattr(trainer, "cfg", None)
+                if cfg_obj is not None:
+                    status["warmup_samples"] = int(getattr(cfg_obj, "warmup_samples", status["warmup_samples"]))
+                    status["replay_save_every"] = int(getattr(cfg_obj, "replay_save_every", status["replay_save_every"]))
+                status["warmup_done"] = bool(getattr(trainer, "is_warmed_up", status["warmup_done"]))
+                status["total_samples"] = int(getattr(trainer, "_total_samples", status["total_samples"]))
+                status["total_train_steps"] = int(getattr(trainer, "_total_train_steps", status["total_train_steps"]))
+                status["last_loss"] = getattr(trainer, "last_loss", status["last_loss"])
+                status["ema_loss"] = getattr(trainer, "ema_loss", status["ema_loss"])
+                status["trainer_device"] = getattr(trainer, "device", status["trainer_device"])
+            status["warmup_done"] = status["warmup_done"] or (
+                status["warmup_samples"] > 0 and status["buffer_size"] >= status["warmup_samples"]
+            )
+            break
+
+        if not status["enabled"] and status["disable_reason"] is None:
+            if not bool(getattr(mc_config, "alpha_hit_enable", True)):
+                status["disable_reason"] = "ALPHA_HIT_ENABLE=0"
+            else:
+                use_torch_env = str(os.environ.get("MC_USE_TORCH", "1")).strip().lower()
+                if use_torch_env in ("0", "false", "no", "off"):
+                    status["disable_reason"] = "MC_USE_TORCH=0"
+
+        if status["min_buffer"] <= 0:
+            status["warmup_done"] = True
+
+        return status
+
     def set_enable_orders(self, enabled: bool) -> None:
         self.enable_orders = bool(enabled)
         try:
@@ -745,6 +824,7 @@ class LiveOrchestrator:
         # ✅ Dynamic Horizon Hold: 진입 시 결정된 Horizon을 최소 보유 시간으로 설정
         if detail is not None:
             meta = detail.get("meta") or {}
+            meta_detail = meta.get("meta_detail") if isinstance(meta.get("meta_detail"), dict) else {}
             entry_h = 0
             if side_u == "LONG":
                 entry_h = int(meta.get("policy_best_h_long") or 0)
@@ -761,6 +841,16 @@ class LiveOrchestrator:
             self.positions[sym]["entry_score_short"] = score_short
             self.positions[sym]["max_score_long"] = score_long
             self.positions[sym]["max_score_short"] = score_short
+            # AlphaHit: store entry features and thresholds for later training
+            try:
+                ah_feat = meta.get("alpha_hit_features") or meta_detail.get("alpha_hit_features")
+                if ah_feat:
+                    self.positions[sym]["alpha_hit_features"] = ah_feat
+                    self.positions[sym]["alpha_hit_entry_ts_ms"] = int(ts_ms)
+                    self.positions[sym]["alpha_hit_tp_pct"] = float(meta.get("event_tp_pct") or config.DEFAULT_TP_PCT)
+                    self.positions[sym]["alpha_hit_sl_pct"] = float(meta.get("event_sl_pct") or config.DEFAULT_SL_PCT)
+            except Exception:
+                pass
 
         self._last_trade_event_by_sym[sym] = "ENTER"
         self._paper_append_trade(
@@ -825,7 +915,54 @@ class LiveOrchestrator:
                 "reason": str(reason or ""),
             }
         )
+        self._alpha_hit_collect_from_position(sym, pos, exit_price, ts_ms, reason)
         self.positions.pop(sym, None)
+
+    def _alpha_hit_collect_from_position(
+        self,
+        sym: str,
+        pos: Dict[str, Any],
+        exit_price: float,
+        ts_ms: int,
+        reason: str,
+    ) -> None:
+        try:
+            features = pos.get("alpha_hit_features")
+            if not features:
+                return
+            entry_ts = int(pos.get("alpha_hit_entry_ts_ms") or pos.get("time") or ts_ms)
+            side = str(pos.get("side") or "").upper()
+            direction = 1 if side == "LONG" else -1
+            entry_price = float(pos.get("entry_price") or 0.0)
+            if entry_price <= 0 or exit_price <= 0:
+                return
+            if direction == 1:
+                realized_r = (float(exit_price) - float(entry_price)) / float(entry_price)
+            else:
+                realized_r = (float(entry_price) - float(exit_price)) / float(entry_price)
+            tp_level = float(pos.get("alpha_hit_tp_pct") or config.DEFAULT_TP_PCT)
+            sl_level = float(pos.get("alpha_hit_sl_pct") or config.DEFAULT_SL_PCT)
+
+            engine = None
+            for eng in getattr(self.hub, "engines", []):
+                if hasattr(eng, "collect_alpha_hit_sample"):
+                    engine = eng
+                    break
+            if engine is None:
+                return
+            engine.collect_alpha_hit_sample(
+                symbol=str(sym),
+                features_np=np.asarray(features, dtype=np.float32),
+                entry_ts_ms=entry_ts,
+                exit_ts_ms=int(ts_ms),
+                direction=direction,
+                exit_reason=str(reason),
+                tp_level=tp_level,
+                sl_level=sl_level,
+                realized_r=realized_r,
+            )
+        except Exception:
+            return
 
     async def _close_position(
         self,
@@ -1835,14 +1972,36 @@ class LiveOrchestrator:
         ob_ts = (self.orderbook.get(sym) or {}).get("ts") or 0
         ob_age = ts - int(ob_ts) if ob_ts else None
         ob_ready = bool((self.orderbook.get(sym) or {}).get("ready"))
+        def _opt_float(val):
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
         ev = _safe_float(decision.get("ev", mc_meta.get("ev", meta.get("ev", 0.0))) if decision else 0.0, 0.0)
         ev_raw = _safe_float(decision.get("ev_raw", mc_meta.get("ev_raw", meta.get("ev_raw", 0.0))) if decision else 0.0, 0.0)
         kelly = _safe_float(mc_meta.get("kelly", meta.get("kelly", 0.0)), 0.0)
         regime = (ctx or {}).get("regime") or meta.get("regime") or "-"
 
+        hybrid_score = _opt_float(decision.get("hybrid_score") if decision else None)
+        if hybrid_score is None:
+            hybrid_score = _opt_float(mc_meta.get("hybrid_score", meta.get("hybrid_score")))
+        hybrid_score_logw = _opt_float(mc_meta.get("hybrid_score_logw", meta.get("hybrid_score_logw")))
+        hybrid_score_long = _opt_float(mc_meta.get("hybrid_score_long", meta.get("hybrid_score_long")))
+        hybrid_score_short = _opt_float(mc_meta.get("hybrid_score_short", meta.get("hybrid_score_short")))
+        hybrid_score_hold = _opt_float(decision.get("hybrid_score_hold") if decision else None)
+        if hybrid_score_hold is None:
+            hybrid_score_hold = _opt_float(mc_meta.get("hybrid_score_hold", meta.get("hybrid_score_hold")))
+        hybrid_action = mc_meta.get("hybrid_action", meta.get("hybrid_action"))
+        hybrid_entry_floor = _opt_float(mc_meta.get("hybrid_entry_floor", meta.get("hybrid_entry_floor")))
+
         unified_score = _opt_float(decision.get("unified_score") if decision else None)
         if unified_score is None:
             unified_score = _opt_float(mc_meta.get("unified_score", meta.get("unified_score")))
+        if unified_score is None and hybrid_score is not None:
+            unified_score = float(hybrid_score)
         if unified_score is None:
             unified_score = float(ev)
         unified_score_long = _opt_float(mc_meta.get("unified_score_long", meta.get("unified_score_long")))
@@ -1851,14 +2010,6 @@ class LiveOrchestrator:
         if unified_score_hold is None:
             unified_score_hold = _opt_float(mc_meta.get("unified_score_hold", meta.get("unified_score_hold")))
         unified_t_star = _opt_float(mc_meta.get("unified_t_star", meta.get("unified_t_star")))
-
-        def _opt_float(val):
-            if val is None:
-                return None
-            try:
-                return float(val)
-            except Exception:
-                return None
 
         # MC event diagnostics
         event_p_tp = _opt_float(mc_meta.get("event_p_tp", meta.get("event_p_tp")))
@@ -1943,6 +2094,13 @@ class LiveOrchestrator:
             "mc": reason,
             "ev": ev,
             "ev_raw": ev_raw,
+            "hybrid_score": hybrid_score,
+            "hybrid_score_logw": hybrid_score_logw,
+            "hybrid_score_long": hybrid_score_long,
+            "hybrid_score_short": hybrid_score_short,
+            "hybrid_score_hold": hybrid_score_hold,
+            "hybrid_action": hybrid_action,
+            "hybrid_entry_floor": hybrid_entry_floor,
             "unified_score": unified_score,
             "unified_score_long": unified_score_long,
             "unified_score_short": unified_score_short,

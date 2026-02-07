@@ -5,6 +5,11 @@ Design notes:
 - Metadata layout: int64 head, int64 tail (monotonic counters, not wrapped).
 - Each slot stores a 4-byte little-endian length prefix + payload bytes.
 """
+from __future__ import annotations
+
+import mmap
+import os
+from pathlib import Path
 from multiprocessing import shared_memory
 from typing import Optional
 
@@ -26,18 +31,46 @@ class SharedMemoryRingBuffer:
         self.slot_size = slot_size
         self.overwrite = overwrite
         self._total_bytes = self.METADATA_SIZE + (size * slot_size)
+        self._uses_mmap = False
+        self._mmap = None
+        self._mmap_file = None
+
+        try:
+            if create:
+                self.shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_bytes)
+                self._meta = np.ndarray((2,), dtype=np.int64, buffer=self.shm.buf)
+                self._meta[:] = 0
+            else:
+                self.shm = shared_memory.SharedMemory(name=name, create=False)
+                if self.shm.size < self._total_bytes:
+                    raise ValueError("existing shared memory is smaller than required")
+                self._meta = np.ndarray((2,), dtype=np.int64, buffer=self.shm.buf)
+            self._buffer_view = self.shm.buf[self.METADATA_SIZE : self._total_bytes]
+            return
+        except PermissionError:
+            # Fall back to file-backed mmap when shm_open is not permitted.
+            self._uses_mmap = True
+            self.shm = None
+
+        base_dir = Path(os.environ.get("RING_BUFFER_DIR") or os.environ.get("TMPDIR") or "/tmp")
+        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name)
+        self._mmap_path = base_dir / f"ringbuf_{safe_name}.bin"
+        self._mmap_path.parent.mkdir(parents=True, exist_ok=True)
 
         if create:
-            self.shm = shared_memory.SharedMemory(name=name, create=True, size=self._total_bytes)
-            self._meta = np.ndarray((2,), dtype=np.int64, buffer=self.shm.buf)
+            self._mmap_file = open(self._mmap_path, "w+b")
+            self._mmap_file.truncate(self._total_bytes)
+            self._mmap = mmap.mmap(self._mmap_file.fileno(), self._total_bytes, access=mmap.ACCESS_WRITE)
+            self._meta = np.ndarray((2,), dtype=np.int64, buffer=self._mmap)
             self._meta[:] = 0
         else:
-            self.shm = shared_memory.SharedMemory(name=name, create=False)
-            if self.shm.size < self._total_bytes:
-                raise ValueError("existing shared memory is smaller than required")
-            self._meta = np.ndarray((2,), dtype=np.int64, buffer=self.shm.buf)
+            if not self._mmap_path.exists():
+                raise FileNotFoundError(f"ring buffer file not found: {self._mmap_path}")
+            self._mmap_file = open(self._mmap_path, "r+b")
+            self._mmap = mmap.mmap(self._mmap_file.fileno(), self._total_bytes, access=mmap.ACCESS_WRITE)
+            self._meta = np.ndarray((2,), dtype=np.int64, buffer=self._mmap)
 
-        self._buffer_view = self.shm.buf[self.METADATA_SIZE : self._total_bytes]
+        self._buffer_view = memoryview(self._mmap)[self.METADATA_SIZE : self._total_bytes]
 
     def write(self, data: bytes) -> None:
         payload_len = len(data)
@@ -83,9 +116,24 @@ class SharedMemoryRingBuffer:
         return data
 
     def close(self, unlink: bool = False) -> None:
-        self.shm.close()
-        if unlink:
-            self.shm.unlink()
+        if self._uses_mmap:
+            try:
+                if self._mmap is not None:
+                    self._mmap.close()
+            finally:
+                if self._mmap_file is not None:
+                    self._mmap_file.close()
+            if unlink and hasattr(self, "_mmap_path"):
+                try:
+                    self._mmap_path.unlink()
+                except Exception:
+                    pass
+            return
+
+        if self.shm is not None:
+            self.shm.close()
+            if unlink:
+                self.shm.unlink()
 
     def __enter__(self) -> "SharedMemoryRingBuffer":
         return self
