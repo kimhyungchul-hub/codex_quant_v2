@@ -1303,6 +1303,7 @@
           LIQ: 'LIQ: liquidity score must meet minimum',
           MIN: 'MIN: estimated notional must meet minimum',
           MEX: 'MEX: exposure notional must meet minimum',
+          VOL: 'VOL: tick volatility must meet minimum',
           FEE: 'FEE: expected EV must cover roundtrip fee+slippage',
           TOP: 'TOP: only top-ranked symbols allowed',
           PMC: 'PMC: pre-MC portfolio gate (EV/CVaR/liq) must pass',
@@ -1329,6 +1330,9 @@
         const minExpTip = (isNum(m.min_entry_exposure_notional))
           ? `${help.MEX} | est_notional=${fmtUsd(m.est_notional)} | min=${fmtUsd(m.min_entry_exposure_notional)} | pct=${fmtPct(m.min_entry_exposure_pct, 3)}`
           : `${help.MEX} | disabled | est_notional=${fmtUsd(m.est_notional)}`;
+        const volTip = (isNum(m.min_tick_vol))
+          ? `${help.VOL} | tick_vol=${fmtNum(m.tick_vol, 6)} | min=${fmtNum(m.min_tick_vol, 6)}`
+          : `${help.VOL} | disabled | tick_vol=${fmtNum(m.tick_vol, 6)}`;
         const feeTip = (isNum(m.fee_filter_cost) || isNum(m.fee_filter_ev))
           ? `${help.FEE} | ev=${fmtPct(m.fee_filter_ev, 4)} | ev_eff=${fmtPct(m.fee_filter_ev_eff, 4)} | lev=${fmtNum(m.fee_filter_lev, 2)} | cost=${fmtPct(m.fee_filter_cost, 4)} | base=${fmtPct(m.fee_filter_base, 4)} | mult=${fmtNum(m.fee_filter_mult, 2)}`
           : `${help.FEE} | disabled`;
@@ -1374,6 +1378,7 @@
           liquidity: ['LIQ', liqTip],
           min_notional: ['MIN', minTip],
           min_exposure: ['MEX', minExpTip],
+          tick_vol: ['VOL', volTip],
           fee: ['FEE', feeTip],
           top_n: ['TOP', topTip],
           pre_mc: ['PMC', pmcTip],
@@ -1393,6 +1398,7 @@
           if (fs.liq === false) addBlocked('LIQ', liqTip);
           if (fs.min_notional === false) addBlocked('MIN', minTip);
           if (fs.min_exposure === false) addBlocked('MEX', minExpTip);
+          if (fs.tick_vol === false) addBlocked('VOL', volTip);
           if (fs.fee === false) addBlocked('FEE', feeTip);
           if (fs.top_n === false) addBlocked('TOP', topTip);
           if (fs.pre_mc === false) addBlocked('PMC', pmcTip);
@@ -1424,6 +1430,7 @@
         if ('liq' in fs) badges.push(badge('LIQ', fs.liq, liqTip));
         if ('min_notional' in fs) badges.push(badge('MIN', fs.min_notional, minTip));
         if ('min_exposure' in fs) badges.push(badge('MEX', fs.min_exposure, minExpTip));
+        if ('tick_vol' in fs) badges.push(badge('VOL', fs.tick_vol, volTip));
         if ('fee' in fs) badges.push(badge('FEE', fs.fee, feeTip));
         if ('top_n' in fs) badges.push(badge('TOP', fs.top_n, topTip));
         if ('pre_mc' in fs) badges.push(badge('PMC', fs.pre_mc, pmcTip));

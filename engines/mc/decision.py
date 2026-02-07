@@ -492,6 +492,8 @@ class MonteCarloDecisionMixin:
         # Optionally compute leverage before simulation (Kelly-style via leverage optimizer).
         ctx_for_sim = ctx
         optimal_leverage = None
+        mc_vol_step = None
+        mc_vol_ann = None
         try:
             use_kelly_lev = str(os.environ.get("HYBRID_USE_KELLY_LEV", "1")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
@@ -1311,6 +1313,33 @@ class MonteCarloDecisionMixin:
             rt_dir = 0
         rt_active = bool(ctx.get("rt_breakout_active", False)) or (rt_score > 0.0 and rt_dir != 0)
 
+        # Tick-level microstructure features (fast direction/volatility)
+        try:
+            tick_trend = float(ctx.get("tick_trend", 0.0) or 0.0)
+        except Exception:
+            tick_trend = 0.0
+        try:
+            tick_ret = float(ctx.get("tick_ret", 0.0) or 0.0)
+        except Exception:
+            tick_ret = 0.0
+        try:
+            tick_vol = float(ctx.get("tick_vol", 0.0) or 0.0)
+        except Exception:
+            tick_vol = 0.0
+        try:
+            tick_dir = int(ctx.get("tick_dir", 0) or 0)
+        except Exception:
+            tick_dir = 0
+        try:
+            tick_breakout_score = float(ctx.get("tick_breakout_score", 0.0) or 0.0)
+        except Exception:
+            tick_breakout_score = 0.0
+        try:
+            tick_breakout_dir = int(ctx.get("tick_breakout_dir", 0) or 0)
+        except Exception:
+            tick_breakout_dir = 0
+        tick_breakout_active = bool(ctx.get("tick_breakout_active", False)) or (tick_breakout_score > 0.0 and tick_breakout_dir != 0)
+
         bias_eps_extra = 0.0
         try:
             impulse_bias = float(os.environ.get("IMPULSE_ENTRY_BIAS_EPS", 0.0) or 0.0)
@@ -1334,6 +1363,16 @@ class MonteCarloDecisionMixin:
             mom_bias_cap = 0.001
         if mom_bias_k > 0 and momentum_z != 0.0:
             bias_eps_extra += min(float(mom_bias_cap), abs(float(momentum_z)) * float(mom_bias_k))
+        try:
+            tick_bias_k = float(os.environ.get("TICK_TREND_BIAS_K", 0.0) or 0.0)
+        except Exception:
+            tick_bias_k = 0.0
+        try:
+            tick_bias_cap = float(os.environ.get("TICK_TREND_BIAS_CAP", 0.001) or 0.001)
+        except Exception:
+            tick_bias_cap = 0.001
+        if tick_bias_k > 0 and tick_trend != 0.0:
+            bias_eps_extra += min(float(tick_bias_cap), abs(float(tick_trend)) * float(tick_bias_k))
 
         # Entry bias: if cash best but near-alternative within epsilon, prefer entry
         try:
@@ -1410,6 +1449,8 @@ class MonteCarloDecisionMixin:
         impulse_bonus = 0.0
         momentum_bonus = 0.0
         rt_breakout_bonus = 0.0
+        tick_bonus = 0.0
+        tick_breakout_bonus = 0.0
         try:
             impulse_enabled = str(os.environ.get("IMPULSE_ENTRY_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
@@ -1434,6 +1475,18 @@ class MonteCarloDecisionMixin:
             momentum_cap = float(os.environ.get("HYBRID_MOMENTUM_BONUS_CAP", 0.004) or 0.004)
         except Exception:
             momentum_cap = 0.004
+        try:
+            tick_bonus_k = float(os.environ.get("TICK_TREND_BONUS_K", 0.0006) or 0.0006)
+        except Exception:
+            tick_bonus_k = 0.0006
+        try:
+            tick_bonus_cap = float(os.environ.get("TICK_TREND_BONUS_CAP", 0.003) or 0.003)
+        except Exception:
+            tick_bonus_cap = 0.003
+        try:
+            tick_breakout_boost = float(os.environ.get("TICK_BREAKOUT_SCORE_BOOST", 0.0020) or 0.0020)
+        except Exception:
+            tick_breakout_boost = 0.0020
 
         if action in ("LONG", "SHORT"):
             if impulse_enabled and impulse_active and impulse_dir != 0:
@@ -1447,10 +1500,44 @@ class MonteCarloDecisionMixin:
                     momentum_bonus = min(float(momentum_cap), float(momentum_z) * float(momentum_k))
                 elif action == "SHORT" and momentum_z < 0:
                     momentum_bonus = min(float(momentum_cap), abs(float(momentum_z)) * float(momentum_k))
-            if impulse_bonus or momentum_bonus or rt_breakout_bonus:
-                score_adj = float(impulse_bonus + momentum_bonus + rt_breakout_bonus)
+            if tick_bonus_k > 0 and tick_trend != 0.0:
+                if action == "LONG" and tick_trend > 0:
+                    tick_bonus = min(float(tick_bonus_cap), abs(float(tick_trend)) * float(tick_bonus_k))
+                elif action == "SHORT" and tick_trend < 0:
+                    tick_bonus = min(float(tick_bonus_cap), abs(float(tick_trend)) * float(tick_bonus_k))
+            if tick_breakout_active and tick_breakout_dir != 0:
+                if (action == "LONG" and tick_breakout_dir > 0) or (action == "SHORT" and tick_breakout_dir < 0):
+                    tick_breakout_bonus = float(tick_breakout_score) * float(tick_breakout_boost)
+            if impulse_bonus or momentum_bonus or rt_breakout_bonus or tick_bonus or tick_breakout_bonus:
+                score_adj = float(impulse_bonus + momentum_bonus + rt_breakout_bonus + tick_bonus + tick_breakout_bonus)
                 score = float(score + score_adj)
                 score_raw = float(score_raw + score_adj)
+
+        # Optional: entry bonus from MC future volatility (encourage high-opportunity regimes)
+        mc_entry_bonus = 0.0
+        try:
+            mc_entry_on = str(os.environ.get("MC_FUTURE_VOL_ENTRY_BONUS", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            mc_entry_on = True
+        if mc_entry_on and mc_vol_step is not None and action in ("LONG", "SHORT"):
+            try:
+                vol_ref = float(os.environ.get("MC_FUTURE_VOL_REF", 0.002) or 0.002)
+            except Exception:
+                vol_ref = 0.002
+            try:
+                entry_k = float(os.environ.get("MC_FUTURE_VOL_ENTRY_K", 0.0005) or 0.0005)
+            except Exception:
+                entry_k = 0.0005
+            try:
+                entry_cap = float(os.environ.get("MC_FUTURE_VOL_ENTRY_MAX", 0.003) or 0.003)
+            except Exception:
+                entry_cap = 0.003
+            if vol_ref > 0 and entry_k > 0:
+                ratio = max(0.0, float(mc_vol_step) / float(vol_ref) - 1.0)
+                mc_entry_bonus = min(float(entry_cap), float(entry_k) * float(ratio))
+                if mc_entry_bonus > 0:
+                    score = float(score + mc_entry_bonus)
+                    score_raw = float(score_raw + mc_entry_bonus)
 
         # Entry floor gate (hybrid)
         entry_floor_env = os.environ.get("HYBRID_ENTRY_FLOOR", os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
@@ -1475,6 +1562,22 @@ class MonteCarloDecisionMixin:
         impulse_override = False
         rt_breakout_override = False
         if action == "WAIT" and flat:
+            # Tick breakout override (fast microstructure breakout)
+            if tick_breakout_active and tick_breakout_dir != 0:
+                try:
+                    tick_margin = float(os.environ.get("TICK_BREAKOUT_ENTRY_MARGIN", 0.0) or 0.0)
+                except Exception:
+                    tick_margin = 0.0
+                score_candidate = float(score)
+                if tick_breakout_boost > 0:
+                    score_candidate = float(score_candidate + float(tick_breakout_score) * float(tick_breakout_boost))
+                if score_candidate >= float(entry_floor - tick_margin):
+                    action = "LONG" if tick_breakout_dir > 0 else "SHORT"
+                    action_idx = 1 if tick_breakout_dir > 0 else 2
+                    tick_breakout_bonus = float(tick_breakout_score) * float(tick_breakout_boost)
+                    score = float(score_candidate)
+                    score_raw = float(score_raw + tick_breakout_bonus)
+
             # Realtime breakout override (current price vs recent highs/lows)
             if rt_active and rt_dir != 0:
                 try:
@@ -1510,6 +1613,31 @@ class MonteCarloDecisionMixin:
                     score_raw = float(score_raw + impulse_bonus)
         if (not biased_entry) and flat and action in ("LONG", "SHORT") and score < entry_floor:
             action = "WAIT"
+
+        # Directional guard: avoid entering against strong tick trend
+        tick_guard_blocked = False
+        try:
+            tick_guard_on = str(os.environ.get("TICK_DIR_GUARD", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tick_guard_on = True
+        if tick_guard_on and flat and action in ("LONG", "SHORT"):
+            try:
+                tick_guard_min = float(os.environ.get("TICK_DIR_GUARD_MIN", 0.6) or 0.6)
+            except Exception:
+                tick_guard_min = 0.6
+            if abs(float(tick_trend)) >= float(tick_guard_min):
+                oppose = (action == "LONG" and tick_trend < 0) or (action == "SHORT" and tick_trend > 0)
+                if oppose:
+                    allow_override = False
+                    if tick_breakout_active and tick_breakout_dir != 0:
+                        allow_override = (action == "LONG" and tick_breakout_dir > 0) or (action == "SHORT" and tick_breakout_dir < 0)
+                    if (not allow_override) and rt_active and rt_dir != 0:
+                        allow_override = (action == "LONG" and rt_dir > 0) or (action == "SHORT" and rt_dir < 0)
+                    if (not allow_override) and impulse_active and impulse_dir != 0:
+                        allow_override = (action == "LONG" and impulse_dir > 0) or (action == "SHORT" and impulse_dir < 0)
+                    if not allow_override:
+                        action = "WAIT"
+                        tick_guard_blocked = True
 
         # Optional: force LONG/SHORT direction by EV (entry evaluation)
         ev_force_used = False
@@ -1674,6 +1802,16 @@ class MonteCarloDecisionMixin:
             "rt_breakout_active": bool(rt_active),
             "rt_breakout_override": bool(rt_breakout_override),
             "rt_breakout_bonus": float(rt_breakout_bonus),
+            "tick_ret": float(tick_ret),
+            "tick_vol": float(tick_vol),
+            "tick_trend": float(tick_trend),
+            "tick_dir": int(tick_dir),
+            "tick_breakout_active": bool(tick_breakout_active),
+            "tick_breakout_dir": int(tick_breakout_dir),
+            "tick_breakout_score": float(tick_breakout_score),
+            "tick_breakout_bonus": float(tick_breakout_bonus),
+            "tick_bonus": float(tick_bonus),
+            "tick_guard_blocked": bool(tick_guard_blocked),
             "force_ev_used": bool(ev_force_used),
             "force_ev_dir": ev_force_dir,
             "force_ev_gap": float(ev_force_gap) if ev_force_gap is not None else None,
@@ -1681,6 +1819,7 @@ class MonteCarloDecisionMixin:
             "force_ev_short": float(ev_force_short) if ev_force_short is not None else None,
             "mc_future_vol_step": float(mc_vol_step) if mc_vol_step is not None else None,
             "mc_future_vol_ann": float(mc_vol_ann) if mc_vol_ann is not None else None,
+            "mc_future_vol_entry_bonus": float(mc_entry_bonus),
             "optimal_leverage": float(lev_used),
             "maint_margin_rate": float(maint_rate) if maint_rate is not None else None,
             "liq_buffer": float(liq_buf) if liq_buf is not None else None,

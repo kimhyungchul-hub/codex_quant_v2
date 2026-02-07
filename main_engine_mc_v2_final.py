@@ -44,6 +44,8 @@ DECIDE_BATCH_TIMEOUT_SEC = MC_DECIDE_BATCH_TIMEOUT_SEC
 
 import asyncio
 import json
+import hmac
+import hashlib
 import time
 import math
 import random
@@ -156,9 +158,22 @@ def _normalize_sym_key(sym: str) -> str:
     if not s:
         return s
     if "/" not in s:
+        # Handle raw Bybit symbols like BTCUSDT/BTCUSDC
+        if s.endswith("USDT") and len(s) > 4:
+            base = s[:-4]
+            return f"{base}/USDT:USDT"
+        if s.endswith("USDC") and len(s) > 4:
+            base = s[:-4]
+            return f"{base}/USDC:USDC"
         return f"{s}/USDT:USDT"
-    if ":USDT" not in s and s.endswith("USDT"):
-        return f"{s}:USDT"
+    if ":" not in s:
+        # Normalize "BTC/USDT" -> "BTC/USDT:USDT"
+        try:
+            quote = s.split("/")[-1]
+            if quote:
+                return f"{s}:{quote}"
+        except Exception:
+            pass
     return s
 
 def _parse_sym_float_map(env_key: str) -> dict[str, float]:
@@ -228,6 +243,13 @@ MIN_ENTRY_NOTIONAL = float(getattr(config, "MIN_ENTRY_NOTIONAL", 0.0) or 0.0)
 MIN_ENTRY_NOTIONAL_PCT = float(getattr(config, "MIN_ENTRY_NOTIONAL_PCT", 0.0) or 0.0)
 MIN_ENTRY_EXPOSURE_PCT = float(getattr(config, "MIN_ENTRY_EXPOSURE_PCT", 0.0) or 0.0)
 MIN_LIQ_SCORE = float(getattr(config, "MIN_LIQ_SCORE", 0.0) or 0.0)
+# Tick-level microstructure features (short-term direction/volatility)
+TICK_BUFFER_SEC = float(getattr(config, "TICK_BUFFER_SEC", 300.0) or 300.0)
+TICK_LOOKBACK_SEC = float(getattr(config, "TICK_LOOKBACK_SEC", 30.0) or 30.0)
+TICK_MIN_SAMPLES = int(getattr(config, "TICK_MIN_SAMPLES", 8) or 8)
+TICK_BREAKOUT_LOOKBACK_SEC = float(getattr(config, "TICK_BREAKOUT_LOOKBACK_SEC", 60.0) or 60.0)
+TICK_BREAKOUT_BUFFER_PCT = float(getattr(config, "TICK_BREAKOUT_BUFFER_PCT", 0.0004) or 0.0004)
+MIN_TICK_VOL = float(getattr(config, "MIN_TICK_VOL", 0.0) or 0.0)
 PRE_MC_ENABLED = bool(getattr(config, "PRE_MC_ENABLED", False))
 PRE_MC_BLOCK_ON_FAIL = bool(getattr(config, "PRE_MC_BLOCK_ON_FAIL", True))
 PRE_MC_MIN_EXPECTED_PNL = float(getattr(config, "PRE_MC_MIN_EXPECTED_PNL", 0.0) or 0.0)
@@ -314,6 +336,13 @@ class LiveOrchestrator:
         self._rebalance_on_next_cycle = False
         self._force_rebalance_cycle = False
         self._last_positions_sync_ms: int | None = None
+        self._exchange_positions_view: list[dict] = []
+        self._exchange_positions_ts: int | None = None
+        self._exchange_positions_source: str | None = None
+        self._ws_positions_cache: dict[str, dict] = {}
+        self._ws_positions_last_ms: int | None = None
+        self._ws_positions_last_err: str | None = None
+        self._ws_positions_connected: bool = False
         self.leverage = DEFAULT_LEVERAGE
         self.max_leverage = MAX_LEVERAGE
         self.enable_orders = bool(ENABLE_LIVE_ORDERS)
@@ -420,6 +449,15 @@ class LiveOrchestrator:
         self.mc_cache_ttl = 2.0  # seconds
 
         self.market = {s: {"price": None, "ts": 0} for s in SYMBOLS}
+        # Tick-level buffer (for short-term direction/volatility)
+        try:
+            _price_refresh = float(os.environ.get("PRICE_REFRESH_SEC", 1.0) or 1.0)
+        except Exception:
+            _price_refresh = 1.0
+        self._tick_buffer_sec = max(5.0, float(TICK_BUFFER_SEC))
+        tick_maxlen = int(max(16, (self._tick_buffer_sec / max(_price_refresh, 0.2)) * 2.0))
+        self._tick_buffer = {s: deque(maxlen=tick_maxlen) for s in SYMBOLS}
+        self._tick_feature_cache: dict[str, tuple[int, dict]] = {}
 
         # 1m close buffer (preload로 한 번에 채움)
         self.ohlcv_buffer = {s: deque(maxlen=OHLCV_PRELOAD_LIMIT) for s in SYMBOLS}
@@ -1329,6 +1367,8 @@ class LiveOrchestrator:
             "liq": None,
             "min_notional": None,
             "min_exposure": None,
+            "tick_vol": None,
+            "fee": None,
             "top_n": None,
             "pre_mc": None,
             "cap": None,
@@ -1866,6 +1906,7 @@ class LiveOrchestrator:
                 liq_ok = None
         min_notional_ok = None
         min_exposure_ok = None
+        tick_vol_ok = None
         fee_ok = None
         fee_cost = None
         fee_ev = None
@@ -1926,6 +1967,12 @@ class LiveOrchestrator:
                 min_exposure_ok = float(est_notional) >= (float(cap_balance) * float(min_exposure_floor))
             except Exception:
                 min_exposure_ok = None
+        if MIN_TICK_VOL > 0:
+            try:
+                tick_vol = meta.get("tick_vol")
+                tick_vol_ok = float(tick_vol) >= float(MIN_TICK_VOL)
+            except Exception:
+                tick_vol_ok = None
         if self.exposure_cap_enabled:
             try:
                 cap_exposure_ok = (self._total_open_notional() + float(est_notional)) <= (float(cap_balance) * float(self.max_notional_frac))
@@ -2013,6 +2060,7 @@ class LiveOrchestrator:
             "liq": liq_ok,
             "min_notional": min_notional_ok,
             "min_exposure": min_exposure_ok,
+            "tick_vol": tick_vol_ok,
             "fee": fee_ok,
             "top_n": None,
             "pre_mc": None,
@@ -2023,7 +2071,7 @@ class LiveOrchestrator:
         }
         if not is_entry:
             # Entry-only filters shouldn't show as blocked for non-entry decisions.
-            for k in ("unified", "spread", "event_cvar", "event_exit", "liq", "min_notional", "min_exposure", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
+            for k in ("unified", "spread", "event_cvar", "event_exit", "liq", "min_notional", "min_exposure", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
                 out[k] = None
         return out
 
@@ -2955,6 +3003,14 @@ class LiveOrchestrator:
             return
         action = (decision or {}).get("action") or "WAIT"
         if action == "EXIT":
+            try:
+                min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+            except Exception:
+                min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+            entry_ts = pos.get("entry_time", ts)
+            age_sec = (ts - entry_ts) / 1000.0 if entry_ts else 0.0
+            if min_hold_sec > 0 and age_sec < float(min_hold_sec):
+                return
             self._close_position(sym, price, "hybrid_exit")
             return
         if not allow_extra_exits:
@@ -3051,6 +3107,14 @@ class LiveOrchestrator:
         **_ignored,
     ):
         ts = time.strftime("%H:%M:%S")
+        # Ensure hold duration is captured for DB logs
+        try:
+            if pos is not None and pos.get("age_sec") is None:
+                entry_ts = pos.get("entry_time")
+                if entry_ts is not None:
+                    pos["age_sec"] = max(0.0, (now_ms() - int(entry_ts)) / 1000.0)
+        except Exception:
+            pass
         # normalize numeric fields
         pnl_val = None if pnl is None else float(pnl)
         notional = pos.get("notional")
@@ -3417,6 +3481,7 @@ class LiveOrchestrator:
         ofi_score = float(self._compute_ofi_score(sym))
         impulse = self._compute_impulse_features(closes, opens, highs, lows, volumes)
         rt_breakout = self._compute_realtime_breakout_features(float(price), highs, lows, volumes)
+        tick_feats = self._compute_tick_features(sym, ts)
         pos = self.positions.get(sym, {})
         pos_size_frac = pos.get("size_frac") if pos else None
         if pos_size_frac is None:
@@ -3489,6 +3554,8 @@ class LiveOrchestrator:
             ctx_out.update(impulse)
         if rt_breakout:
             ctx_out.update(rt_breakout)
+        if tick_feats:
+            ctx_out.update(tick_feats)
         return ctx_out
 
     def _build_batch_context_soa(self, ts: int) -> tuple[list[dict], np.ndarray]:
@@ -3546,6 +3613,7 @@ class LiveOrchestrator:
             ofi_score = float(self._compute_ofi_score(sym))
             impulse = self._compute_impulse_features(closes, opens, highs, lows, volumes)
             rt_breakout = self._compute_realtime_breakout_features(float(price), highs, lows, volumes)
+            tick_feats = self._compute_tick_features(sym, ts)
             pos = self.positions.get(sym, {})
             pos_qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
             pos_side_val = 0
@@ -3613,6 +3681,8 @@ class LiveOrchestrator:
                 ctx.update(impulse)
             if rt_breakout:
                 ctx.update(rt_breakout)
+            if tick_feats:
+                ctx.update(tick_feats)
             if self._hybrid_entry_floor_dyn is not None:
                 ctx["hybrid_entry_floor_dyn"] = float(self._hybrid_entry_floor_dyn)
             if self._hybrid_conf_scale_dyn is not None:
@@ -3860,6 +3930,22 @@ class LiveOrchestrator:
             has_pos = pos_qty_now != 0.0
             is_entry = (decision.get("action") in ("LONG", "SHORT")) and (not has_pos)
 
+            # Attach tick-level diagnostics for UI/debug
+            try:
+                decision_meta.setdefault("tick_ret", ctx.get("tick_ret"))
+                decision_meta.setdefault("tick_vol", ctx.get("tick_vol"))
+                decision_meta.setdefault("tick_trend", ctx.get("tick_trend"))
+                decision_meta.setdefault("tick_dir", ctx.get("tick_dir"))
+                decision_meta.setdefault("tick_breakout_active", ctx.get("tick_breakout_active"))
+                decision_meta.setdefault("tick_breakout_dir", ctx.get("tick_breakout_dir"))
+                decision_meta.setdefault("tick_breakout_score", ctx.get("tick_breakout_score"))
+                decision_meta.setdefault("tick_breakout_level", ctx.get("tick_breakout_level"))
+                decision_meta.setdefault("tick_window_sec", ctx.get("tick_window_sec"))
+                decision_meta.setdefault("tick_samples", ctx.get("tick_samples"))
+                decision_meta.setdefault("min_tick_vol", float(MIN_TICK_VOL) if MIN_TICK_VOL > 0 else None)
+            except Exception:
+                pass
+
             top_n_status = self._top_n_status(sym)
             pre_mc_status = self._pre_mc_status()
 
@@ -4017,6 +4103,8 @@ class LiveOrchestrator:
                     blocked.append("min_notional")
                 if fs.get("min_exposure") is False:
                     blocked.append("min_exposure")
+                if fs.get("tick_vol") is False:
+                    blocked.append("tick_vol")
                 if fs.get("top_n") is False:
                     blocked.append("top_n")
                 if fs.get("cap") is False:
@@ -4062,7 +4150,14 @@ class LiveOrchestrator:
                 pos = self.positions.get(sym) or {}
                 meta = decision.get("meta") or {}
                 age_sec = (ts - int(pos.get("entry_time", ts))) / 1000.0
-                do_exit, reason = should_exit_position(pos, meta, age_sec=age_sec, policy=self.exit_policy)
+                try:
+                    min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+                except Exception:
+                    min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+                if min_hold_sec > 0 and age_sec < float(min_hold_sec):
+                    do_exit, reason = False, "min_hold"
+                else:
+                    do_exit, reason = should_exit_position(pos, meta, age_sec=age_sec, policy=self.exit_policy)
                 if do_exit:
                     self._close_position(sym, float(price), f"MC_EXIT:{reason}")
                     exited_by_event = True
@@ -4741,8 +4836,10 @@ class LiveOrchestrator:
                 for s in SYMBOLS:
                     last = (tickers.get(s) or {}).get("last")
                     if last is not None:
-                        self.market[s]["price"] = float(last)
+                        px = float(last)
+                        self.market[s]["price"] = px
                         self.market[s]["ts"] = ts
+                        self._append_tick_price(s, px, ts)
                         ok_any = True
                 if ok_any:
                     self._last_feed_ok_ms = ts
@@ -4909,6 +5006,239 @@ class LiveOrchestrator:
             out[str(sym)] = p
         return out
 
+    def _build_exchange_positions_view(self, pos_map: dict[str, dict], now_ts: int) -> list[dict]:
+        """Build a lightweight positions list from exchange data for dashboard display."""
+        out: list[dict] = []
+        for sym, ex in (pos_map or {}).items():
+            try:
+                size = float(ex.get("size_f", 0.0) or 0.0)
+            except Exception:
+                size = 0.0
+            if abs(size) < 1e-9:
+                continue
+            info = ex.get("info") or {}
+            side_raw = ex.get("side") or info.get("side")
+            side = None
+            if side_raw:
+                s = str(side_raw).lower()
+                if "long" in s or "buy" in s:
+                    side = "LONG"
+                elif "short" in s or "sell" in s:
+                    side = "SHORT"
+            if side is None:
+                side = "SHORT" if size < 0 else "LONG"
+            qty = abs(size)
+
+            def _pick(*vals):
+                for v in vals:
+                    if v is None:
+                        continue
+                    try:
+                        fv = float(v)
+                    except Exception:
+                        continue
+                    if math.isfinite(fv) and fv > 0:
+                        return fv
+                return None
+
+            entry_px = _pick(ex.get("entryPrice"), ex.get("entry_price"), info.get("entryPrice"), info.get("avgPrice"))
+            mark_px = _pick(ex.get("markPrice"), ex.get("lastPrice"), info.get("markPrice"), info.get("lastPrice"))
+            if entry_px is None:
+                entry_px = mark_px
+            notional = _pick(ex.get("notional"), info.get("positionValue"))
+            if notional is None and entry_px is not None:
+                notional = abs(qty * entry_px)
+            if notional is None and mark_px is not None:
+                notional = abs(qty * mark_px)
+            leverage = _pick(ex.get("leverage"), info.get("leverage")) or float(self.leverage)
+
+            entry_time = None
+            try:
+                entry_time = int(info.get("createdTime") or info.get("createdTimeMs") or info.get("updateTime") or info.get("updatedTime"))
+            except Exception:
+                entry_time = None
+            if entry_time is None:
+                entry_time = now_ts
+            entry_time = self._normalize_entry_time_ms(entry_time, default=now_ts)
+
+            cap_frac = float(notional / self.balance) if (self.balance and notional) else 0.0
+            size_frac = 0.0
+            try:
+                size_frac = float(notional or 0.0) / max(float(self.balance) * max(float(leverage), 1e-6), 1e-6)
+            except Exception:
+                size_frac = 0.0
+
+            out.append({
+                "symbol": sym,
+                "side": side,
+                "entry_price": float(entry_px or 0.0),
+                "entry_time": int(entry_time),
+                "quantity": float(qty),
+                "notional": float(notional or 0.0),
+                "size_frac": float(size_frac),
+                "leverage": float(leverage),
+                "cap_frac": float(cap_frac),
+                "current": float(mark_px) if mark_px is not None else None,
+                "pos_source": "exchange",
+            })
+        return out
+
+    def _positions_fetch_params(self) -> dict:
+        """Best-effort params for Bybit position fetches (unified account needs category)."""
+        try:
+            cat = str(os.environ.get("BYBIT_POSITIONS_CATEGORY", "")).strip()
+        except Exception:
+            cat = ""
+        if not cat:
+            try:
+                if any((":USDT" in s) or str(s).endswith("USDT") for s in SYMBOLS):
+                    cat = "linear"
+            except Exception:
+                cat = ""
+        if not cat:
+            return {}
+        return {"category": cat}
+
+    def _bybit_ws_endpoint(self) -> str:
+        try:
+            override = str(os.environ.get("BYBIT_WS_PRIVATE_ENDPOINT", "")).strip()
+        except Exception:
+            override = ""
+        if override:
+            return override
+        try:
+            use_testnet = bool(getattr(config, "BYBIT_TESTNET", False))
+        except Exception:
+            use_testnet = False
+        return "wss://stream-testnet.bybit.com/v5/private" if use_testnet else "wss://stream.bybit.com/v5/private"
+
+    def _bybit_ws_signature(self, api_key: str, api_secret: str, expires_ms: int, mode: str = "realtime") -> str:
+        # Bybit WS v5 uses HMAC SHA256; default payload follows legacy GET/realtime scheme.
+        if mode == "v5":
+            payload = f"{expires_ms}{api_key}"
+        else:
+            payload = f"GET/realtime{expires_ms}"
+        return hmac.new(api_secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def _apply_ws_positions(self, entries: list[dict], now_ts: int, reset: bool = False) -> None:
+        if reset:
+            self._ws_positions_cache = {}
+        for item in entries:
+            if not isinstance(item, dict):
+                continue
+            raw_sym = item.get("symbol") or item.get("symbolName") or item.get("info", {}).get("symbol")
+            sym = _normalize_sym_key(raw_sym)
+            if not sym:
+                continue
+            size_val = item.get("size")
+            if size_val is None:
+                size_val = item.get("positionAmt")
+            if size_val is None:
+                size_val = item.get("qty")
+            try:
+                size = float(size_val or 0.0)
+            except Exception:
+                size = 0.0
+            side_raw = item.get("side") or item.get("positionSide")
+            side = None
+            if side_raw:
+                s = str(side_raw).lower()
+                if "long" in s or "buy" in s:
+                    side = "LONG"
+                elif "short" in s or "sell" in s:
+                    side = "SHORT"
+            if side is None:
+                side = "SHORT" if size < 0 else "LONG"
+            size_abs = abs(size)
+            if size_abs < 1e-12:
+                self._ws_positions_cache.pop(sym, None)
+                continue
+            ex = {
+                "symbol": sym,
+                "side": side,
+                "size_f": size_abs if side == "LONG" else -size_abs,
+                "entryPrice": item.get("entryPrice") or item.get("avgPrice"),
+                "markPrice": item.get("markPrice") or item.get("lastPrice"),
+                "notional": item.get("positionValue") or item.get("notional"),
+                "leverage": item.get("leverage"),
+                "info": item,
+            }
+            self._ws_positions_cache[sym] = ex
+        try:
+            self._exchange_positions_view = self._build_exchange_positions_view(self._ws_positions_cache, now_ts)
+            self._exchange_positions_ts = int(now_ts)
+            self._exchange_positions_source = "ws"
+            self._ws_positions_last_ms = int(now_ts)
+        except Exception:
+            pass
+
+    async def bybit_ws_positions_loop(self) -> None:
+        """Optional Bybit private WS positions stream for faster dashboard sync."""
+        while True:
+            enabled = str(os.environ.get("BYBIT_WS_POSITIONS", "0")).strip().lower() in ("1", "true", "yes", "on")
+            if not enabled:
+                await asyncio.sleep(2.0)
+                continue
+            if not self.enable_orders:
+                await asyncio.sleep(2.0)
+                continue
+            api_key = getattr(self.exchange, "apiKey", None)
+            api_secret = getattr(self.exchange, "secret", None)
+            if not api_key or not api_secret:
+                self._log_err("[BYBIT_WS] apiKey/secret missing; skip WS positions")
+                await asyncio.sleep(5.0)
+                continue
+            endpoint = self._bybit_ws_endpoint()
+            try:
+                reconnect_sec = float(os.environ.get("BYBIT_WS_RECONNECT_SEC", 5.0) or 5.0)
+            except Exception:
+                reconnect_sec = 5.0
+            try:
+                auth_mode = str(os.environ.get("BYBIT_WS_AUTH_MODE", "realtime") or "realtime").strip().lower()
+            except Exception:
+                auth_mode = "realtime"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(endpoint, heartbeat=20) as ws:
+                        self._ws_positions_connected = True
+                        self._ws_positions_last_err = None
+                        expires_ms = int(time.time() * 1000) + 10_000
+                        sign = self._bybit_ws_signature(str(api_key), str(api_secret), expires_ms, mode=auth_mode)
+                        await ws.send_json({"op": "auth", "args": [api_key, expires_ms, sign]})
+                        await ws.send_json({"op": "subscribe", "args": ["position"]})
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                try:
+                                    data = json.loads(msg.data)
+                                except Exception:
+                                    continue
+                                if isinstance(data, dict):
+                                    op = data.get("op")
+                                    if op == "auth":
+                                        if not data.get("success", False):
+                                            self._log_err(f"[BYBIT_WS] auth failed: {data}")
+                                            break
+                                    if op == "subscribe":
+                                        if not data.get("success", True):
+                                            self._log_err(f"[BYBIT_WS] subscribe failed: {data}")
+                                            break
+                                    topic = data.get("topic") or ""
+                                    if str(topic).startswith("position"):
+                                        entries = data.get("data")
+                                        if isinstance(entries, dict):
+                                            entries = [entries]
+                                        if isinstance(entries, list):
+                                            reset = str(data.get("type") or "").lower() == "snapshot"
+                                            self._apply_ws_positions(entries, now_ms(), reset=reset)
+                            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                                break
+            except Exception as e:
+                self._ws_positions_last_err = str(e)
+                self._log_err(f"[BYBIT_WS] positions loop error: {e}")
+            finally:
+                self._ws_positions_connected = False
+            await asyncio.sleep(max(1.0, reconnect_sec))
+
     def _ensure_symbol_state(self, sym: str) -> None:
         if sym not in self.market:
             self.market[sym] = {"price": None, "ts": 0}
@@ -5053,17 +5383,27 @@ class LiveOrchestrator:
         if include_all is None:
             include_all = bool(getattr(config, "SYNC_POSITIONS_ALL", True))
         try:
+            fetch_params = self._positions_fetch_params()
             raw = raw_positions
             if raw is None:
                 try:
                     if include_all:
-                        raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions)
+                        if fetch_params:
+                            raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions, None, fetch_params)
+                        else:
+                            raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions)
                     else:
-                        raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions, SYMBOLS)
+                        if fetch_params:
+                            raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions, SYMBOLS, fetch_params)
+                        else:
+                            raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions, SYMBOLS)
                 except Exception as e:
                     msg = str(e)
                     if "fetchPositions() does not accept an array" in msg or "does not accept an array" in msg:
-                        raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions)
+                        if fetch_params:
+                            raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions, None, fetch_params)
+                        else:
+                            raw = await self._ccxt_call("fetch_positions(sync)", self.exchange.fetch_positions)
                     else:
                         raise
             pos_map = self._normalize_exchange_positions(raw if isinstance(raw, list) else [])
@@ -5201,6 +5541,12 @@ class LiveOrchestrator:
             self.positions = new_positions
         else:
             self.positions.update(new_positions)
+        try:
+            self._exchange_positions_view = list(new_positions.values())
+            self._exchange_positions_ts = int(now_ts)
+            self._exchange_positions_source = "rest"
+        except Exception:
+            pass
         try:
             for sym in new_positions.keys():
                 self._external_close_missing_counts.pop(sym, None)
@@ -5366,17 +5712,30 @@ class LiveOrchestrator:
             except Exception:
                 interval = 10.0
             try:
+                fetch_params = self._positions_fetch_params()
                 try:
-                    raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS)
+                    if fetch_params:
+                        raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS, fetch_params)
+                    else:
+                        raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS)
                 except Exception as e:
                     msg = str(e)
                     # Bybit: fetchPositions does not accept an array with more than one symbol.
                     if "fetchPositions() does not accept an array" in msg or "does not accept an array" in msg:
-                        raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions)
+                        if fetch_params:
+                            raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, None, fetch_params)
+                        else:
+                            raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions)
                     else:
                         raise
                 pos_map = self._normalize_exchange_positions(raw if isinstance(raw, list) else [])
                 now_ts = now_ms()
+                try:
+                    self._exchange_positions_view = self._build_exchange_positions_view(pos_map, now_ts)
+                    self._exchange_positions_ts = int(now_ts)
+                    self._exchange_positions_source = "rest"
+                except Exception:
+                    pass
                 if pos_map:
                     self._empty_positions_fetches = 0
                     self._last_nonempty_pos_fetch_ms = int(now_ts)
@@ -5957,6 +6316,127 @@ class LiveOrchestrator:
             "rt_breakout_vol_ratio": float(vol_ratio) if vol_ratio is not None else None,
         }
 
+    def _append_tick_price(self, sym: str, price: float, ts_ms: int) -> None:
+        buf = self._tick_buffer.get(sym)
+        if buf is None:
+            return
+        try:
+            px = float(price)
+        except Exception:
+            return
+        ts_val = int(ts_ms)
+        buf.append((ts_val, px))
+        try:
+            cutoff = ts_val - int(self._tick_buffer_sec * 1000.0)
+            while buf and buf[0][0] < cutoff:
+                buf.popleft()
+        except Exception:
+            pass
+
+    def _compute_tick_features(self, sym: str, ts_ms: int | None = None) -> dict:
+        default = {
+            "tick_ret": 0.0,
+            "tick_vol": 0.0,
+            "tick_mom": 0.0,
+            "tick_trend": 0.0,
+            "tick_dir": 0,
+            "tick_samples": 0,
+            "tick_window_sec": float(TICK_LOOKBACK_SEC),
+            "tick_breakout_active": False,
+            "tick_breakout_dir": 0,
+            "tick_breakout_score": 0.0,
+            "tick_breakout_level": None,
+        }
+        buf = self._tick_buffer.get(sym)
+        if not buf or len(buf) < 2:
+            return default
+        try:
+            now_ms = int(ts_ms or buf[-1][0])
+        except Exception:
+            now_ms = int(buf[-1][0])
+
+        cache = self._tick_feature_cache.get(sym)
+        if cache and cache[0] == now_ms:
+            return cache[1]
+
+        try:
+            lookback_sec = float(os.environ.get("TICK_LOOKBACK_SEC", TICK_LOOKBACK_SEC) or TICK_LOOKBACK_SEC)
+        except Exception:
+            lookback_sec = float(TICK_LOOKBACK_SEC)
+        lookback_sec = max(1.0, lookback_sec)
+        cutoff = now_ms - int(lookback_sec * 1000.0)
+        vals = [p for t, p in buf if t >= cutoff]
+        if len(vals) < int(max(2, TICK_MIN_SAMPLES)):
+            out = dict(default)
+            out["tick_samples"] = len(vals)
+            out["tick_window_sec"] = float(lookback_sec)
+            self._tick_feature_cache[sym] = (now_ms, out)
+            return out
+
+        try:
+            arr = np.asarray(vals, dtype=np.float64)
+            rets = np.diff(np.log(np.maximum(arr, 1e-12)))
+            tick_ret = float(math.log(arr[-1] / max(arr[0], 1e-12)))
+            tick_vol = float(rets.std()) if rets.size else 0.0
+            tick_mom = float(rets.mean()) if rets.size else 0.0
+        except Exception:
+            tick_ret = 0.0
+            tick_vol = 0.0
+            tick_mom = 0.0
+        tick_trend = 0.0
+        if tick_vol > 0:
+            tick_trend = float(tick_ret / max(tick_vol, 1e-9))
+        tick_trend = float(max(-8.0, min(8.0, tick_trend)))
+        tick_dir = 1 if tick_trend > 0 else (-1 if tick_trend < 0 else 0)
+
+        # Tick breakout: recent high/low vs last price
+        try:
+            breakout_lb = float(os.environ.get("TICK_BREAKOUT_LOOKBACK_SEC", TICK_BREAKOUT_LOOKBACK_SEC) or TICK_BREAKOUT_LOOKBACK_SEC)
+        except Exception:
+            breakout_lb = float(TICK_BREAKOUT_LOOKBACK_SEC)
+        breakout_lb = max(1.0, breakout_lb)
+        cutoff_b = now_ms - int(breakout_lb * 1000.0)
+        vals_b = [p for t, p in buf if t >= cutoff_b]
+        tick_breakout_active = False
+        tick_breakout_dir = 0
+        tick_breakout_score = 0.0
+        tick_breakout_level = None
+        try:
+            buffer_pct = float(os.environ.get("TICK_BREAKOUT_BUFFER_PCT", TICK_BREAKOUT_BUFFER_PCT) or TICK_BREAKOUT_BUFFER_PCT)
+        except Exception:
+            buffer_pct = float(TICK_BREAKOUT_BUFFER_PCT)
+        if len(vals_b) >= 3:
+            last = float(vals_b[-1])
+            prev = vals_b[:-1]
+            hi = max(prev)
+            lo = min(prev)
+            if hi > 0 and last > hi * (1.0 + buffer_pct):
+                tick_breakout_active = True
+                tick_breakout_dir = 1
+                tick_breakout_level = float(hi)
+                tick_breakout_score = float((last - hi) / max(hi, 1e-12))
+            elif lo > 0 and last < lo * (1.0 - buffer_pct):
+                tick_breakout_active = True
+                tick_breakout_dir = -1
+                tick_breakout_level = float(lo)
+                tick_breakout_score = float((lo - last) / max(lo, 1e-12))
+
+        out = {
+            "tick_ret": float(tick_ret),
+            "tick_vol": float(tick_vol),
+            "tick_mom": float(tick_mom),
+            "tick_trend": float(tick_trend),
+            "tick_dir": int(tick_dir),
+            "tick_samples": int(len(vals)),
+            "tick_window_sec": float(lookback_sec),
+            "tick_breakout_active": bool(tick_breakout_active),
+            "tick_breakout_dir": int(tick_breakout_dir),
+            "tick_breakout_score": float(tick_breakout_score),
+            "tick_breakout_level": float(tick_breakout_level) if tick_breakout_level is not None else None,
+        }
+        self._tick_feature_cache[sym] = (now_ms, out)
+        return out
+
     def _read_symbols_csv_from_file(self, path: Path) -> list[str]:
         try:
             if not path.exists():
@@ -6022,56 +6502,111 @@ class LiveOrchestrator:
         unreal = 0.0
         total_notional = 0.0
         pos_list = []
-        for sym, pos in self.positions.items():
-            px = None
-            try:
-                px = self.market.get(sym, {}).get("price")
-            except Exception:
-                px = None
-            if px is None:
+        use_exchange = False
+        try:
+            use_exchange = bool(self.enable_orders) and str(os.environ.get("DASHBOARD_USE_EXCHANGE_POSITIONS", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            use_exchange = False
+        if use_exchange and self._exchange_positions_ts is not None:
+            for pos in list(self._exchange_positions_view or []):
+                sym = pos.get("symbol")
+                px = pos.get("current")
+                if px is None:
+                    try:
+                        px = self.market.get(sym, {}).get("price")
+                    except Exception:
+                        px = None
+                if px is None:
+                    try:
+                        px = float(pos.get("entry_price") or 0.0)
+                    except Exception:
+                        px = None
+                if px is None:
+                    continue
+                entry = float(pos.get("entry_price", px))
+                side = str(pos.get("side") or "")
+                qty = float(pos.get("quantity", 0.0))
+                notional = float(pos.get("notional", 0.0))
+                pnl = ((px - entry) * qty) if side == "LONG" else ((entry - px) * qty)
+                unreal += pnl
+                total_notional += notional
+                lev = float(pos.get("leverage", self.leverage))
+                base_notional = notional / max(lev, 1e-6)
                 try:
-                    px = float(pos.get("entry_price") or 0.0)
+                    age_sec = max(0.0, (now_ms() - pos.get("entry_time", now_ms())) / 1000.0)
+                except Exception:
+                    age_sec = 0.0
+                pos_list.append({
+                    "symbol": sym,
+                    "side": side,
+                    "entry_price": entry,
+                    "current": float(px),
+                    "pnl": float(pnl),
+                    "roe": float(pnl / base_notional) if base_notional else 0.0,
+                    "leverage": lev,
+                    "quantity": qty,
+                    "notional": notional,
+                    "cap_frac": float(notional / self.balance) if self.balance else 0.0,
+                    "size_frac": pos.get("size_frac"),
+                    "tag": pos.get("tag"),
+                    "age_sec": age_sec,
+                    "opt_hold_entry_sec": pos.get("opt_hold_entry_sec"),
+                    "opt_hold_curr_sec": pos.get("opt_hold_curr_sec"),
+                    "opt_hold_curr_remaining_sec": pos.get("opt_hold_curr_remaining_sec"),
+                    "hold_eval_ts": pos.get("hold_eval_ts"),
+                    "pos_source": pos.get("pos_source"),
+                })
+        else:
+            for sym, pos in self.positions.items():
+                px = None
+                try:
+                    px = self.market.get(sym, {}).get("price")
                 except Exception:
                     px = None
-            if px is None:
-                continue
-            entry = float(pos.get("entry_price", px))
-            side = str(pos.get("side") or "")
-            qty = float(pos.get("quantity", 0.0))
-            notional = float(pos.get("notional", 0.0))
-            pnl = ((px - entry) * qty) if side == "LONG" else ((entry - px) * qty)
-            unreal += pnl
-            total_notional += notional
-            lev = float(pos.get("leverage", self.leverage))
-            base_notional = notional / max(lev, 1e-6)
-            age_sec = max(0.0, (now_ms() - pos.get("entry_time", now_ms())) / 1000.0)
-            opt_hold_entry = pos.get("opt_hold_entry_sec") or pos.get("opt_hold_sec")
-            opt_hold_curr = pos.get("opt_hold_curr_sec") or pos.get("opt_hold_sec") or opt_hold_entry
-            opt_hold_rem = pos.get("opt_hold_curr_remaining_sec")
-            if opt_hold_rem is None and opt_hold_curr is not None:
-                try:
-                    opt_hold_rem = max(0.0, float(opt_hold_curr) - float(age_sec))
-                except Exception:
-                    opt_hold_rem = None
-            pos_list.append({
-                "symbol": sym,
-                "side": side,
-                "entry_price": entry,
-                "current": float(px),
-                "pnl": float(pnl),
-                "roe": float(pnl / base_notional) if base_notional else 0.0,
-                "leverage": lev,
-                "quantity": qty,
-                "notional": notional,
-                "cap_frac": float(notional / self.balance) if self.balance else 0.0,
-                "size_frac": pos.get("size_frac"),
-                "tag": pos.get("tag"),
-                "age_sec": age_sec,
-                "opt_hold_entry_sec": opt_hold_entry,
-                "opt_hold_curr_sec": opt_hold_curr,
-                "opt_hold_curr_remaining_sec": opt_hold_rem,
-                "hold_eval_ts": pos.get("hold_eval_ts"),
-            })
+                if px is None:
+                    try:
+                        px = float(pos.get("entry_price") or 0.0)
+                    except Exception:
+                        px = None
+                if px is None:
+                    continue
+                entry = float(pos.get("entry_price", px))
+                side = str(pos.get("side") or "")
+                qty = float(pos.get("quantity", 0.0))
+                notional = float(pos.get("notional", 0.0))
+                pnl = ((px - entry) * qty) if side == "LONG" else ((entry - px) * qty)
+                unreal += pnl
+                total_notional += notional
+                lev = float(pos.get("leverage", self.leverage))
+                base_notional = notional / max(lev, 1e-6)
+                age_sec = max(0.0, (now_ms() - pos.get("entry_time", now_ms())) / 1000.0)
+                opt_hold_entry = pos.get("opt_hold_entry_sec") or pos.get("opt_hold_sec")
+                opt_hold_curr = pos.get("opt_hold_curr_sec") or pos.get("opt_hold_sec") or opt_hold_entry
+                opt_hold_rem = pos.get("opt_hold_curr_remaining_sec")
+                if opt_hold_rem is None and opt_hold_curr is not None:
+                    try:
+                        opt_hold_rem = max(0.0, float(opt_hold_curr) - float(age_sec))
+                    except Exception:
+                        opt_hold_rem = None
+                pos_list.append({
+                    "symbol": sym,
+                    "side": side,
+                    "entry_price": entry,
+                    "current": float(px),
+                    "pnl": float(pnl),
+                    "roe": float(pnl / base_notional) if base_notional else 0.0,
+                    "leverage": lev,
+                    "quantity": qty,
+                    "notional": notional,
+                    "cap_frac": float(notional / self.balance) if self.balance else 0.0,
+                    "size_frac": pos.get("size_frac"),
+                    "tag": pos.get("tag"),
+                    "age_sec": age_sec,
+                    "opt_hold_entry_sec": opt_hold_entry,
+                    "opt_hold_curr_sec": opt_hold_curr,
+                    "opt_hold_curr_remaining_sec": opt_hold_rem,
+                    "hold_eval_ts": pos.get("hold_eval_ts"),
+                })
         equity = float(self.balance) + float(unreal)
         self._equity_history.append({"time": now_ms(), "equity": equity})
         util = float(total_notional / self.balance) if self.balance else 0.0
@@ -6676,8 +7211,13 @@ class LiveOrchestrator:
                     "unrealized_pnl": float(unreal),
                     "utilization": util,
                     "utilization_cap": MAX_NOTIONAL_EXPOSURE if self.exposure_cap_enabled else None,
-                    "positions_count": int(len(self.positions)),
+                    "positions_count": int(len(pos_list)),
                     "positions": pos_list,
+                    "positions_source": (
+                        "exchange_ws" if (self.enable_orders and self._exchange_positions_source == "ws")
+                        else ("exchange" if (self.enable_orders and self._exchange_positions_ts is not None) else "engine")
+                    ),
+                    "positions_sync_ts": self._exchange_positions_ts,
                     "history": list(self._equity_history),
                     "live_wallet_balance": self._live_wallet_balance,
                     "live_equity": self._live_equity,
@@ -7603,6 +8143,20 @@ async def main():
         "enableRateLimit": True,
         "timeout": CCXT_TIMEOUT_MS,
     }
+    try:
+        default_type = str(os.environ.get("BYBIT_DEFAULT_TYPE", "swap")).strip().lower()
+    except Exception:
+        default_type = "swap"
+    try:
+        default_settle = str(os.environ.get("BYBIT_DEFAULT_SETTLE", "USDT")).strip()
+    except Exception:
+        default_settle = "USDT"
+    if default_type or default_settle:
+        ex_cfg.setdefault("options", {})
+        if default_type:
+            ex_cfg["options"]["defaultType"] = default_type
+        if default_settle:
+            ex_cfg["options"]["defaultSettle"] = default_settle
     live_enabled = bool(getattr(config, "ENABLE_LIVE_ORDERS", False))
     trade_cfg = dict(ex_cfg)
     if live_enabled:
@@ -7683,6 +8237,7 @@ async def main():
                 asyncio.create_task(real_orch.fetch_orderbook_loop())
                 asyncio.create_task(real_orch.fetch_balance_loop())
                 asyncio.create_task(real_orch.fetch_positions_loop())
+                asyncio.create_task(real_orch.bybit_ws_positions_loop())
                 asyncio.create_task(real_orch.refresh_top_volume_universe_loop())
                 asyncio.create_task(real_orch.hold_eval_loop())
                 asyncio.create_task(real_orch.decision_loop())
