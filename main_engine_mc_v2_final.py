@@ -2989,6 +2989,37 @@ class LiveOrchestrator:
         pos = self.positions.get(sym)
         if not pos or price is None:
             return
+        # Exchange liquidation price hard stop (if available)
+        try:
+            use_ex_liq = str(os.environ.get("EXCHANGE_LIQ_SL", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            use_ex_liq = True
+        if use_ex_liq:
+            liq_price = pos.get("liq_price")
+            if liq_price is None:
+                liq_price = pos.get("liqPrice")
+            if liq_price is None:
+                try:
+                    liq_price = (pos.get("meta") or {}).get("liq_price")
+                except Exception:
+                    liq_price = None
+            try:
+                liq_price = float(liq_price) if liq_price is not None else None
+            except Exception:
+                liq_price = None
+            if liq_price is not None and liq_price > 0:
+                try:
+                    buf_pct = float(os.environ.get("EXCHANGE_LIQ_SL_BUFFER_PCT", 0.0) or 0.0)
+                except Exception:
+                    buf_pct = 0.0
+                side = str(pos.get("side") or "")
+                if side == "LONG":
+                    trigger = float(price) <= float(liq_price) * (1.0 + max(0.0, buf_pct))
+                else:
+                    trigger = float(price) >= float(liq_price) * (1.0 - max(0.0, buf_pct))
+                if trigger:
+                    self._close_position(sym, float(price), "exchange_liq_sl", exit_kind="SL")
+                    return
         try:
             hold_only = str(os.environ.get("HOLD_EVAL_ONLY", "0")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
@@ -5003,6 +5034,14 @@ class LiveOrchestrator:
             except Exception:
                 size_f = 0.0
             p["size_f"] = size_f
+            # Best-effort liquidation price from raw payload
+            if "liqPrice" not in p and "liq_price" not in p:
+                try:
+                    liq_raw = p.get("info", {}).get("liqPrice")
+                except Exception:
+                    liq_raw = None
+                if liq_raw is not None:
+                    p["liqPrice"] = liq_raw
             out[str(sym)] = p
         return out
 
@@ -5045,6 +5084,7 @@ class LiveOrchestrator:
             mark_px = _pick(ex.get("markPrice"), ex.get("lastPrice"), info.get("markPrice"), info.get("lastPrice"))
             if entry_px is None:
                 entry_px = mark_px
+            liq_px = _pick(ex.get("liqPrice"), ex.get("liq_price"), info.get("liqPrice"))
             notional = _pick(ex.get("notional"), info.get("positionValue"))
             if notional is None and entry_px is not None:
                 notional = abs(qty * entry_px)
@@ -5079,6 +5119,7 @@ class LiveOrchestrator:
                 "leverage": float(leverage),
                 "cap_frac": float(cap_frac),
                 "current": float(mark_px) if mark_px is not None else None,
+                "liq_price": float(liq_px) if liq_px is not None else None,
                 "pos_source": "exchange",
             })
         return out
@@ -5161,6 +5202,7 @@ class LiveOrchestrator:
                 "markPrice": item.get("markPrice") or item.get("lastPrice"),
                 "notional": item.get("positionValue") or item.get("notional"),
                 "leverage": item.get("leverage"),
+                "liqPrice": item.get("liqPrice") or item.get("liq_price"),
                 "info": item,
             }
             self._ws_positions_cache[sym] = ex
@@ -5447,6 +5489,7 @@ class LiveOrchestrator:
             mark_px = _pick(ex.get("markPrice"), ex.get("lastPrice"), info.get("markPrice"), info.get("lastPrice"))
             if entry_px is None:
                 entry_px = mark_px
+            liq_px = _pick(ex.get("liqPrice"), ex.get("liq_price"), info.get("liqPrice"))
             notional = _pick(ex.get("notional"), info.get("positionValue"))
             if notional is None and entry_px is not None:
                 notional = abs(qty * entry_px)
@@ -5484,6 +5527,7 @@ class LiveOrchestrator:
                 "order_status": "ack",
                 "order_ack_ts": int(now_ts),
                 "pos_source": "exchange_sync",
+                "liq_price": float(liq_px) if liq_px is not None else None,
                 "margin": float(margin) if margin is not None else None,
                 "current_price": float(mark_px) if mark_px is not None else None,
                 "managed": bool(getattr(config, "MANAGE_SYNCED_POSITIONS", True)),

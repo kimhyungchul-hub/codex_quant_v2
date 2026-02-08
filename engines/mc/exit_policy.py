@@ -452,6 +452,13 @@ class MonteCarloExitPolicyMixin:
                 return None
 
         score_exit_signal = None
+        # 1) Current hold time (seconds) from decision meta (if provided)
+        current_hold_sec = 0.0
+        if decision_meta:
+            try:
+                current_hold_sec = float(decision_meta.get("hold_sec", 0.0) or 0.0)
+            except Exception:
+                current_hold_sec = 0.0
         if decision_meta is not None:
             meta_src = decision_meta
             nested = decision_meta.get("meta") if isinstance(decision_meta, dict) else None
@@ -466,15 +473,29 @@ class MonteCarloExitPolicyMixin:
             if score_long is not None or score_short is not None:
                 horizon_scale = math.sqrt(max(1.0, float(horizon_sec)) / 180.0)
                 entry_th = max(0.0, float(config.score_entry_threshold)) * horizon_scale
-                exit_th = max(0.0, float(config.score_exit_threshold)) * horizon_scale
-                exit_th = max(exit_th, float(config.score_entry_floor))
-                extend_th = max(exit_th, entry_th * max(0.0, float(config.score_extend_mult)))
+                exit_th_base = max(0.0, float(config.score_exit_threshold))
+                # 2) Grace period: ignore score-based exit shortly after entry
+                grace_period_sec = max(300.0, float(horizon_sec) * 0.15)
+                if current_hold_sec < grace_period_sec:
+                    real_exit_th = -999.0
+                    if MC_VERBOSE_PRINT:
+                        print(
+                            f"[EXIT_POLICY] {symbol} | Grace Period Active ({current_hold_sec:.0f}s < {grace_period_sec:.0f}s). Ignoring Score Drop."
+                        )
+                        logger.info(
+                            f"[EXIT_POLICY] {symbol} | Grace Period Active ({current_hold_sec:.0f}s < {grace_period_sec:.0f}s). Ignoring Score Drop."
+                        )
+                else:
+                    real_exit_th = exit_th_base * horizon_scale
+
+                real_exit_th = max(real_exit_th, float(config.score_entry_floor))
+                extend_th = max(real_exit_th, entry_th * max(0.0, float(config.score_extend_mult)))
                 score_side = score_long if direction > 0 else score_short
-                out_meta["score_exit_threshold"] = float(exit_th)
+                out_meta["score_exit_threshold"] = float(real_exit_th)
                 out_meta["score_extend_threshold"] = float(extend_th)
                 out_meta["score_side"] = float(score_side) if score_side is not None else None
                 if score_side is not None:
-                    if score_side <= exit_th:
+                    if score_side <= real_exit_th:
                         score_exit_signal = "EXIT"
                     elif score_side < extend_th:
                         score_exit_signal = "WEAK_HOLD"

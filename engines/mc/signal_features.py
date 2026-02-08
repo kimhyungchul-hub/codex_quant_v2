@@ -2,12 +2,139 @@ from __future__ import annotations
 
 import math
 import os
+import logging
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 from engines.mc.config import config
 
 from engines.mc.constants import MC_VERBOSE_PRINT, SECONDS_PER_YEAR
+
+logger = logging.getLogger(__name__)
+
+
+def _calculate_refined_mu_alpha_with_debug(
+    closes: np.ndarray,
+    ofi_score: float,
+    current_vol: float,
+    long_term_vol: float,
+    regime_kama: float,
+    base_params: Dict[str, Any],
+) -> tuple[float, Dict[str, Any]]:
+    """
+    Refined mu_alpha with acceleration + OFI divergence + vol-adaptive weighting.
+    Returns (final_mu, debug_dict).
+    """
+    windows = [5, 10, 20]
+    velocities: list[float] = []
+    accelerations: list[float] = []
+    for w in windows:
+        if closes.size < w + 2:
+            continue
+        r_now = float(np.log(closes[-1] / closes[-w]))
+        if closes.size >= 2 * w:
+            r_prev = float(np.log(closes[-w] / closes[-2 * w]))
+        else:
+            r_prev = r_now
+        vel = r_now
+        acc = r_now - r_prev
+        velocities.append(vel)
+        accelerations.append(acc)
+
+    if velocities:
+        weights = np.array([0.5, 0.3, 0.2], dtype=np.float64)[: len(velocities)]
+        weights = weights / np.sum(weights)
+        avg_velocity = float(np.dot(velocities, weights))
+        avg_acceleration = float(np.dot(accelerations, weights))
+    else:
+        avg_velocity = 0.0
+        avg_acceleration = 0.0
+
+    momentum_score = float(avg_velocity)
+    accel_dampen = False
+    if (avg_velocity > 0 and avg_acceleration < 0) or (avg_velocity < 0 and avg_acceleration > 0):
+        momentum_score *= 0.5
+        accel_dampen = True
+        logger.debug("[MU_DEBUG] Acceleration divergence detected. Dampening momentum.")
+
+    mu_mom_scale = float(base_params.get("mu_mom_scale", 10.0))
+    mu_mom = float(momentum_score * mu_mom_scale)
+
+    mu_ofi_scale = float(base_params.get("mu_ofi_scale", 15.0))
+    mu_ofi = float(ofi_score * mu_ofi_scale)
+
+    divergence = False
+    combined_raw = 0.0
+    w_mom = None
+    w_ofi = None
+    if np.sign(mu_mom) != np.sign(mu_ofi) and abs(mu_ofi) > 0.5:
+        divergence = True
+        combined_raw = 0.0
+    else:
+        vol_ratio = float(current_vol / (long_term_vol + 1e-9))
+        w_ofi = float(min(0.7, max(0.2, 0.5 * vol_ratio)))
+        w_mom = float(1.0 - w_ofi)
+        combined_raw = float((mu_mom * w_mom) + (mu_ofi * w_ofi))
+
+    chop_threshold = float(base_params.get("chop_threshold", 0.3))
+    if regime_kama < chop_threshold:
+        regime_factor = float((regime_kama / chop_threshold) ** 2)
+        final_mu = float(combined_raw * regime_factor)
+    else:
+        boost = 1.2 if bool(base_params.get("boost_enabled", False)) else 1.0
+        final_mu = float(combined_raw * boost)
+        regime_factor = float(boost)
+
+    alpha_scaling = float(base_params.get("alpha_scaling_factor", 1.0))
+    final_mu = float(final_mu * alpha_scaling)
+
+    cap = float(base_params.get("mu_cap", 15.0))
+    floor = float(base_params.get("mu_floor", -15.0))
+    mu_clipped = False
+    if final_mu > cap:
+        final_mu = cap
+        mu_clipped = True
+    elif final_mu < floor:
+        final_mu = floor
+        mu_clipped = True
+
+    debug = {
+        "avg_velocity": float(avg_velocity),
+        "avg_acceleration": float(avg_acceleration),
+        "accel_dampen": bool(accel_dampen),
+        "mu_mom": float(mu_mom),
+        "mu_ofi": float(mu_ofi),
+        "divergence": bool(divergence),
+        "combined_raw": float(combined_raw),
+        "w_mom": float(w_mom) if w_mom is not None else None,
+        "w_ofi": float(w_ofi) if w_ofi is not None else None,
+        "vol_ratio": float(current_vol / (long_term_vol + 1e-9)),
+        "regime_factor": float(regime_factor),
+        "alpha_scaling_factor": float(alpha_scaling),
+        "mu_alpha_cap": float(cap),
+        "mu_alpha_floor": float(floor),
+        "mu_alpha_clipped": bool(mu_clipped),
+    }
+    return final_mu, debug
+
+
+def calculate_refined_mu_alpha(
+    closes: np.ndarray,
+    ofi_score: float,
+    current_vol: float,
+    long_term_vol: float,
+    regime_kama: float,
+    base_params: dict,
+) -> float:
+    """
+    [개선된 Mu Alpha 산출 로직]
+    기존의 단순 가중평균을 넘어, 가속도(Acceleration)와 다이버전스를 반영하여
+    변곡점에서의 손실을 방지합니다.
+    """
+    final_mu, _ = _calculate_refined_mu_alpha_with_debug(
+        closes, ofi_score, current_vol, long_term_vol, regime_kama, base_params
+    )
+    return float(final_mu)
 
 
 def ema(values: Sequence[float], period: int) -> Optional[float]:
@@ -82,137 +209,15 @@ class MonteCarloSignalFeaturesMixin:
         bs = float(bar_seconds) if float(bar_seconds) > 0 else 60.0
         n = len(closes)
 
-        def _mom_mu_ann(window_bars: int) -> tuple[float, float, float]:
-            w = int(window_bars)
-            if w <= 1 or n <= w:
-                return 0.0, 0.0, 0.0
-            p0 = float(closes[-w - 1])
-            p1 = float(closes[-1])
-            if p0 <= 0.0 or p1 <= 0.0:
-                return 0.0, 0.0, 0.0
-            try:
-                lr = math.log(p1 / p0)
-            except Exception:
-                return 0.0, 0.0, 0.0
-            # Stabilize annualization: short-window momentum can explode when scaled to per-year.
-            # Use a tau floor (in seconds) and optional log-return clipping.
-            lr_cap = config.mu_mom_lr_cap
-            if lr_cap > 0:
-                lr = float(max(-lr_cap, min(lr_cap, float(lr))))
-
-            tau_floor = config.mu_mom_tau_floor_sec
-            tau = max(1e-9, float(w) * bs, float(max(0.0, tau_floor)))
-            
-            # Calculate annualized momentum
-            mu_ann_raw = float((lr / tau) * SECONDS_PER_YEAR)
-            
-            # ✅ NEW: Cap annualized momentum directly to prevent explosion
-            mu_ann_cap = config.mu_mom_ann_cap
-            if mu_ann_cap > 0:
-                mu_ann = float(max(-mu_ann_cap, min(mu_ann_cap, mu_ann_raw)))
-            else:
-                mu_ann = mu_ann_raw
-            
-            return float(mu_ann), float(lr), float(tau)
-
-        mom_cfg = ((15, 0.35), (30, 0.30), (60, 0.25), (120, 0.10))
-        use_dual = str(os.environ.get("MU_ALPHA_DUAL_SPEED", "0")).strip().lower() in ("1", "true", "yes", "on")
-        try:
-            fast_weight = float(os.environ.get("MU_ALPHA_FAST_WEIGHT", 0.6) or 0.6)
-        except Exception:
-            fast_weight = 0.6
-        fast_weight = float(max(0.0, min(1.0, fast_weight)))
-
-        def _parse_int_list(raw: str, default: Sequence[int]) -> list[int]:
-            if not raw:
-                return list(default)
-            out: list[int] = []
-            for part in raw.replace(";", ",").split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    v = int(float(part))
-                except Exception:
-                    continue
-                if v > 1:
-                    out.append(v)
-            return out or list(default)
-
-        def _parse_float_list(raw: str, default: Sequence[float]) -> list[float]:
-            if not raw:
-                return list(default)
-            out: list[float] = []
-            for part in raw.replace(";", ",").split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    v = float(part)
-                except Exception:
-                    continue
-                out.append(v)
-            return out or list(default)
-        mom_terms_w = []
-        mom_w = []
-        mom_each: Dict[str, Any] = {}
-        for w, wt in mom_cfg:
-            if n > int(w) + 1:
-                mu_w, lr_w, tau_w = _mom_mu_ann(int(w))
-                mom_each[f"mu_mom_{int(w)}"] = float(mu_w)
-                mom_each[f"lr_mom_{int(w)}"] = float(lr_w)
-                mom_each[f"tau_mom_{int(w)}_sec"] = float(tau_w)
-                mom_terms_w.append(float(mu_w) * float(wt))
-                mom_w.append(float(wt))
-        mu_mom = float(sum(mom_terms_w) / max(1e-12, float(sum(mom_w)))) if mom_terms_w else 0.0
-
-        mu_mom_fast = 0.0
-        mu_mom_slow = float(mu_mom)
-        mom_each_fast: Dict[str, Any] = {}
-        if use_dual:
-            fast_windows = _parse_int_list(os.environ.get("MU_ALPHA_FAST_WINDOWS", ""), (5, 10, 20, 40))
-            fast_weights = _parse_float_list(os.environ.get("MU_ALPHA_FAST_WEIGHTS", ""), (0.4, 0.3, 0.2, 0.1))
-            if len(fast_windows) != len(fast_weights):
-                if fast_windows:
-                    fast_weights = [1.0 / len(fast_windows)] * len(fast_windows)
-                else:
-                    fast_weights = []
-            mom_terms_fast = []
-            mom_w_fast = []
-            for w, wt in zip(fast_windows, fast_weights):
-                if n > int(w) + 1:
-                    mu_w, lr_w, tau_w = _mom_mu_ann(int(w))
-                    mom_each_fast[f"mu_mom_fast_{int(w)}"] = float(mu_w)
-                    mom_each_fast[f"lr_mom_fast_{int(w)}"] = float(lr_w)
-                    mom_each_fast[f"tau_mom_fast_{int(w)}_sec"] = float(tau_w)
-                    mom_terms_fast.append(float(mu_w) * float(wt))
-                    mom_w_fast.append(float(wt))
-            if mom_terms_fast:
-                mu_mom_fast = float(sum(mom_terms_fast) / max(1e-12, float(sum(mom_w_fast))))
-            mu_mom = float((1.0 - fast_weight) * float(mu_mom_slow) + float(fast_weight) * float(mu_mom_fast))
-
-        # OFI는 매우 단기 알파로 취급 (연율로 스케일)
+        # OFI clipping
         try:
             ofi = float(ofi_score)
         except Exception:
             ofi = 0.0
         ofi = float(max(-1.0, min(1.0, ofi)))
-        try:
-            ofi_scale = config.mu_ofi_scale
-        except Exception:
-            ofi_scale = 8.0
-        mu_ofi = float(ofi * ofi_scale)
 
-        r = str(regime or "").lower()
-
-        # Smooth regime scaling (always-on): use a continuous "chop_score" (0=trend, 1=chop)
-        # based on Kaufman efficiency ratio over recent window.
-        # This avoids hard-switch flicker at regime boundaries.
-        scale_min = config.mu_alpha_scale_min
-        scale_min = float(max(0.0, min(1.0, scale_min)))
-        chop_window_bars = config.mu_alpha_chop_window_bars
-        chop_window_bars = max(10, int(chop_window_bars))
-
+        # Kaufman Efficiency Ratio (0~1)
+        chop_window_bars = max(10, int(config.mu_alpha_chop_window_bars))
         er = None
         chop_score = None
         try:
@@ -231,130 +236,74 @@ class MonteCarloSignalFeaturesMixin:
             er = None
             chop_score = None
 
-        # Fallback if chop_score can't be computed (should be rare).
         if chop_score is None:
-            if r == "chop":
-                chop_score = 1.0
-            else:
-                chop_score = 0.0
+            chop_score = 1.0 if str(regime or "").lower() == "chop" else 0.0
 
-        regime_scale = float(1.0 - (1.0 - scale_min) * float(chop_score))
-
-        # Adaptive weighting (optional): vol이 낮으면 OFI 비중↑, vol이 높으면 모멘텀 비중↑
-        w_mom = 0.70
-        w_ofi = 0.30
+        # Volatility windows for adaptive weighting
         vol_short = None
         vol_long = None
-        vol_ratio = None
         try:
-            use_vol_adaptive = str(os.environ.get("MU_ALPHA_VOL_ADAPTIVE", "1")).strip().lower() in ("1", "true", "yes", "on")
+            x = np.asarray(closes, dtype=np.float64)
+            rets = np.diff(np.log(x))
+            if rets.size >= 5:
+                sb = min(int(config.mu_alpha_vol_short_bars), int(rets.size))
+                lb = min(int(config.mu_alpha_vol_long_bars), int(rets.size))
+                vol_short = float(np.std(rets[-sb:])) if sb >= 2 else None
+                vol_long = float(np.std(rets[-lb:])) if lb >= 2 else None
         except Exception:
-            use_vol_adaptive = True
-        try:
-            w_mom_base = config.mu_alpha_w_mom_base
-            w_mom_min = config.mu_alpha_w_mom_min
-            w_mom_max = config.mu_alpha_w_mom_max
-            if use_vol_adaptive:
-                short_bars = config.mu_alpha_vol_short_bars
-                long_bars = config.mu_alpha_vol_long_bars
-                short_bars = max(5, short_bars)
-                long_bars = max(short_bars, long_bars)
+            vol_short = None
+            vol_long = None
 
-                x = np.asarray(closes, dtype=np.float64)
-                rets = np.diff(np.log(x))
-                if rets.size >= 5:
-                    sb = min(int(short_bars), int(rets.size))
-                    lb = min(int(long_bars), int(rets.size))
-                    vol_short = float(np.std(rets[-sb:])) if sb >= 2 else None
-                    vol_long = float(np.std(rets[-lb:])) if lb >= 2 else None
-                    if vol_short is not None and vol_long is not None and vol_long > 1e-12:
-                        vol_ratio = float(vol_short / vol_long)
-                        # 변동성이 평소보다 크면 모멘텀 비중↑ (base*ratio)
-                        w_mom = float(max(w_mom_min, min(w_mom_max, w_mom_base * vol_ratio)))
-                        w_ofi = float(1.0 - w_mom)
-            else:
-                w_mom = float(max(w_mom_min, min(w_mom_max, w_mom_base)))
-                w_ofi = float(1.0 - w_mom)
-        except Exception:
-            # fallback to fixed weights
-            w_mom = 0.70
-            w_ofi = 0.30
+        current_vol = float(vol_short) if vol_short is not None else 0.0
+        long_term_vol = float(vol_long) if vol_long is not None else max(current_vol, 1e-9)
 
-        mu_alpha_raw = float(regime_scale * (w_mom * mu_mom + w_ofi * mu_ofi))
-        
-        # ✅ Apply dynamic scaling factor
-        scaling = config.alpha_scaling_factor
-        mu_alpha_raw_before = mu_alpha_raw
-        
-        # ✅ NEW: Trend strength boost - 추세가 강할수록 신호 증폭
-        # er (efficiency ratio)가 높으면 추세가 강함 → 부스터 적용
-        trend_boost = 1.0
-        if config.alpha_signal_boost and er is not None:
-            # er=1.0 (perfect trend) → boost=1.5, er=0.0 (chop) → boost=1.0
-            # Normalized from 2.0 max to 1.5 max for stability
-            trend_boost = 1.0 + 0.5 * float(er)  # 1.0 ~ 1.5
-        
-        mu_alpha_raw = mu_alpha_raw * scaling * trend_boost
-        
-        # Debug: Print scaling factor (first time only)
-        if not hasattr(config, '_scaling_logged'):
-            print(f"[ALPHA_SCALING_DEBUG] alpha_scaling_factor={scaling}, trend_boost={trend_boost:.2f}, mu_alpha_raw_before={mu_alpha_raw_before:.6f}, mu_alpha_raw_after={mu_alpha_raw:.6f}")
-            config._scaling_logged = True
+        base_params = {
+            "mu_mom_scale": float(os.environ.get("MU_MOM_SCALE", 10.0) or 10.0),
+            "mu_ofi_scale": float(getattr(config, "mu_ofi_scale", 10.0) or 10.0),
+            "mu_cap": float(config.mu_alpha_cap),
+            "mu_floor": float(config.mu_alpha_floor),
+            "boost_enabled": bool(config.alpha_signal_boost),
+            "alpha_scaling_factor": float(config.alpha_scaling_factor),
+            "chop_threshold": 0.3,
+        }
 
-        mu_cap = config.mu_alpha_cap
-        mu_floor = config.mu_alpha_floor
-        mu_alpha = float(mu_alpha_raw)
-        mu_alpha_clipped = False
-        
-        # Apply asymmetric bounds
-        if mu_alpha > mu_cap:
-            mu_alpha = mu_cap
-            mu_alpha_clipped = True
-        elif mu_alpha < mu_floor:
-            mu_alpha = mu_floor
-            mu_alpha_clipped = True
+        mu_alpha, dbg = _calculate_refined_mu_alpha_with_debug(
+            np.asarray(closes, dtype=np.float64),
+            ofi,
+            current_vol,
+            long_term_vol,
+            float(er or 0.0),
+            base_params,
+        )
 
         out: Dict[str, Any] = {
             "bar_seconds": float(bs),
             "n_closes": int(n),
             "regime": str(regime or ""),
-            "regime_scale": float(regime_scale),
             "er": float(er) if er is not None else None,
             "chop_score": float(chop_score) if chop_score is not None else None,
-            "scale_min": float(scale_min),
-            "w_mom": float(w_mom),
-            "w_ofi": float(w_ofi),
+            "ofi_score_clipped": float(ofi),
             "vol_short": float(vol_short) if vol_short is not None else None,
             "vol_long": float(vol_long) if vol_long is not None else None,
-            "vol_ratio": float(vol_ratio) if vol_ratio is not None else None,
-            "mu_mom_tau_floor_sec": config.mu_mom_tau_floor_sec,
-            "mu_mom_lr_cap": config.mu_mom_lr_cap,
-            "ofi_score_clipped": float(ofi),
-            "ofi_scale": float(ofi_scale),
-            "mu_ofi": float(mu_ofi),
-            "mu_mom": float(mu_mom),
-            "mu_mom_slow": float(mu_mom_slow),
-            "mu_mom_fast": float(mu_mom_fast),
-            "mu_alpha_fast_weight": float(fast_weight),
-            "mu_alpha_dual_speed": bool(use_dual),
-            "alpha_scaling_factor": float(scaling),
-            "trend_boost": float(trend_boost),
-            "mu_alpha_raw_before": float(mu_alpha_raw_before),
-            "mu_alpha_raw": float(mu_alpha_raw),
-            "mu_alpha_cap": float(mu_cap),
-            "mu_alpha_clipped": bool(mu_alpha_clipped),
+            "mu_mom": float(dbg.get("mu_mom", 0.0)),
+            "mu_ofi": float(dbg.get("mu_ofi", 0.0)),
+            "mu_alpha_raw": float(dbg.get("combined_raw", 0.0)),
+            "mu_alpha_cap": float(dbg.get("mu_alpha_cap", config.mu_alpha_cap)),
+            "mu_alpha_clipped": bool(dbg.get("mu_alpha_clipped", False)),
             "mu_alpha": float(mu_alpha),
+            "mu_alpha_accel_dampen": bool(dbg.get("accel_dampen", False)),
+            "mu_alpha_divergence": bool(dbg.get("divergence", False)),
+            "mu_alpha_w_mom": dbg.get("w_mom"),
+            "mu_alpha_w_ofi": dbg.get("w_ofi"),
+            "mu_alpha_vol_ratio": dbg.get("vol_ratio"),
+            "alpha_scaling_factor": float(dbg.get("alpha_scaling_factor", config.alpha_scaling_factor)),
         }
-        out.update(mom_each)
-        if mom_each_fast:
-            out.update(mom_each_fast)
-        
-        # Debug: Print mu_alpha calculation
+
         if MC_VERBOSE_PRINT:
             print(
-                f"[ALPHA_DEBUG] mu_mom={mu_mom:.6f} mu_ofi={mu_ofi:.6f} regime_scale={regime_scale:.2f} mu_alpha_raw={mu_alpha_raw:.6f} mu_alpha={mu_alpha:.6f}"
+                f"[ALPHA_DEBUG] mu_mom={out['mu_mom']:.6f} mu_ofi={out['mu_ofi']:.6f} mu_alpha_raw={out['mu_alpha_raw']:.6f} mu_alpha={out['mu_alpha']:.6f}"
             )
-        
+
         return out
 
     @staticmethod
