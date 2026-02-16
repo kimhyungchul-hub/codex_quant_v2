@@ -50,7 +50,9 @@ DASHBOARD_PORT = 9998
 FINDINGS_OUTPUT = os.path.join(PROJECT_ROOT, "docs", "RESEARCH_FINDINGS.md")
 FINDINGS_JSON = os.path.join(PROJECT_ROOT, "state", "research_findings.json")
 RESEARCH_CYCLES_JSON = os.path.join(PROJECT_ROOT, "state", "research_cycles.json")
+LAST_ANALYZED_JSON = os.path.join(PROJECT_ROOT, "state", "research_last_analyzed.json")
 MAX_CYCLE_HISTORY = 80
+MIN_NEW_TRADES_FOR_REANALYSIS = 3  # 최소 3개의 새 거래가 있어야 재분석
 
 
 def _load_cycle_history() -> list[dict]:
@@ -68,6 +70,33 @@ def _save_cycle_history(rows: list[dict]) -> None:
     p = Path(RESEARCH_CYCLES_JSON)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(rows[-MAX_CYCLE_HISTORY:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_last_analyzed() -> dict:
+    """Load last analyzed trade info (timestamp, trade count, hash)."""
+    p = Path(LAST_ANALYZED_JSON)
+    if not p.exists():
+        return {"last_trade_ts": 0, "last_trade_count": 0, "last_pnl_hash": ""}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"last_trade_ts": 0, "last_trade_count": 0, "last_pnl_hash": ""}
+
+
+def _save_last_analyzed(data: dict) -> None:
+    """Save last analyzed trade info."""
+    p = Path(LAST_ANALYZED_JSON)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _compute_trades_hash(trades: list) -> str:
+    """Compute a hash of trade PnLs to detect if data changed."""
+    import hashlib
+    if not trades:
+        return ""
+    pnl_str = ",".join([f"{getattr(t, 'realized_pnl', 0):.6f}" for t in trades[-50:]])
+    return hashlib.md5(pnl_str.encode()).hexdigest()[:12]
 
 
 def _get_latest_equity() -> float | None:
@@ -207,6 +236,41 @@ def run_cf_cycle(
             "last_update_ts": time.time(),
             "running": False,
         }
+
+    # ── Check for new trades to avoid repeated analysis ──
+    last_analyzed = _load_last_analyzed()
+    current_hash = _compute_trades_hash(trades)
+    current_count = len(trades)
+    latest_ts = max((getattr(t, "timestamp_ms", 0) for t in trades), default=0)
+    
+    new_trade_count = current_count - int(last_analyzed.get("last_trade_count", 0))
+    hash_changed = current_hash != last_analyzed.get("last_pnl_hash", "")
+    
+    if not hash_changed and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
+        logger.info(f"[SKIP] No significant new trades (new={new_trade_count}, min={MIN_NEW_TRADES_FOR_REANALYSIS}). Skipping CF cycle.")
+        run_cf_cycle._cycle = cycle_index
+        _update_dashboard({
+            "running": False,
+            "stage_current": "skipped",
+            "skip_reason": "no_new_trades",
+        })
+        return {
+            "status": "skipped_no_new_trades",
+            "cycle_count": cycle_index,
+            "cycle_started_ts": cycle_started_ts,
+            "last_update_ts": time.time(),
+            "running": False,
+            "new_trade_count": new_trade_count,
+            "min_required": MIN_NEW_TRADES_FOR_REANALYSIS,
+        }
+
+    # Update last analyzed info
+    _save_last_analyzed({
+        "last_trade_ts": latest_ts,
+        "last_trade_count": current_count,
+        "last_pnl_hash": current_hash,
+        "analyzed_at": time.time(),
+    })
 
     simulators = ALL_SIMULATORS
     if stage_filter:

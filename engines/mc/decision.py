@@ -154,9 +154,17 @@ class MonteCarloDecisionMixin:
         if "pmaker_entry" not in ctx:
             ctx["pmaker_entry"] = config.pmaker_prob
 
-        use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
+        # ══════════════════════════════════════════════════════════════════════
+        # [HYBRID UNIFIED SYSTEM] 진입/청산 로직 통일
+        # hybrid_only=True: 모든 청산규칙을 사전 MC 시뮬레이션 → 정확한 EV 산출
+        # 방향 결정: exp_vals (long vs short) 비교로 결정 (mu_alpha 부호 단독 결정 X)
+        # ══════════════════════════════════════════════════════════════════════
+        # Priority: env > config default (True)
         hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
-        hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+        if hybrid_only_env is not None:
+            hybrid_only = str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            hybrid_only = bool(config.mc_hybrid_only)  # default: True
 
         if hybrid_only:
             return self._decide_hybrid_only(ctx, params, seed, symbol, price, regime_ctx, boost_val)
@@ -364,12 +372,15 @@ class MonteCarloDecisionMixin:
         ) if horizons_short and ev_short_gross and cvar_short_gross else (0.0, 0.0)
 
         # ────────────────────────────────────────────────────────────────
-        # [FIX 2026-02-16] mu_alpha 부호 기반 방향 결정 (DirectionModel)
-        # 기존: score_long >= score_short → noise-dominated (EV 차이 ~0.001%p)
-        # 변경: mu_alpha 부호 + 다중 신호 합의 → 방향 결정
-        #       MC Ψ score → EV 크기 및 리스크 평가에만 사용
+        # [DEPRECATED] mu_alpha 부호 기반 방향 결정 (DirectionModel)
+        # NOTE: MC_HYBRID_ONLY=1 (기본)일 때는 이 경로 미사용
+        # hybrid 체계에서는 exp_vals 비교로 방향 결정 → 진입/청산 로직 일치
         # ────────────────────────────────────────────────────────────────
-        _use_direction_model = str(os.environ.get("USE_DIRECTION_MODEL", "1")).strip().lower() in ("1", "true", "yes", "on")
+        _use_direction_model_env = os.environ.get("USE_DIRECTION_MODEL")
+        if _use_direction_model_env is not None:
+            _use_direction_model = str(_use_direction_model_env).strip().lower() in ("1", "true", "yes", "on")
+        else:
+            _use_direction_model = bool(config.use_direction_model)  # default: False (hybrid 체계)
         
         if _use_direction_model:
             try:
@@ -2379,11 +2390,16 @@ class MonteCarloDecisionMixin:
                     pass
 
                 # ────────────────────────────────────────────────────────────────
-                # [FIX 2026-02-16] mu_alpha 부호 기반 방향 결정 (DirectionModel) — batch path
-                # 기존: score_long > score_short → noise-dominated (Dual-Path Sync)
+                # [DEPRECATED] mu_alpha 부호 기반 방향 결정 (DirectionModel) — batch path
+                # NOTE: MC_HYBRID_ONLY=1 (기본)일 때는 이 경로 미사용
+                # hybrid 체계에서는 exp_vals 비교로 방향 결정 → 진입/청산 로직 일치
                 # ────────────────────────────────────────────────────────────────
                 direction = 0
-                _batch_use_dir_model = str(os.environ.get("USE_DIRECTION_MODEL", "1")).strip().lower() in ("1", "true", "yes", "on")
+                _batch_dir_env = os.environ.get("USE_DIRECTION_MODEL")
+                if _batch_dir_env is not None:
+                    _batch_use_dir_model = str(_batch_dir_env).strip().lower() in ("1", "true", "yes", "on")
+                else:
+                    _batch_use_dir_model = bool(config.use_direction_model)  # default: False
                 if _batch_use_dir_model:
                     try:
                         from engines.mc.direction_model import compute_direction_override

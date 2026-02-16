@@ -1,6 +1,6 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-16 14:39
+> Auto-generated: 2026-02-16 15:01
 > Baseline: 4909 trades, PnL=$-59.16, WR=36.5%, R:R=1.48
 
 ## Pipeline Stage Impact Summary

@@ -44,6 +44,15 @@ class MCConfig:
     johnson_su_delta: float = field(default_factory=lambda: get_env_float("MC_JOHNSON_SU_DELTA", 1.0))
     skip_exit_policy: bool = field(default_factory=lambda: get_env_bool("SKIP_EXIT_POLICY", False))
     
+    # --- Hybrid Score System (unified direction/entry/exit decision) ---
+    # MC_HYBRID_ONLY=1: 진입/청산 로직을 hybrid 체계로 통일
+    # hybrid 체계는 LSM + Beam Search로 모든 청산규칙을 사전 시뮬레이션하여 EV 산출
+    mc_hybrid_only: bool = field(default_factory=lambda: get_env_bool("MC_HYBRID_ONLY", True))
+    # MC_USE_HYBRID_PLANNER: hybrid planner 활성화 (mc_hybrid_only=true면 자동 활성화)
+    mc_use_hybrid_planner: bool = field(default_factory=lambda: get_env_bool("MC_USE_HYBRID_PLANNER", True))
+    # USE_DIRECTION_MODEL=0: hybrid 체계에서는 exp_vals 비교로 방향 결정 (mu_alpha 부호 단독 결정 비활성화)
+    use_direction_model: bool = field(default_factory=lambda: get_env_bool("USE_DIRECTION_MODEL", False))
+    
     # --- Alpha / Signal Features ---
     # ALPHA_SIGNAL_BOOST: 신호 강화 모드 (true면 공격적 설정 적용)
     alpha_signal_boost: bool = field(default_factory=lambda: get_env_bool("ALPHA_SIGNAL_BOOST", False))

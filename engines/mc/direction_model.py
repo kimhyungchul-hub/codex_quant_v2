@@ -1,7 +1,16 @@
 """
 Direction Model: mu_alpha 부호 기반 방향 결정 + 보정된 확신도 모델
 
-## 구조적 문제 해결
+⚠️ DEPRECATED in Hybrid Score System (MC_HYBRID_ONLY=1)
+================================================================================
+Hybrid 체계(기본값)에서는 이 모델 대신 LSM exp_vals 비교로 방향을 결정합니다.
+- Hybrid: exp_vals[long] vs exp_vals[short] 직접 비교 → 진입/청산 로직 일치
+- Legacy: mu_alpha 부호 기반 → 진입/청산 불일치 가능
+
+USE_DIRECTION_MODEL=1로 설정하면 레거시 모드로 전환됩니다 (비권장).
+================================================================================
+
+## 구조적 문제 해결 (Legacy 모드)
 1. MC 시뮬레이션의 EV_long ≈ EV_short (drift negligible vs noise)
    - mu_alpha(연간화) / 31,536,000 = ~3e-7 per step drift
    - sigma * sqrt(dt) = ~9e-5 per step noise
