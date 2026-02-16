@@ -84,6 +84,10 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
       <div id="bestCF"></div>
     </div>
   </div>
+  <div class="card" style="margin-bottom:12px">
+    <h2>🧪 Applied Performance (Auto-Apply)</h2>
+    <div id="applyPerf"></div>
+  </div>
   <div class="card">
     <h2>🔬 Top Recommendations</h2>
     <div id="topRecommendations"></div>
@@ -186,6 +190,55 @@ function render(data) {
   tr.innerHTML = topN.map(f => `
     <div class="recommendation">${esc(f.recommendation||'No recommendation')}</div>
   `).join('') || '<span style="color:var(--text2)">Waiting for sweep results...</span>';
+
+  // Auto-apply performance
+  const ap = document.getElementById('applyPerf');
+  const history = Array.isArray(data.apply_history) ? data.apply_history : [];
+  const auto = data.auto_apply || {};
+  const monitoring = history.filter(h => h && h.status === 'monitoring');
+  const applied = history.filter(h => h && h.status === 'applied');
+  const rolled = history.filter(h => h && h.status === 'rolled_back');
+  const finalized = history.filter(h => h && (h.status === 'applied' || h.status === 'rolled_back'));
+  let avgDelta = null;
+  if (finalized.length > 0) {
+    const deltas = finalized
+      .map(h => Number(h.equity_after_monitor) - Number(h.equity_at_apply))
+      .filter(v => Number.isFinite(v));
+    if (deltas.length) avgDelta = deltas.reduce((a,b)=>a+b,0) / deltas.length;
+  }
+  const histRows = history.slice().reverse().slice(0, 8);
+  const fmtDelta = (h) => {
+    const a = Number(h.equity_at_apply);
+    const b = Number(h.equity_after_monitor);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return '-';
+    const d = b - a;
+    const sign = d >= 0 ? '+' : '';
+    return `${sign}$${d.toFixed(2)}`;
+  };
+  ap.innerHTML = `
+    <div style="margin-bottom:8px">
+      <span class="metric info">History=${history.length}</span>
+      <span class="metric neutral">Monitoring=${monitoring.length}</span>
+      <span class="metric good">Applied=${applied.length}</span>
+      <span class="metric bad">RolledBack=${rolled.length}</span>
+      <span class="metric ${avgDelta===null?'info':avgDelta>=0?'good':'bad'}">Avg ΔEq=${avgDelta===null?'-':(avgDelta>=0?'+':'')+'$'+avgDelta.toFixed(2)}</span>
+      <span class="metric info">LastAction=${esc(String(auto.last_action||'-'))}</span>
+    </div>
+    ${histRows.length ? `
+      <table>
+        <tr><th>Time</th><th>Finding</th><th>Stage</th><th>Status</th><th>ΔEquity</th></tr>
+        ${histRows.map(h => `
+          <tr>
+            <td>${new Date((Number(h.timestamp)||0)*1000).toLocaleString()}</td>
+            <td>${esc(h.finding_id||'-')}</td>
+            <td>${esc(h.stage||'-')}</td>
+            <td>${esc(h.status||'-')}</td>
+            <td style="color:${(fmtDelta(h).startsWith('+')?'var(--green)':fmtDelta(h).startsWith('-')?'var(--red)':'var(--text2)')}">${fmtDelta(h)}</td>
+          </tr>
+        `).join('')}
+      </table>
+    ` : '<span style="color:var(--text2)">No apply history yet</span>'}
+  `;
 
   // All findings
   const af = document.getElementById('allFindings');

@@ -534,7 +534,7 @@
         <table id="mktTable">
           <thead>
             <tr>
-              <th data-k="rank" title="TOP 필터 기준 순위(없으면 점수 순위)">RANK</th>
+              <th data-k="rank" title="TOP 필터 기준 순위(없으면 점수 순위), 괄호 값은 랭크 점수">RANK</th>
               <th data-k="symbol">SYM</th>
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
@@ -1476,18 +1476,20 @@
       data.forEach((d) => {
         const scoreRank = scoreRankMap.get(d.symbol) || null;
         d.score_rank = scoreRank;
+        d.rank_score = d._score_for_rank;
         // Keep rank consistent with engine top_n gate when available.
         if (d.top_n_active === true && isNum(d.top_n_rank)) d.rank = Number(d.top_n_rank);
         else d.rank = scoreRank;
       });
 
       data.sort((a, b) => {
-        const va = a[sortKey], vb = b[sortKey];
-        const na = (va === null || va === undefined) ? -Infinity : va;
-        const nb = (vb === null || vb === undefined) ? -Infinity : vb;
-        if (na < nb) return sortAsc ? -1 : 1;
-        if (na > nb) return sortAsc ? 1 : -1;
-        return 0;
+        const ar = isNum(a.rank) ? Number(a.rank) : Number.POSITIVE_INFINITY;
+        const br = isNum(b.rank) ? Number(b.rank) : Number.POSITIVE_INFINITY;
+        if (ar !== br) return ar - br;
+        const as = isNum(a.rank_score) ? Number(a.rank_score) : -Infinity;
+        const bs = isNum(b.rank_score) ? Number(b.rank_score) : -Infinity;
+        if (as !== bs) return bs - as;
+        return String(a.symbol || '').localeCompare(String(b.symbol || ''));
       });
 
       // ✅ smooth: reuse <tr> nodes, reorder with fragment
@@ -1525,7 +1527,10 @@
 
         // column mapping: rank, symbol, price, status, filter, ψ, ψ_hold, t*, kelly, roe%, lev
         c[0].className = 'mono';
-        c[0].innerHTML = isTop4 ? `<b style="color:var(--accent)">${r.rank}</b>` : (r.rank !== null && r.rank !== undefined ? String(r.rank) : '-');
+        const rankText = (r.rank !== null && r.rank !== undefined) ? String(r.rank) : '-';
+        const rankScoreText = isNum(r.rank_score) ? (Number(r.rank_score) * 100).toFixed(3) : '-';
+        const rankMain = isTop4 ? `<b style="color:var(--accent)">${rankText}</b>` : rankText;
+        c[0].innerHTML = `${rankMain}<div class="muted" style="font-size:11px;line-height:1.1">S:${rankScoreText}</div>`;
 
         c[1].className = 'mono';
         c[1].innerHTML = `<b>${r.symbol}</b>`;

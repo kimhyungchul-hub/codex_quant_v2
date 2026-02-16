@@ -98,6 +98,12 @@ def run_cf_cycle(
 
     elapsed = time.perf_counter() - t0
     findings = engine.get_top_findings(20)
+    apply_history_snapshot = []
+    try:
+        from research.auto_apply import get_apply_history
+        apply_history_snapshot = get_apply_history()
+    except Exception:
+        apply_history_snapshot = []
 
     result = {
         "status": "ok",
@@ -111,6 +117,7 @@ def run_cf_cycle(
         "findings": [asdict(f) for f in findings],
         "top_10": [asdict(f) for f in findings[:10]],
         "sweep_progress": sweep_progress,
+        "apply_history": apply_history_snapshot,
         "cycle_count": getattr(run_cf_cycle, "_cycle", 0),
         "last_update_ts": time.time(),
     }
