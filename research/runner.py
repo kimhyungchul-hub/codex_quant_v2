@@ -65,6 +65,24 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return bool(default)
 
 
+def _file_env_bool(name: str, default: bool = False) -> bool:
+    """Read boolean env from state/bybit.env when process env is not exported."""
+    try:
+        env_path = Path(PROJECT_ROOT) / "state" / "bybit.env"
+        if not env_path.exists():
+            return bool(default)
+        for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = raw.strip()
+            if (not s) or s.startswith("#") or ("=" not in s):
+                continue
+            k, v = s.split("=", 1)
+            if str(k).strip() == name:
+                return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return bool(default)
+    return bool(default)
+
+
 def _load_cycle_history() -> list[dict]:
     p = Path(RESEARCH_CYCLES_JSON)
     if not p.exists():
@@ -248,7 +266,7 @@ def run_cf_cycle(
         }
 
     # ── Check for new trades to avoid repeated analysis ──
-    always_run_cf = _env_bool("ALWAYS_RUN_CF", False)
+    always_run_cf = _env_bool("ALWAYS_RUN_CF", _file_env_bool("ALWAYS_RUN_CF", False))
     last_analyzed = _load_last_analyzed()
     current_hash = _compute_trades_hash(trades)
     current_count = len(trades)
