@@ -3356,6 +3356,8 @@ class LiveOrchestrator:
             except Exception:
                 curr_equity = float(self.balance or 0.0)
             self._write_json_atomic(self.state_files["balance"], curr_equity)
+            self._write_json_atomic(self.state_dir / "balance.json", curr_equity)
+            self._write_json_atomic(BASE_DIR / "balance.json", curr_equity)
         except Exception as e:
             self._log_err(f"[ERR] persist state (JSON): {e}")
         
