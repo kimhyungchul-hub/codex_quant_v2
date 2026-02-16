@@ -327,13 +327,23 @@ class MonteCarloDecisionMixin:
         cost_roe = float(cost_base * lev_val)
         cost_roe_exit = float(0.5 * cost_base * lev_val)
         rho_val = float(ctx_final.get("rho", config.unified_rho))
-        lambda_val = float(ctx_final.get("unified_lambda", config.unified_risk_lambda))
+
+        # ── RegimePolicy의 risk_lambda로 Ψ 계산 ──
+        try:
+            from engines.mc.regime_policy import get_regime_policy as _grp_dec
+        except ImportError:
+            from .regime_policy import get_regime_policy as _grp_dec
+        _dec_regime = str(ctx_final.get("regime") or "").strip().lower()
+        _dec_sigma = float(ctx_final.get("sigma") or 0.5)
+        _dec_rpol = _grp_dec(_dec_regime, _dec_sigma)
+        lambda_val = float(ctx_final.get("unified_lambda", _dec_rpol.risk_lambda))
 
         # Convert net cumulative vectors to gross for marginal extraction
         ev_long_gross = [v + cost_roe for v in ev_long]
         ev_short_gross = [v + cost_roe for v in ev_short]
-        cvar_long_gross = [v + cost_roe for v in cvar_long]
-        cvar_short_gross = [v + cost_roe for v in cvar_short]
+        # [FIX 2026-02-15] CVaR는 net 그대로 사용 (cost 가산 시 |CVaR| 축소 → Ψ 왜곡)
+        cvar_long_gross = list(cvar_long)
+        cvar_short_gross = list(cvar_short)
 
         score_long, t_long = _calc_unified_score(
             horizons_long, ev_long_gross, cvar_long_gross,
@@ -353,14 +363,76 @@ class MonteCarloDecisionMixin:
             cost=cost_roe_exit, rho=rho_val, lambda_param=lambda_val,
         ) if horizons_short and ev_short_gross and cvar_short_gross else (0.0, 0.0)
 
-        if score_long >= score_short:
-            best_score = float(score_long)
-            best_dir = 1
-            best_t = float(t_long)
+        # ────────────────────────────────────────────────────────────────
+        # [FIX 2026-02-16] mu_alpha 부호 기반 방향 결정 (DirectionModel)
+        # 기존: score_long >= score_short → noise-dominated (EV 차이 ~0.001%p)
+        # 변경: mu_alpha 부호 + 다중 신호 합의 → 방향 결정
+        #       MC Ψ score → EV 크기 및 리스크 평가에만 사용
+        # ────────────────────────────────────────────────────────────────
+        _use_direction_model = str(os.environ.get("USE_DIRECTION_MODEL", "1")).strip().lower() in ("1", "true", "yes", "on")
+        
+        if _use_direction_model:
+            try:
+                from engines.mc.direction_model import compute_direction_override
+                _mu_alpha_for_dir = float(metrics.get("mu_alpha", ctx_final.get("mu_alpha", 0.0)) or 0.0)
+                _dir_result = compute_direction_override(
+                    mu_alpha=_mu_alpha_for_dir,
+                    meta=metrics,
+                    ctx=ctx_final,
+                    score_long=float(score_long),
+                    score_short=float(score_short),
+                    ev_long=float(ev_long_gross[0]) if ev_long_gross else 0.0,
+                    ev_short=float(ev_short_gross[0]) if ev_short_gross else 0.0,
+                )
+                best_dir = int(_dir_result["direction"])
+                # EV 크기는 선택된 방향의 Ψ score 사용
+                if best_dir == 1:
+                    best_score = float(score_long)
+                    best_t = float(t_long)
+                else:
+                    best_score = float(score_short)
+                    best_t = float(t_short)
+                # [FIX 2026-02-16] MC win_rate 보존 — DirectionModel confidence는 별도 키로 저장
+                # win_value(=MC win_rate)를 덮어쓰지 않음. sizing/leverage는 MC win_rate 기반
+                metrics["direction_confidence"] = float(_dir_result["confidence"])
+                metrics["direction_model_used"] = True
+                metrics["direction_model_source"] = str(_dir_result.get("direction_source", "unknown"))
+                metrics["direction_model_consensus"] = float(_dir_result.get("consensus_score", 0.0))
+                metrics["direction_model_agreement"] = bool(_dir_result.get("agreement", True))
+                metrics["direction_model_signal_count"] = int(_dir_result.get("signal_count", 0))
+                metrics["direction_model_raw_conf"] = float(_dir_result.get("raw_confidence", _dir_result["confidence"]))
+                metrics["mu_dir_conf"] = float(_dir_result["confidence"])
+                metrics["mu_dir_prob_long"] = float(0.5 + 0.5 * _dir_result.get("consensus_score", 0.0))
+                if _throttled_log(symbol, "DIR_MODEL", 30000):
+                    print(
+                        f"[DIR_MODEL] {symbol} dir={best_dir} "
+                        f"src={_dir_result.get('direction_source')} "
+                        f"consensus={_dir_result.get('consensus_score', 0):.3f} "
+                        f"conf={_dir_result['confidence']:.3f} "
+                        f"agree={_dir_result.get('agreement')} "
+                        f"mu={_mu_alpha_for_dir:.4f} "
+                        f"Ψ_L={score_long:.6f} Ψ_S={score_short:.6f}"
+                    )
+            except Exception as _dir_err:
+                print(f"[DIR_MODEL] {symbol} fallback to Ψ comparison: {_dir_err}")
+                if score_long >= score_short:
+                    best_score = float(score_long)
+                    best_dir = 1
+                    best_t = float(t_long)
+                else:
+                    best_score = float(score_short)
+                    best_dir = -1
+                    best_t = float(t_short)
         else:
-            best_score = float(score_short)
-            best_dir = -1
-            best_t = float(t_short)
+            # 기존 로직 (noise-dominated Ψ 비교)
+            if score_long >= score_short:
+                best_score = float(score_long)
+                best_dir = 1
+                best_t = float(t_long)
+            else:
+                best_score = float(score_short)
+                best_dir = -1
+                best_t = float(t_short)
 
         ev_expected = _pick_ev_expected(metrics, best_dir)
 
@@ -371,7 +443,7 @@ class MonteCarloDecisionMixin:
         elif pos_side == -1:
             hold_score = float(score_short_hold)
 
-        entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+        entry_floor = float(_dec_rpol.entry_floor)
         if config.score_only_mode:
             if best_dir == 1:
                 action = "LONG"
@@ -1656,6 +1728,20 @@ class MonteCarloDecisionMixin:
             force_ev = str(os.environ.get("FORCE_EV_DIRECTION", "0")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             force_ev = False
+
+        # [FIX 2026-02-16] Chop regime에서 FORCE_EV_DIRECTION 비활성화
+        # CF evidence: chop에서 MC EV 차이가 미미하여 FORCE_EV가 랜덤에 가까운 방향 선택을 유발
+        # mu_alpha mean=-26.4 (bearish) 인데 74% LONG 진입 → FORCE_EV가 원인
+        if force_ev:
+            regime_for_ev = str(ctx.get("regime", "chop"))
+            if regime_for_ev in ("chop",):
+                try:
+                    force_ev_chop = str(os.environ.get("FORCE_EV_DIRECTION_CHOP", "0")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    force_ev_chop = False
+                if not force_ev_chop:
+                    force_ev = False
+
         if force_ev:
             try:
                 ctx_ev = dict(ctx)
@@ -2235,7 +2321,10 @@ class MonteCarloDecisionMixin:
                         cost_roe_full = float(cost_base * lev_val)
                         cost_roe_exit = float(0.5 * cost_roe_full)
                         rho_val = float(src.get("unified_rho", config.unified_rho))
-                        lambda_val = float(src.get("unified_lambda", config.unified_risk_lambda))
+                        _db_regime = str(ctx.get("regime") or "").strip().lower()
+                        _db_sigma = float(ctx.get("sigma") or 0.5)
+                        _db_rpol = _grp_dec(_db_regime, _db_sigma)
+                        lambda_val = float(src.get("unified_lambda", _db_rpol.risk_lambda))
                         ev_long_gross = [v + cost_roe_full for v in ev_long_vec]
                         ev_short_gross = [v + cost_roe_full for v in ev_short_vec]
                         cvar_long_gross = [v + cost_roe_full for v in cvar_long_vec]
@@ -2270,7 +2359,10 @@ class MonteCarloDecisionMixin:
                             cost_base = float(src.get("fee_roundtrip_total", metrics.get("fee_roundtrip_total", 0.0)) or 0.0)
                             cost_roe_full = float(cost_base * lev_val)
                             rho_val = float(src.get("unified_rho", config.unified_rho))
-                            lambda_val = float(src.get("unified_lambda", config.unified_risk_lambda))
+                            _db2_regime = str(ctx.get("regime") or "").strip().lower()
+                            _db2_sigma = float(ctx.get("sigma") or 0.5)
+                            _db2_rpol = _grp_dec(_db2_regime, _db2_sigma)
+                            lambda_val = float(src.get("unified_lambda", _db2_rpol.risk_lambda))
                             ev_long_gross = [v + cost_roe_full for v in ev_long_vec]
                             ev_short_gross = [v + cost_roe_full for v in ev_short_vec]
                             cvar_long_gross = [v + cost_roe_full for v in cvar_long_vec]
@@ -2286,18 +2378,68 @@ class MonteCarloDecisionMixin:
                 except Exception:
                     pass
 
+                # ────────────────────────────────────────────────────────────────
+                # [FIX 2026-02-16] mu_alpha 부호 기반 방향 결정 (DirectionModel) — batch path
+                # 기존: score_long > score_short → noise-dominated (Dual-Path Sync)
+                # ────────────────────────────────────────────────────────────────
                 direction = 0
-                if score_long > score_short:
-                    direction = 1
-                elif score_short > score_long:
-                    direction = -1
-                elif policy_score > 0:
-                    direction = 1
-                elif policy_score < 0:
-                    direction = -1
+                _batch_use_dir_model = str(os.environ.get("USE_DIRECTION_MODEL", "1")).strip().lower() in ("1", "true", "yes", "on")
+                if _batch_use_dir_model:
+                    try:
+                        from engines.mc.direction_model import compute_direction_override
+                        _bmu = float(ctx.get("mu_alpha", 0.0) or 0.0)
+                        _bdir_result = compute_direction_override(
+                            mu_alpha=_bmu,
+                            meta=metrics,
+                            ctx=ctx,
+                            score_long=float(score_long),
+                            score_short=float(score_short),
+                            ev_long=float(metrics.get("ev_long", 0.0) or 0.0),
+                            ev_short=float(metrics.get("ev_short", 0.0) or 0.0),
+                        )
+                        direction = int(_bdir_result["direction"])
+                        metrics["direction_model_used"] = True
+                        metrics["direction_model_source"] = str(_bdir_result.get("direction_source", "unknown"))
+                        metrics["direction_model_consensus"] = float(_bdir_result.get("consensus_score", 0.0))
+                        metrics["direction_model_agreement"] = bool(_bdir_result.get("agreement", True))
+                        metrics["direction_model_signal_count"] = int(_bdir_result.get("signal_count", 0))
+                        metrics["direction_model_raw_conf"] = float(_bdir_result.get("raw_confidence", _bdir_result["confidence"]))
+                        metrics["mu_dir_conf"] = float(_bdir_result["confidence"])
+                        metrics["mu_dir_prob_long"] = float(0.5 + 0.5 * _bdir_result.get("consensus_score", 0.0))
+                        # Throttled logging
+                        if _throttled_log(sym, "DIR_MODEL_BATCH", 30000):
+                            print(
+                                f"[DIR_MODEL] {sym} dir={direction} "
+                                f"src={_bdir_result.get('direction_source')} "
+                                f"consensus={_bdir_result.get('consensus_score', 0):.3f} "
+                                f"conf={_bdir_result['confidence']:.3f} "
+                                f"mu={_bmu:.4f} "
+                                f"Ψ_L={score_long:.6f} Ψ_S={score_short:.6f}"
+                            )
+                    except Exception as _bdir_err:
+                        print(f"[DIR_MODEL] {sym} batch fallback: {_bdir_err}")
+                        if score_long > score_short:
+                            direction = 1
+                        elif score_short > score_long:
+                            direction = -1
+                        elif policy_score > 0:
+                            direction = 1
+                        elif policy_score < 0:
+                            direction = -1
+                else:
+                    if score_long > score_short:
+                        direction = 1
+                    elif score_short > score_long:
+                        direction = -1
+                    elif policy_score > 0:
+                        direction = 1
+                    elif policy_score < 0:
+                        direction = -1
 
-                # Refresh policy_score after any recompute
-                policy_score = float(score_long) if float(score_long) >= float(score_short) else float(score_short)
+                # Refresh policy_score — MUST match DirectionModel's chosen direction
+                # [FIX 2026-02-16] 이전: max(score_long, score_short) → 방향과 무관한 score 사용
+                # 수정: DirectionModel이 선택한 방향의 Ψ score 사용
+                policy_score = float(score_long) if direction == 1 else float(score_short)
 
                 ev_expected = _pick_ev_expected(metrics, direction)
 
@@ -2325,6 +2467,10 @@ class MonteCarloDecisionMixin:
                 metric_copy["unified_score"] = policy_score
                 metric_copy["unified_score_long"] = float(score_long)
                 metric_copy["unified_score_short"] = float(score_short)
+                if metrics.get("direction_model_used"):
+                    metric_copy["direction_model_consensus"] = float(metrics.get("direction_model_consensus", 0.0))
+                    metric_copy["direction_model_source"] = str(metrics.get("direction_model_source", ""))
+                    metric_copy["direction_confidence"] = float(metrics.get("mu_dir_conf", 0.5))
 
                 pos_side = int(ctx.get("position_side", 0) or 0)
                 if hold_score is None:

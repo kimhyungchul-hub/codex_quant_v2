@@ -48,17 +48,21 @@ class MCConfig:
     # ALPHA_SIGNAL_BOOST: 신호 강화 모드 (true면 공격적 설정 적용)
     alpha_signal_boost: bool = field(default_factory=lambda: get_env_bool("ALPHA_SIGNAL_BOOST", False))
     # mu_alpha_cap: 연율 기대수익 상한
-    mu_alpha_cap: float = field(default_factory=lambda: get_env_float("MU_ALPHA_CAP", 15.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 5.0))
-    # alpha_scaling_factor: 신호 강화 시 1.5, 기본 1.0 (normalized from 3.0)
-    alpha_scaling_factor: float = field(default_factory=lambda: get_env_float("ALPHA_SCALING_FACTOR", 1.5 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 1.0))
+    # [FIX 2026-02-09] 15→5: ±15 포화(97.6% pegging) 방지. 방향 gradient 유지
+    mu_alpha_cap: float = field(default_factory=lambda: get_env_float("MU_ALPHA_CAP", 5.0))
+    # alpha_scaling_factor: 신호 배율
+    # [FIX 2026-02-09] BOOST 모드 1.5→1.2: cap 축소에 맞춰 과도한 스케일링 방지
+    alpha_scaling_factor: float = field(default_factory=lambda: get_env_float("ALPHA_SCALING_FACTOR", 1.2 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 1.0))
     mu_mom_lr_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_LR_CAP", 0.15 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 0.10))
     mu_mom_tau_floor_sec: float = field(default_factory=lambda: get_env_float("MU_MOM_TAU_FLOOR_SEC", 900.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 1800.0))
     # mu_mom_ann_cap: 연율 모멘텀 상한 (신호 강화 시 10.0)
     mu_mom_ann_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_ANN_CAP", 10.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 3.0))
     # mu_alpha_floor: mu_alpha 하한
-    mu_alpha_floor: float = field(default_factory=lambda: get_env_float("MU_ALPHA_FLOOR", -10.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else -3.0))
-    # mu_ofi_scale: OFI의 연율 알파 변환 계수 (신호 강화 시 15.0, normalized from 30.0)
-    mu_ofi_scale: float = field(default_factory=lambda: get_env_float("MU_OFI_SCALE", 15.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 10.0))
+    # [FIX 2026-02-09] -10→-5: cap과 대칭 유지
+    mu_alpha_floor: float = field(default_factory=lambda: get_env_float("MU_ALPHA_FLOOR", -5.0))
+    # mu_ofi_scale: OFI의 연율 알파 변환 계수
+    # [FIX 2026-02-09] 15→8: OFI 0.3만으로도 mu_ofi=4.5→cap 미도달. Gradient 보존
+    mu_ofi_scale: float = field(default_factory=lambda: get_env_float("MU_OFI_SCALE", 8.0))
     mu_alpha_scale_min: float = field(default_factory=lambda: get_env_float("MU_ALPHA_SCALE_MIN", 0.5))
     mu_alpha_chop_window_bars: int = field(default_factory=lambda: get_env_int("MU_ALPHA_CHOP_WINDOW_BARS", 60))
     mu_alpha_w_mom_base: float = field(default_factory=lambda: get_env_float("MU_ALPHA_W_MOM_BASE", 0.50))
@@ -123,7 +127,7 @@ class MCConfig:
     hurst_low: float = field(default_factory=lambda: get_env_float("HURST_LOW", 0.45))
     hurst_high: float = field(default_factory=lambda: get_env_float("HURST_HIGH", 0.55))
     hurst_trend_boost: float = field(default_factory=lambda: get_env_float("HURST_TREND_BOOST", 1.15))
-    hurst_random_dampen: float = field(default_factory=lambda: get_env_float("HURST_RANDOM_DAMPEN", 0.25))
+    hurst_random_dampen: float = field(default_factory=lambda: get_env_float("HURST_RANDOM_DAMPEN", 0.75))
     ou_theta: float = field(default_factory=lambda: get_env_float("OU_THETA", 0.3))
     ou_weight: float = field(default_factory=lambda: get_env_float("OU_WEIGHT", 0.7))
     ou_mean_window: int = field(default_factory=lambda: get_env_int("OU_MEAN_WINDOW", 60))

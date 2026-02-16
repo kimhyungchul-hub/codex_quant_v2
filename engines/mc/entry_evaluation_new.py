@@ -400,22 +400,93 @@ class MonteCarloEntryEvaluationMixin:
             use_dir_corr = False
         if use_dir_corr:
             dir_edge = _s(ctx.get("mu_dir_edge"), 0.0)
-            dir_conf = _s(ctx.get("mu_dir_conf"), abs(dir_edge))
-            dir_prob_long = _s(ctx.get("mu_dir_prob_long"), 0.5)
+            dir_prob_long = float(max(0.0, min(1.0, _s(ctx.get("mu_dir_prob_long"), 0.5))))
+            dir_conf_ctx = _s(ctx.get("mu_dir_conf"), abs(dir_edge))
+            dir_conf_prob = float(max(dir_prob_long, 1.0 - dir_prob_long))
+            try:
+                conf_source = str(os.environ.get("ALPHA_DIRECTION_CONF_SOURCE", "auto")).strip().lower()
+            except Exception:
+                conf_source = "auto"
+            try:
+                conf_mismatch_tol = float(os.environ.get("ALPHA_DIRECTION_CONF_MISMATCH_TOL", 0.08) or 0.08)
+            except Exception:
+                conf_mismatch_tol = 0.08
+            conf_mismatch_tol = float(max(0.0, min(0.5, conf_mismatch_tol)))
+            dir_conf_recomputed = False
+            if conf_source == "probability":
+                dir_conf = float(dir_conf_prob)
+                dir_conf_recomputed = True
+            elif conf_source == "context":
+                dir_conf = float(dir_conf_ctx)
+            else:
+                if (not math.isfinite(float(dir_conf_ctx))) or (abs(float(dir_conf_ctx) - float(dir_conf_prob)) > float(conf_mismatch_tol)):
+                    dir_conf = float(dir_conf_prob)
+                    dir_conf_recomputed = True
+                else:
+                    dir_conf = float(dir_conf_ctx)
             dir_strength = float(getattr(config, "alpha_direction_strength", 0.6))
-            dir_conf_th = float(getattr(config, "alpha_direction_min_confidence", 0.55))
+            reg_now = str(regime_ctx or "").strip().lower()
+            reg_key = "CHOP"
+            if reg_now == "trend":
+                reg_key = "TREND"
+            elif reg_now in ("volatile", "random", "noise"):
+                reg_key = "VOLATILE"
+            try:
+                reg_strength_raw = os.environ.get(f"ALPHA_DIRECTION_STRENGTH_{reg_key}")
+                if reg_strength_raw is None or str(reg_strength_raw).strip() == "":
+                    reg_strength_raw = os.environ.get("ALPHA_DIRECTION_STRENGTH")
+                if reg_strength_raw is not None and str(reg_strength_raw).strip() != "":
+                    dir_strength = float(reg_strength_raw)
+            except Exception:
+                pass
+            try:
+                dir_conf_th_reg = os.environ.get(f"ALPHA_DIRECTION_MIN_CONFIDENCE_{reg_key}")
+                if dir_conf_th_reg is None or str(dir_conf_th_reg).strip() == "":
+                    dir_conf_th_reg = os.environ.get("ALPHA_DIRECTION_MIN_CONFIDENCE")
+                if dir_conf_th_reg is not None and str(dir_conf_th_reg).strip() != "":
+                    dir_conf_th = float(dir_conf_th_reg)
+                else:
+                    dir_conf_th = float(getattr(config, "alpha_direction_min_confidence", 0.55))
+            except Exception:
+                dir_conf_th = float(getattr(config, "alpha_direction_min_confidence", 0.55))
             dir_conf_floor = float(getattr(config, "alpha_direction_confidence_floor", 0.45))
             dir_conf_th = float(max(dir_conf_th, dir_conf_floor))
             dir_conf = float(max(0.0, min(1.0, dir_conf)))
+            try:
+                chop_penalty = float(os.environ.get("ALPHA_DIRECTION_CHOP_CONF_PENALTY", 0.06) or 0.06)
+            except Exception:
+                chop_penalty = 0.06
+            try:
+                trend_boost = float(os.environ.get("ALPHA_DIRECTION_TREND_CONF_BOOST", 0.04) or 0.04)
+            except Exception:
+                trend_boost = 0.04
+            try:
+                volatile_penalty = float(os.environ.get("ALPHA_DIRECTION_VOLATILE_CONF_PENALTY", 0.03) or 0.03)
+            except Exception:
+                volatile_penalty = 0.03
+            dir_conf_eff = float(dir_conf)
+            if reg_key == "CHOP":
+                dir_conf_eff = float(max(0.0, dir_conf_eff - max(0.0, chop_penalty)))
+            elif reg_key == "TREND":
+                dir_conf_eff = float(min(1.0, dir_conf_eff + max(0.0, trend_boost)))
+            elif reg_key == "VOLATILE":
+                dir_conf_eff = float(max(0.0, dir_conf_eff - max(0.0, volatile_penalty)))
             dir_blend = 0.0
-            if abs(dir_edge) > 0.0 and dir_conf >= dir_conf_th and dir_strength > 0.0:
+            if abs(dir_edge) > 0.0 and dir_conf_eff >= dir_conf_th and dir_strength > 0.0:
                 # Blend current mu toward classifier-indicated direction, but keep magnitude anchored.
                 dir_target = math.copysign(abs(mu_alpha_raw), float(dir_edge))
-                dir_blend = float(min(1.0, max(0.0, dir_strength * dir_conf)))
+                dir_blend = float(min(1.0, max(0.0, dir_strength * dir_conf_eff)))
                 mu_alpha_raw = float((1.0 - dir_blend) * float(mu_alpha_raw) + dir_blend * float(dir_target))
             mu_alpha_parts["mu_dir_prob_long"] = float(dir_prob_long)
             mu_alpha_parts["mu_dir_edge"] = float(dir_edge)
             mu_alpha_parts["mu_dir_conf"] = float(dir_conf)
+            mu_alpha_parts["mu_dir_conf_ctx"] = float(dir_conf_ctx)
+            mu_alpha_parts["mu_dir_conf_prob"] = float(dir_conf_prob)
+            mu_alpha_parts["mu_dir_conf_eff"] = float(dir_conf_eff)
+            mu_alpha_parts["mu_dir_conf_source"] = str(conf_source)
+            mu_alpha_parts["mu_dir_conf_recomputed"] = bool(dir_conf_recomputed)
+            mu_alpha_parts["mu_dir_regime_key"] = str(reg_key)
+            mu_alpha_parts["mu_dir_strength_eff"] = float(dir_strength)
             mu_alpha_parts["mu_dir_conf_min_required"] = float(dir_conf_th)
             mu_alpha_parts["mu_dir_blend"] = float(dir_blend)
         mu_alpha_parts["mu_alpha_raw"] = float(mu_alpha_raw)

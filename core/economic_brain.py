@@ -97,14 +97,9 @@ class EconomicBrain:
         lambda_param: float,
     ) -> tuple[float, float]:
         """
-        Unified Psi score based on marginal utility flow.
+        Ratio-based Ψ score for entry evaluation.
 
-        Inputs:
-          - cumulative_ev/cumulative_cvar: cumulative (to-horizon) EV/CVaR vectors.
-          - cost: one-time transaction cost (ROE units, leverage-adjusted).
-
-        Returns:
-          - (best_score, t_star)
+        Ψ(h) = (EV(h) - C) / (|CVaR(h)| × (1+λ) + ε) × (1/√h)
         """
         if horizons_sec is None or cumulative_ev is None or cumulative_cvar is None:
             return 0.0, 0.0
@@ -120,17 +115,13 @@ class EconomicBrain:
         ev = ev[:n]
         cv = cv[:n]
 
-        dt = np.diff(h, prepend=0.0)
-        safe_dt = np.where(dt > 0.0, dt, 1.0)
-        marginal_ev = np.diff(ev, prepend=0.0) / safe_dt
-        marginal_cvar = np.diff(cv, prepend=0.0) / safe_dt
-
-        utility_rate = marginal_ev - float(lambda_param) * np.abs(marginal_cvar)
+        # Ratio-based Ψ
+        ev_net = ev - float(cost)
+        cvar_abs = np.abs(cv) + 1e-8
+        denominator = cvar_abs * (1.0 + float(lambda_param))
+        time_w = 1.0 / np.sqrt(np.maximum(h, 1.0))
         discount = np.exp(-float(rho) * h)
-        gross_napv = np.cumsum((utility_rate - float(rho)) * discount * dt)
-
-        denom = np.where(h > 0.0, h, 1.0)
-        psi_score = (gross_napv - float(cost)) / denom
+        psi_score = (ev_net / denominator) * time_w * discount
 
         best_idx = int(np.argmax(psi_score))
         return float(psi_score[best_idx]), float(h[best_idx])

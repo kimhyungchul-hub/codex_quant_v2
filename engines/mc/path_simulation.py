@@ -17,6 +17,58 @@ from engines.mc.params import JOHNSON_SU_GAMMA, JOHNSON_SU_DELTA
 logger = logging.getLogger(__name__)
 
 
+# ── Ornstein-Uhlenbeck (OU) Process helpers ──────────────────────
+# dX_t = theta * (mu - X_t) * dt + sigma * dW_t
+# Used for chop/mean-reversion regime: prices oscillate around a mean
+# instead of drifting indefinitely (GBM).
+
+def _ou_paths_numpy(
+    s0: float,
+    mu_level: float,
+    theta: float,
+    sigma: float,
+    n_paths: int,
+    n_steps: int,
+    dt: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Generate OU price paths (NumPy).  Returns shape (n_paths, n_steps+1)."""
+    paths = np.empty((n_paths, n_steps + 1), dtype=np.float64)
+    paths[:, 0] = s0
+    sqrt_dt = math.sqrt(dt)
+    z = rng.standard_normal((n_paths, n_steps))
+    for t in range(n_steps):
+        x = paths[:, t]
+        dx = theta * (mu_level - x) * dt + sigma * x * sqrt_dt * z[:, t]
+        paths[:, t + 1] = np.maximum(x + dx, s0 * 0.01)  # floor at 1% of s0
+    return paths
+
+
+def _ou_paths_torch(
+    s0: float,
+    mu_level: float,
+    theta: float,
+    sigma: float,
+    n_paths: int,
+    n_steps: int,
+    dt: float,
+    seed: int,
+    device,
+) -> "torch.Tensor":
+    """Generate OU price paths (PyTorch GPU).  Returns shape (n_paths, n_steps+1)."""
+    sqrt_dt = math.sqrt(dt)
+    torch.manual_seed(seed & 0xFFFFFFFF)
+    z = torch.randn(n_paths, n_steps, device=device, dtype=torch.float32)
+    paths = torch.empty(n_paths, n_steps + 1, device=device, dtype=torch.float32)
+    paths[:, 0] = s0
+    floor_val = s0 * 0.01
+    for t in range(n_steps):
+        x = paths[:, t]
+        dx = theta * (mu_level - x) * dt + sigma * x * sqrt_dt * z[:, t]
+        paths[:, t + 1] = torch.clamp(x + dx, min=floor_val)
+    return paths
+
+
 def _simulate_paths_price_jax_core(
     key,
     s0: float,
@@ -152,6 +204,48 @@ else:  # pragma: no cover
 
 
 class MonteCarloPathSimulationMixin:
+
+    # ── OU Process simulation (Chop 레짐 전용) ──
+    def simulate_paths_ou(
+        self,
+        *,
+        seed: int,
+        s0: float,
+        mu_level: float,
+        theta: float,
+        sigma: float,
+        n_paths: int,
+        n_steps: int,
+        dt: float,
+    ) -> np.ndarray:
+        """
+        Ornstein-Uhlenbeck 프로세스 기반 가격 경로 생성.
+        횡보장(Chop)에서 가격이 mu_level(박스권 중심) 주위를 진동하는 모델.
+        dX_t = θ(μ - X_t)dt + σ·X_t·dW_t  (multiplicative OU)
+
+        Returns: shape (n_paths, n_steps+1)
+        """
+        use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK and not DEV_MODE
+        if use_torch:
+            try:
+                device = get_torch_device()
+                if device is None:
+                    raise RuntimeError("torch device unavailable")
+                paths_t = _ou_paths_torch(
+                    s0, mu_level, theta, sigma,
+                    int(n_paths), int(n_steps), float(dt),
+                    int(seed), device,
+                )
+                return to_numpy(paths_t).astype(np.float64)
+            except Exception as e:
+                logger.warning(f"[MC_OU] Torch OU simulation failed, fallback NumPy: {e}")
+
+        rng = np.random.default_rng(int(seed) & 0xFFFFFFFF)
+        return _ou_paths_numpy(
+            s0, mu_level, theta, sigma,
+            int(n_paths), int(n_steps), float(dt), rng,
+        )
+
     def simulate_paths_price(
         self,
         *,
@@ -165,6 +259,9 @@ class MonteCarloPathSimulationMixin:
         return_jax: bool = False,
         return_torch: bool = False,
         return_stats: bool = False,
+        regime: str = "",
+        ou_theta: float = 0.0,
+        ou_mu_level: float = 0.0,
     ) -> np.ndarray | jnp.ndarray:
         """
         1초 단위 가격 경로를 생성한다 (JAX JIT 최적화 버전).
@@ -172,7 +269,26 @@ class MonteCarloPathSimulationMixin:
           paths[:,0] = s0 (t=0), paths[:,t] = price at t seconds
         - tail mode: gaussian | student_t | bootstrap | johnson_su
         - return_stats=True 시 control variate 기반 평균(cv_mean) 포함
+        - regime="chop" + ou_theta>0 → OU Process 사용 (평균 회귀)
         """
+        # ── Chop 레짐 OU Process 분기 ──
+        use_ou = (
+            regime in ("chop", "mean_revert")
+            and ou_theta > 0
+            and str(os.environ.get("MC_USE_OU_CHOP", "1")).strip().lower() in ("1", "true", "yes", "on")
+        )
+        if use_ou:
+            mu_level = ou_mu_level if ou_mu_level > 0 else s0
+            paths = self.simulate_paths_ou(
+                seed=seed, s0=s0, mu_level=mu_level,
+                theta=ou_theta, sigma=sigma,
+                n_paths=n_paths, n_steps=n_steps, dt=dt,
+            )
+            if return_stats:
+                stats = {"raw_mean": float(np.mean(paths[:, -1])), "cv_mean": float(np.mean(paths[:, -1])), "c_opt": 0.0}
+                return paths, stats
+            return paths
+
         n_paths_i = int(max(1, int(n_paths)))
         n_steps_i = int(max(1, int(n_steps)))
         mode = str(getattr(self, "_tail_mode", self.default_tail_mode))

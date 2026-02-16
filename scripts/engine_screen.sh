@@ -9,6 +9,7 @@ PY_BIN="${ENGINE_PY_BIN:-$ROOT_DIR/.venv/bin/python}"
 PID_FILE="${ENGINE_PID_FILE:-$ROOT_DIR/engine.pid}"
 LOG_FILE="${ENGINE_LOG_FILE:-$ROOT_DIR/state/codex_engine.log}"
 PORT="${ENGINE_PORT:-9999}"
+HEALTH_TIMEOUT_SEC="${ENGINE_HEALTH_TIMEOUT_SEC:-90}"
 
 usage() {
   cat <<'EOF'
@@ -33,7 +34,12 @@ require_prereqs() {
 }
 
 find_pid() {
-  pgrep -f "Python.*${ENTRY_FILE}" | head -n 1 || true
+  local entry_base
+  entry_base="$(basename "$ENTRY_FILE")"
+  {
+    pgrep -f "Python.*${ENTRY_FILE}" || true
+    pgrep -f "Python.*${entry_base}" || true
+  } | awk '!seen[$0]++' | sort -n | tail -n 1
 }
 
 write_pid_file() {
@@ -45,10 +51,13 @@ write_pid_file() {
 }
 
 stop_engine() {
+  local entry_base
+  entry_base="$(basename "$ENTRY_FILE")"
   if screen -ls 2>/dev/null | grep -q "[[:space:]]${SESSION_NAME}[[:space:]]"; then
     screen -S "$SESSION_NAME" -X quit || true
   fi
   pkill -f "$ENTRY_FILE" 2>/dev/null || true
+  pkill -f "$entry_base" 2>/dev/null || true
   rm -f "$PID_FILE"
 }
 
@@ -64,12 +73,21 @@ start_engine() {
   screen -dmS "$SESSION_NAME" /bin/bash -lc "$cmd"
 
   local ok=0
-  for _ in $(seq 1 40); do
-    if curl -s -o /dev/null "http://127.0.0.1:${PORT}/"; then
+  local attempts=0
+  local sleep_sec=0.5
+  attempts="$(python3 - <<PY
+import math
+print(max(1, int(math.ceil(float(${HEALTH_TIMEOUT_SEC}) / ${sleep_sec}))))
+PY
+)"
+  for _ in $(seq 1 "${attempts}"); do
+    local code
+    code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 "http://127.0.0.1:${PORT}/" || true)"
+    if [ -n "$code" ] && [ "$code" != "000" ]; then
       ok=1
       break
     fi
-    sleep 0.5
+    sleep "${sleep_sec}"
   done
 
   write_pid_file

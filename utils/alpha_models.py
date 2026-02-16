@@ -628,6 +628,55 @@ def load_weight_vector(path: str) -> Optional[np.ndarray]:
     return None
 
 
+def _parse_probability_calibration(raw: Any) -> Dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    typ = str(raw.get("type") or "").strip().lower()
+    if typ != "platt_v1":
+        return None
+    try:
+        a = float(raw.get("a"))
+        b = float(raw.get("b"))
+    except Exception:
+        return None
+    if not np.isfinite(a) or not np.isfinite(b):
+        return None
+    out: Dict[str, Any] = {"type": "platt_v1", "a": float(a), "b": float(b)}
+    for k in ("logloss_before", "logloss_after"):
+        try:
+            v = float(raw.get(k))
+        except Exception:
+            continue
+        if np.isfinite(v):
+            out[k] = float(v)
+    try:
+        n = int(raw.get("sample_n"))
+        if n > 0:
+            out["sample_n"] = int(n)
+    except Exception:
+        pass
+    return out
+
+
+def _apply_probability_calibration(p_long: float, calib: Dict[str, Any] | None) -> float:
+    p = float(np.clip(_safe_float(p_long, 0.5), 1e-6, 1.0 - 1e-6))
+    if not isinstance(calib, dict):
+        return p
+    if str(calib.get("type") or "").strip().lower() != "platt_v1":
+        return p
+    try:
+        a = float(calib.get("a"))
+        b = float(calib.get("b"))
+    except Exception:
+        return p
+    if not np.isfinite(a) or not np.isfinite(b):
+        return p
+    z = math.log(p / (1.0 - p))
+    z_cal = float(np.clip(a * z + b, -30.0, 30.0))
+    p_cal = float(1.0 / (1.0 + math.exp(-z_cal)))
+    return float(np.clip(p_cal, 0.0, 1.0))
+
+
 def _load_direction_submodel(data: Dict[str, Any], base_dir: str | None = None) -> Dict[str, Any]:
     if not isinstance(data, dict):
         return {}
@@ -645,6 +694,7 @@ def _load_direction_submodel(data: Dict[str, Any], base_dir: str | None = None) 
         "bias": float(_safe_float(data.get("bias"), 0.0)),
         "model_type": str(data.get("model_type") or "logistic_v1"),
         "lgbm_benchmark": data.get("lgbm_benchmark"),
+        "calibration": _parse_probability_calibration(data.get("calibration")),
     }
     mean = data.get("mean")
     std = data.get("std")
@@ -656,6 +706,7 @@ def _load_direction_submodel(data: Dict[str, Any], base_dir: str | None = None) 
     # Optional LightGBM load.
     use_lgbm = str(os.environ.get("ALPHA_DIRECTION_USE_LGBM", "0")).strip().lower() in ("1", "true", "yes", "on")
     lgbm_path = None
+    lgbm_meta: Dict[str, Any] | None = None
     try:
         lgbm_meta = data.get("lgbm_benchmark") or {}
         if isinstance(lgbm_meta, dict):
@@ -671,6 +722,9 @@ def _load_direction_submodel(data: Dict[str, Any], base_dir: str | None = None) 
             out["lgbm_booster"] = lgb.Booster(model_file=lgbm_path)
             out["lgbm_feature_names"] = list(names)
             out["model_type"] = "hybrid_lgbm"
+            out["lgbm_calibration"] = _parse_probability_calibration(
+                lgbm_meta.get("calibration") if isinstance(lgbm_meta, dict) else None
+            )
         except Exception:
             pass
     return out
@@ -736,10 +790,13 @@ def _predict_direction_single(model: Dict[str, Any], features: Dict[str, float])
         return 0.5, 0.0, 0.0
 
     x = np.asarray([_safe_float(features.get(k), 0.0) for k in names], dtype=np.float64)
+    calib_default = model.get("calibration") if isinstance(model.get("calibration"), dict) else None
     lgbm_booster = model.get("lgbm_booster")
     if lgbm_booster is not None:
         try:
             p_long = float(np.asarray(lgbm_booster.predict(x.reshape(1, -1))).reshape(-1)[0])
+            lgbm_calib = model.get("lgbm_calibration") if isinstance(model.get("lgbm_calibration"), dict) else None
+            p_long = _apply_probability_calibration(p_long, lgbm_calib if lgbm_calib is not None else calib_default)
             p_long = float(np.clip(p_long, 0.0, 1.0))
             edge = float(2.0 * p_long - 1.0)
             # Use probability-side confidence for gating (>=0.5), not edge magnitude.
@@ -756,6 +813,7 @@ def _predict_direction_single(model: Dict[str, Any], features: Dict[str, float])
     z = float(np.dot(w, x) + bias)
     z = float(np.clip(z, -30.0, 30.0))
     p_long = float(1.0 / (1.0 + math.exp(-z)))
+    p_long = _apply_probability_calibration(p_long, calib_default)
     p_long = float(np.clip(p_long, 0.0, 1.0))
     edge = float(2.0 * p_long - 1.0)
     # Use probability-side confidence for gating (>=0.5), not edge magnitude.

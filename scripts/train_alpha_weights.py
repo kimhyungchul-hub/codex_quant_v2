@@ -133,6 +133,99 @@ def _direction_hit_rate(y_ret: np.ndarray, p_hat: np.ndarray, min_side_prob: flo
     return float(np.mean(actions[valid] == y_sign[valid]))
 
 
+def _logit_from_prob(p_hat: np.ndarray) -> np.ndarray:
+    p_hat = np.asarray(p_hat, dtype=np.float64).reshape(-1)
+    p_hat = np.clip(p_hat, 1e-6, 1.0 - 1e-6)
+    return np.log(p_hat / (1.0 - p_hat))
+
+
+def _fit_platt_scaler(
+    y_true: np.ndarray,
+    p_hat: np.ndarray,
+    *,
+    lr: float = 0.05,
+    n_iter: int = 800,
+    lam: float = 1e-3,
+) -> dict[str, Any] | None:
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    p_hat = np.asarray(p_hat, dtype=np.float64).reshape(-1)
+    if y_true.size < 64 or p_hat.size != y_true.size:
+        return None
+    pos = int(np.sum(y_true >= 0.5))
+    neg = int(y_true.size - pos)
+    if pos <= 0 or neg <= 0:
+        return None
+    z = _logit_from_prob(p_hat)
+    a = 1.0
+    b = 0.0
+    n_f = float(max(1, y_true.size))
+    for _ in range(int(max(1, n_iter))):
+        p_cal = _sigmoid(a * z + b)
+        diff = p_cal - y_true
+        grad_a = float(np.dot(diff, z) / n_f + float(lam) * (a - 1.0))
+        grad_b = float(np.mean(diff))
+        a -= float(lr) * grad_a
+        b -= float(lr) * grad_b
+        if not np.isfinite(a) or not np.isfinite(b):
+            return None
+    p_post = _sigmoid(a * z + b)
+    ll_before = float(_binary_logloss(y_true, p_hat))
+    ll_after = float(_binary_logloss(y_true, p_post))
+    try:
+        min_improve = float(os.environ.get("ALPHA_DIRECTION_CALIBRATION_MIN_IMPROVE", 0.0) or 0.0)
+    except Exception:
+        min_improve = 0.0
+    if (ll_before - ll_after) < float(min_improve):
+        return None
+    return {
+        "type": "platt_v1",
+        "a": float(a),
+        "b": float(b),
+        "logloss_before": float(ll_before),
+        "logloss_after": float(ll_after),
+        "sample_n": int(y_true.size),
+    }
+
+
+def _maybe_fit_probability_calibration(y_true: np.ndarray, p_hat: np.ndarray) -> dict[str, Any] | None:
+    try:
+        enabled = str(os.environ.get("ALPHA_DIRECTION_CALIBRATION_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        enabled = True
+    if not enabled:
+        return None
+    try:
+        min_samples = int(os.environ.get("ALPHA_DIRECTION_CALIBRATION_MIN_SAMPLES", 400) or 400)
+    except Exception:
+        min_samples = 400
+    if int(np.asarray(y_true).shape[0]) < int(max(64, min_samples)):
+        return None
+    return _fit_platt_scaler(y_true, p_hat)
+
+
+def _serialize_calibration(calib: Any) -> dict[str, Any] | None:
+    if not isinstance(calib, dict):
+        return None
+    typ = str(calib.get("type") or "").strip()
+    if not typ:
+        return None
+    out: dict[str, Any] = {"type": typ}
+    for k in ("a", "b", "logloss_before", "logloss_after"):
+        try:
+            v = float(calib.get(k))
+        except Exception:
+            continue
+        if np.isfinite(v):
+            out[k] = float(v)
+    try:
+        n = int(calib.get("sample_n"))
+        if n > 0:
+            out["sample_n"] = int(n)
+    except Exception:
+        pass
+    return out
+
+
 def _split_time_series(X: np.ndarray, y: np.ndarray, valid_frac: float = 0.2, min_valid: int = 200):
     n = int(X.shape[0])
     n_valid = int(max(min_valid, round(n * float(valid_frac))))
@@ -321,6 +414,12 @@ def _fit_logistic_tuned(
                 "score": 0.0,
             },
         }
+    calibration = None
+    try:
+        p_va_best = _sigmoid(X_va_n @ np.asarray(best["w"], dtype=np.float64) + float(best["b"]))
+        calibration = _maybe_fit_probability_calibration(y_va, p_va_best)
+    except Exception:
+        calibration = None
     # Refit with tuned params on full dataset for runtime model.
     x_mean_full = np.mean(X, axis=0)
     x_std_full = np.std(X, axis=0)
@@ -356,6 +455,7 @@ def _fit_logistic_tuned(
         "train_hit": float(train_hit),
         "train_coverage": float(train_coverage),
     }
+    best["calibration"] = calibration
     return best, trials
 
 
@@ -468,6 +568,12 @@ def _fit_lightgbm_tuned(
             }
     if best is None:
         return None, trials
+    calibration = None
+    try:
+        p_va_best = np.asarray(best["booster"].predict(X_va, num_iteration=best.get("best_iteration") or None), dtype=np.float64).reshape(-1)
+        calibration = _maybe_fit_probability_calibration(y_va, p_va_best)
+    except Exception:
+        calibration = None
     # Refit best params on full sample.
     best_params = dict(best["params"])
     d_all = lgb.Dataset(X, label=y_bin)
@@ -492,6 +598,7 @@ def _fit_lightgbm_tuned(
         "train_coverage": float(train_coverage),
     }
     best["best_iteration"] = int(n_round)
+    best["calibration"] = calibration
     return best, trials
 
 
@@ -786,6 +893,7 @@ def train_mu_direction_model(
                 "train_metrics": dict(best_reg.get("train_metrics") or {}),
                 "valid_metrics": dict(best_reg.get("metrics") or {}),
                 "tuned_params": dict(best_reg.get("params") or {}),
+                "calibration": _serialize_calibration(best_reg.get("calibration")),
             }
             reg_lgbm_best = None
             reg_lgbm_trials: list[dict[str, Any]] = []
@@ -805,6 +913,7 @@ def train_mu_direction_model(
                             "valid_bal_acc": float((reg_lgbm_best.get("metrics") or {}).get("valid_bal_acc", 0.0)),
                             "valid_expectancy_bps": float((reg_lgbm_best.get("metrics") or {}).get("valid_expectancy_bps", 0.0)),
                             "train_metrics": dict(reg_lgbm_best.get("train_metrics") or {}),
+                            "calibration": _serialize_calibration(reg_lgbm_best.get("calibration")),
                             "params": {
                                 "num_leaves": int((reg_lgbm_best.get("params") or {}).get("num_leaves", 0)),
                                 "learning_rate": float((reg_lgbm_best.get("params") or {}).get("learning_rate", 0.0)),
@@ -860,6 +969,7 @@ def train_mu_direction_model(
                 "params": params_log,
                 "valid_metrics": valid_metrics,
                 "train_metrics": train_metrics,
+                "calibration": _serialize_calibration(best_log.get("calibration")),
             },
             "lightgbm_best": None,
             "logistic_trials": sorted(log_trials, key=lambda r: float(r.get("score", -1e9)), reverse=True)[:12],
@@ -877,6 +987,7 @@ def train_mu_direction_model(
                 "train_metrics": dict(lgbm_best.get("train_metrics") or {}),
                 "best_iteration": int(lgbm_best.get("best_iteration") or 0),
                 "model_path": lgbm_model_path,
+                "calibration": _serialize_calibration(lgbm_best.get("calibration")),
             }
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=True, indent=2, sort_keys=True)
@@ -904,6 +1015,7 @@ def train_mu_direction_model(
         "valid_expectancy_bps": float(valid_metrics.get("valid_expectancy_bps", 0.0)),
         "valid_hit": float(valid_metrics.get("valid_hit", 0.5)),
         "tuned_params": params_log,
+        "calibration": _serialize_calibration(best_log.get("calibration")),
         "default_regime": "chop",
         "by_regime": by_regime,
         "regime_stats": regime_stats,
@@ -913,6 +1025,7 @@ def train_mu_direction_model(
             "valid_auc": float((lgbm_best or {}).get("metrics", {}).get("valid_auc", 0.0)) if lgbm_best is not None else None,
             "valid_bal_acc": float((lgbm_best or {}).get("metrics", {}).get("valid_bal_acc", 0.0)) if lgbm_best is not None else None,
             "model_path": lgbm_model_path if lgbm_best is not None else None,
+            "calibration": _serialize_calibration((lgbm_best or {}).get("calibration")) if lgbm_best is not None else None,
         },
         "trained_at": int(time.time()),
     }

@@ -217,10 +217,13 @@ class MonteCarloEngine(
         # dt is year-fraction per simulation step.
         self.dt = float(self.time_step_sec) / 31536000.0
         
-        # Fee settings: USE_MAKER_ORDERS=true → Maker fee (0.02% roundtrip)
+        # Fee settings (per Bybit derivatives: maker=0.01% per-side, taker=0.06% per-side)
+        # fee_roundtrip_base = taker roundtrip = 2 × 0.0006 = 0.0012
+        # fee_roundtrip_maker_base = maker roundtrip = 2 × 0.0001 = 0.0002
+        # [FIX 2026-02-13] fee_roundtrip_base는 항상 taker RT여야 함 (이전: USE_MAKER 시 maker로 잘못 설정)
         _use_maker = bool(getattr(base_config, "USE_MAKER_ORDERS", True))
-        self.fee_roundtrip_base = 0.0002 if _use_maker else 0.0012  # Maker: 0.02%, Taker: 0.12%
-        self.fee_roundtrip_maker_base = 0.0002  # 0.01% * 2 sides
+        self.fee_roundtrip_base = 0.0012  # ALWAYS taker roundtrip: 2 × 0.0006
+        self.fee_roundtrip_maker_base = 0.0002  # maker roundtrip: 2 × 0.0001
         self.slippage_perc = 0.0001 if _use_maker else 0.0003  # Maker: ~0, Taker: slippage
 
         self.default_tail_mode = "student_t"

@@ -16,6 +16,58 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _is_true(v: str | None) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, default) or default)
+    except Exception:
+        return int(default)
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, default) or default)
+    except Exception:
+        return float(default)
+
+
+def _load_env_file(path: Path) -> None:
+    try:
+        if not path.exists():
+            return
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            key = k.strip()
+            if not key:
+                continue
+            val = v.strip()
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                val = val[1:-1]
+            os.environ.setdefault(key, val)
+    except Exception:
+        return
+
+
+def _load_env_file_if_requested(repo_root: Path) -> None:
+    if not (_is_true(os.environ.get("USE_BYBIT_ENV")) or _is_true(os.environ.get("AUTO_REVAL_LOAD_ENV"))):
+        return
+    env_path_raw = os.environ.get("AUTO_REVAL_ENV_FILE", "state/bybit.env")
+    env_path = Path(env_path_raw)
+    if not env_path.is_absolute():
+        env_path = (repo_root / env_path).resolve()
+    _load_env_file(env_path)
+
+
 def _acquire_singleton_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = open(lock_path, "a+", encoding="utf-8")
@@ -46,6 +98,32 @@ def _build_reval_cmd(args: argparse.Namespace) -> list[str]:
         str(args.diag_out),
         "--cf-out",
         str(args.cf_out),
+        "--reason-matrix-out",
+        str(args.reason_matrix_out),
+        "--entry-score-driver-out",
+        str(args.entry_score_driver_out),
+        "--reval-loss-driver-out",
+        str(args.reval_loss_driver_out),
+        "--reval-loss-driver-top-csv",
+        str(args.reval_loss_driver_top_csv),
+        "--reval-loss-driver-history-out",
+        str(args.reval_loss_driver_history_out),
+        "--capital-steps",
+        str(args.capital_steps),
+        "--slippage-exit-out",
+        str(args.slippage_exit_out),
+        "--slippage-exit-limit",
+        str(int(args.slippage_exit_limit)),
+        "--slippage-match-window-sec",
+        str(float(args.slippage_match_window_sec)),
+        "--min-notional-tune-out",
+        str(args.min_notional_tune_out),
+        "--min-notional-effectiveness-out",
+        str(args.min_notional_effectiveness_out),
+        "--min-notional-recent-limit",
+        str(int(args.min_notional_recent_limit)),
+        "--entry-sample-limit",
+        str(int(args.entry_sample_limit)),
         "--status-out",
         str(args.status_out),
         "--stage4-baseline-out",
@@ -69,6 +147,12 @@ def _build_tune_cmd(args: argparse.Namespace) -> list[str]:
         str(args.diag_out),
         "--cf-in",
         str(args.cf_out),
+        "--reason-matrix-in",
+        str(args.reason_matrix_out),
+        "--entry-score-driver-in",
+        str(args.entry_score_driver_out),
+        "--reval-loss-driver-in",
+        str(args.reval_loss_driver_out),
         "--stage4-compare-in",
         str(args.stage4_compare_out),
         "--override-out",
@@ -92,15 +176,31 @@ def _read_json(path: Path) -> dict:
 
 
 def main() -> int:
+    repo_root = Path(__file__).resolve().parents[1]
+    _load_env_file_if_requested(repo_root)
+
     ap = argparse.ArgumentParser(
         description="Single-instance auto reval watcher. Prevents duplicate loops and reruns per +N EXIT batch."
     )
     ap.add_argument("--db", default="state/bot_data_live.db")
-    ap.add_argument("--target-new", type=int, default=200)
-    ap.add_argument("--poll-sec", type=float, default=60.0)
-    ap.add_argument("--timeout-sec", type=float, default=0.0)
+    ap.add_argument("--target-new", type=int, default=_env_int("AUTO_REVAL_TARGET_NEW", 120))
+    ap.add_argument("--poll-sec", type=float, default=_env_float("AUTO_REVAL_POLL_SEC", 60.0))
+    ap.add_argument("--timeout-sec", type=float, default=_env_float("AUTO_REVAL_TIMEOUT_SEC", 0.0))
     ap.add_argument("--diag-out", default="state/entry_exit_diagnosis_report.json")
     ap.add_argument("--cf-out", default="state/counterfactual_replay_report_new_window.json")
+    ap.add_argument("--reason-matrix-out", default="state/entry_exit_reason_matrix_report.json")
+    ap.add_argument("--entry-score-driver-out", default="state/entry_score_driver_report.json")
+    ap.add_argument("--reval-loss-driver-out", default="state/reval_loss_driver_report.json")
+    ap.add_argument("--reval-loss-driver-top-csv", default="state/reval_loss_driver_top_loss_positions.csv")
+    ap.add_argument("--reval-loss-driver-history-out", default="state/reval_loss_driver_history.json")
+    ap.add_argument("--capital-steps", default="1500,3000,6000,9000")
+    ap.add_argument("--slippage-exit-out", default="state/slippage_exit_200_report.json")
+    ap.add_argument("--slippage-exit-limit", type=int, default=_env_int("AUTO_REVAL_SLIPPAGE_EXIT_LIMIT", 200))
+    ap.add_argument("--slippage-match-window-sec", type=float, default=_env_float("AUTO_REVAL_SLIPPAGE_MATCH_WINDOW_SEC", 120.0))
+    ap.add_argument("--min-notional-tune-out", default="state/min_notional_tuning_report.json")
+    ap.add_argument("--min-notional-effectiveness-out", default="state/min_notional_effectiveness_report.json")
+    ap.add_argument("--min-notional-recent-limit", type=int, default=_env_int("AUTO_REVAL_MIN_NOTIONAL_RECENT_LIMIT", 1200))
+    ap.add_argument("--entry-sample-limit", type=int, default=_env_int("AUTO_REVAL_ENTRY_SAMPLE_LIMIT", 1200))
     ap.add_argument("--status-out", default="state/auto_reval_db_report.json")
     ap.add_argument("--stage4-baseline-out", default="state/stage4_liq_regret_baseline.json")
     ap.add_argument("--stage4-compare-out", default="state/stage4_liq_regret_compare.json")
@@ -118,8 +218,6 @@ def main() -> int:
     ap.add_argument("--auto-tune-retrain-timeout-sec", type=float, default=240.0)
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
-
-    repo_root = Path(__file__).resolve().parents[1]
     lock_path = (repo_root / args.lock_file).resolve()
     lock_fd = _acquire_singleton_lock(lock_path)
     if lock_fd is None:

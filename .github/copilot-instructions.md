@@ -10,6 +10,26 @@
    - 형식: `[YYYY-MM-DD] 변경 내용 요약 (수정된 파일명)`
    - `CODE_MAP_v2.md` 구조 변경 시 업데이트 제안 포함.
 4. **수학 공식:** 공식 수정/참조 시 `docs/MATHEMATICS.md`를 기준으로 삼으십시오.
+
+## 📚 필수 참조 문서 (작업 전 반드시 확인)
+작업 유형에 따라 아래 문서를 반드시 읽고 맥락을 파악한 후 코드를 수정하십시오.
+
+| 작업 유형 | 참조 문서 | 핵심 내용 |
+|-----------|----------|-----------|
+| **신호/필터/임계치 조정** | `docs/SIGNAL_PIPELINE_REFERENCE.md` | mu_alpha→EV→unified_score 9단계 파이프라인, 감쇠 체인, 유효 floor 계산, 환경변수 참조표 |
+| **EV/점수 필터 디버깅** | `docs/UNIFIED_SCORE_FILTER_GUIDE.md` | 5가지 진단법, threshold 설정 가이드, 빠른 디버깅 명령어 |
+| **MC 엔진/수학** | `docs/MATHEMATICS.md` | GBM, First Passage, Unified Score Ψ(t) 공식 |
+| **아키텍처/파일 구조** | `docs/CODE_MAP_v2.md` | 모듈 의존 관계, 엔진 파이프라인, 주요 클래스 |
+| **환경변수 전수** | `docs/env_vars.md` | 모든 환경변수 목록 및 기본값 |
+| **JAX/Metal 메모리** | `docs/JAX_METAL_MEMORY.md` | BFC allocator, 메모리 프리워밍, XLA 환경 |
+| **런타임 설정** | `docs/RUNTIME_CONFIG.md` | auto_tune, hot-reload, 동적 설정 |
+| **GARCH 파라미터** | `docs/garch_param_pipeline.md` | σ 추정 파이프라인 |
+| **mu_alpha ML** | `docs/MU_ALPHA_ML_SPEC.md` | 방향 예측 모델 spec |
+| **시스템 개요** | `docs/SYSTEM_OVERVIEW_KR.md` | 전체 아키텍처 한국어 설명 |
+| **데이터 영속성** | `docs/DATA_PERSISTENCE.md` | SQLite/JSON 저장 구조 |
+| **대시보드 운영** | `docs/ENGINE_DASHBOARD_RUNBOOK.md` | 대시보드 운영 매뉴얼 |
+
+> **⚠️ 특히 신호 강도/진입 필터/레버리지 관련 수정 시 반드시 `SIGNAL_PIPELINE_REFERENCE.md`를 먼저 읽을 것.** 이 문서에 감쇠 체인 누적 테이블, 유효 임계치 계산 공식, fee 이중 차감 이슈 등 핵심 함정이 기록되어 있음.
 5. 로그를 읽거나 명령을 실행하는데에 있어서 권한 문제로 막힌다면 서버를 백그라운드에서 실행하고, 로그는 /tmp/server.log에 저장해서 읽을 것. 또는 tail 명령 대신 read 명령을 사용해서 100줄 정도를 읽어볼 것.
 ## 🛠 기술 스택 및 환경
 - **Language:** Python 3.11 (JAX 호환성 고정), Shell Script (Bash)
@@ -162,6 +182,171 @@ ev_entry_threshold / ev_entry_threshold_dyn
 - **Fallback Logic:** Ticker 데이터가 늦게 오면 `price=None`이 될 수 있음. 이때는 즉시 OHLCV의 마지막 `close` 값을 Fallback으로 사용해야 함.
 - **JAX Lazy Loading 함정 (2026-01-22):** `jax_backend.py`에서 `jax = None`으로 초기화되고 `ensure_jax()`가 모듈 끝에서 호출되지만, 다른 모듈에서 `from jax_backend import jax` 시점에는 아직 초기화 전일 수 있음. Exception handler에서 `jax.devices()`를 호출하면 `AttributeError: 'NoneType' object has no attribute 'devices'` 발생. 반드시 handler 내에서 `ensure_jax()` 재호출 + `jax as jax_module` 재import 필요.
 - **Dashboard Data 누락 (2026-01-22):** JAX 초기화 실패로 인해 `decision_loop`에서 에러가 발생하면 `broadcast(rows)` 호출이 안 되어 WebSocket으로 `full_update`가 전송되지 않음. 브라우저는 `init` 메시지만 받고 데이터 없음. 엔진 내부 예외 처리가 데이터 전송까지 막지 않도록 `try-except` 범위를 좁혀야 함.
+- **mu_alpha 방향 정보 절삭 (2026-02-13):** `entry_evaluation.py`에서 compound dampening, Hurst random dampen, chop guard 등 여러 단계의 감쇠 로직이 mu_alpha를 연쇄적으로 0에 가깝게 만들어서 방향 신호가 사실상 사라짐. mu_alpha 절대값이 0.0001 미만이면 MC 시뮬레이션에서 모든 방향이 동일하게 평가되어 랜덤 방향 진입이 발생. **항상 total_dampen_ratio를 모니터링**하고, 0.05 이하로 떨어지면 경고를 출력하도록 해야 함.
+- **SQ 필터 핑퐁 (2026-02-13):** `refresh_top_volume_universe_loop`에서 퇴출된 심볼이 candidate pool에 재진입하여 퇴출↔복귀를 반복(ASTER→HYPE→ASTER...). 퇴출된 심볼은 `_evicted_blacklist`에 일정 기간(최소 6시간) 보관하여 재입장을 차단해야 함.
+
+### 6. 데이터 파이프라인 무결성 (Data Pipeline Integrity) - CRITICAL!
+**원칙:** 매매 로직 자체보다 **데이터를 처리하는 과정에서의 오류**가 더 치명적이다. 방향 신호(mu_alpha), 가격(price), 레짐(regime) 등의 데이터가 파이프라인을 통과하면서 잘리거나, None이 되거나, 의도치 않게 변형되는 것을 방지해야 한다.
+
+**필수 방어 패턴:**
+1. **감쇠 체인 모니터링:** mu_alpha 등 연속적으로 감쇠를 가하는 로직에서는 최종 감쇠 비율(`total_dampen_ratio = dampened / original`)을 로그로 남기고, 임계치 이하(예: 0.05)면 경고를 출력할 것.
+   ```python
+   # ✅ GOOD: 감쇠 추적
+   original_mu = mu_alpha
+   mu_alpha *= hurst_factor    # step 1
+   mu_alpha *= chop_factor     # step 2
+   mu_alpha *= compound_factor # step 3
+   total_ratio = abs(mu_alpha / (original_mu + 1e-12))
+   if total_ratio < 0.05:
+       logger.warning(f"[MU_ALPHA_DAMPEN] {sym} total_ratio={total_ratio:.4f} — signal nearly destroyed")
+   ```
+
+2. **None/NaN 전파 차단:** 데이터가 파이프라인의 각 단계를 통과할 때 None/NaN이 아닌지 확인하고, None이면 즉시 안전한 기본값으로 대체할 것. 특히 `price`, `mu`, `sigma`, `regime` 필드가 None인 채로 다음 단계로 전달되면 안 됨.
+   ```python
+   # ❌ BAD: None이 그대로 전달
+   ctx["price"] = ticker_price  # ticker_price가 None일 수 있음
+   
+   # ✅ GOOD: fallback 처리
+   ctx["price"] = ticker_price if ticker_price is not None else ohlcv_last_close
+   assert ctx["price"] is not None, f"No price available for {sym}"
+   ```
+
+3. **Direction-Value 일관성 검증:** 진입 결정 직전에 방향(direction)과 mu_alpha의 부호가 일치하는지 검증. mu < 0 인데 LONG, 또는 mu > 0 인데 SHORT이면 진입을 거부할 것.
+   ```python
+   # ✅ GOOD: 방향 일관성 검증
+   if direction == "LONG" and mu_alpha < -0.001:
+       logger.warning(f"[DIR_MISMATCH] {sym} direction=LONG but mu_alpha={mu_alpha:.6f}")
+       return HOLD  # 진입 거부
+   ```
+
+4. **Exchange Sync 시 필드 완전성:** 거래소에서 포지션을 동기화할 때, 새로 생성하는 position dict에 반드시 모든 필수 필드(`regime`, `entry_ev`, `direction` 등)를 포함할 것. 누락된 필드가 있으면 하류(downstream) 로직에서 KeyError 또는 기본값 사용으로 인한 잘못된 판단이 발생함.
+
+5. **환경변수-코드 정합성:** `.env` 파일의 값이 코드에서 기대하는 타입/범위와 일치하는지 확인. 특히 bool 값은 `"0"/"1"/"true"/"false"` 모두 지원하도록 `str(v).strip().lower() in ("1", "true", "yes", "on")` 패턴을 사용할 것.
+
+### 7. 엔진 재시작 프로토콜 (Engine Restart Protocol) - CRITICAL!
+
+### 8. 버그 재발 방지 규칙 (Bug Prevention Rules) - CRITICAL!
+> **배경:** 과거 버그 분석에서 4가지 패턴이 반복적으로 발견됨. 코딩 에이전트는 코드 생성/수정 시 이 규칙을 반드시 확인할 것.
+
+#### Pattern A: Dual-Path Sync Failure (단일/배치 경로 불일치)
+**문제:** 같은 로직이 `_build_decision_context()` (단일)와 `_build_batch_context_soa()` (배치) 두 경로에 존재하며, 한쪽만 수정하면 다른 쪽은 stale 상태가 됨.
+
+**필수 규칙:**
+```python
+# ❌ BAD: 한 경로만 수정
+def _build_decision_context(self, sym, ...):
+    ctx["new_field"] = compute_new_field(sym)  # ← 여기만 추가
+
+# ✅ GOOD: 반드시 양쪽 동시 수정
+def _build_decision_context(self, sym, ...):
+    ctx["new_field"] = compute_new_field(sym)
+
+def _build_batch_context_soa(self, symbols, ...):
+    for i, sym in enumerate(symbols):
+        ctx["new_field"] = compute_new_field(sym)  # ← 반드시 여기도 추가
+```
+
+**체크리스트:**
+- [ ] `_build_decision_context()`를 수정했으면 `_build_batch_context_soa()`도 동일 수정
+- [ ] `_min_filter_states()`를 수정했으면 배치 필터 경로도 확인
+- [ ] 새 필드 추가 시 양쪽 경로의 기본값이 동일한지 확인
+- [ ] `grep -n "new_field_name" main_engine_mc_v2_final.py`로 양쪽에 존재하는지 확인
+
+#### Pattern B: 환경변수 관리 실패
+**문제:** `.env` 파일에 같은 변수가 중복 정의되어 마지막 값만 적용되거나, 코드 기본값과 .env 값이 타입 불일치.
+
+**필수 규칙:**
+```bash
+# ❌ BAD: .env에 중복 변수
+HURST_RANDOM_DAMPEN=0.60
+# ... 200줄 후 ...
+HURST_RANDOM_DAMPEN=0.75  # ← 이 값만 적용됨
+
+# ✅ GOOD: 추가 전 중복 확인
+grep -n "VARIABLE_NAME" state/bybit.env .env.midterm .env.scalp
+```
+
+**체크리스트:**
+- [ ] 환경변수 추가/수정 전 `grep -rn "VAR_NAME" state/ .env*`로 중복 확인
+- [ ] bool 변수는 `str(v).strip().lower() in ("1", "true", "yes", "on")` 패턴 사용
+- [ ] float 변수 파싱 시 `get_env_float()` 헬퍼 사용 (직접 `float(os.environ[...])` 금지)
+- [ ] 새 환경변수 추가 시 `docs/env_vars.md`에 문서화
+
+#### Pattern C: 수학적 지름길 오류 (Mathematical Shortcut)
+**문제:** `ev_short = -ev_long` 같은 대칭 가정을 하면 fee 비대칭(funding rate 등)이 무시됨. Short EV는 별도 시뮬레이션이 필수.
+
+**필수 규칙:**
+```python
+# ❌ BAD: 대칭 가정
+ev_short = -ev_long  # fee, funding rate, slippage 모두 무시됨
+
+# ✅ GOOD: 별도 시뮬레이션
+ev_long  = mc_simulate(direction=+1, ...)
+ev_short = mc_simulate(direction=-1, ...)  # fee/funding 독립 계산
+```
+
+**체크리스트:**
+- [ ] Long/Short EV를 독립적으로 시뮬레이션하는지 확인
+- [ ] `±` 부호 반전으로 direction을 결정하는 코드가 있으면 fee 처리 확인
+- [ ] Ito 보정항(`-0.5σ²`)이 올바른 모드에서만 적용되는지 확인 (Gaussian만)
+- [ ] TP/SL 비율이 방향별로 독립적인지 확인
+
+#### Pattern D: 부호 규약 혼동 (Sign Convention Confusion)
+**문제:** CVaR은 음수(손실)인데 cost_roe를 더하면(+) 절대값이 줄어들어 리스크가 과소평가됨. 금융 변수의 부호 규약을 혼동하면 방향이 반대되는 치명적 버그 발생.
+
+**필수 규칙:**
+```python
+# ❌ BAD: CVaR에 비용을 더함 → |CVaR| 감소 → 리스크 과소평가
+cvar_adjusted = cvar + cost_roe  # cvar=-0.05, cost=0.01 → -0.04 (더 낮은 리스크로 잘못 계산)
+
+# ✅ GOOD: CVaR에서 비용을 빼서 |CVaR| 증가 → 리스크 보수적 반영
+cvar_adjusted = cvar - abs(cost_roe)  # cvar=-0.05, cost=0.01 → -0.06 (더 높은 리스크)
+```
+
+**체크리스트:**
+- [ ] CVaR 조정 시 부호 방향 확인: 비용 추가 = 더 큰 손실 = 더 낮은(음수) CVaR
+- [ ] `direction × value` 패턴에서 direction이 +1/-1 중 올바른 값인지 확인
+- [ ] mu < 0이면 Short, mu > 0이면 Long — 방향 일관성 검증
+- [ ] 레버리지 계산에서 `abs()` 사용이 적절한지 확인
+
+#### 문서-코드 정합성 유지 규칙 (NEW!)
+**문제:** 코드 기본값을 변경한 후 문서(SIGNAL_PIPELINE_REFERENCE.md, env_vars.md 등)를 업데이트하지 않아 문서가 stale 상태가 됨.
+
+**필수 규칙:**
+- [ ] `engines/mc/config.py` 기본값 변경 시 `docs/SIGNAL_PIPELINE_REFERENCE.md` 동시 업데이트
+- [ ] `regime.py` 승수 변경 시 SIGNAL_PIPELINE 감쇠 체인 테이블 갱신
+- [ ] `regime_policy.py` 파라미터 변경 시 env_vars.md 동시 업데이트
+- [ ] 환경변수 추가/삭제 시 `docs/env_vars.md` + `.github/copilot-instructions.md` 동시 반영
+- [ ] Change Log 작성 시 영향 받은 문서도 명시
+**원칙:** 엔진 코드(`main_engine_mc_v2_final.py`, `engines/mc/*.py`, `core/*.py`)를 수정한 후에는 **반드시 엔진을 재시작**해야 변경 사항이 반영된다. Python은 런타임에 모듈을 핫 리로드하지 않으므로, 코드 수정만으로는 실행 중인 엔진에 영향이 없다.
+
+**재시작 절차:**
+```bash
+# 1. 기존 엔진 프로세스 종료
+pkill -f main_engine_mc_v2_final.py
+
+# 2. 종료 확인 (5초 대기)
+sleep 2 && ps aux | grep main_engine | grep -v grep
+
+# 3. syntax check (재시작 전 필수!)
+python3 -m py_compile main_engine_mc_v2_final.py && echo "OK"
+
+# 4. 환경변수 로드 후 재시작
+source state/bybit.env && ENABLE_LIVE_ORDERS=1 nohup python3 main_engine_mc_v2_final.py > /tmp/engine.log 2>&1 &
+
+# 5. 시작 확인
+sleep 5 && tail -20 /tmp/engine.log
+```
+
+**재시작이 필요한 변경:**
+- ✅ 엔진 코드 수정 (`.py` 파일)
+- ✅ `engines/mc/config.py` 기본값 변경
+- ✅ 새로운 환경변수 추가
+
+**재시작 불필요한 변경:**
+- ❎ `state/bybit.env` 값 변경 (os.environ에서 동적으로 읽는 변수에 한함)
+- ❎ `state/auto_tune_overrides.json` 업데이트 (hot-reload 지원)
+- ❎ `dashboard_v2.html` 수정 (브라우저 새로고침만 필요)
 ---
 
 ## Recent Changes (2026-01-24)

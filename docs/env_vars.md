@@ -132,6 +132,8 @@ FUNNEL_WIN_FLOOR_VOLATILE
 HARD_STOP_LOSS_FRAC
 HARD_STOP_LOSS_PRICE_FRAC
 HARD_STOP_LOSS_ROE_FRAC
+HURST_RANDOM_DAMPEN
+HURST_TREND_BOOST
 JAX_COMPILATION_CACHE_DIR
 JAX_GIT_HASH
 JAX_MC_DEVICE
@@ -404,6 +406,31 @@ XDG_RUNTIME_DIR
 XDG_STATE_HOME
 YARL_NO_EXTENSIONS
 ```
+
+---
+
+## [2026-02-01] CF 기반 새 필터 변수
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MU_ALPHA_DIRECTION_GATE` | `1` | mu_alpha 부호 ↔ 매매 방향 정합성 게이트 (1=활성) |
+| `MU_ALIGN_MIN_ABS` | `0.01` | mu_alpha 절대값이 이 값 미만이면 게이트 미적용 |
+| `TOD_FILTER_ENABLED` | `1` | 시간대 필터 활성화 (1=활성) |
+| `TRADING_BAD_HOURS_UTC` | `6,7` | 진입 차단 시간대 (UTC, 쉼표 구분) |
+| `REGIME_SIDE_BLOCK_LIST` | `bear_long,bull_short` | 차단할 regime_side 조합 (쉼표 구분, 소문자) |
+
+---
+
+## [2026-02-15] Auto Diagnostics (자기 개선 시스템)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AUTO_DIAGNOSTICS_ENABLED` | `1` | 자동 진단 시스템 활성화 (1=활성) |
+| `AUTO_DIAG_INTERVAL_SEC` | `3600` | 진단 실행 주기 (초, 기본 1시간) |
+| `AUTO_DIAG_LOOKBACK_HOURS` | `4.0` | 분석 대상 거래 lookback 기간 (시간) |
+
+파일: `core/auto_diagnostics.py` → 5가지 진단 모듈 (Direction Accuracy, Regime×Side, Time-of-Day, Sizing/Leverage, Hold Duration)
+출력: `state/diagnostics_overrides.json` → `auto_tune_overrides.json`에 merge → hot-reload
 
 ---
 

@@ -354,9 +354,15 @@ class DatabaseManager:
                     -- 컨텍스트
                     side TEXT,
                     exec_type TEXT,
+                    selected_exec_type TEXT,
+                    fill_source TEXT,
+                    is_real_fill INTEGER,
                     volatility REAL,
                     spread_bps REAL,
                     order_size REAL,
+                    filled_qty REAL,
+                    fee_rate REAL,
+                    latency_ms REAL,
                     
                     -- 시장 상태
                     bid_price REAL,
@@ -364,6 +370,7 @@ class DatabaseManager:
                     volume_24h REAL
                 )
             """)
+            self._ensure_slippage_schema_columns(cursor)
             
             # ─────────────────────────────────────────────────────────────────
             # 7. 진단 메트릭 (Diagnostics)
@@ -454,6 +461,23 @@ class DatabaseManager:
                 continue
             cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
 
+    def _ensure_slippage_schema_columns(self, cursor: sqlite3.Cursor) -> None:
+        """과거 slippage_analysis 스키마에 누락된 컬럼을 보강한다."""
+        cursor.execute("PRAGMA table_info(slippage_analysis)")
+        existing = {str(row[1]) for row in cursor.fetchall()}
+        add_columns = [
+            ("filled_qty", "REAL"),
+            ("fee_rate", "REAL"),
+            ("latency_ms", "REAL"),
+            ("selected_exec_type", "TEXT"),
+            ("fill_source", "TEXT"),
+            ("is_real_fill", "INTEGER"),
+        ]
+        for col, col_type in add_columns:
+            if col in existing:
+                continue
+            cursor.execute(f"ALTER TABLE slippage_analysis ADD COLUMN {col} {col_type}")
+
     # 내부적으로 동기/비동기 공용으로 사용할 파라미터 빌더
     def _prepare_trade_params(self, trade_data: Dict[str, Any], mode: TradingMode) -> Tuple:
         def _f(val: Any, default: float = 0.0) -> float:
@@ -485,6 +509,11 @@ class DatabaseManager:
         if target > 0:
             slippage_bps = (fill - target) / target * 10000.0
 
+        entry_conf = _fn(trade_data.get("entry_confidence"))
+        if entry_conf is None:
+            # Backward-compatible fallback for older payloads that only carry direction confidence.
+            entry_conf = _fn(trade_data.get("pred_mu_dir_conf"))
+
         return (
             trade_data.get("symbol"),
             trade_data.get("side"),
@@ -507,7 +536,7 @@ class DatabaseManager:
             trade_data.get("entry_reason"),
             _fn(trade_data.get("entry_ev")),
             _fn(trade_data.get("entry_kelly")),
-            _fn(trade_data.get("entry_confidence")),
+            entry_conf,
             _fn(trade_data.get("realized_pnl")),
             _fn(trade_data.get("roe")),
             _fn(trade_data.get("hold_duration_sec")),
@@ -545,6 +574,35 @@ class DatabaseManager:
         )
 
     def _prepare_position_params(self, symbol: str, pos_data: Dict[str, Any], mode: TradingMode) -> Tuple:
+        entry_raw = (
+            pos_data.get("entry_time_ms")
+            if pos_data.get("entry_time_ms") is not None
+            else (
+                pos_data.get("entry_time")
+                if pos_data.get("entry_time") is not None
+                else pos_data.get("time")
+            )
+        )
+
+        entry_time_ms = None
+        if entry_raw is not None:
+            try:
+                entry_time_ms = int(float(entry_raw))
+                if entry_time_ms < 1_000_000_000_000:
+                    entry_time_ms *= 1000
+                elif entry_time_ms > 100_000_000_000_000:
+                    entry_time_ms = int(entry_time_ms / 1000)
+            except Exception:
+                entry_time_ms = None
+
+        now_ts = int(time.time() * 1000)
+        age_sec = pos_data.get("age_sec")
+        if age_sec is None and entry_time_ms is not None:
+            try:
+                age_sec = max(0.0, (int(now_ts) - int(entry_time_ms)) / 1000.0)
+            except Exception:
+                age_sec = None
+
         return (
             symbol,
             mode.value,
@@ -560,9 +618,9 @@ class DatabaseManager:
             pos_data.get("unrealized_pnl") or pos_data.get("pnl"),
             pos_data.get("roe"),
             pos_data.get("max_roe"),
-            pos_data.get("time") or pos_data.get("entry_time_ms"),
-            int(time.time() * 1000),
-            pos_data.get("age_sec"),
+            entry_time_ms,
+            now_ts,
+            age_sec,
             pos_data.get("entry_group"),
             pos_data.get("entry_rank"),
             pos_data.get("entry_order"),
@@ -862,9 +920,11 @@ class DatabaseManager:
                 INSERT INTO slippage_analysis (
                     symbol, timestamp_ms, target_price, fill_price, slippage_bps,
                     estimated_slippage_bps, estimation_error_bps,
-                    side, exec_type, volatility, spread_bps, order_size,
+                    side, exec_type, selected_exec_type, fill_source, is_real_fill,
+                    volatility, spread_bps, order_size,
+                    filled_qty, fee_rate, latency_ms,
                     bid_price, ask_price, volume_24h
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 slippage_data['symbol'],
                 slippage_data.get('timestamp_ms', int(time.time() * 1000)),
@@ -875,9 +935,15 @@ class DatabaseManager:
                 actual_slip - est_slip if est_slip else None,
                 slippage_data.get('side'),
                 slippage_data.get('exec_type'),
+                slippage_data.get('selected_exec_type'),
+                slippage_data.get('fill_source'),
+                slippage_data.get('is_real_fill'),
                 slippage_data.get('volatility'),
                 slippage_data.get('spread_bps'),
                 slippage_data.get('order_size'),
+                slippage_data.get('filled_qty'),
+                slippage_data.get('fee_rate'),
+                slippage_data.get('latency_ms'),
                 slippage_data.get('bid_price'),
                 slippage_data.get('ask_price'),
                 slippage_data.get('volume_24h'),

@@ -49,10 +49,15 @@ class MonteCarloFirstPassageMixin:
         if str(side).upper() == "SHORT":
             direction = -1.0
 
-        drift = direction * (mu - 0.5 * sigma * sigma) * dt
-        diffusion = sigma * math.sqrt(dt)
-
         mode = str(dist_override or getattr(self, "_tail_mode", self.default_tail_mode))
+
+        # Mode-aware drift: Gaussian keeps Ito correction, heavy-tail/boot removes it
+        # (must match path_simulation.py to avoid EV bias between FP and path results)
+        if mode in ("student_t", "bootstrap", "johnson_su"):
+            drift = direction * float(mu) * dt
+        else:
+            drift = direction * (mu - 0.5 * sigma * sigma) * dt
+        diffusion = sigma * math.sqrt(dt)
         df = float(getattr(self, "_student_t_df", self.default_student_t_df))
         br = getattr(self, "_bootstrap_returns", None)
         use_torch = bool(getattr(self, "_use_torch", True)) and _TORCH_OK

@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codex Quant — Research Lab</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--text2:#8b949e;--accent:#58a6ff;--green:#3fb950;--red:#f85149;--orange:#d29922;--purple:#a371f7}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'SF Mono','Fira Code',monospace;background:var(--bg);color:var(--text);padding:16px}
+h1{font-size:1.15em;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px}
+h1 .status{width:10px;height:10px;border-radius:50%;background:var(--red)}
+h1 .status.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+@media(max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px}
+.card h2{font-size:0.85em;color:var(--text2);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+.metric{display:inline-block;margin:4px 8px 4px 0;padding:4px 10px;border-radius:4px;font-size:0.82em}
+.metric.good{background:#1b3a2c;color:var(--green)}
+.metric.bad{background:#3a1b1b;color:var(--red)}
+.metric.neutral{background:#2a2a1b;color:var(--orange)}
+.metric.info{background:#1b2a3a;color:var(--accent)}
+.finding{border-left:3px solid var(--accent);padding:10px 14px;margin:6px 0;background:rgba(88,166,255,0.05);border-radius:0 6px 6px 0;transition:all .2s}
+.finding:hover{background:rgba(88,166,255,0.1)}
+.finding .title{font-weight:600;color:var(--text);margin-bottom:4px;font-size:0.9em}
+.finding .detail{font-size:0.78em;color:var(--text2);white-space:pre-wrap}
+.finding .improvement{font-size:0.85em;font-weight:700}
+.finding .improvement.pos{color:var(--green)}
+.finding .improvement.neg{color:var(--red)}
+.finding .badge{display:inline-block;padding:2px 6px;border-radius:3px;font-size:0.7em;margin-left:6px}
+.finding .badge.high{background:var(--green);color:#000}
+.finding .badge.med{background:var(--orange);color:#000}
+.finding .badge.low{background:var(--text2);color:#000}
+.progress-bar{height:4px;background:var(--border);border-radius:2px;margin:8px 0}
+.progress-bar .fill{height:100%;background:var(--accent);border-radius:2px;transition:width .5s}
+table{width:100%;border-collapse:collapse;font-size:0.8em;margin-top:8px}
+th{text-align:left;color:var(--text2);border-bottom:1px solid var(--border);padding:6px 8px}
+td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
+.regime-chip{display:inline-block;padding:2px 8px;border-radius:10px;font-size:0.72em;font-weight:600}
+.regime-chip.bull{background:#1b3a2c;color:var(--green)}
+.regime-chip.bear{background:#3a1b1b;color:var(--red)}
+.regime-chip.chop{background:#2a2a1b;color:var(--orange)}
+.regime-chip.volatile{background:#2a1b3a;color:var(--purple)}
+#log{max-height:200px;overflow-y:auto;font-size:0.72em;color:var(--text2);background:rgba(0,0,0,0.3);padding:8px;border-radius:4px;margin-top:8px}
+.sweep-stage{display:flex;align-items:center;gap:8px;margin:4px 0;font-size:0.8em}
+.sweep-stage .name{min-width:140px;color:var(--text2)}
+.sweep-stage .bar{flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.sweep-stage .bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.sweep-stage .bar-fill.done{background:var(--green)}
+.sweep-stage .bar-fill.running{background:var(--accent);animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.recommendation{background:#1b2a1b;border:1px solid var(--green);border-radius:6px;padding:10px;margin:6px 0;font-size:0.8em;white-space:pre-wrap}
+.tabs{display:flex;gap:0;margin-bottom:12px;border-bottom:1px solid var(--border)}
+.tab{padding:8px 16px;cursor:pointer;color:var(--text2);border-bottom:2px solid transparent;font-size:0.85em}
+.tab.active{color:var(--accent);border-color:var(--accent)}
+.tab-content{display:none}
+.tab-content.active{display:block}
+</style>
+</head>
+<body>
+<h1>
+  <span class="status" id="connStatus"></span>
+  Research Lab — Counterfactual Engine
+  <span style="font-size:0.7em;color:var(--text2);margin-left:auto" id="cycleInfo">cycle 0</span>
+</h1>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('overview')">Overview</div>
+  <div class="tab" onclick="switchTab('findings')">Findings</div>
+  <div class="tab" onclick="switchTab('sweep')">Sweep Progress</div>
+  <div class="tab" onclick="switchTab('regime')">Regime Analysis</div>
+  <div class="tab" onclick="switchTab('log')">Log</div>
+</div>
+
+<!-- OVERVIEW TAB -->
+<div class="tab-content active" id="tab-overview">
+  <div class="grid">
+    <div class="card">
+      <h2>📊 Baseline Metrics (Current)</h2>
+      <div id="baselineMetrics"></div>
+    </div>
+    <div class="card">
+      <h2>🏆 Best CF Scenario</h2>
+      <div id="bestCF"></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>🔬 Top Recommendations</h2>
+    <div id="topRecommendations"></div>
+  </div>
+</div>
+
+<!-- FINDINGS TAB -->
+<div class="tab-content" id="tab-findings">
+  <div class="card">
+    <h2>📋 All Findings (sorted by impact)</h2>
+    <div id="allFindings"></div>
+  </div>
+</div>
+
+<!-- SWEEP PROGRESS TAB -->
+<div class="tab-content" id="tab-sweep">
+  <div class="card">
+    <h2>⚡ Parameter Sweep Progress</h2>
+    <div id="sweepProgress"></div>
+  </div>
+</div>
+
+<!-- REGIME TAB -->
+<div class="tab-content" id="tab-regime">
+  <div class="card">
+    <h2>🏷 Performance by Regime</h2>
+    <div id="regimeTable"></div>
+  </div>
+</div>
+
+<!-- LOG TAB -->
+<div class="tab-content" id="tab-log">
+  <div class="card">
+    <h2>📝 Research Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let reconnectTimer = null;
+let logLines = [];
+const MAX_LOG = 200;
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.getElementById('tab-'+name).classList.add('active');
+}
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('connStatus').classList.add('on');
+    addLog('WebSocket connected');
+  };
+  ws.onclose = () => {
+    document.getElementById('connStatus').classList.remove('on');
+    if (!reconnectTimer) reconnectTimer = setTimeout(() => { reconnectTimer=null; connect(); }, 3000);
+  };
+  ws.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'heartbeat') return;
+      render(data);
+    } catch(err) { addLog('Parse error: '+err); }
+  };
+}
+
+function render(data) {
+  // Cycle info
+  const ci = document.getElementById('cycleInfo');
+  ci.textContent = `cycle ${data.cycle_count||0} | ${data.running?'⚡ Running':'⏸ Idle'} | ${new Date((data.last_update_ts||0)*1000).toLocaleTimeString()}`;
+
+  // Baseline
+  const bl = data.baseline || {};
+  const bm = document.getElementById('baselineMetrics');
+  bm.innerHTML = metricChips(bl);
+
+  // Best CF
+  const findings = data.findings || data.top_10 || [];
+  const bc = document.getElementById('bestCF');
+  if (findings.length > 0) {
+    const best = findings[0];
+    bc.innerHTML = `
+      <div class="finding">
+        <div class="title">${esc(best.title)} <span class="badge ${best.confidence>=0.6?'high':best.confidence>=0.3?'med':'low'}">${(best.confidence*100).toFixed(0)}%</span></div>
+        <div class="improvement ${best.improvement_pct>0?'pos':'neg'}">ΔPnL: $${best.improvement_pct>=0?'+':''}${best.improvement_pct.toFixed(2)}</div>
+        <div class="detail">${esc(best.description||'')}</div>
+      </div>`;
+  } else {
+    bc.innerHTML = '<span style="color:var(--text2)">No findings yet...</span>';
+  }
+
+  // Top recommendations
+  const tr = document.getElementById('topRecommendations');
+  const topN = findings.slice(0, 5);
+  tr.innerHTML = topN.map(f => `
+    <div class="recommendation">${esc(f.recommendation||'No recommendation')}</div>
+  `).join('') || '<span style="color:var(--text2)">Waiting for sweep results...</span>';
+
+  // All findings
+  const af = document.getElementById('allFindings');
+  af.innerHTML = findings.map((f,i) => `
+    <div class="finding">
+      <div class="title">#${i+1} ${esc(f.title)} <span class="badge ${f.confidence>=0.6?'high':f.confidence>=0.3?'med':'low'}">${(f.confidence*100).toFixed(0)}%</span></div>
+      <div class="improvement ${f.improvement_pct>0?'pos':'neg'}">ΔPnL: $${f.improvement_pct>=0?'+':''}${f.improvement_pct.toFixed(2)}</div>
+      <div class="detail">${esc(f.description||'')}</div>
+      <div class="recommendation" style="margin-top:6px">${esc(f.recommendation||'')}</div>
+    </div>
+  `).join('') || '<span style="color:var(--text2)">No findings</span>';
+
+  // Sweep progress
+  const sp = document.getElementById('sweepProgress');
+  const progress = data.sweep_progress || {};
+  sp.innerHTML = Object.entries(progress).map(([stage, info]) => {
+    const pct = info.total > 0 ? (info.done / info.total * 100) : 0;
+    const status = info.status || 'pending';
+    return `<div class="sweep-stage">
+      <span class="name">${esc(stage)}</span>
+      <div class="bar"><div class="bar-fill ${status}" style="width:${pct}%"></div></div>
+      <span>${info.done||0}/${info.total||0}</span>
+    </div>`;
+  }).join('') || '<span style="color:var(--text2)">Not started</span>';
+
+  // Regime
+  const rt = document.getElementById('regimeTable');
+  const byRegime = data.baseline_by_regime || {};
+  let rtHtml = '<table><tr><th>Regime</th><th>N</th><th>PnL</th><th>WR</th><th>R:R</th><th>Edge</th><th>Sharpe</th></tr>';
+  for (const [regime, m] of Object.entries(byRegime)) {
+    rtHtml += `<tr>
+      <td><span class="regime-chip ${regime}">${regime}</span></td>
+      <td>${m.n}</td>
+      <td style="color:${m.pnl>=0?'var(--green)':'var(--red)'}">${m.pnl>=0?'+':''}$${m.pnl.toFixed(2)}</td>
+      <td>${(m.wr*100).toFixed(1)}%</td>
+      <td>${m.rr.toFixed(2)}</td>
+      <td style="color:${m.edge>=0?'var(--green)':'var(--red)'}">${(m.edge*100).toFixed(1)}pp</td>
+      <td>${m.sharpe.toFixed(2)}</td>
+    </tr>`;
+  }
+  rtHtml += '</table>';
+  rt.innerHTML = rtHtml;
+}
+
+function metricChips(m) {
+  if (!m || !m.n) return '<span style="color:var(--text2)">Loading...</span>';
+  return `
+    <span class="metric info">N=${m.n}</span>
+    <span class="metric ${m.pnl>=0?'good':'bad'}">PnL=$${m.pnl>=0?'+':''}${m.pnl.toFixed(2)}</span>
+    <span class="metric ${m.wr>=0.5?'good':m.wr>=0.4?'neutral':'bad'}">WR=${(m.wr*100).toFixed(1)}%</span>
+    <span class="metric ${m.rr>=1?'good':m.rr>=0.5?'neutral':'bad'}">R:R=${m.rr.toFixed(2)}</span>
+    <span class="metric ${m.edge>=0?'good':'bad'}">Edge=${(m.edge*100).toFixed(1)}pp</span>
+    <span class="metric ${m.sharpe>=1?'good':m.sharpe>=0?'neutral':'bad'}">Sharpe=${m.sharpe.toFixed(2)}</span>
+    <span class="metric ${m.pf>=1?'good':'bad'}">PF=${m.pf.toFixed(2)}</span>
+    <span class="metric bad">MaxDD=$${m.max_dd.toFixed(2)}</span>
+  `;
+}
+
+function addLog(msg) {
+  logLines.push(`[${new Date().toLocaleTimeString()}] ${msg}`);
+  if (logLines.length > MAX_LOG) logLines.shift();
+  const el = document.getElementById('log');
+  el.innerHTML = logLines.map(l => `<div>${esc(l)}</div>`).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
+function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+connect();
+</script>
+</body>
+</html>

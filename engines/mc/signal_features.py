@@ -69,7 +69,16 @@ def _calculate_refined_mu_alpha_with_debug(
     w_ofi = None
     if np.sign(mu_mom) != np.sign(mu_ofi) and abs(mu_ofi) > 0.5:
         divergence = True
-        combined_raw = 0.0
+        # [FIX 2026-02-09] 발산 시 dominant signal의 30% 유지 (이전: 0으로 완전 소멸)
+        # Chop에서 mom↔OFI 부호 불일치는 흔하므로, 방향 정보를 완전 제거하면 안 됨
+        if abs(mu_mom) >= abs(mu_ofi):
+            combined_raw = float(mu_mom * 0.3)
+            w_mom = 0.3
+            w_ofi = 0.0
+        else:
+            combined_raw = float(mu_ofi * 0.3)
+            w_mom = 0.0
+            w_ofi = 0.3
     else:
         vol_ratio = float(current_vol / (long_term_vol + 1e-9))
         w_ofi = float(min(0.7, max(0.2, 0.5 * vol_ratio)))
@@ -78,7 +87,11 @@ def _calculate_refined_mu_alpha_with_debug(
 
     chop_threshold = float(base_params.get("chop_threshold", 0.3))
     if regime_kama < chop_threshold:
-        regime_factor = float((regime_kama / chop_threshold) ** 2)
+        # [FIX 2026-02-09] 이차 댐핑(quadratic) → 선형 댐핑으로 변경
+        # 이전: (regime_kama/0.3)^2 → ER=0.1에서 0.11배 (89% 감쇄)
+        # 변경: max(0.3, regime_kama/0.3) → ER=0.1에서 0.33배 (66% 감쇄)
+        # regime.py에서 chop×0.8 추가 적용되므로 총 감쇄를 합리적 수준으로 제한
+        regime_factor = float(max(0.3, regime_kama / chop_threshold))
         final_mu = float(combined_raw * regime_factor)
     else:
         boost = 1.2 if bool(base_params.get("boost_enabled", False)) else 1.0

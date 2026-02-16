@@ -16,7 +16,7 @@ from engines.mc import jax_backend as jax_backend
 from engines.mc.jax_backend import summarize_gbm_horizons_multi_symbol_jax
 from engines.mc.params import MCParams
 from engines.mc.config import config
-from regime import adjust_mu_sigma
+from regime import adjust_mu_sigma, get_regime_mu_sigma
 
 # ✅ Exit Policy Flag - Full exit policy calculation by default to include all exit logic in MC simulation
 # Set SKIP_EXIT_POLICY=true to use simplified summary-based EV (faster but less accurate)
@@ -71,6 +71,19 @@ def _calc_unified_score_from_cumulative(
     rho: float,
     lambda_param: float,
 ) -> tuple[float, float]:
+    """
+    Ratio-based Ψ (Psi) score.
+
+    기존 penalty-based 방식 (Ψ = NAPV - C)/h 는 EV ≈ 0 일 때 cost가 지배하여
+    항상 음수가 됨. Ratio-based 방식으로 변경:
+
+       Ψ(h) = (EV(h) - C) / (|CVaR(h)| + ε) × (1/√h)
+
+    - 분모에 |CVaR|을 넣어 risk-normalised score 생성
+    - λ로 CVaR 가중치 조절 (λ 클수록 보수적)
+    - 1/√h 로 시간 효율성 반영 (짧은 horizon 선호)
+    - Cost는 분자에서 1회 차감 (EV - C)
+    """
     h = np.asarray(horizons_sec, dtype=float)
     ev = np.asarray(cumulative_ev, dtype=float)
     cv = np.asarray(cumulative_cvar, dtype=float)
@@ -82,15 +95,25 @@ def _calc_unified_score_from_cumulative(
     h = h[:n]
     ev = ev[:n]
     cv = cv[:n]
-    dt = np.diff(h, prepend=0.0)
-    safe_dt = np.where(dt > 0.0, dt, 1.0)
-    marginal_ev = np.diff(ev, prepend=0.0) / safe_dt
-    marginal_cvar = np.diff(cv, prepend=0.0) / safe_dt
-    utility_rate = marginal_ev - float(lambda_param) * np.abs(marginal_cvar)
+
+    # ── Ratio-based Ψ ──
+    # 분자: EV(h) - Cost (net return)
+    ev_net = ev - float(cost)
+
+    # 분모: |CVaR(h)| × (1 + λ) + ε
+    # λ가 크면 CVaR 패널티 증가 → 보수적
+    cvar_abs = np.abs(cv) + 1e-8
+    denominator = cvar_abs * (1.0 + float(lambda_param))
+
+    # 시간 효율: 1/√h
+    time_w = 1.0 / np.sqrt(np.maximum(h, 1.0))
+
+    # 할인 (rho > 0 이면 장기 horizon 할인)
     discount = np.exp(-float(rho) * h)
-    gross_napv = np.cumsum((utility_rate - float(rho)) * discount * dt)
-    denom = np.where(h > 0.0, h, 1.0)
-    psi_score = (gross_napv - float(cost)) / denom
+
+    # Ψ score per horizon
+    psi_score = (ev_net / denominator) * time_w * discount
+
     best_idx = int(np.argmax(psi_score))
     return float(psi_score[best_idx]), float(h[best_idx])
 
@@ -331,6 +354,25 @@ class MonteCarloEntryEvaluationMixin:
         comp_sum_w = 0.0
         comp_sum = 0.0
 
+        # ── [FIX 2026-02-15] Clamp each component to MU_ALPHA_CAP BEFORE mixing ──
+        # Parity with batch path (L3750). Individual components can reach ±630,000
+        # after annualization, dominating comp_sum.
+        try:
+            _comp_cap = float(config.mu_alpha_cap)
+        except Exception:
+            _comp_cap = 5.0
+        try:
+            _comp_floor = float(config.mu_alpha_floor)
+        except Exception:
+            _comp_floor = -_comp_cap
+
+        def _clamp_comp_val(v):
+            try:
+                v = float(v or 0.0)
+            except Exception:
+                return 0.0
+            return float(max(_comp_floor, min(_comp_cap, v)))
+
         def _add_comp(name: str, val: float, w: float) -> None:
             nonlocal comp_sum_w, comp_sum
             if w is None:
@@ -338,6 +380,7 @@ class MonteCarloEntryEvaluationMixin:
             w = float(w)
             if w <= 0:
                 return
+            val = _clamp_comp_val(val)
             comp_sum_w += w
             comp_sum += w * float(val)
             mu_alpha_parts[name] = float(val)
@@ -394,16 +437,23 @@ class MonteCarloEntryEvaluationMixin:
                 low = float(getattr(config, "hurst_low", 0.45))
                 high = float(getattr(config, "hurst_high", 0.55))
                 if hurst < low:
+                    # Mean-reverting → OU blend (신호 방향을 반전하여 박스권 반대편 진입)
                     mu_ou = _s(ctx.get("mu_ou"), 0.0)
                     ou_w = float(getattr(config, "ou_weight", 0.7))
                     mu_alpha_raw = float((1.0 - ou_w) * mu_alpha_raw + ou_w * mu_ou)
                     mu_alpha_parts["hurst_regime"] = "mean_revert"
+                    # [2026-02-14] OU simulation 사용 플래그 설정
+                    ctx["_use_ou_sim"] = True
+                    ctx["_ou_theta"] = float(getattr(config, "ou_theta", 0.3))
                 elif hurst > high:
                     boost = float(getattr(config, "hurst_trend_boost", 1.15))
                     mu_alpha_raw = float(mu_alpha_raw * boost)
                     mu_alpha_parts["hurst_regime"] = "trend"
                 else:
-                    damp = float(getattr(config, "hurst_random_dampen", 0.25))
+                    # [FIX 2026-02-14] Random walk 댐핑 완화: 0.60 → 0.75
+                    # Chop 레짐에서 다른 감쇠와 겹치면 총 감쇠 95%+ 달성됨
+                    # 0.75로 완화하여 Chop에서도 진입 가능성 유지
+                    damp = float(getattr(config, "hurst_random_dampen", 0.75))
                     mu_alpha_raw = float(mu_alpha_raw * damp)
                     mu_alpha_parts["hurst_regime"] = "random"
 
@@ -523,12 +573,16 @@ class MonteCarloEntryEvaluationMixin:
         try:
             mu_cap = config.mu_alpha_cap
         except Exception:
-            mu_cap = 40.0
+            mu_cap = 5.0
+        try:
+            mu_floor = config.mu_alpha_floor
+        except Exception:
+            mu_floor = -5.0
         mu_alpha_final = float(mu_alpha_pmaker_adjusted)
         if mu_alpha_final > mu_cap:
             mu_alpha_final = mu_cap
-        elif mu_alpha_final < -mu_cap:
-            mu_alpha_final = -mu_cap
+        elif mu_alpha_final < mu_floor:
+            mu_alpha_final = mu_floor
 
         # Optional: EMA smoothing (residual alpha / inertia) to reduce signal flicker.
         # - Enabled when MU_ALPHA_EMA_ALPHA in (0, 1].
@@ -553,8 +607,8 @@ class MonteCarloEntryEvaluationMixin:
                 # safety clamp
                 if mu_alpha_final > mu_cap:
                     mu_alpha_final = mu_cap
-                elif mu_alpha_final < -mu_cap:
-                    mu_alpha_final = -mu_cap
+                elif mu_alpha_final < mu_floor:
+                    mu_alpha_final = mu_floor
 
                 mu_alpha_parts["mu_alpha_before_ema"] = float(mu_alpha_pre_ema)
                 mu_alpha_parts["mu_alpha_ema_alpha"] = float(mu_alpha_ema_alpha)
@@ -567,6 +621,28 @@ class MonteCarloEntryEvaluationMixin:
                 logger.warning(f"[MU_ALPHA_EMA] {symbol} | Failed to apply EMA smoothing: {e}")
 
         mu_alpha_parts["mu_alpha"] = float(mu_alpha_final)  # 최종 mu_alpha 업데이트
+
+        # ── [FIX 2026-02-13] Compound dampening 추적 ──
+        # signal_features의 combined_raw → 최종 mu_alpha_final 사이 총 감쇄율 추적
+        try:
+            sf_combined_raw = float(mu_alpha_parts.get("combined_raw") or mu_alpha_parts.get("mu_mom", 0.0) or 0.0)
+            if abs(sf_combined_raw) > 1e-8:
+                total_dampen_ratio = 1.0 - abs(mu_alpha_final) / abs(sf_combined_raw)
+            else:
+                total_dampen_ratio = 0.0
+            mu_alpha_parts["total_dampen_ratio"] = float(max(0.0, min(1.0, total_dampen_ratio)))
+            # Alert: 총 감쇄가 90% 이상이면 위험
+            if total_dampen_ratio > 0.90 and abs(sf_combined_raw) > 0.5:
+                logger.warning(
+                    f"[COMPOUND_DAMPEN_ALERT] {symbol} | "
+                    f"raw={sf_combined_raw:.4f} → final={mu_alpha_final:.4f} | "
+                    f"total_dampen={total_dampen_ratio*100:.1f}% (>90%!) | "
+                    f"hurst_regime={mu_alpha_parts.get('hurst_regime')} | "
+                    f"regime_factor={mu_alpha_parts.get('regime_factor')}"
+                )
+        except Exception:
+            pass
+
         try:
             ctx["mu_alpha"] = float(mu_alpha_final)
         except Exception:
@@ -684,7 +760,9 @@ class MonteCarloEntryEvaluationMixin:
             expected_spread_cost = float((1.0 - p_maker) * float(expected_spread_cost_raw))
 
         # --- PMAKER survival override (from orchestrator decision.meta) ---
-        pmaker_entry = 0.0
+        # [FIX 2026-02-13] pmaker_entry 기본값을 config.pmaker_prob로 변경 (이전: 0.0 → fee mix 무의미)
+        _pmaker_default = float(getattr(config, "pmaker_prob", 0.9))
+        pmaker_entry = _pmaker_default
         pmaker_entry_delay_sec = 0.0
         pmaker_entry_short = 0.0
         pmaker_entry_short_delay_sec = 0.0
@@ -693,7 +771,7 @@ class MonteCarloEntryEvaluationMixin:
         pmaker_override_used = False
         try:
             meta_in = ctx.get("meta") or {}
-            pmaker_entry = float(ctx.get("pmaker_entry") or meta_in.get("pmaker_entry") or 0.0)
+            pmaker_entry = float(ctx.get("pmaker_entry") or meta_in.get("pmaker_entry") or _pmaker_default)
             if MC_VERBOSE_PRINT:
                 print(
                     f"[PMAKER_DEBUG] {symbol} | evaluate_entry_metrics: pmaker_entry={pmaker_entry:.4f} from ctx.get={ctx.get('pmaker_entry')} meta_in.get={meta_in.get('pmaker_entry')}"
@@ -705,7 +783,7 @@ class MonteCarloEntryEvaluationMixin:
             if MC_VERBOSE_PRINT:
                 print(f"[PMAKER_DEBUG] {symbol} | evaluate_entry_metrics: pmaker_entry read failed: {e}")
             logger.warning(f"[PMAKER_DEBUG] {symbol} | evaluate_entry_metrics: pmaker_entry read failed: {e}")
-            pmaker_entry = 0.0
+            pmaker_entry = _pmaker_default
         try:
             meta_in = ctx.get("meta") or {}
             pmaker_entry_delay_sec = float(ctx.get("pmaker_entry_delay_sec") or meta_in.get("pmaker_entry_delay_sec") or 0.0)
@@ -754,9 +832,9 @@ class MonteCarloEntryEvaluationMixin:
         # Guard against NaN/Inf leaking from ctx/meta (would silently become null in JSON).
         try:
             if not math.isfinite(float(pmaker_entry)):
-                pmaker_entry = 0.0
+                pmaker_entry = _pmaker_default
         except Exception:
-            pmaker_entry = 0.0
+            pmaker_entry = _pmaker_default
         try:
             if not math.isfinite(float(pmaker_entry_delay_sec)):
                 pmaker_entry_delay_sec = 0.0
@@ -937,6 +1015,9 @@ class MonteCarloEntryEvaluationMixin:
         step_sec = int(getattr(self, "time_step_sec", 1) or 1)
         step_sec = int(max(1, step_sec))
         n_paths = int(getattr(params, "n_paths", config.n_paths_live))
+        use_ou_sim = bool(ctx.get("_use_ou_sim", False))
+        ou_theta = float(ctx.get("_ou_theta", 0.0) or 0.0)
+        ou_mu_level = float(price)
         
         # [A] Price paths generation (1st call)
         max_h_sec = int(max(horizons_for_sim)) if horizons_for_sim else 0
@@ -951,6 +1032,9 @@ class MonteCarloEntryEvaluationMixin:
             n_steps=max_steps,
             dt=float(self.dt),
             return_torch=True,
+            regime=("chop" if use_ou_sim else str(regime_ctx or "")),
+            ou_theta=ou_theta,
+            ou_mu_level=ou_mu_level,
         )
         t1_gen1 = time.perf_counter()
 
@@ -1077,6 +1161,9 @@ class MonteCarloEntryEvaluationMixin:
                 n_steps=int(max_policy_steps),
                 dt=float(self.dt),
                 return_torch=True,
+                regime=("chop" if use_ou_sim else str(regime_ctx or "")),
+                ou_theta=ou_theta,
+                ou_mu_level=ou_mu_level,
             )
             paths_reused = False
         t1_gen2 = time.perf_counter()
@@ -1763,29 +1850,33 @@ class MonteCarloEntryEvaluationMixin:
         h_arr_pol = np.asarray(policy_horizons, dtype=np.int64)
         n_pol = int(h_arr_pol.size)
 
-        # objective / constraint knobs
-        # Available modes:
-        # - "ratio_time_var": default mode (EV/CVaR * time_weight - lambda*var)
-        # - "new_objective": new objective with signal reliability penalty (EV / (CVaR + 2*Std_Dev) * time_weight)
-        # - "signal_reliability": alias for "new_objective"
-        obj_mode = config.policy_objective_mode
-        lambda_var = config.policy_lambda_var
+        # ── Regime-Adaptive Objective ──
+        # RegimePolicy가 objective mode, λ, TP/SL, consensus 등을 레짐별로 자동 결정.
+        # 환경변수 override 가능.
+        try:
+            from engines.mc.regime_policy import get_regime_policy, log_regime_policy
+        except ImportError:
+            from .regime_policy import get_regime_policy, log_regime_policy
+
+        try:
+            reg = str(regime_ctx or "").strip().lower()
+        except Exception:
+            reg = "chop"
+
+        # sigma는 evaluate_entry_metrics 상위 스코프에 이미 존재
+        _realized_sigma = float(sigma) if sigma is not None else 0.5
+        _rpol = get_regime_policy(reg, _realized_sigma)
+        if MC_VERBOSE_PRINT:
+            log_regime_policy(_rpol, symbol)
+
+        obj_mode = _rpol.objective_mode
+        lambda_var = _rpol.lambda_var
         cvar_eps = config.policy_cvar_eps
         max_p_liq = config.policy_max_p_liq
         min_profit_cost = config.policy_min_profit_cost
         max_dd_abs = config.policy_max_dd_abs
 
-        min_gap = config.policy_min_ev_gap
-        # In chop/volatile, require a larger directional edge to avoid noisy long/short flips.
-        try:
-            reg = str(regime_ctx or "").strip().lower()
-        except Exception:
-            reg = "chop"
-        min_gap_eff = float(min_gap)
-        if reg == "chop":
-            min_gap_eff = float(max(min_gap_eff, 0.0006))
-        elif reg == "volatile":
-            min_gap_eff = float(max(min_gap_eff, 0.0008))
+        min_gap_eff = float(_rpol.min_ev_gap)
 
         def _metric_arr(per_h: list[dict], key: str) -> np.ndarray:
             out = []
@@ -1841,41 +1932,42 @@ class MonteCarloEntryEvaluationMixin:
         std_long_h = np.sqrt(np.maximum(var_long_h, 0.0))
         std_short_h = np.sqrt(np.maximum(var_short_h, 0.0))
         
-        # New objective function: J = (EV_net) / (CVaR + (2.0 * Std_Dev)) * (1 / sqrt(T))
-        # This replaces the previous ratio-based approach
+        # ── Regime-Adaptive Objective Computation ──
+        # RegimePolicy에서 결정된 obj_mode에 따라 horizon별 objective 계산
+        # 변동성 정규화: σ_ref / σ_realized 로 스코어 스케일을 시장에 맞춤
+        sigma_ref = max(float(_rpol.sigma_ref), 0.01)
+        sigma_safe = max(float(_realized_sigma), 0.01)
+        vol_norm = sigma_ref / sigma_safe  # σ 높으면 norm < 1
+
         denominator_long = abs_cvar_long + (2.0 * std_long_h)
         denominator_short = abs_cvar_short + (2.0 * std_short_h)
-        
-        # Avoid division by zero
         denominator_long = np.maximum(denominator_long, 1e-12)
         denominator_short = np.maximum(denominator_short, 1e-12)
         
         # Time efficiency weight: 1 / sqrt(T)
         time_w = 1.0 / np.sqrt(np.maximum(h_arr_pol.astype(np.float64), 1.0))
         
-        # ✅ Gross Score 옵션: 비용 제외한 순수 방향성 평가
-        use_gross_score = config.use_gross_score
+        # ✅ Gross/Net EV selection (regime policy decides)
+        use_gross_score = _rpol.use_gross_score
         
         if use_gross_score:
-            # Gross EV (비용 제외)
-            ev_long_gross = ev_long_h + float(cost_total_roe)
-            ev_short_gross = ev_short_h + float(cost_total_roe)
-            
-            # Gross Score
-            j_new_long = (ev_long_gross / denominator_long) * time_w
-            j_new_short = (ev_short_gross / denominator_short) * time_w
+            ev_long_obj = ev_long_h + float(cost_total_roe)
+            ev_short_obj = ev_short_h + float(cost_total_roe)
         else:
-            # Net EV (비용 포함, 기본값)
-            j_new_long = (ev_long_h / denominator_long) * time_w
-            j_new_short = (ev_short_h / denominator_short) * time_w
+            ev_long_obj = ev_long_h
+            ev_short_obj = ev_short_h
+        
+        # j_new (signal reliability)
+        j_new_long = (ev_long_obj / denominator_long) * time_w
+        j_new_short = (ev_short_obj / denominator_short) * time_w
         
         # Keep existing components for backward compatibility
-        j_ratio_long = ev_long_h / abs_cvar_long
-        j_ratio_short = ev_short_h / abs_cvar_short
+        j_ratio_long = ev_long_obj / abs_cvar_long
+        j_ratio_short = ev_short_obj / abs_cvar_short
         j_ratio_time_long = j_ratio_long * time_w
         j_ratio_time_short = j_ratio_short * time_w
-        j_ev_var_long = ev_long_h - float(lambda_var) * var_long_h
-        j_ev_var_short = ev_short_h - float(lambda_var) * var_short_h
+        j_ev_var_long = ev_long_obj - float(lambda_var) * var_long_h
+        j_ev_var_short = ev_short_obj - float(lambda_var) * var_short_h
 
         if obj_mode in ("ratio", "cvar_ratio"):
             obj_long_raw = j_ratio_long
@@ -1887,13 +1979,16 @@ class MonteCarloEntryEvaluationMixin:
             obj_long_raw = j_ev_var_long
             obj_short_raw = j_ev_var_short
         elif obj_mode in ("new_objective", "signal_reliability"):
-            # Use the new objective function with signal reliability penalty
             obj_long_raw = j_new_long
             obj_short_raw = j_new_short
         else:
             # default: combine (1)+(3) with (2) penalty
             obj_long_raw = j_ratio_time_long - float(lambda_var) * var_long_h
             obj_short_raw = j_ratio_time_short - float(lambda_var) * var_short_h
+
+        # ✅ 변동성 정규화 적용 — 스코어 스케일을 시장 환경과 독립적으로 유지
+        obj_long_raw = obj_long_raw * vol_norm
+        obj_short_raw = obj_short_raw * vol_norm
 
         # TP-hit reliability weighting (per-horizon). Penalize low TP hit on positive scores.
         tp_floor = float(max(0.0, min(1.0, config.score_tp_floor)))
@@ -2097,7 +2192,7 @@ class MonteCarloEntryEvaluationMixin:
         # Each horizon is a candidate. Neighbors contribute weight based on:
         # 1. Distance (closer = more weight)
         # 2. Direction agreement (same side, positive)
-        local_consensus_alpha = config.policy_local_consensus_alpha
+        local_consensus_alpha = float(_rpol.local_consensus_alpha)
         base_horizon = config.policy_local_consensus_base_h
         
         n_horizons = int(h_arr_pol.size) if h_arr_pol.size > 0 else 0
@@ -2206,11 +2301,11 @@ class MonteCarloEntryEvaluationMixin:
         # ✅ SCORE-BASED DIRECTION: 롱과 숏을 독립적으로 판단 (차등 임계점 적용)
         policy_direction_reason = None
         
-        # Determine effective threshold for the best horizon
+        # Determine effective threshold for the best horizon (regime-adaptive)
         best_h_chosen = (best_h_long_weighted if score_long >= score_short else best_h_short_weighted)
-        th_base = float(max(0.0, config.score_entry_threshold))
+        th_base = float(max(0.0, _rpol.score_entry_threshold))
         score_threshold_eff = th_base * math.sqrt(float(best_h_chosen) / 180.0)
-        score_threshold_eff = float(max(config.score_entry_floor, score_threshold_eff))
+        score_threshold_eff = float(max(_rpol.score_entry_floor, score_threshold_eff))
 
         # TP-hit gate at a fixed horizon (default 5m) to suppress entries with near-zero TP hit.
         tp_entry_min = float(max(0.0, min(1.0, config.score_tp_entry_min)))
@@ -2586,6 +2681,17 @@ class MonteCarloEntryEvaluationMixin:
         meta["policy_score_threshold_eff"] = float(score_threshold_eff)
         meta["policy_min_ev_gap"] = min_gap_eff
         meta["policy_best_ev_gap"] = float(best_ev_gap)
+        # ── Regime-Adaptive Policy Metadata ──
+        meta["regime_policy_mode"] = str(_rpol.objective_mode)
+        meta["regime_policy_lambda_var"] = float(_rpol.lambda_var)
+        meta["regime_policy_vol_norm"] = float(vol_norm)
+        meta["regime_policy_sigma_realized"] = float(_realized_sigma)
+        meta["regime_policy_regime"] = str(_rpol.regime)
+        meta["regime_policy_tp_pct"] = float(_rpol.tp_pct)
+        meta["regime_policy_sl_pct"] = float(_rpol.sl_pct)
+        meta["regime_policy_max_leverage"] = float(_rpol.max_leverage)
+        meta["regime_policy_entry_floor"] = float(_rpol.entry_floor + _rpol.entry_floor_add)
+        meta["regime_policy_allow_counter_trend"] = bool(_rpol.allow_counter_trend)
         meta["policy_ev_gap"] = float(ev_gap)
         meta["policy_p_pos_gap"] = float(p_pos_gap)
         meta["policy_tp_5m_long"] = float(tp_long_5m) if tp_long_5m is not None else None
@@ -3370,7 +3476,8 @@ class MonteCarloEntryEvaluationMixin:
             event_cvar_pct = None
         try:
             if event_ev_pct is not None and event_cvar_pct is not None:
-                lambda_val = float(ctx.get("unified_lambda", config.unified_risk_lambda))
+                # RegimePolicy의 risk_lambda 사용
+                lambda_val = float(ctx.get("unified_lambda", _rpol.risk_lambda))
                 rho_val = float(ctx.get("rho", config.unified_rho))
                 tau_evt = float(event_metrics.get("event_t_median") or max(self.horizons))
                 tau_evt = float(max(1.0, tau_evt))
@@ -3497,6 +3604,11 @@ class MonteCarloEntryEvaluationMixin:
             # ✅ NEW: Per-horizon EV vectors for Economic NAPV Brain
             "policy_ev_per_h_long": [float(x) for x in ev_long_h] if 'ev_long_h' in locals() else [],
             "policy_ev_per_h_short": [float(x) for x in ev_short_h] if 'ev_short_h' in locals() else [],
+            # Feature propagation for downstream sizing/leverage
+            "sigma": float(sigma),
+            "vpin": float(ctx.get("vpin", 0.5)),
+            "hurst_exp": float(ctx.get("hurst", 0.5)),
+            "regime": str(ctx.get("regime", "chop")),
         }
         if alpha_hit_features_np is not None:
             try:
@@ -3573,7 +3685,7 @@ class MonteCarloEntryEvaluationMixin:
         mu_dir_conf_vals = []
         alpha_hit_preds = [None for _ in range(num_symbols)]
         alpha_hit_features_list = [None for _ in range(num_symbols)]
-        from regime import adjust_mu_sigma
+        from regime import adjust_mu_sigma, get_regime_mu_sigma
 
         for idx, t in enumerate(tasks):
             ctx, params = t["ctx"], t["params"]
@@ -3594,7 +3706,13 @@ class MonteCarloEntryEvaluationMixin:
                 rets = np.diff(np.log(np.maximum(closes, 1e-12)))
                 sigma_base = float(rets.std()) * math.sqrt(SECONDS_PER_YEAR / bar_seconds)
             
-            sigma_base = float(sigma_base or 0.15)
+            if sigma_base is None or float(sigma_base) <= 0.0:
+                try:
+                    _sig_fallback = get_regime_mu_sigma(str(regime), str(ctx.get("session", "OFF")), symbol=str(sym))[1]
+                except Exception:
+                    _sig_fallback = 0.15
+                sigma_base = float(_sig_fallback or 0.15)
+            sigma_base = float(max(1e-6, float(sigma_base)))
 
             # Optional advanced alpha mix (batch-safe approximation)
             try:
@@ -3632,20 +3750,38 @@ class MonteCarloEntryEvaluationMixin:
                 comp_w += w
                 comp_sum += w * v
 
+            # ── [FIX 2026-02-13] Clamp each component to MU_ALPHA_CAP BEFORE mixing ──
+            # Individual components (mu_kf, mu_bayes, etc.) can reach ±630,000 after
+            # annualization, dominating the comp_sum.  Clamp to ±mu_cap first.
+            try:
+                _comp_cap = float(config.mu_alpha_cap)
+            except Exception:
+                _comp_cap = 5.0
+            try:
+                _comp_floor = float(config.mu_alpha_floor)
+            except Exception:
+                _comp_floor = -_comp_cap
+            def _clamp_comp(v):
+                try:
+                    v = float(v or 0.0)
+                except Exception:
+                    return 0.0
+                return float(max(_comp_floor, min(_comp_cap, v)))
+
             if use_mlofi:
-                _add_comp(float(ctx.get("mlofi", 0.0) or 0.0) * float(getattr(config, "mlofi_scale", 8.0)), float(getattr(config, "mlofi_weight", 0.20)))
+                _add_comp(_clamp_comp(float(ctx.get("mlofi", 0.0) or 0.0) * float(getattr(config, "mlofi_scale", 8.0))), float(getattr(config, "mlofi_weight", 0.20)))
             if use_kf:
-                _add_comp(ctx.get("mu_kf", 0.0), float(getattr(config, "kf_weight", 0.20)))
+                _add_comp(_clamp_comp(ctx.get("mu_kf", 0.0)), float(getattr(config, "kf_weight", 0.20)))
             if use_bayes:
-                _add_comp(ctx.get("mu_bayes", 0.0), float(getattr(config, "bayes_weight", 0.10)))
+                _add_comp(_clamp_comp(ctx.get("mu_bayes", 0.0)), float(getattr(config, "bayes_weight", 0.10)))
             if use_arima:
-                _add_comp(ctx.get("mu_ar", 0.0), float(getattr(config, "arima_weight", 0.10)))
+                _add_comp(_clamp_comp(ctx.get("mu_ar", 0.0)), float(getattr(config, "arima_weight", 0.10)))
             if use_pf:
-                _add_comp(ctx.get("mu_pf", 0.0), float(getattr(config, "pf_weight", 0.10)))
+                _add_comp(_clamp_comp(ctx.get("mu_pf", 0.0)), float(getattr(config, "pf_weight", 0.10)))
             if use_ml:
-                _add_comp(ctx.get("mu_ml", 0.0), float(getattr(config, "ml_weight", 0.15)))
+                _add_comp(_clamp_comp(ctx.get("mu_ml", 0.0)), float(getattr(config, "ml_weight", 0.15)))
             if use_causal:
-                _add_comp(ctx.get("mu_causal", 0.0), float(getattr(config, "causal_weight", 0.05)))
+                _add_comp(_clamp_comp(ctx.get("mu_causal", 0.0)), float(getattr(config, "causal_weight", 0.05)))
 
             if comp_w > 1.0:
                 comp_sum = comp_sum / comp_w
@@ -3667,7 +3803,7 @@ class MonteCarloEntryEvaluationMixin:
                     elif h > high:
                         mu_alpha = float(mu_alpha * float(getattr(config, "hurst_trend_boost", 1.15)))
                     else:
-                        mu_alpha = float(mu_alpha * float(getattr(config, "hurst_random_dampen", 0.25)))
+                        mu_alpha = float(mu_alpha * float(getattr(config, "hurst_random_dampen", 0.75)))
 
             if use_vpin and ctx.get("vpin") is not None:
                 try:
@@ -3738,6 +3874,33 @@ class MonteCarloEntryEvaluationMixin:
                     dir_target = math.copysign(abs(mu_alpha), float(dir_edge))
                     dir_blend = float(min(1.0, max(0.0, dir_strength * dir_conf)))
                     mu_alpha = float((1.0 - dir_blend) * float(mu_alpha) + dir_blend * float(dir_target))
+
+            # ── [FIX 2026-02-13] Apply MU_ALPHA_CAP in batch path (parity with single-symbol) ──
+            mu_alpha = float(max(_comp_floor, min(_comp_cap, mu_alpha)))
+            mu_alpha_raw = float(max(_comp_floor, min(_comp_cap, mu_alpha_raw)))
+
+            # Warm-up fallback: 재시작 직후 mu_alpha≈0인 경우 base drift 일부를 사용해 방향 신호 소실 방지
+            try:
+                mu_zero_eps = float(getattr(config, "mu_alpha_zero_eps", 1e-4) or 1e-4)
+            except Exception:
+                mu_zero_eps = 1e-4
+            try:
+                warmup_bars = int(getattr(config, "mu_alpha_warmup_bars", 360) or 360)
+            except Exception:
+                warmup_bars = 360
+            if abs(float(mu_alpha)) <= float(mu_zero_eps) and len(closes or []) < int(warmup_bars):
+                try:
+                    fallback_mult = float(getattr(config, "mu_alpha_warmup_fallback_mult", 0.35) or 0.35)
+                except Exception:
+                    fallback_mult = 0.35
+                mu_fb = float(ctx.get("mu_base", 0.0) or 0.0) * float(fallback_mult)
+                if abs(mu_fb) > 0.0:
+                    mu_alpha = float(max(_comp_floor, min(_comp_cap, mu_fb)))
+                    mu_alpha_raw = float(mu_alpha)
+                    try:
+                        ctx["mu_alpha_warmup_fallback"] = True
+                    except Exception:
+                        pass
 
             mu_alpha_vals.append(float(mu_alpha))
             mu_alpha_raw_vals.append(float(mu_alpha_raw))
@@ -3852,7 +4015,36 @@ class MonteCarloEntryEvaluationMixin:
         mus_orig = np.array(mus, dtype=np.float32)
         sigmas_orig = np.array(sigmas, dtype=np.float32)
         leverages_orig = np.array([float(t["ctx"].get("leverage") or 1.0) for t in tasks], dtype=np.float32)
-        fees_orig = np.array([(float(self.fee_roundtrip_base) + float(self.slippage_perc)) for _ in tasks], dtype=np.float32)
+        fee_taker_rt = float(self.fee_roundtrip_base)
+        fee_maker_rt = float(getattr(self, "fee_roundtrip_maker_base", 0.0002))
+        spread_cap = float(getattr(config, "spread_pct_max", 0.0) or 0.0)
+        exec_mode = str(getattr(config, "exec_mode", "maker_then_market") or "maker_then_market").strip().lower()
+        pmaker_default = float(getattr(config, "pmaker_prob", 0.9) or 0.9)
+        fees_orig_list = []
+        for _t in tasks:
+            _ctx = _t.get("ctx") or {}
+            _meta = _ctx.get("meta") or {}
+            try:
+                spread_pct = float(_ctx.get("spread_pct", 0.0002) or 0.0002)
+            except Exception:
+                spread_pct = 0.0002
+            spread_pct = float(max(0.0, spread_pct))
+            if spread_cap > 0.0:
+                spread_pct = min(spread_pct, spread_cap)
+            try:
+                p_maker = float(_ctx.get("pmaker_entry") or _meta.get("pmaker_entry") or pmaker_default)
+            except Exception:
+                p_maker = pmaker_default
+            p_maker = float(max(0.0, min(1.0, p_maker)))
+            fee_mix = fee_taker_rt
+            slip_mix = float(self.slippage_perc)
+            spread_mix = 0.5 * spread_pct
+            if exec_mode == "maker_then_market":
+                fee_mix = float(p_maker * fee_maker_rt + (1.0 - p_maker) * fee_taker_rt)
+                slip_mix = float((1.0 - p_maker) * float(self.slippage_perc))
+                spread_mix = float((1.0 - p_maker) * spread_mix)
+            fees_orig_list.append(float(max(0.0, fee_mix + slip_mix + spread_mix)))
+        fees_orig = np.array(fees_orig_list, dtype=np.float32)
 
         # Padding
         seeds_jax = np.zeros(pad_size, dtype=np.uint32)
@@ -4229,7 +4421,17 @@ class MonteCarloEntryEvaluationMixin:
             cost_roe = float(cost_base * lev_val)
             cost_entry_roe = float(cost_roe / 2.0)
             rho_val = float(tasks[i]["ctx"].get("rho", config.unified_rho))
-            lambda_val = float(tasks[i]["ctx"].get("unified_lambda", config.unified_risk_lambda))
+
+            # ── RegimePolicy의 risk_lambda를 Ψ 계산에 적용 ──
+            # 기존: config.unified_risk_lambda (고정 1.0) → 레짐별 차등화
+            _batch_regime_tag = str(tasks[i]["ctx"].get("regime") or "").strip().lower()
+            _batch_sigma_val = float(tasks[i]["ctx"].get("sigma") or 0.5)
+            try:
+                from engines.mc.regime_policy import get_regime_policy as _grp_batch
+            except ImportError:
+                from .regime_policy import get_regime_policy as _grp_batch
+            _batch_rpol = _grp_batch(_batch_regime_tag, _batch_sigma_val)
+            lambda_val = float(tasks[i]["ctx"].get("unified_lambda", _batch_rpol.risk_lambda))
 
             # AlphaHit blending (batch)
             alpha_pred = alpha_hit_preds[i] if i < len(alpha_hit_preds) else None
@@ -4308,10 +4510,12 @@ class MonteCarloEntryEvaluationMixin:
                 var_short_vec = np.zeros_like(ev_short_vec, dtype=np.float64)
 
             # Convert net cumulative vectors to gross (remove one-time cost)
+            # EV: gross = net + cost (Ψ 내부에서 cost 재차감하여 원래 net 복원)
+            # CVaR: net 그대로 사용 (CVaR는 Ψ 분모에만 사용되며, cost 가산 시 |CVaR| 축소 → Ψ 왜곡)
             ev_long_gross = ev_long_vec + cost_roe
             ev_short_gross = ev_short_vec + cost_roe
-            cvar_long_gross = cvar_long_vec + cost_roe
-            cvar_short_gross = cvar_short_vec + cost_roe
+            cvar_long_gross = cvar_long_vec   # [FIX 2026-02-15] net CVaR 그대로 (cost 가산 제거)
+            cvar_short_gross = cvar_short_vec  # [FIX 2026-02-15] net CVaR 그대로
 
             score_long, t_long = _calc_unified_score_from_cumulative(
                 h_list, ev_long_gross, cvar_long_gross,
@@ -4356,7 +4560,10 @@ class MonteCarloEntryEvaluationMixin:
                     trend_max_vpin = 0.80
                 dir_conf_batch = float(mu_dir_conf_vals[i]) if i < len(mu_dir_conf_vals) and mu_dir_conf_vals[i] is not None else 0.0
                 try:
-                    vpin_batch = float(tasks[i]["ctx"].get("vpin") or tasks[i]["ctx"].get("alpha_vpin") or 0.0)
+                    _vpin_raw = tasks[i]["ctx"].get("vpin")
+                    if _vpin_raw is None:
+                        _vpin_raw = tasks[i]["ctx"].get("alpha_vpin")
+                    vpin_batch = float(_vpin_raw) if _vpin_raw is not None else 0.0
                 except Exception:
                     vpin_batch = 0.0
                 if float(dir_conf_batch) >= float(trend_min_dir_conf) and float(vpin_batch) <= float(trend_max_vpin):
@@ -4560,6 +4767,12 @@ class MonteCarloEntryEvaluationMixin:
                     "ci_gate_pass": bool(can_enter_ci),
                     "n_paths": int(n_paths),
                     "perf": perf,
+                    # Feature propagation for downstream sizing/leverage
+                    "sigma": float(sigmas_jax[i]),
+                    "vpin": float(tasks[i]["ctx"].get("vpin", 0.5)),
+                    "hurst_exp": float(tasks[i]["ctx"].get("hurst", 0.5)),
+                    "regime": str(tasks[i]["ctx"].get("regime", "chop")),
+                    "regime_policy_regime": str(_batch_rpol.regime) if _batch_rpol else str(tasks[i]["ctx"].get("regime", "chop")),
                 },
             }
             if alpha_hit_features_list[i] is not None:

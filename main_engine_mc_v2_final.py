@@ -28,6 +28,21 @@ except RuntimeError:
 import bootstrap
 
 from pathlib import Path
+
+# Explicitly load state/bybit.env to ensure API keys are available
+# This is needed when engine is started via nohup without source-ing env
+_bybit_env_path = Path(__file__).resolve().parent / "state" / "bybit.env"
+if _bybit_env_path.exists():
+    try:
+        from utils.helpers import _load_env_file
+        _loaded = _load_env_file(str(_bybit_env_path))
+        if _loaded:
+            import logging
+            logging.getLogger(__name__).debug(f"[BOOTSTRAP] Loaded {_bybit_env_path}")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[BOOTSTRAP] Failed to load {_bybit_env_path}: {e}")
+
 import config
 from engines.mc.config import config as mc_config
 from concurrent.futures import ThreadPoolExecutor
@@ -121,6 +136,14 @@ except Exception:
     pass
 from engines.mc_engine import mc_first_passage_tp_sl_jax
 from engines.mc_risk import compute_cvar, kelly_with_cvar, PyramidTracker, ExitPolicy, should_exit_position
+from engines.mc.unified_sizing import (
+    compute_unified_sizing,
+    UnifiedSizingConfig,
+    _signal_quality as unified_signal_quality,
+    _regime_max_leverage as unified_regime_max_lev,
+    _liquidation_cap as unified_liq_cap,
+    get_config as get_unified_sizing_config,
+)
 from regime import adjust_mu_sigma, time_regime, get_regime_mu_sigma
 from engines.running_stats import RunningStats
 from engines.kelly_allocator import KellyAllocator
@@ -180,9 +203,9 @@ ERROR_BURST_WINDOW_SEC = 120
 DEFAULT_SIZE_FRAC = 0.10            # balance 대비 기본 진입 비중 (더 공격적)
 MAX_POSITION_HOLD_SEC = int(getattr(config, "MAX_POSITION_HOLD_SEC", 600))  # 보유 상한(환경변수 기반)
 POSITION_HOLD_MIN_SEC = int(getattr(config, "POSITION_HOLD_MIN_SEC", 0))  # 최소 보유 시간 (초)
-POSITION_CAP_ENABLED = False        # 포지션 개수 제한 비활성화(무제한 진입)
+POSITION_CAP_ENABLED = True          # [2026-02-14] 포지션 수 제한 활성화 (집중투자)
 EXPOSURE_CAP_ENABLED = True         # 노출 한도 사용
-MAX_CONCURRENT_POSITIONS = 99999
+MAX_CONCURRENT_POSITIONS = int(os.environ.get("MAX_CONCURRENT_POSITIONS", 6))  # [2026-02-14] 6개 집중
 MAX_NOTIONAL_EXPOSURE = float(getattr(config, "MAX_NOTIONAL_EXPOSURE", 10.0))  # 기본 총 노출 한도 (잔고 대비 배수)
 LIVE_MAX_NOTIONAL_EXPOSURE = float(getattr(config, "LIVE_MAX_NOTIONAL_EXPOSURE", 10.0))  # 라이브 모드 최소 1000%
 REBALANCE_THRESHOLD_FRAC = float(getattr(config, "REBALANCE_THRESHOLD_FRAC", 0.02))
@@ -236,6 +259,7 @@ REBALANCE_THRESHOLD_MAP = _parse_sym_float_map("REBALANCE_THRESHOLD_MAP")
 REBALANCE_MIN_INTERVAL_MAP = _parse_sym_float_map("REBALANCE_MIN_INTERVAL_MAP")
 REBALANCE_MIN_NOTIONAL_MAP = _parse_sym_float_map("REBALANCE_MIN_NOTIONAL_MAP")
 REBALANCE_ENABLED = str(os.environ.get("REBALANCE_ENABLE", os.environ.get("REBALANCE_ENABLED", "1"))).strip().lower() in ("1", "true", "yes", "on")
+REBALANCE_ON_HOLD_TOPN = str(os.environ.get("REBALANCE_ON_HOLD_TOPN", "1")).strip().lower() in ("1", "true", "yes", "on")
 EV_DROP_THRESHOLD = 0.0003          # EV 급락 exit 감지 임계
 K_LEV = float(getattr(config, "K_LEV", 2000.0))  # 레버리지 스케일 (환경변수 기반)
 EV_EXIT_FLOOR = {"bull": -0.0003, "bear": -0.0003, "chop": -0.0002, "volatile": -0.0002}
@@ -243,6 +267,16 @@ EV_DROP = {"bull": 0.0010, "bear": 0.0010, "chop": 0.0008, "volatile": 0.0008}
 PSL_RISE = {"bull": 0.05, "bear": 0.05, "chop": 0.03, "volatile": 0.03}
 MAX_DRAWDOWN_LIMIT = float(os.environ.get("MAX_DRAWDOWN_LIMIT", 0.10) or 0.10)  # Kill Switch 기준 (10% DD)
 EXECUTION_MODE = "maker_dynamic"   # maker_dynamic | market
+
+# ── [2026-02-14] Volatility Breakout Kill Switch ──
+VOL_BREAKOUT_ENABLED = str(os.environ.get("VOL_BREAKOUT_KILLSWITCH", "1")).strip().lower() in ("1", "true", "yes", "on")
+VOL_BREAKOUT_RV_MULT = float(os.environ.get("VOL_BREAKOUT_RV_MULT", 2.5) or 2.5)  # rv_short > rv_long * mult → breakout
+VOL_BREAKOUT_OFI_THRESHOLD = float(os.environ.get("VOL_BREAKOUT_OFI_THRESHOLD", 0.7) or 0.7)  # OFI 쏠림 임계
+VOL_BREAKOUT_VPIN_THRESHOLD = float(os.environ.get("VOL_BREAKOUT_VPIN_THRESHOLD", 0.85) or 0.85)  # VPIN 독성 임계
+
+# ── [2026-02-14] VPIN Adverse Selection Guard ──
+VPIN_MAKER_CANCEL_ENABLED = str(os.environ.get("VPIN_MAKER_CANCEL_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+VPIN_MAKER_CANCEL_THRESHOLD = float(os.environ.get("VPIN_MAKER_CANCEL_THRESHOLD", 0.80) or 0.80)
 
 # ---- Portfolio Selection (TOP N 종목 선택)
 TOP_N_SYMBOLS = int(getattr(config, "TOP_N_SYMBOLS", 4))  # 상위 N개 종목만 진입 (<=0이면 전체)
@@ -369,6 +403,7 @@ class LiveOrchestrator:
         self._live_balance_key_warned = False
         self._live_balance_stale_warned = False
         self._live_balance_cache_warned = False
+        self._live_balance_nonpos_warned = False
         self._hold_eval_lock = threading.Lock()
         self._rebalance_on_next_cycle = False
         self._force_rebalance_cycle = False
@@ -377,6 +412,9 @@ class LiveOrchestrator:
         self._exchange_positions_by_symbol: dict[str, dict] = {}
         self._exchange_positions_ts: int | None = None
         self._exchange_positions_source: str | None = None
+        self._exchange_positions_raw_count: int = 0
+        self._exchange_positions_view_count: int = 0
+        self._exchange_positions_filter_universe: bool = False
         self._ws_positions_cache: dict[str, dict] = {}
         self._ws_positions_last_ms: int | None = None
         self._ws_positions_last_err: str | None = None
@@ -441,7 +479,10 @@ class LiveOrchestrator:
         self._ev_regime_hist: dict[tuple[str, str], deque] = {}
         self._ev_thr_ema: dict[tuple[str, str], float] = {}
         self._ev_thr_ema_ts: dict[tuple[str, str], int] = {}
-        self._ev_drop_state: dict[str, dict] = {s: {"prev": None, "streak": 0} for s in SYMBOLS}
+        self._ev_drop_state: dict[str, dict] = {
+            s: {"prev": None, "streak": 0, "prev_opp_conf": None, "prev_opp_edge": None}
+            for s in SYMBOLS
+        }
         self._spread_regime_hist: dict[tuple[str, str], deque] = {}
         self._liq_regime_hist: dict[tuple[str, str], deque] = {}
         self._ofi_resid_hist: dict[tuple[str, str], deque] = {}
@@ -450,11 +491,18 @@ class LiveOrchestrator:
         self._ema_ev: dict[str, tuple[float, int]] = {}
         self._ema_psl: dict[str, tuple[float, int]] = {}
         self._exit_bad_ticks: dict[str, int] = {s: 0 for s in SYMBOLS}
+        # mu_alpha sign-flip exit state
+        self._mu_sign_state: dict[str, dict] = {
+            s: {"prev_sign": 0, "streak": 0} for s in SYMBOLS
+        }
+        # Direction gate hysteresis (regime-aware confirm ticks).
+        self._dir_gate_pass_streak: dict[str, int] = {s: 0 for s in SYMBOLS}
         self._dyn_leverage = {s: self.leverage for s in SYMBOLS}
         self._last_leverage_sync_ms_by_sym: dict[str, int] = {}
         self._last_leverage_target_by_sym: dict[str, float] = {}
         self._leverage_sync_fail_by_sym: dict[str, dict] = {}
         self._balance_reject_110007_by_sym: dict[str, dict] = {}
+        self._balance_reject_global_until_ms: int = 0
         self._symbol_quality_cache_by_sym: dict[str, dict] = {}
         self._lev_floor_sticky_counts: dict[str, int] = {s: 0 for s in SYMBOLS}
         self._lev_diag_last_ms_by_sym: dict[str, int] = {}
@@ -604,8 +652,41 @@ class LiveOrchestrator:
         self._new_exit_anchor_path = self.state_dir / "new_exit_anchor.json"
         self._new_exit_anchor_closed = 0
         self._new_exit_anchor_loaded = False
-        self._reval_target_min = int(os.environ.get("REVAL_TARGET_MIN_NEW_CLOSED", 200) or 200)
-        self._reval_target_max = int(os.environ.get("REVAL_TARGET_MAX_NEW_CLOSED", 300) or 300)
+        _reval_target_fallback = int(os.environ.get("AUTO_REVAL_TARGET_NEW", 120) or 120)
+        self._reval_target_min = int(os.environ.get("REVAL_TARGET_MIN_NEW_CLOSED", _reval_target_fallback) or _reval_target_fallback)
+        self._reval_target_max = int(
+            os.environ.get(
+                "REVAL_TARGET_MAX_NEW_CLOSED",
+                os.environ.get("REVAL_TARGET_MIN_NEW_CLOSED", self._reval_target_min),
+            )
+            or self._reval_target_min
+        )
+        self._reval_target_min = max(1, int(self._reval_target_min))
+        self._reval_target_max = max(int(self._reval_target_min), int(self._reval_target_max))
+        # ── [2026-02-13] mu_alpha auto-calibration state ──
+        self._mu_alpha_rolling: deque = deque(maxlen=2000)  # (ts_ms, mu_alpha, regime, dir_conf)
+        self._mu_alpha_calibrate_interval_sec = float(os.environ.get("MU_ALPHA_CALIBRATE_INTERVAL_SEC", 600) or 600)
+        self._mu_alpha_calibrate_last_ms = 0
+        self._mu_alpha_calibrate_path = self.state_dir / "mu_alpha_calibration.json"
+        self._mu_alpha_calibrate_enabled = str(os.environ.get("MU_ALPHA_AUTO_CALIBRATE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        # ── [2026-02-13] MC Health Watchdog state ──
+        self._mc_health_interval_sec = float(os.environ.get("MC_HEALTH_INTERVAL_SEC", 120) or 120)
+        self._mc_health_last_ms: int = 0
+        self._mc_health_snapshot: dict = {}  # latest health check results for dashboard
+        self._mc_health_auto_fix_enabled = str(os.environ.get("MC_HEALTH_AUTO_FIX", "1")).strip().lower() in ("1", "true", "yes", "on")
+        self._mc_health_issue_streak: dict[str, int] = {}
+        self._mc_health_last_fix_ms: int = 0
+        # ── [2026-02-13] MC Metric Sanity Monitor ──
+        try:
+            from engines.mc.metric_sanity import MCMetricSanityMonitor
+            self._mc_sanity_monitor = MCMetricSanityMonitor()
+        except Exception:
+            self._mc_sanity_monitor = None
+        self._mc_sanity_snapshot: dict = {}
+        # Adaptive entry threshold controller (linked to mu_alpha + MC EV state)
+        self._adaptive_entry_interval_sec = float(os.environ.get("ADAPTIVE_ENTRY_INTERVAL_SEC", 60) or 60)
+        self._adaptive_entry_last_ms: int = 0
+        self._adaptive_entry_snapshot: dict = {}
         self._auto_reval_status_path = self.state_dir / "auto_reval_db_report.json"
         self._auto_reval_status_reload_sec = float(os.environ.get("AUTO_REVAL_STATUS_RELOAD_SEC", 5.0) or 5.0)
         self._auto_reval_status_last_load_ms = 0
@@ -620,6 +701,25 @@ class LiveOrchestrator:
         self._auto_tune_status_cache: dict[str, object] = {}
         self._auto_tune_last_apply_ms = 0
         self._auto_tune_last_batch_id = 0
+        # ── [2026-02-15] Auto Diagnostics Engine (자기 개선 시스템) ──
+        self._auto_diag_engine = None
+        self._auto_diag_last_ms: int = 0
+        self._auto_diag_interval_sec = float(os.environ.get("AUTO_DIAG_INTERVAL_SEC", 3600) or 3600)
+        self._auto_diag_enabled = str(os.environ.get("AUTO_DIAGNOSTICS_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        self._auto_diag_snapshot: dict = {}
+        try:
+            from core.auto_diagnostics import AutoDiagnosticsEngine
+            _db_p = str(self.state_dir / "bot_data_live.db")
+            self._auto_diag_engine = AutoDiagnosticsEngine(
+                db_path=_db_p,
+                output_path=str(self.state_dir / "diagnostics_overrides.json"),
+                state_path=str(self.state_dir / "diagnostics_state.json"),
+                lookback_hours=float(os.environ.get("AUTO_DIAG_LOOKBACK_HOURS", 4.0) or 4.0),
+                interval_sec=self._auto_diag_interval_sec,
+            )
+            self._log("[AUTO_DIAG] Self-improving diagnostics engine initialized")
+        except Exception as _ade:
+            self._log(f"[AUTO_DIAG] init skip: {_ade}")
         self._event_exit_strict_consistency = str(
             os.environ.get("EVENT_EXIT_STRICT_CONSISTENCY_MODE", "1")
         ).strip().lower() in ("1", "true", "yes", "on")
@@ -1402,6 +1502,565 @@ class LiveOrchestrator:
             "timestamp": int(ts_ms or now_ms()),
         }
 
+    # ────────────────────────────────────────────────────────────────
+    # Auto Diagnostics Engine  (periodic, every _auto_diag_interval_sec)
+    # 자동 진단 & 자기 개선: 최근 거래 분석 → 파라미터 자동 조정
+    # ────────────────────────────────────────────────────────────────
+    def _run_auto_diagnostics(self) -> None:
+        """Run auto diagnostics engine if enough time has elapsed."""
+        if not self._auto_diag_enabled or self._auto_diag_engine is None:
+            return
+        try:
+            results = self._auto_diag_engine.run_diagnostics()
+            # Snapshot for dashboard
+            crit = sum(1 for r in results if r.severity == "CRITICAL")
+            high = sum(1 for r in results if r.severity == "HIGH")
+            med = sum(1 for r in results if r.severity == "MEDIUM")
+            self._auto_diag_snapshot = {
+                "last_run": int(time.time() * 1000),
+                "findings": len(results),
+                "critical": crit,
+                "high": high,
+                "medium": med,
+                "adjustments": self._auto_diag_engine.state.total_adjustments,
+                "consecutive_loss_cycles": self._auto_diag_engine.state.consecutive_loss_cycles,
+            }
+            if results:
+                sev_summary = []
+                if crit:
+                    sev_summary.append(f"CRITICAL={crit}")
+                if high:
+                    sev_summary.append(f"HIGH={high}")
+                if med:
+                    sev_summary.append(f"MEDIUM={med}")
+                self._log(f"[AUTO_DIAG] Diagnostics completed: {len(results)} findings ({', '.join(sev_summary)})")
+                for r in results:
+                    if r.severity in ("CRITICAL", "HIGH"):
+                        self._log(f"[AUTO_DIAG][{r.severity}] [{r.module}] {r.message[:200]}")
+                        if r.recommendation:
+                            self._log(f"[AUTO_DIAG] → Override: {r.recommendation}")
+            else:
+                self._log("[AUTO_DIAG] No findings — system healthy")
+        except Exception as e:
+            self._log_err(f"[AUTO_DIAG] diagnostics error: {e}")
+
+    # ────────────────────────────────────────────────────────────────
+    # MC Health Watchdog  (periodic, every _mc_health_interval_sec)
+    # ────────────────────────────────────────────────────────────────
+    def _run_mc_health_watchdog(self, batch_decisions: list[dict]) -> dict:
+        """Comprehensive MC pipeline health check.
+
+        Checks mu_alpha, sigma, fee, EV, direction consistency, and more.
+        Registers anomalies for dashboard display and optionally auto-fixes.
+        Returns health snapshot dict for dashboard ``mc_health`` field.
+        """
+        import numpy as _np
+        ts = now_ms()
+        checks: list[dict] = []
+        fixes_applied: list[str] = []
+        all_ok = True
+
+        # ── 1. mu_alpha 범위 검사 ──
+        mu_vals = []
+        for dec in (batch_decisions or []):
+            m = dec.get("meta") or {}
+            ma = m.get("mu_alpha") or m.get("pred_mu_alpha")
+            if ma is not None:
+                mu_vals.append(float(ma))
+
+        if mu_vals:
+            mu_arr = _np.array(mu_vals, dtype=_np.float64)
+            mu_mean = float(_np.mean(mu_arr))
+            mu_abs_mean = float(_np.mean(_np.abs(mu_arr)))
+            mu_max = float(_np.max(_np.abs(mu_arr)))
+            try:
+                mu_cap = float(os.environ.get("MU_ALPHA_CAP", 5.0) or 5.0)
+            except Exception:
+                mu_cap = 5.0
+
+            # Check 1a: mu_alpha 초과 (cap이 안 먹힌 경우)
+            if mu_max > mu_cap * 1.1:
+                msg = f"mu_alpha cap 초과: max={mu_max:.2f} > cap={mu_cap} — batch path capping 미적용 가능성"
+                checks.append({"name": "mu_alpha_cap", "status": "CRITICAL", "msg": msg})
+                self._register_anomaly("MC_MU_CAP", "CRITICAL", msg)
+                all_ok = False
+            # Check 1b: 모든 mu_alpha가 0 (warm-up 미완)
+            elif mu_abs_mean < 0.001 and len(mu_vals) > 10:
+                msg = f"mu_alpha 거의 0: |mean|={mu_abs_mean:.6f} — alpha 모델 warm-up 미완 또는 신호 사라짐"
+                checks.append({"name": "mu_alpha_zero", "status": "WARN", "msg": msg})
+                all_ok = False
+            # Check 1c: 대부분 pegged (방향 다양성 없음)
+            elif mu_max > 0:
+                pegged = float(_np.sum(_np.abs(mu_arr) >= (mu_cap - 0.01))) / len(mu_arr)
+                if pegged > 0.8:
+                    msg = f"mu_alpha {pegged*100:.0f}% pegged at cap={mu_cap} — 과도한 신호 또는 dampening 부족"
+                    checks.append({"name": "mu_alpha_pegged", "status": "WARN", "msg": msg})
+                    all_ok = False
+                else:
+                    checks.append({"name": "mu_alpha_range", "status": "OK", "msg": f"|mean|={mu_abs_mean:.4f}, max={mu_max:.4f}"})
+            else:
+                checks.append({"name": "mu_alpha_range", "status": "OK", "msg": f"|mean|={mu_abs_mean:.4f}"})
+
+        # ── 2. sigma 다양성 검사 ──
+        sigma_vals = []
+        for dec in (batch_decisions or []):
+            m = dec.get("meta") or {}
+            s = (
+                m.get("sigma")
+                or m.get("sigma_adj")
+                or m.get("sigma_sim")
+                or m.get("sigma_annual")
+                or dec.get("sigma")
+            )
+            if s is not None:
+                try:
+                    sigma_vals.append(float(s))
+                except Exception:
+                    pass
+
+        if len(sigma_vals) > 5:
+            sigma_arr = _np.array(sigma_vals, dtype=_np.float64)
+            sigma_std = float(_np.std(sigma_arr))
+            sigma_mean = float(_np.mean(sigma_arr))
+            if sigma_std < 0.001 and sigma_mean > 0:
+                msg = f"sigma 동일: mean={sigma_mean:.4f}, std={sigma_std:.6f} — GARCH 미분화 (warm-up 중)"
+                checks.append({"name": "sigma_diversity", "status": "INFO", "msg": msg})
+            else:
+                checks.append({"name": "sigma_diversity", "status": "OK", "msg": f"mean={sigma_mean:.4f}, std={sigma_std:.4f}"})
+        else:
+            checks.append({"name": "sigma_diversity", "status": "SKIP", "msg": f"sigma samples insufficient ({len(sigma_vals)})"})
+
+        # ── 3. fee 정합성 검사 ──
+        try:
+            _mc_eng = self._get_local_mc_engine()
+            if _mc_eng is None:
+                raise RuntimeError("mc_engine not available")
+            fee_rt_base = float(getattr(_mc_eng, "fee_roundtrip_base", 0))
+            fee_rt_maker = float(getattr(_mc_eng, "fee_roundtrip_maker_base", 0))
+            if abs(fee_rt_base - fee_rt_maker) < 0.0001:
+                msg = f"fee_taker_RT={fee_rt_base:.6f} ≈ fee_maker_RT={fee_rt_maker:.6f} → fee mix 무의미!"
+                checks.append({"name": "fee_parity", "status": "CRITICAL", "msg": msg})
+                self._register_anomaly("MC_FEE", "CRITICAL", msg)
+                all_ok = False
+                # Auto-fix
+                if self._mc_health_auto_fix_enabled:
+                    _mc_eng.fee_roundtrip_base = 0.0012
+                    _mc_eng.fee_roundtrip_maker_base = 0.0002
+                    fixes_applied.append("fee_roundtrip_base: 0.0002→0.0012")
+                    self._register_anomaly("MC_FEE_FIX", "INFO", f"Auto-fix: fee_roundtrip_base=0.0012 (taker RT)")
+            else:
+                checks.append({"name": "fee_parity", "status": "OK", "msg": f"taker_RT={fee_rt_base:.4f}, maker_RT={fee_rt_maker:.4f}"})
+        except Exception:
+            checks.append({"name": "fee_parity", "status": "SKIP", "msg": "mc_engine not available"})
+
+        # ── 4. EV 전체 방향 검사 (모두 음수이면 진입 불가) ──
+        ev_vals = []
+        regime_vals = []
+        for dec in (batch_decisions or []):
+            m = dec.get("meta") or {}
+            ev = m.get("ev") or m.get("unified_score") or m.get("policy_ev_mix")
+            if ev is not None:
+                ev_vals.append(float(ev))
+            try:
+                _rg = str(m.get("regime") or dec.get("regime") or "").strip().lower()
+                if _rg:
+                    regime_vals.append(_rg)
+            except Exception:
+                pass
+
+        if ev_vals:
+            ev_arr = _np.array(ev_vals)
+            ev_max = float(_np.max(ev_arr))
+            ev_mean = float(_np.mean(ev_arr))
+            pos_ratio = float(_np.sum(ev_arr > 0)) / len(ev_arr)
+            chop_ratio = 0.0
+            if regime_vals:
+                chop_ratio = float(sum(1 for r in regime_vals if r == "chop") / max(1, len(regime_vals)))
+            if pos_ratio == 0.0:
+                if chop_ratio >= 0.7:
+                    msg = f"모든 EV 음수: mean={ev_mean:.6f}, max={ev_max:.6f}, chop={chop_ratio*100:.0f}% — 비용 우위(chop)로 진입 불가"
+                else:
+                    msg = f"모든 EV 음수: mean={ev_mean:.6f}, max={ev_max:.6f} — 진입 불가 상태"
+                checks.append({"name": "ev_all_negative", "status": "WARN", "msg": msg})
+                all_ok = False
+            else:
+                checks.append({"name": "ev_positive_ratio", "status": "OK", "msg": f"{pos_ratio*100:.0f}% positive, mean={ev_mean:.6f}, chop={chop_ratio*100:.0f}%"})
+
+        # ── 5. 방향 일치성 (mu vs direction) ──
+        dir_mismatch = 0
+        dir_total = 0
+        for dec in (batch_decisions or []):
+            m = dec.get("meta") or {}
+            direction = m.get("direction", "")
+            ma = m.get("mu_alpha")
+            if ma is not None and direction in ("LONG", "SHORT"):
+                dir_total += 1
+                if (direction == "LONG" and float(ma) < -0.5) or (direction == "SHORT" and float(ma) > 0.5):
+                    dir_mismatch += 1
+        if dir_total > 0:
+            mismatch_rate = dir_mismatch / dir_total
+            if mismatch_rate > 0.3:
+                msg = f"방향 불일치 {dir_mismatch}/{dir_total} ({mismatch_rate*100:.0f}%) — mu↔direction mismatch"
+                checks.append({"name": "dir_consistency", "status": "WARN", "msg": msg})
+                all_ok = False
+            else:
+                checks.append({"name": "dir_consistency", "status": "OK", "msg": f"mismatch={dir_mismatch}/{dir_total}"})
+
+        # ── 6. dt 정합성 ──
+        try:
+            _mc_eng_dt = self._get_local_mc_engine()
+            if _mc_eng_dt is None:
+                raise RuntimeError("mc_engine not available for dt check")
+            step_sec = float(getattr(_mc_eng_dt, "time_step_sec", 60))
+            dt = float(getattr(_mc_eng_dt, "dt", 0))
+            expected_dt = step_sec / 31536000.0
+            if abs(dt - expected_dt) > 1e-10:
+                msg = f"dt 불일치: dt={dt:.2e}, expected={expected_dt:.2e} (step_sec={step_sec})"
+                checks.append({"name": "dt_consistency", "status": "CRITICAL", "msg": msg})
+                self._register_anomaly("MC_DT", "CRITICAL", msg)
+                all_ok = False
+            else:
+                checks.append({"name": "dt_consistency", "status": "OK", "msg": f"dt={dt:.2e}"})
+        except Exception:
+            pass
+
+        # ── 7. Batch 시간 모니터링 ──
+        try:
+            last_elapsed = getattr(self, "_last_batch_elapsed_ms", 0)
+            timeout_sec = float(os.environ.get("DECIDE_BATCH_TIMEOUT_SEC", 60) or 60)
+            if last_elapsed > timeout_sec * 1000 * 0.8:
+                msg = f"배치 시간 위험: {last_elapsed/1000:.1f}s / timeout {timeout_sec}s ({last_elapsed/timeout_sec/10:.0f}%)"
+                checks.append({"name": "batch_timeout", "status": "WARN", "msg": msg})
+                all_ok = False
+            else:
+                checks.append({"name": "batch_timeout", "status": "OK", "msg": f"{last_elapsed/1000:.1f}s"})
+        except Exception:
+            pass
+
+        # ── 결과 조립 ──
+        snapshot = {
+            "timestamp_ms": int(ts),
+            "all_ok": bool(all_ok),
+            "checks": checks,
+            "fixes_applied": fixes_applied,
+            "n_symbols": len(batch_decisions or []),
+        }
+        try:
+            _extra_fixes = self._apply_mc_health_remediation(checks, snapshot)
+            if _extra_fixes:
+                fixes_applied.extend(list(_extra_fixes))
+        except Exception as _fix_err:
+            self._log(f"[MC_HEALTH] remediation error: {_fix_err}")
+
+        # ── MC Metric Sanity Monitor (comprehensive checks) ──
+        try:
+            if self._mc_sanity_monitor is not None:
+                sanity_report = self._mc_sanity_monitor.check_batch(batch_decisions)
+                sanity_fixes = self._mc_sanity_monitor.auto_tune(sanity_report)
+                self._mc_sanity_snapshot = self._mc_sanity_monitor.get_dashboard_payload(sanity_report)
+                if sanity_fixes:
+                    fixes_applied.extend(sanity_fixes)
+                    for sf in sanity_fixes:
+                        self._log(f"[MC_SANITY] 🔧 Auto-fix: {sf}")
+                snapshot["mc_sanity"] = self._mc_sanity_snapshot.get("mc_sanity", {})
+                # Log critical/warn alerts
+                for a in sanity_report.alerts:
+                    if a.severity == "CRITICAL":
+                        self._log(f"[MC_SANITY] 🚨 CRITICAL {a.metric}({a.symbol}): {a.message}")
+                    elif a.severity == "WARN":
+                        self._log(f"[MC_SANITY] ⚠️ {a.metric}({a.symbol}): {a.message}")
+                if not all_ok or not sanity_report.all_ok:
+                    all_ok = False
+        except Exception as _sanity_err:
+            self._log(f"[MC_SANITY] error: {_sanity_err}")
+
+        snapshot["all_ok"] = bool(all_ok)
+        self._mc_health_snapshot = snapshot
+
+        # ── 로그 (이상 시에만) ──
+        if not all_ok:
+            failed = [c for c in checks if c["status"] not in ("OK", "INFO", "SKIP")]
+            for c in failed:
+                self._log(f"[MC_HEALTH] ❌ {c['name']}: {c['msg']}")
+            if fixes_applied:
+                self._log(f"[MC_HEALTH] 🔧 Auto-fixes: {fixes_applied}")
+        else:
+            self._log(f"[MC_HEALTH] ✅ All {len(checks)} checks passed (n={len(batch_decisions or [])} symbols)")
+
+        return snapshot
+
+    def _apply_mc_health_remediation(self, checks: list[dict], snapshot: dict) -> list[str]:
+        """Run bounded self-healing actions for recurring MC health issues."""
+        fixes: list[str] = []
+        ts_now = now_ms()
+
+        # update streaks
+        check_map = {str(c.get("name") or ""): str(c.get("status") or "") for c in (checks or [])}
+        for name, status in check_map.items():
+            if status in ("WARN", "CRITICAL"):
+                self._mc_health_issue_streak[name] = int(self._mc_health_issue_streak.get(name, 0)) + 1
+            else:
+                self._mc_health_issue_streak[name] = 0
+
+        if not self._mc_health_auto_fix_enabled:
+            return fixes
+
+        # rate limit: at most once per 3 minutes
+        if (ts_now - int(self._mc_health_last_fix_ms or 0)) < 180_000:
+            return fixes
+
+        ev_neg_streak = int(self._mc_health_issue_streak.get("ev_all_negative", 0))
+        if ev_neg_streak >= 3:
+            try:
+                cur_net = float(os.environ.get("ENTRY_NET_EXPECTANCY_MIN", -0.0008) or -0.0008)
+            except Exception:
+                cur_net = -0.0008
+            try:
+                net_step = float(os.environ.get("MC_HEALTH_NET_FLOOR_STEP", 0.0002) or 0.0002)
+            except Exception:
+                net_step = 0.0002
+            try:
+                net_min = float(os.environ.get("MC_HEALTH_NET_FLOOR_MIN", -0.0025) or -0.0025)
+            except Exception:
+                net_min = -0.0025
+            new_net = float(max(net_min, cur_net - abs(net_step)))
+            if new_net < cur_net - 1e-12:
+                os.environ["ENTRY_NET_EXPECTANCY_MIN"] = f"{new_net:.8f}"
+                os.environ.setdefault("ENTRY_NET_EXPECTANCY_MIN_CHOP", f"{new_net:.8f}")
+                fixes.append(f"ENTRY_NET_EXPECTANCY_MIN {cur_net:.6f}->{new_net:.6f}")
+
+            # Relax hard min-notional if it is suppressing utilization too much.
+            try:
+                cur_min_notional = float(MIN_ENTRY_NOTIONAL)
+            except Exception:
+                cur_min_notional = 0.0
+            try:
+                target_min = float(os.environ.get("MC_HEALTH_MIN_NOTIONAL_TARGET", 5.0) or 5.0)
+            except Exception:
+                target_min = 5.0
+            if cur_min_notional > target_min:
+                new_min_notional = float(max(target_min, cur_min_notional * 0.85))
+                globals()["MIN_ENTRY_NOTIONAL"] = float(new_min_notional)
+                os.environ["MIN_ENTRY_NOTIONAL"] = f"{new_min_notional:.6f}"
+                os.environ["MIN_ENTRY_NOTIONAL_STRICT_BASE_FLOOR"] = "0"
+                fixes.append(f"MIN_ENTRY_NOTIONAL {cur_min_notional:.3f}->{new_min_notional:.3f}")
+
+        if fixes:
+            self._mc_health_last_fix_ms = int(ts_now)
+            for f in fixes:
+                self._register_anomaly("MC_HEALTH_FIX", "INFO", f"Auto-remediation: {f}")
+            snapshot.setdefault("fixes_applied", [])
+            snapshot["fixes_applied"] = list(snapshot.get("fixes_applied") or []) + list(fixes)
+        return fixes
+
+    def _run_adaptive_entry_threshold_controller(self, batch_decisions: list[dict], ts_now_ms: int) -> dict:
+        """Adapt entry floor with mu_alpha/EV regime drift so threshold meaning stays stable."""
+        mu_vals: list[float] = []
+        ev_vals: list[float] = []
+        for dec in (batch_decisions or []):
+            m = dec.get("meta") or {}
+            try:
+                ma = m.get("mu_alpha") or m.get("pred_mu_alpha")
+                if ma is not None:
+                    mu_vals.append(float(ma))
+            except Exception:
+                pass
+            try:
+                ev = m.get("ev") or m.get("unified_score") or m.get("policy_ev_mix")
+                if ev is not None:
+                    ev_vals.append(float(ev))
+            except Exception:
+                pass
+
+        if len(ev_vals) < 5:
+            return self._adaptive_entry_snapshot if isinstance(self._adaptive_entry_snapshot, dict) else {}
+
+        try:
+            base_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", -0.0003) or -0.0003)
+        except Exception:
+            base_floor = -0.0003
+        try:
+            mu_ref = float(os.environ.get("ADAPTIVE_ENTRY_MU_REF", 1.0) or 1.0)
+        except Exception:
+            mu_ref = 1.0
+        try:
+            ev_ref = float(os.environ.get("ADAPTIVE_ENTRY_EV_REF", -0.00010) or -0.00010)
+        except Exception:
+            ev_ref = -0.00010
+        try:
+            k_mu = float(os.environ.get("ADAPTIVE_ENTRY_K_MU", 0.00025) or 0.00025)
+        except Exception:
+            k_mu = 0.00025
+        try:
+            k_ev = float(os.environ.get("ADAPTIVE_ENTRY_K_EV", 0.6) or 0.6)
+        except Exception:
+            k_ev = 0.6
+        try:
+            k_neg = float(os.environ.get("ADAPTIVE_ENTRY_K_NEG", 0.00025) or 0.00025)
+        except Exception:
+            k_neg = 0.00025
+        try:
+            floor_min = float(os.environ.get("ADAPTIVE_ENTRY_FLOOR_MIN", -0.0030) or -0.0030)
+        except Exception:
+            floor_min = -0.0030
+        try:
+            floor_max = float(os.environ.get("ADAPTIVE_ENTRY_FLOOR_MAX", 0.0005) or 0.0005)
+        except Exception:
+            floor_max = 0.0005
+
+        mu_abs_mean = float(np.mean(np.abs(np.asarray(mu_vals, dtype=np.float64)))) if mu_vals else 0.0
+        ev_arr = np.asarray(ev_vals, dtype=np.float64)
+        ev_mean = float(np.mean(ev_arr))
+        neg_ratio = float(np.mean(ev_arr <= 0.0))
+
+        shift_mu = -float(k_mu) * float(max(0.0, mu_ref - mu_abs_mean))
+        shift_ev = -float(k_ev) * float(max(0.0, ev_ref - ev_mean))
+        shift_neg = -float(k_neg) * float(max(0.0, neg_ratio - 0.5))
+        target_floor = float(base_floor + shift_mu + shift_ev + shift_neg)
+        target_floor = float(max(floor_min, min(floor_max, target_floor)))
+
+        prev = self._hybrid_entry_floor_dyn
+        prev_ts = int(self._hybrid_entry_floor_dyn_ts or ts_now_ms)
+        dt_sec = max(1.0, (int(ts_now_ms) - prev_ts) / 1000.0)
+        try:
+            half_life = float(os.environ.get("ADAPTIVE_ENTRY_EMA_HALFLIFE_SEC", 300.0) or 300.0)
+        except Exception:
+            half_life = 300.0
+        if half_life <= 0:
+            ema = target_floor
+        else:
+            alpha = 1.0 - math.exp(-math.log(2.0) * dt_sec / max(half_life, 1e-6))
+            ema = target_floor if prev is None else (alpha * target_floor + (1.0 - alpha) * float(prev))
+
+        self._hybrid_entry_floor_dyn = float(ema)
+        self._hybrid_entry_floor_dyn_ts = int(ts_now_ms)
+        self._adaptive_entry_snapshot = {
+            "timestamp_ms": int(ts_now_ms),
+            "base_floor": float(base_floor),
+            "target_floor": float(target_floor),
+            "dynamic_floor": float(self._hybrid_entry_floor_dyn),
+            "mu_abs_mean": float(mu_abs_mean),
+            "ev_mean": float(ev_mean),
+            "ev_neg_ratio": float(neg_ratio),
+            "n": int(len(ev_vals)),
+        }
+        return self._adaptive_entry_snapshot
+
+    # ────────────────────────────────────────────────────────────────
+    # mu_alpha auto-calibration  (periodic, every _mu_alpha_calibrate_interval_sec)
+    # ────────────────────────────────────────────────────────────────
+    def _run_mu_alpha_auto_calibration(self, ts_now_ms: int) -> None:
+        """Compute percentiles from rolling mu_alpha buffer and auto-adjust thresholds.
+
+        Writes results to ``state/mu_alpha_calibration.json`` **and** updates
+        ``os.environ`` so that downstream code picks up the new values immediately.
+        """
+        import numpy as _np
+
+        samples = list(self._mu_alpha_rolling)
+        if len(samples) < 50:
+            return
+
+        # ── 1. Regime 분류 ─────────────────────────────
+        regime_buckets: dict[str, list[tuple]] = {}
+        for ts, ma, reg, dconf in samples:
+            key = "chop"  # default
+            rl = (reg or "").lower()
+            if "trend" in rl or "bull" in rl:
+                key = "trend"
+            elif "bear" in rl:
+                key = "bear"
+            elif "chop" in rl or "range" in rl or "sideways" in rl:
+                key = "chop"
+            regime_buckets.setdefault(key, []).append((ts, ma, reg, dconf))
+
+        calibration: dict = {
+            "timestamp_ms": int(ts_now_ms),
+            "total_samples": len(samples),
+            "regimes": {},
+        }
+
+        env_updates: dict[str, str] = {}
+
+        for regime_key, entries in regime_buckets.items():
+            abs_mus = _np.array([abs(e[1]) for e in entries], dtype=_np.float64)
+            dconfs = _np.array([e[3] for e in entries if e[3] is not None], dtype=_np.float64)
+
+            mu_stats = {
+                "count": int(len(abs_mus)),
+                "mean": float(_np.mean(abs_mus)),
+                "median": float(_np.median(abs_mus)),
+                "std": float(_np.std(abs_mus)),
+                "p10": float(_np.percentile(abs_mus, 10)),
+                "p25": float(_np.percentile(abs_mus, 25)),
+                "p50": float(_np.percentile(abs_mus, 50)),
+                "p75": float(_np.percentile(abs_mus, 75)),
+                "p90": float(_np.percentile(abs_mus, 90)),
+            }
+            dc_stats = {}
+            if len(dconfs) >= 10:
+                dc_stats = {
+                    "count": int(len(dconfs)),
+                    "mean": float(_np.mean(dconfs)),
+                    "p10": float(_np.percentile(dconfs, 10)),
+                    "p25": float(_np.percentile(dconfs, 25)),
+                    "p50": float(_np.percentile(dconfs, 50)),
+                    "p75": float(_np.percentile(dconfs, 75)),
+                }
+
+            calibration["regimes"][regime_key] = {
+                "mu_alpha_abs": mu_stats,
+                "dir_conf": dc_stats,
+            }
+
+            # ── 2. Threshold 계산: P25 기준 (전체의 ~75%가 통과) ──
+            if regime_key == "chop":
+                # mu_alpha 임계치: P20 사용 (충분한 진입 기회 보장)
+                proposed_mu = float(_np.percentile(abs_mus, 20))
+                # 하한/상한 클리핑: 너무 낮으면 노이즈 진입, 너무 높으면 기회 상실
+                proposed_mu = max(0.0001, min(proposed_mu, 0.05))
+                env_updates["CHOP_ENTRY_MIN_MU_ALPHA"] = f"{proposed_mu:.6f}"
+
+                if len(dconfs) >= 10:
+                    proposed_dc = float(_np.percentile(dconfs, 15))
+                    proposed_dc = max(0.01, min(proposed_dc, 0.5))
+                    env_updates["CHOP_ENTRY_MIN_DIR_CONF"] = f"{proposed_dc:.4f}"
+
+            elif regime_key == "trend":
+                proposed_mu = float(_np.percentile(abs_mus, 15))
+                proposed_mu = max(0.0001, min(proposed_mu, 0.03))
+                env_updates["TREND_ENTRY_MIN_MU_ALPHA"] = f"{proposed_mu:.6f}"
+
+            elif regime_key == "bear":
+                proposed_mu = float(_np.percentile(abs_mus, 25))
+                proposed_mu = max(0.0005, min(proposed_mu, 0.1))
+                env_updates["BEAR_ENTRY_MIN_MU_ALPHA"] = f"{proposed_mu:.6f}"
+
+        # ── 3. 환경변수 업데이트 (즉시 반영) ──
+        for k, v in env_updates.items():
+            old_val = os.environ.get(k, "(unset)")
+            os.environ[k] = v
+            self._log(f"[MU_CALIB] {k}: {old_val} → {v}")
+
+        calibration["env_updates"] = env_updates
+
+        # ── 4. JSON 영속화 ──
+        try:
+            self._write_json_atomic(self._mu_alpha_calibrate_path, calibration)
+        except Exception as exc:
+            self._log(f"[MU_CALIB] persist failed: {exc}")
+
+        # ── 5. 요약 로그 ──
+        chop_info = calibration.get("regimes", {}).get("chop", {}).get("mu_alpha_abs", {})
+        self._log(
+            f"[MU_CALIB] 완료 — samples={len(samples)}, "
+            f"chop(n={chop_info.get('count', 0)}, "
+            f"mean={chop_info.get('mean', 0):.4f}, "
+            f"p25={chop_info.get('p25', 0):.4f}, "
+            f"p75={chop_info.get('p75', 0):.4f}), "
+            f"updates={env_updates}"
+        )
+
     def _load_auto_reval_status(self, force: bool = False) -> None:
         ts_ms = now_ms()
         if not force:
@@ -1436,11 +2095,146 @@ class LiveOrchestrator:
                 return int(default)
         raw = self._auto_reval_status_cache if isinstance(self._auto_reval_status_cache, dict) else {}
         cfg = raw.get("config") if isinstance(raw.get("config"), dict) else {}
+        last_ready = raw.get("last_ready") if isinstance(raw.get("last_ready"), dict) else {}
         summary = raw.get("summary") if isinstance(raw.get("summary"), dict) else {}
+        summary_source = "summary"
+        if not summary and isinstance(last_ready.get("summary"), dict):
+            summary = last_ready.get("summary")
+            summary_source = "last_ready.summary"
+        last_ready_summary = last_ready.get("summary") if isinstance(last_ready.get("summary"), dict) else {}
         summary_kpi = summary.get("batch_kpi") if isinstance(summary.get("batch_kpi"), dict) else {}
+        summary_kpi_source = summary_source if summary_kpi else ""
         summary_kpi_delta = summary.get("batch_kpi_delta") if isinstance(summary.get("batch_kpi_delta"), dict) else {}
-        runs = raw.get("runs") if isinstance(raw.get("runs"), list) else []
+        summary_exit_kpi_gate = summary.get("exit_kpi_gate") if isinstance(summary.get("exit_kpi_gate"), dict) else {}
+        summary_cf_entry = summary.get("counterfactual_entry") if isinstance(summary.get("counterfactual_entry"), dict) else {}
         progress = raw.get("progress") if isinstance(raw.get("progress"), dict) else {}
+        if not summary_kpi and isinstance(progress.get("last_batch_kpi"), dict):
+            summary_kpi = progress.get("last_batch_kpi")
+            summary_kpi_source = "progress.last_batch_kpi"
+        if not summary_kpi and isinstance(last_ready_summary.get("batch_kpi"), dict):
+            summary_kpi = last_ready_summary.get("batch_kpi")
+            summary_kpi_source = "last_ready.batch_kpi"
+        if not summary_kpi_delta and isinstance(progress.get("last_batch_kpi_delta"), dict):
+            summary_kpi_delta = progress.get("last_batch_kpi_delta")
+        summary_slip = summary.get("slippage_exit_200") if isinstance(summary.get("slippage_exit_200"), dict) else {}
+        summary_min_notional = summary.get("min_notional_tuning") if isinstance(summary.get("min_notional_tuning"), dict) else {}
+        try:
+            slip_out = cfg.get("slippage_exit_out")
+            slip_path = Path(str(slip_out)) if slip_out else (self.state_dir / "slippage_exit_200_report.json")
+            if slip_path.exists():
+                with slip_path.open("r", encoding="utf-8") as _sf:
+                    slip_obj = json.load(_sf)
+                if isinstance(slip_obj, dict):
+                    summary_slip = slip_obj
+        except Exception:
+            summary_slip = summary_slip if isinstance(summary_slip, dict) else {}
+        try:
+            # Keep SlipErr/ExecAB moving between reval-ready batches using latest slippage rows.
+            live_slip_limit = _to_int(cfg.get("slippage_exit_limit"), _to_int(cfg.get("target_new"), _to_int(summary_slip.get("exit_limit"), 120)))
+            db_path = Path(str(self._db_path))
+            if db_path.exists():
+                with sqlite3.connect(str(db_path)) as _conn:
+                    _cur = _conn.cursor()
+                    _slip_cols = {str(r[1]) for r in _cur.execute("PRAGMA table_info(slippage_analysis)").fetchall()}
+                    _selected_col = "selected_exec_type" if "selected_exec_type" in _slip_cols else "NULL AS selected_exec_type"
+                    _rows = _cur.execute(
+                        f"""
+                        SELECT slippage_bps, estimated_slippage_bps, estimation_error_bps, exec_type, {_selected_col}
+                        FROM slippage_analysis
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (int(max(20, live_slip_limit)),),
+                    ).fetchall()
+                if _rows:
+                    _errs = []
+                    _maker_abs = []
+                    _taker_abs = []
+                    _match_n = 0
+                    _maker_sel_n = 0
+                    _maker_fallback_n = 0
+                    for _r in _rows:
+                        _slip = self._safe_float(_r[0], 0.0) or 0.0
+                        _est = self._safe_float(_r[1], None)
+                        _err = self._safe_float(_r[2], None)
+                        if _err is None and _est is not None:
+                            _err = float(_slip - _est)
+                        if _err is not None:
+                            _errs.append(float(_err))
+                        _actual_exec = str(_r[3] or "").lower()
+                        _sel_exec = str(_r[4] or "").lower()
+                        _actual_group = "maker" if ("maker" in _actual_exec and "fallback" not in _actual_exec) else "taker"
+                        if "maker" in _sel_exec:
+                            _sel_group = "maker"
+                        elif ("market" in _sel_exec) or ("taker" in _sel_exec):
+                            _sel_group = "taker"
+                        else:
+                            _sel_group = "maker" if "maker" in _actual_exec else "taker"
+                        _abs_slip = abs(float(_slip))
+                        if _sel_group == "maker":
+                            _maker_abs.append(_abs_slip)
+                            _maker_sel_n += 1
+                            if _actual_group != "maker":
+                                _maker_fallback_n += 1
+                        else:
+                            _taker_abs.append(_abs_slip)
+                        if _sel_group == _actual_group:
+                            _match_n += 1
+                    _mae = (sum(abs(x) for x in _errs) / len(_errs)) if _errs else None
+                    _rmse = (math.sqrt(sum(x * x for x in _errs) / len(_errs))) if _errs else None
+                    _bias = (sum(_errs) / len(_errs)) if _errs else None
+                    _maker_avg = (sum(_maker_abs) / len(_maker_abs)) if _maker_abs else None
+                    _taker_avg = (sum(_taker_abs) / len(_taker_abs)) if _taker_abs else None
+                    summary_slip = {
+                        **summary_slip,
+                        "available": True,
+                        "source": "live_recent_slippage_table",
+                        "exit_limit": int(max(20, live_slip_limit)),
+                        "matched_n": int(len(_rows)),
+                        "match_rate": float(len(_rows) / max(1, int(max(20, live_slip_limit)))),
+                        "estimation_mae_bps": _mae,
+                        "estimation_rmse_bps": _rmse,
+                        "estimation_bias_bps": _bias,
+                        "selected_exec_ab": {
+                            "maker": {"n": int(len(_maker_abs)), "avg_abs_slippage_bps": _maker_avg, "avg_error_mae_bps": None},
+                            "taker": {"n": int(len(_taker_abs)), "avg_abs_slippage_bps": _taker_avg, "avg_error_mae_bps": None},
+                            "delta_abs_slippage_bps_taker_minus_maker": (
+                                float(_taker_avg - _maker_avg) if (_taker_avg is not None and _maker_avg is not None) else None
+                            ),
+                            "delta_error_mae_bps_taker_minus_maker": None,
+                            "selected_vs_actual_match_rate": float(_match_n / max(1, len(_rows))),
+                            "maker_selected_fallback_rate": float(_maker_fallback_n / max(1, _maker_sel_n)) if _maker_sel_n > 0 else None,
+                        },
+                    }
+        except Exception:
+            pass
+        if not summary_min_notional:
+            try:
+                mn_out = cfg.get("min_notional_tune_out")
+                mn_path = Path(str(mn_out)) if mn_out else (self.state_dir / "min_notional_tuning_report.json")
+                if mn_path.exists():
+                    with mn_path.open("r", encoding="utf-8") as _mf:
+                        mn_obj = json.load(_mf)
+                    if isinstance(mn_obj, dict):
+                        summary_min_notional = mn_obj
+            except Exception:
+                summary_min_notional = {}
+        summary_exec_ab = summary_slip.get("selected_exec_ab") if isinstance(summary_slip.get("selected_exec_ab"), dict) else {}
+        if not summary_cf_entry:
+            try:
+                cf_out = cfg.get("cf_out")
+                if cf_out:
+                    cf_path = Path(str(cf_out))
+                    if cf_path.exists():
+                        with cf_path.open("r", encoding="utf-8") as _cf:
+                            cf_obj = json.load(_cf)
+                        if isinstance(cf_obj, dict):
+                            summary_cf_entry = cf_obj.get("entry_counterfactual") if isinstance(cf_obj.get("entry_counterfactual"), dict) else {}
+            except Exception:
+                summary_cf_entry = {}
+        runs = raw.get("runs") if isinstance(raw.get("runs"), list) else []
+        if not runs and isinstance(last_ready.get("runs"), list):
+            runs = last_ready.get("runs")
         reports_total = 3
         reports_ready = 0
         for r in runs:
@@ -1451,19 +2245,70 @@ class LiveOrchestrator:
                     reports_ready += 1
             except Exception:
                 continue
+        reports_ok = _to_int(raw.get("reports_ok"), _to_int(last_ready.get("reports_ok"), 0))
+        if reports_ready <= 0 and reports_ok > 0:
+            reports_ready = int(reports_ok)
         reports_ready = max(0, min(reports_total, int(reports_ready)))
 
-        target_new = _to_int(cfg.get("target_new"), int(self._reval_target_min or 200))
+        target_new = _to_int(cfg.get("target_new"), int(self._reval_target_min or 120))
         new_closed = _to_int(raw.get("new_closed_total"), 0)
         new_closed_cum = _to_int(raw.get("new_closed_total_cum"), _to_int(progress.get("processed_new_closed_total"), new_closed))
         remaining = _to_int(raw.get("remaining_to_target"), max(0, int(target_new) - int(new_closed)))
         completed_batches = _to_int(progress.get("completed_batches"), 0)
         completed_reports_total = _to_int(progress.get("completed_reports_total"), 0)
         status_ts = _to_int(raw.get("heartbeat_ts_ms"), _to_int(raw.get("timestamp_ms"), 0))
+        if status_ts <= 0 and isinstance(last_ready, dict):
+            status_ts = _to_int(last_ready.get("heartbeat_ts_ms"), _to_int(last_ready.get("timestamp_ms"), 0))
         now_ts = int(ts_ms or now_ms())
         stale_sec = None
         if status_ts > 0:
             stale_sec = max(0.0, (float(now_ts) - float(status_ts)) / 1000.0)
+
+        direction_hit_val = self._safe_float(summary_kpi.get("direction_hit"), None)
+        entry_issue_ratio_val = self._safe_float(summary_kpi.get("entry_issue_ratio"), None)
+        avg_exit_regret_val = self._safe_float(summary_kpi.get("avg_exit_regret"), None)
+        kpi_source = str(summary_kpi_source or "")
+        last_ready_summary_kpi = last_ready_summary.get("batch_kpi") if isinstance(last_ready_summary.get("batch_kpi"), dict) else {}
+        last_ready_direction_hit_val = self._safe_float(last_ready_summary_kpi.get("direction_hit"), None)
+        last_ready_entry_issue_ratio_val = self._safe_float(last_ready_summary_kpi.get("entry_issue_ratio"), None)
+        last_ready_avg_exit_regret_val = self._safe_float(last_ready_summary_kpi.get("avg_exit_regret"), None)
+        if direction_hit_val is None and last_ready_direction_hit_val is not None:
+            direction_hit_val = float(last_ready_direction_hit_val)
+            kpi_source = "last_ready.batch_kpi"
+        if entry_issue_ratio_val is None and last_ready_entry_issue_ratio_val is not None:
+            entry_issue_ratio_val = float(last_ready_entry_issue_ratio_val)
+            if not kpi_source:
+                kpi_source = "last_ready.batch_kpi"
+        if avg_exit_regret_val is None and last_ready_avg_exit_regret_val is not None:
+            avg_exit_regret_val = float(last_ready_avg_exit_regret_val)
+            if not kpi_source:
+                kpi_source = "last_ready.batch_kpi"
+        if direction_hit_val is None:
+            try:
+                _diag_dir = summary.get("diagnosis_direction") if isinstance(summary.get("diagnosis_direction"), dict) else {}
+                _miss = self._safe_float(_diag_dir.get("miss_rate"), None)
+                if _miss is not None:
+                    direction_hit_val = float(max(0.0, min(1.0, 1.0 - float(_miss))))
+                    if not kpi_source:
+                        kpi_source = "summary.diagnosis_direction"
+            except Exception:
+                direction_hit_val = None
+        if entry_issue_ratio_val is None:
+            try:
+                _diag_attr = summary.get("diagnosis_attribution") if isinstance(summary.get("diagnosis_attribution"), dict) else {}
+                entry_issue_ratio_val = self._safe_float(_diag_attr.get("entry_issue_rate"), None)
+                if entry_issue_ratio_val is not None and not kpi_source:
+                    kpi_source = "summary.diagnosis_attribution"
+            except Exception:
+                entry_issue_ratio_val = None
+        if avg_exit_regret_val is None:
+            try:
+                _cf_exit = summary.get("counterfactual_exit") if isinstance(summary.get("counterfactual_exit"), dict) else {}
+                avg_exit_regret_val = self._safe_float(_cf_exit.get("avg_exit_regret"), None)
+                if avg_exit_regret_val is not None and not kpi_source:
+                    kpi_source = "summary.counterfactual_exit"
+            except Exception:
+                avg_exit_regret_val = None
 
         return {
             "exists": bool(self._auto_reval_status_path.exists()),
@@ -1479,12 +2324,46 @@ class LiveOrchestrator:
             "closed_total": _to_int(raw.get("closed_total"), 0),
             "completed_batches": int(max(0, completed_batches)),
             "completed_reports_total": int(max(0, completed_reports_total)),
-            "direction_hit": self._safe_float(summary_kpi.get("direction_hit"), None),
-            "entry_issue_ratio": self._safe_float(summary_kpi.get("entry_issue_ratio"), None),
-            "avg_exit_regret": self._safe_float(summary_kpi.get("avg_exit_regret"), None),
+            "last_ready_available": bool(bool(last_ready)),
+            "last_ready_new_closed_total": _to_int(last_ready.get("new_closed_total"), 0),
+            "last_ready_closed_total": _to_int(last_ready.get("closed_total"), 0),
+            "last_ready_reports_ok": _to_int(last_ready.get("reports_ok"), 0),
+            "last_ready_timestamp": _to_int(last_ready.get("timestamp_ms"), 0),
+            "direction_hit": direction_hit_val,
+            "entry_issue_ratio": entry_issue_ratio_val,
+            "avg_exit_regret": avg_exit_regret_val,
+            "kpi_source": str(kpi_source or ""),
+            "last_ready_direction_hit": last_ready_direction_hit_val,
+            "last_ready_entry_issue_ratio": last_ready_entry_issue_ratio_val,
+            "last_ready_avg_exit_regret": last_ready_avg_exit_regret_val,
             "direction_hit_delta": self._safe_float(summary_kpi_delta.get("direction_hit"), None),
             "entry_issue_ratio_delta": self._safe_float(summary_kpi_delta.get("entry_issue_ratio"), None),
             "avg_exit_regret_delta": self._safe_float(summary_kpi_delta.get("avg_exit_regret"), None),
+            "exit_kpi_grade": str(summary_exit_kpi_gate.get("grade") or ""),
+            "exit_kpi_pass": bool(summary_exit_kpi_gate.get("pass") is True),
+            "exit_kpi_improving": bool(summary_exit_kpi_gate.get("improving") is True),
+            "exit_kpi_severe_fail": bool(summary_exit_kpi_gate.get("severe_fail") is True),
+            "exit_kpi_message": str(summary_exit_kpi_gate.get("message") or ""),
+            "entry_side_profitable_rate_best_h": self._safe_float(summary_cf_entry.get("side_profitable_rate_best_h"), None),
+            "entry_opp_side_better_rate": self._safe_float(summary_cf_entry.get("opp_side_better_rate"), None),
+            "entry_avg_direction_regret": self._safe_float(summary_cf_entry.get("avg_direction_regret"), None),
+            "entry_p50_direction_regret": self._safe_float(summary_cf_entry.get("p50_direction_regret"), None),
+            "entry_p90_direction_regret": self._safe_float(summary_cf_entry.get("p90_direction_regret"), None),
+            "slip_exit_200_available": bool(summary_slip.get("available") is True),
+            "slip_exit_200_match_rate": self._safe_float(summary_slip.get("match_rate"), None),
+            "slip_exit_200_estimation_mae_bps": self._safe_float(summary_slip.get("estimation_mae_bps"), None),
+            "slip_exit_200_estimation_rmse_bps": self._safe_float(summary_slip.get("estimation_rmse_bps"), None),
+            "slip_exit_200_estimation_bias_bps": self._safe_float(summary_slip.get("estimation_bias_bps"), None),
+            "slip_exit_200_sample_n": _to_int(summary_slip.get("matched_n"), 0),
+            "slip_exit_limit": _to_int(cfg.get("slippage_exit_limit"), _to_int(summary_slip.get("exit_limit"), _to_int(cfg.get("target_new"), 120))),
+            "slip_exit_source": str(summary_slip.get("source") or ""),
+            "exec_ab_maker_abs_slip_bps": self._safe_float((summary_exec_ab.get("maker") or {}).get("avg_abs_slippage_bps"), None),
+            "exec_ab_taker_abs_slip_bps": self._safe_float((summary_exec_ab.get("taker") or {}).get("avg_abs_slippage_bps"), None),
+            "exec_ab_delta_abs_slip_bps": self._safe_float(summary_exec_ab.get("delta_abs_slippage_bps_taker_minus_maker"), None),
+            "exec_ab_match_rate": self._safe_float(summary_exec_ab.get("selected_vs_actual_match_rate"), None),
+            "exec_ab_maker_fallback_rate": self._safe_float(summary_exec_ab.get("maker_selected_fallback_rate"), None),
+            "min_notional_blocked_n": _to_int(summary_min_notional.get("min_notional_blocked_n"), 0),
+            "min_notional_blocked_share": self._safe_float(summary_min_notional.get("min_notional_blocked_share"), None),
             "timestamp": int(status_ts if status_ts > 0 else now_ts),
             "stale_sec": stale_sec,
         }
@@ -1545,6 +2424,14 @@ class LiveOrchestrator:
             ov = payload.get("overrides") if isinstance(payload.get("overrides"), dict) else payload
             if not isinstance(ov, dict):
                 return
+            try:
+                block_raw = str(os.environ.get(
+                    "AUTO_TUNE_OVERRIDE_BLOCKLIST",
+                    "LEVERAGE_TARGET_MAX,LEVERAGE_LOW_CONF_CAP,LEVERAGE_HIGH_VPIN_CAP,MAX_NOTIONAL_EXPOSURE,LIVE_MAX_NOTIONAL_EXPOSURE,KELLY_TOTAL_EXPOSURE"
+                ) or "")
+                block_keys = {tok.strip().upper() for tok in block_raw.split(",") if tok and tok.strip()}
+            except Exception:
+                block_keys = set()
             applied = 0
             cleaned: dict[str, object] = {}
             for k, v in ov.items():
@@ -1552,6 +2439,8 @@ class LiveOrchestrator:
                 if not key:
                     continue
                 if not all(ch.isalnum() or ch == "_" for ch in key):
+                    continue
+                if key in block_keys:
                     continue
                 val_txt = self._normalize_auto_tune_env_value(v)
                 if val_txt is None:
@@ -1581,6 +2470,7 @@ class LiveOrchestrator:
         raw = self._auto_tune_status_cache if isinstance(self._auto_tune_status_cache, dict) else {}
         retrain = raw.get("retrain") if isinstance(raw.get("retrain"), dict) else {}
         metrics = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {}
+        fixed_gate = raw.get("fixed_gate_trigger") if isinstance(raw.get("fixed_gate_trigger"), dict) else {}
         try:
             stale_sec = None
             r_ts = int(raw.get("timestamp_ms", 0) or 0)
@@ -1611,6 +2501,11 @@ class LiveOrchestrator:
             "event_mc_exit_rate": self._safe_float(metrics.get("event_mc_exit_rate"), None),
             "liq_like_rate": self._safe_float(metrics.get("liq_like_rate"), None),
             "avg_roe": self._safe_float(metrics.get("avg_roe"), None),
+            "exit_kpi_grade": str(fixed_gate.get("grade") or ""),
+            "exit_kpi_pass": bool(fixed_gate.get("pass") is True),
+            "exit_kpi_improving": bool(fixed_gate.get("improving") is True),
+            "exit_kpi_severe_fail": bool(fixed_gate.get("severe_fail") is True),
+            "exit_kpi_message": str(fixed_gate.get("message") or ""),
             "timestamp": int(raw.get("timestamp_ms", 0) or 0),
             "stale_sec": stale_sec,
         }
@@ -2245,6 +3140,11 @@ class LiveOrchestrator:
     def _sizing_balance(self) -> float:
         """Balance used for order sizing (prefer live free balance when available)."""
         if self.enable_orders:
+            try:
+                if int(self._balance_reject_global_until_ms or 0) > int(now_ms()):
+                    return 0.0
+            except Exception:
+                pass
             # Guard against stale/missing live balance (avoid over-allocating)
             try:
                 stale_sec = float(os.environ.get("LIVE_BALANCE_STALE_SEC", 15.0) or 15.0)
@@ -2254,9 +3154,27 @@ class LiveOrchestrator:
                 cache_max_age_sec = float(os.environ.get("LIVE_BALANCE_CACHE_MAX_AGE_SEC", 180.0) or 180.0)
             except Exception:
                 cache_max_age_sec = 180.0
+            try:
+                block_nonpos_free = str(os.environ.get("LIVE_ORDER_BLOCK_ON_NONPOSITIVE_FREE", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                block_nonpos_free = True
             last_ms = int(self._last_live_sync_ms or 0)
             age_ms = (now_ms() - last_ms) if last_ms else (10**12)
             is_stale = (not last_ms) or age_ms > int(stale_sec * 1000)
+            free_seen = False
+            free_nonpos = False
+            free_val = None
+            try:
+                free = self._live_free_balance
+                if free is not None:
+                    _fv = float(free)
+                    if math.isfinite(_fv):
+                        free_seen = True
+                        free_val = float(_fv)
+                        if _fv <= 0:
+                            free_nonpos = True
+            except Exception:
+                pass
             if is_stale:
                 if not self._live_balance_stale_warned:
                     self._log_err("[LIVE_BAL] balance stale/missing; blocking live sizing")
@@ -2264,17 +3182,18 @@ class LiveOrchestrator:
                 # If sync is briefly stale but we still have recent cached free/wallet,
                 # continue sizing from cache to avoid long entry blackouts.
                 if last_ms and age_ms <= int(max(cache_max_age_sec, stale_sec) * 1000):
-                    try:
-                        free = self._live_free_balance
-                        if free is not None:
-                            free_val = float(free)
-                            if math.isfinite(free_val) and free_val > 0:
-                                if not self._live_balance_cache_warned:
-                                    self._log("[LIVE_BAL] using cached free balance while sync is stale")
-                                    self._live_balance_cache_warned = True
-                                return free_val
-                    except Exception:
-                        pass
+                    if free_seen and free_val is not None and free_val > 0:
+                        if not self._live_balance_cache_warned:
+                            self._log("[LIVE_BAL] using cached free balance while sync is stale")
+                            self._live_balance_cache_warned = True
+                        return float(free_val)
+                    if free_nonpos and block_nonpos_free:
+                        if not self._live_balance_nonpos_warned:
+                            self._log_err(
+                                f"[LIVE_BAL] non-positive free balance while stale; blocking sizing (free={free_val})"
+                            )
+                            self._live_balance_nonpos_warned = True
+                        return 0.0
                     try:
                         wallet = self._live_wallet_balance
                         if wallet is not None:
@@ -2295,19 +3214,23 @@ class LiveOrchestrator:
             else:
                 self._live_balance_stale_warned = False
                 self._live_balance_cache_warned = False
-            try:
-                free = self._live_free_balance
-                if free is not None:
-                    free_val = float(free)
-                    if math.isfinite(free_val) and free_val > 0:
-                        return free_val
-            except Exception:
-                pass
+                self._live_balance_nonpos_warned = False
+            if free_seen and free_val is not None:
+                if free_val > 0:
+                    return float(free_val)
+                if block_nonpos_free:
+                    if not self._live_balance_nonpos_warned:
+                        self._log_err(f"[LIVE_BAL] non-positive free balance; blocking sizing (free={free_val})")
+                        self._live_balance_nonpos_warned = True
+                    return 0.0
             try:
                 allow_fallback = str(os.environ.get("LIVE_ALLOW_BALANCE_FALLBACK", "0")).strip().lower() in ("1", "true", "yes", "on")
             except Exception:
                 allow_fallback = False
             if not allow_fallback:
+                return 0.0
+            # When exchange reports a concrete non-positive free balance, do not fallback to wallet balance.
+            if free_nonpos and block_nonpos_free:
                 return 0.0
         try:
             return float(self.balance)
@@ -2501,6 +3424,7 @@ class LiveOrchestrator:
     @staticmethod
     def _extract_filter_states(decision: dict) -> dict:
         """decision 객체에서 filter_states 추출 (여러 위치에서 찾기)"""
+        sq_enabled = str(os.environ.get("SYMBOL_QUALITY_FILTER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         # 기본값: 모든 필터 통과 (회색 표시)
         default_filter_states = {
             "unified": None,
@@ -2530,20 +3454,32 @@ class LiveOrchestrator:
         
         # 1. decision 최상위
         if decision.get("filter_states"):
-            return decision["filter_states"]
+            out = dict(decision["filter_states"])
+            if not sq_enabled:
+                out["symbol_quality"] = None
+            return out
         # 2. decision.meta
         meta = decision.get("meta") or {}
         if meta.get("filter_states"):
-            return meta["filter_states"]
+            out = dict(meta["filter_states"])
+            if not sq_enabled:
+                out["symbol_quality"] = None
+            return out
         # 3. decision.details 내부
         for d in decision.get("details", []):
             if isinstance(d, dict):
                 if d.get("filter_states"):
-                    return d["filter_states"]
+                    out = dict(d["filter_states"])
+                    if not sq_enabled:
+                        out["symbol_quality"] = None
+                    return out
                 # details 내부의 meta
                 dm = d.get("meta") or {}
                 if dm.get("filter_states"):
-                    return dm["filter_states"]
+                    out = dict(dm["filter_states"])
+                    if not sq_enabled:
+                        out["symbol_quality"] = None
+                    return out
         
         # 아무것도 찾지 못하면 기본값 반환
         return default_filter_states
@@ -2977,7 +3913,18 @@ class LiveOrchestrator:
                         hybrid_only = False
                     score_label = "HYB" if hybrid_only else "UNI"
                     score_val = hybrid_score if (hybrid_only and hybrid_score is not None) else (unified_score or 0.0)
-                    floor_val = hybrid_entry_floor if hybrid_only else float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+                    # RegimePolicy floor 표시
+                    if hybrid_only:
+                        floor_val = hybrid_entry_floor
+                    else:
+                        floor_val = 0.00001
+                        try:
+                            from engines.mc.regime_policy import get_regime_policy as _grp_flog
+                            _fl_regime = str(dec.get("regime") or regime_tag or "").strip().lower()
+                            _fl_rpol = _grp_flog(_fl_regime, 0.5)
+                            floor_val = float(_fl_rpol.entry_floor)
+                        except Exception:
+                            pass
                     floor_txt = f"{(floor_val or 0.0):.5f}" if floor_val is not None else "-"
                     self._log(
                         f"[FILTER] {sym} all_pass | Action:{status} | {score_label}:{(score_val or 0.0):.5f} | FLOOR:{floor_txt} | EV_best:{ev_best_txt} | EV_sum:{(ev or 0.0):.5f}"
@@ -3048,6 +3995,1147 @@ class LiveOrchestrator:
                         if out is not None:
                             return out
         return default
+
+    def _entry_roundtrip_cost(
+        self,
+        decision: dict | None = None,
+        meta: dict | None = None,
+        *,
+        symbol: str | None = None,
+        side: str | None = None,
+        leverage: float | None = None,
+        quantity: float | None = None,
+    ) -> tuple[float, dict[str, object]]:
+        """Estimate expected roundtrip cost for entry gating with size-aware execution."""
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                raw = os.environ.get(name)
+                if raw is None or str(raw).strip() == "":
+                    return float(default)
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        def _env_bool(name: str, default: bool) -> bool:
+            try:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return bool(default)
+                return str(raw).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                return bool(default)
+
+        def _pick_float(*vals):
+            for v in vals:
+                try:
+                    if v is None:
+                        continue
+                    vv = float(v)
+                    if math.isfinite(vv):
+                        return vv
+                except Exception:
+                    continue
+            return None
+
+        m = meta if isinstance(meta, dict) else {}
+        d = decision if isinstance(decision, dict) else {}
+
+        maker_fee_default = self._safe_float(getattr(self, "fee_maker", None), None)
+        taker_fee_default = self._safe_float(getattr(self, "fee_taker", None), None)
+        if maker_fee_default is None:
+            maker_fee_default = 0.0002
+        if taker_fee_default is None:
+            taker_fee_default = 0.00055
+
+        maker_fee = float(_env_float("ENTRY_COST_MAKER_FEE_RATE", maker_fee_default))
+        taker_fee = float(_env_float("ENTRY_COST_TAKER_FEE_RATE", taker_fee_default))
+        extra_slip_bps = float(max(0.0, _env_float("ENTRY_COST_EXTRA_SLIPPAGE_BPS", 0.0)))
+        static_slip_bps = float(max(0.0, _env_float("HYBRID_SLIPPAGE_BPS", 0.0)))
+        exec_mode = str(os.environ.get("ENTRY_COST_EXEC_MODE", "auto") or "auto").strip().lower()
+        exit_exec_mode = str(os.environ.get("ENTRY_COST_EXIT_EXEC_MODE", "auto") or "auto").strip().lower()
+
+        sym = str(
+            symbol
+            or m.get("symbol")
+            or d.get("symbol")
+            or m.get("sym")
+            or d.get("sym")
+            or ""
+        ).strip()
+        side_hint = str(side or d.get("action") or m.get("action") or m.get("side") or d.get("side") or "").upper().strip()
+        if side_hint not in ("LONG", "SHORT"):
+            side_hint = "LONG"
+        regime_hint = str(m.get("regime") or d.get("regime") or m.get("regime_bucket") or d.get("regime_bucket") or "chop")
+        vpin_val = _pick_float(
+            m.get("alpha_vpin"),
+            d.get("alpha_vpin"),
+            m.get("vpin"),
+            d.get("vpin"),
+            m.get("event_exit_dynamic_vpin"),
+            d.get("event_exit_dynamic_vpin"),
+            0.0,
+        )
+        vpin_val = float(max(0.0, min(1.0, vpin_val or 0.0)))
+        shock_vpin_th = float(_env_float("ORDER_SHOCK_VPIN_THRESHOLD", 0.88))
+        regime_bucket = self._normalize_regime_bucket(regime_hint)
+        shock_ctx = bool(regime_bucket == "volatile" or vpin_val >= shock_vpin_th)
+
+        lev = _pick_float(
+            leverage,
+            d.get("leverage"),
+            m.get("leverage"),
+            self._dyn_leverage.get(sym) if sym else None,
+            self.leverage,
+            1.0,
+        )
+        lev = float(max(1.0, lev or 1.0))
+
+        px_hint = _pick_float(
+            m.get("entry_price"),
+            d.get("entry_price"),
+            m.get("target_price"),
+            d.get("target_price"),
+            m.get("price"),
+            d.get("price"),
+        )
+        if px_hint is None and sym:
+            px_hint = self._entry_order_price_hint(sym, side_hint)
+
+        qty = _pick_float(
+            quantity,
+            m.get("qty"),
+            d.get("qty"),
+            m.get("size"),
+            d.get("size"),
+            m.get("quantity"),
+            d.get("quantity"),
+        )
+        notional_hint = _pick_float(
+            m.get("est_notional"),
+            d.get("est_notional"),
+            m.get("notional"),
+            d.get("notional"),
+            m.get("entry_notional"),
+            d.get("entry_notional"),
+        )
+        if qty is None and notional_hint is not None and px_hint is not None and px_hint > 0:
+            qty = float(max(0.0, notional_hint / max(px_hint, 1e-12)))
+        if (qty is None or qty <= 0) and sym:
+            try:
+                d_ctx = d if isinstance(d, dict) and d else {"action": side_hint, "meta": m}
+                _, est_notional, est_qty = self._calc_position_size(d_ctx, 1.0, lev, symbol=sym, use_cycle_reserve=False)
+                if est_qty is not None and float(est_qty) > 0:
+                    qty = float(est_qty)
+                elif est_notional is not None and px_hint is not None and px_hint > 0:
+                    qty = float(max(0.0, float(est_notional) / max(px_hint, 1e-12)))
+            except Exception:
+                pass
+        qty = float(max(0.0, qty or 0.0))
+
+        # Fallback for missing symbol/size context: legacy static estimate.
+        if not sym or qty <= 0:
+            mode_hint = str(m.get("exec_mode") or d.get("exec_mode") or "").strip().lower()
+            if not mode_hint:
+                mode_hint = str(getattr(mc_config, "execution_mode", EXECUTION_MODE) or EXECUTION_MODE).strip().lower()
+            if exec_mode == "maker":
+                use_maker = True
+            elif exec_mode == "taker":
+                use_maker = False
+            else:
+                use_maker = bool("maker" in mode_hint) or bool(USE_MAKER_ORDERS)
+            fee_rate = float(maker_fee if use_maker else taker_fee)
+            fee_roundtrip = float(max(0.0, 2.0 * fee_rate))
+            slip_bps = float(max(0.0, static_slip_bps + extra_slip_bps))
+            slippage_roundtrip = float(max(0.0, 2.0 * slip_bps * 1e-4))
+            total = float(fee_roundtrip + slippage_roundtrip)
+            info: dict[str, object] = {
+                "exec_mode": "maker" if use_maker else "taker",
+                "fee_rate": float(fee_rate),
+                "fee_roundtrip": float(fee_roundtrip),
+                "slippage_bps": float(slip_bps),
+                "extra_slippage_bps": float(extra_slip_bps),
+                "slippage_roundtrip": float(slippage_roundtrip),
+                "entry_cost_rate": float(total * 0.5),
+                "exit_cost_rate": float(total * 0.5),
+                "funding_cost_rate": 0.0,
+            }
+            return total, info
+
+        edge_rate = _pick_float(
+            m.get("entry_ev_side_net"),
+            d.get("entry_ev_side_net"),
+            m.get("pred_ev"),
+            d.get("pred_ev"),
+            m.get("entry_ev_max_net"),
+            d.get("entry_ev_max_net"),
+        )
+        proxy_pos = {
+            "regime": regime_hint,
+            "alpha_vpin": vpin_val,
+            "ofi_score": _pick_float(m.get("ofi_score"), d.get("ofi_score"), 0.0),
+            "pred_ev": edge_rate,
+            "entry_ev_side_net": edge_rate,
+            "entry_ev_max_net": _pick_float(m.get("entry_ev_max_net"), d.get("entry_ev_max_net"), edge_rate),
+            "entry_ev": edge_rate,
+        }
+
+        entry_profile = self._estimate_execution_profile(
+            sym,
+            side_hint,
+            qty,
+            reduce_only=False,
+            position_side=side_hint,
+            price_hint=px_hint,
+            pos=proxy_pos,
+        )
+        entry_maker_cost = float(max(0.0, self._safe_float(entry_profile.get("maker_cost_rate"), maker_fee) or maker_fee))
+        entry_taker_cost = float(max(0.0, self._safe_float(entry_profile.get("taker_cost_rate"), taker_fee) or taker_fee))
+        entry_selected_cost = float(max(0.0, self._safe_float(entry_profile.get("selected_cost_rate"), entry_taker_cost) or entry_taker_cost))
+        entry_selected_exec = str(entry_profile.get("selected_exec_type") or "market")
+        if exec_mode == "maker":
+            entry_cost_rate = float(entry_maker_cost)
+            entry_exec = "maker_dynamic"
+        elif exec_mode == "taker":
+            entry_cost_rate = float(entry_taker_cost)
+            entry_exec = "market"
+        else:
+            entry_cost_rate = float(entry_selected_cost)
+            entry_exec = entry_selected_exec
+
+        exit_side = "SHORT" if side_hint == "LONG" else "LONG"
+        exit_px_hint = self._entry_order_price_hint(sym, exit_side)
+        exit_profile = self._estimate_execution_profile(
+            sym,
+            exit_side,
+            qty,
+            reduce_only=True,
+            position_side=side_hint,
+            price_hint=exit_px_hint,
+            pos=proxy_pos,
+        )
+        exit_maker_cost = float(max(0.0, self._safe_float(exit_profile.get("maker_cost_rate"), maker_fee) or maker_fee))
+        exit_taker_cost = float(max(0.0, self._safe_float(exit_profile.get("taker_cost_rate"), taker_fee) or taker_fee))
+        exit_selected_cost = float(max(0.0, self._safe_float(exit_profile.get("selected_cost_rate"), exit_taker_cost) or exit_taker_cost))
+        exit_selected_exec = str(exit_profile.get("selected_exec_type") or "market")
+        if exit_exec_mode == "maker":
+            exit_cost_rate = float(exit_maker_cost)
+            exit_exec = "maker_dynamic"
+        elif exit_exec_mode == "taker":
+            exit_cost_rate = float(exit_taker_cost)
+            exit_exec = "market"
+        else:
+            exit_cost_rate = float(exit_selected_cost)
+            exit_exec = exit_selected_exec
+
+        if shock_ctx:
+            shock_blend = float(max(0.0, min(1.0, _env_float("ENTRY_COST_EXIT_SHOCK_TAKER_BLEND", 0.80))))
+        else:
+            shock_blend = float(max(0.0, min(1.0, _env_float("ENTRY_COST_EXIT_TAKER_BLEND", 0.20))))
+        exit_cost_rate = float((1.0 - shock_blend) * float(exit_cost_rate) + shock_blend * float(exit_taker_cost))
+
+        hold_sec = _pick_float(
+            m.get("target_hold_sec"),
+            d.get("target_hold_sec"),
+            m.get("opt_hold_entry_sec"),
+            d.get("opt_hold_entry_sec"),
+            m.get("policy_horizon_sec"),
+            d.get("policy_horizon_sec"),
+            m.get("event_hold_target_sec"),
+            d.get("event_hold_target_sec"),
+        )
+        if hold_sec is None:
+            hold_sec = _env_float("POLICY_HORIZON_SEC", 3600.0)
+        hold_sec = float(max(0.0, hold_sec))
+        include_funding = _env_bool("ENTRY_COST_INCLUDE_FUNDING", False)
+        funding_cost_rate = 0.0
+        if include_funding and hold_sec > 0:
+            funding_rate_8h = _env_float("ENTRY_COST_FUNDING_RATE_8H", 0.0)
+            funding_hourly = float(funding_rate_8h / 8.0)
+            funding_cost_rate = float(abs(funding_hourly) * (hold_sec / 3600.0))
+        holding_bps_per_hour = float(max(0.0, _env_float("ENTRY_COST_HOLDING_BPS_PER_HOUR", 0.0)))
+        if holding_bps_per_hour > 0 and hold_sec > 0:
+            funding_cost_rate += float(holding_bps_per_hour * 1e-4 * (hold_sec / 3600.0))
+
+        extra_cost_rate = float(2.0 * extra_slip_bps * 1e-4)
+        total = float(max(0.0, entry_cost_rate + exit_cost_rate + funding_cost_rate + extra_cost_rate))
+        entry_slip_bps = float(self._safe_float(entry_profile.get("size_impact_bps"), 0.0) or 0.0)
+        exit_slip_bps = float(self._safe_float(exit_profile.get("size_impact_bps"), 0.0) or 0.0)
+        info: dict[str, object] = {
+            "exec_mode": str(entry_exec),
+            "fee_rate": float(maker_fee if "maker" in str(entry_exec).lower() else taker_fee),
+            "fee_roundtrip": float(max(0.0, maker_fee + taker_fee)),
+            "slippage_bps": float(entry_slip_bps if entry_slip_bps > 0 else static_slip_bps),
+            "extra_slippage_bps": float(extra_slip_bps),
+            "slippage_roundtrip": float(max(0.0, (entry_slip_bps + exit_slip_bps) * 1e-4)),
+            "entry_cost_rate": float(entry_cost_rate),
+            "exit_cost_rate": float(exit_cost_rate),
+            "funding_cost_rate": float(max(0.0, funding_cost_rate)),
+            "entry_exec_mode": str(entry_exec),
+            "exit_exec_mode": str(exit_exec),
+            "entry_p_fill": float(self._safe_float(entry_profile.get("p_fill"), 0.0) or 0.0),
+            "exit_p_fill": float(self._safe_float(exit_profile.get("p_fill"), 0.0) or 0.0),
+            "entry_spread_bps": float(self._safe_float(entry_profile.get("spread_bps"), 0.0) or 0.0),
+            "exit_spread_bps": float(self._safe_float(exit_profile.get("spread_bps"), 0.0) or 0.0),
+            "entry_size_impact_bps": float(entry_slip_bps),
+            "exit_size_impact_bps": float(exit_slip_bps),
+            "shock_ctx": bool(shock_ctx),
+            "shock_blend": float(shock_blend),
+            "symbol": sym,
+            "qty": float(qty),
+            "hold_sec": float(hold_sec),
+        }
+        return total, info
+
+    @staticmethod
+    def _parse_env_float_list(env_key: str, default_vals: list[float]) -> list[float]:
+        raw = str(os.environ.get(env_key, "")).strip()
+        if not raw:
+            return [float(x) for x in default_vals]
+        out: list[float] = []
+        for tok in raw.split(","):
+            s = tok.strip()
+            if not s:
+                continue
+            try:
+                out.append(float(s))
+            except Exception:
+                continue
+        return out if out else [float(x) for x in default_vals]
+
+    def _effective_total_exposure_cap(self, cap_balance: float | None = None) -> float:
+        base_cap = float(self.max_notional_frac or 0.0)
+        try:
+            tier_enabled = str(os.environ.get("CAPITAL_TIER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tier_enabled = True
+        try:
+            apply_cap = str(os.environ.get("CAPITAL_TIER_APPLY_TOTAL_CAP", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            apply_cap = True
+        try:
+            tier_override_base = str(os.environ.get("CAPITAL_TIER_TOTAL_CAP_OVERRIDE_BASE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tier_override_base = True
+        if (not tier_enabled) or (not apply_cap):
+            return float(max(0.0, base_cap))
+        try:
+            bal = float(cap_balance if cap_balance is not None else self._exposure_cap_balance())
+        except Exception:
+            bal = float(self.balance or 0.0)
+        tiers = self._parse_env_float_list("CAPITAL_TIER_USDT", [500.0, 1500.0, 3000.0, 6000.0, 9000.0])
+        # [2026-02-14] MC E안: 소액 tier 5.0x (기존 2.0x) — 자본 집중 전략
+        caps = self._parse_env_float_list("CAPITAL_TIER_TOTAL_CAP", [5.0, 5.0, 6.0, 7.5, 9.0, 12.0])
+        if len(caps) < (len(tiers) + 1):
+            caps.extend([caps[-1]] * (len(tiers) + 1 - len(caps)))
+        idx = 0
+        for th in tiers:
+            if float(bal) < float(th):
+                break
+            idx += 1
+        cap_tier = float(caps[min(idx, len(caps) - 1)])
+        if tier_override_base and cap_tier > 0:
+            return float(max(0.0, cap_tier))
+        if base_cap > 0:
+            return float(max(0.0, min(base_cap, cap_tier)))
+        return float(max(0.0, cap_tier))
+
+    def _effective_min_entry_notional(self, eff_balance: float, regime_hint: str | None = None) -> float:
+        base_floor = float(MIN_ENTRY_NOTIONAL) if MIN_ENTRY_NOTIONAL > 0 else 0.0
+        if MIN_ENTRY_NOTIONAL_PCT > 0:
+            try:
+                base_floor = max(base_floor, float(eff_balance) * float(MIN_ENTRY_NOTIONAL_PCT))
+            except Exception:
+                pass
+        try:
+            strict_base_floor = str(os.environ.get("MIN_ENTRY_NOTIONAL_STRICT_BASE_FLOOR", "0")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            strict_base_floor = False
+        try:
+            hard_min = float(os.environ.get("MIN_ENTRY_NOTIONAL_HARD_MIN", 0.5) or 0.5)
+        except Exception:
+            hard_min = 0.5
+        try:
+            cap_ratio = float(os.environ.get("MIN_ENTRY_NOTIONAL_BALANCE_CAP_RATIO", 0.15) or 0.15)
+        except Exception:
+            cap_ratio = 0.15
+        try:
+            tier_enabled = str(os.environ.get("CAPITAL_TIER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tier_enabled = True
+        try:
+            apply_min = str(os.environ.get("CAPITAL_TIER_APPLY_MIN_NOTIONAL", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            apply_min = True
+        try:
+            tier_override_base = str(os.environ.get("CAPITAL_TIER_MIN_NOTIONAL_OVERRIDE_BASE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tier_override_base = True
+        tier_floor = 0.0
+        if tier_enabled and apply_min:
+            tiers = self._parse_env_float_list("CAPITAL_TIER_USDT", [500.0, 1500.0, 3000.0, 6000.0, 9000.0])
+            tier_vals = self._parse_env_float_list("CAPITAL_TIER_MIN_NOTIONAL", [0.1, 0.2, 0.5, 1.0, 2.0, 4.0])
+            if len(tier_vals) < (len(tiers) + 1):
+                tier_vals.extend([tier_vals[-1]] * (len(tiers) + 1 - len(tier_vals)))
+            idx = 0
+            for th in tiers:
+                if float(eff_balance) < float(th):
+                    break
+                idx += 1
+            tier_floor = float(tier_vals[min(idx, len(tier_vals) - 1)])
+        if tier_enabled and apply_min and tier_override_base and tier_floor > 0:
+            floor = float(max(0.0, tier_floor))
+        else:
+            floor = float(max(0.0, base_floor, tier_floor))
+        if strict_base_floor and base_floor > 0:
+            floor = float(max(float(floor), float(base_floor)))
+        if floor > 0:
+            floor = float(max(float(hard_min), floor))
+            if float(cap_ratio) > 0:
+                try:
+                    cap_floor = float(max(0.0, float(eff_balance) * float(cap_ratio)))
+                    if cap_floor > 0:
+                        floor = float(max(float(hard_min), min(floor, cap_floor)))
+                except Exception:
+                    pass
+        if regime_hint:
+            try:
+                reg_floor, _ = self._regime_entry_min_notional(regime_hint)
+                floor = max(float(floor), float(reg_floor or 0.0))
+            except Exception:
+                pass
+        return float(max(0.0, floor))
+
+    def _orderbook_depth_notional(self, symbol: str, side: str, depth_levels: int = 5) -> float:
+        try:
+            ob = self.orderbook.get(symbol) or {}
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            levels = asks if str(side).upper() == "LONG" else bids
+            depth = max(1, int(depth_levels))
+            total = 0.0
+            for lv in levels[:depth]:
+                if not lv or len(lv) < 2:
+                    continue
+                px = float(lv[0] or 0.0)
+                sz = float(lv[1] or 0.0)
+                if px > 0 and sz > 0:
+                    total += px * sz
+            return float(max(0.0, total))
+        except Exception:
+            return 0.0
+
+    def _estimate_adv_notional(self, symbol: str, price_hint: float | None = None) -> float:
+        px = None
+        try:
+            if price_hint is not None and float(price_hint) > 0:
+                px = float(price_hint)
+        except Exception:
+            px = None
+        if px is None:
+            px = self._entry_order_price_hint(symbol, "LONG")
+        if px is None or px <= 0:
+            return 0.0
+        try:
+            vols = list(self.ohlcv_volume.get(symbol, []))
+        except Exception:
+            vols = []
+        if not vols:
+            return 0.0
+        lookback = max(30, min(len(vols), 240))
+        arr = vols[-lookback:]
+        try:
+            avg_min_vol = float(sum(float(v or 0.0) for v in arr) / float(max(1, len(arr))))
+        except Exception:
+            avg_min_vol = 0.0
+        if avg_min_vol <= 0:
+            return 0.0
+        adv_base = avg_min_vol * 1440.0
+        return float(max(0.0, adv_base * float(px)))
+
+    def _estimate_size_aware_slippage_bps(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float | None,
+        *,
+        sigma: float | None = None,
+        vpin: float | None = None,
+        regime_hint: str | None = None,
+        shock: bool = False,
+        depth_levels: int = 5,
+    ) -> dict[str, float]:
+        px = float(price) if (price is not None and float(price) > 0) else float(self._entry_order_price_hint(symbol, side) or 0.0)
+        notional = float(max(0.0, float(qty or 0.0) * max(px, 0.0)))
+        depth_notional = self._orderbook_depth_notional(symbol, side, depth_levels=depth_levels)
+        adv_notional = self._estimate_adv_notional(symbol, price_hint=px)
+        spread_bps = 0.0
+        try:
+            ob = self.orderbook.get(symbol) or {}
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if bids and asks:
+                bid = float(bids[0][0] or 0.0)
+                ask = float(asks[0][0] or 0.0)
+                mid = 0.5 * (bid + ask) if bid > 0 and ask > 0 else 0.0
+                if mid > 0:
+                    spread_bps = float(max(0.0, (ask - bid) / mid * 10000.0))
+        except Exception:
+            spread_bps = 0.0
+        if sigma is None:
+            try:
+                closes = list(self.ohlcv_buffer.get(symbol, []))
+                _, sig = self._compute_returns_and_vol(closes)
+                sigma = float(sig) if sig is not None else 0.0
+            except Exception:
+                sigma = 0.0
+        sigma = float(max(0.0, sigma or 0.0))
+        vpin_val = float(max(0.0, min(1.0, vpin or 0.0)))
+        ratio_adv = float(notional / max(adv_notional, 1e-6)) if adv_notional > 0 else 0.0
+        ratio_depth = float(notional / max(depth_notional, 1e-6)) if depth_notional > 0 else 0.0
+        ratio_adv_sqrt = math.sqrt(max(0.0, ratio_adv))
+        regime = self._normalize_regime_bucket(regime_hint)
+        regime_term = 0.0
+        if regime == "trend":
+            regime_term = float(os.environ.get("SLIP_REGIME_TERM_TREND_BPS", "0.20") or 0.20)
+        elif regime == "volatile":
+            regime_term = float(os.environ.get("SLIP_REGIME_TERM_VOLATILE_BPS", "0.90") or 0.90)
+        elif regime == "mean_revert":
+            regime_term = float(os.environ.get("SLIP_REGIME_TERM_MEAN_REVERT_BPS", "0.35") or 0.35)
+        else:
+            regime_term = float(os.environ.get("SLIP_REGIME_TERM_CHOP_BPS", "0.55") or 0.55)
+        b0 = float(os.environ.get("SLIP_MODEL_B0_BPS", "0.15") or 0.15)
+        b1 = float(os.environ.get("SLIP_MODEL_B1_SPREAD", "0.65") or 0.65)
+        b2 = float(os.environ.get("SLIP_MODEL_B2_ADV", "7.50") or 7.50)
+        b3 = float(os.environ.get("SLIP_MODEL_B3_DEPTH", "9.50") or 9.50)
+        b4 = float(os.environ.get("SLIP_MODEL_B4_SIGMA", "120.0") or 120.0)
+        b5 = float(os.environ.get("SLIP_MODEL_B5_VPIN", "2.50") or 2.50)
+        shock_term = float(os.environ.get("SLIP_MODEL_SHOCK_BPS", "1.25") or 1.25) if shock else 0.0
+        slip_bps = (
+            float(b0)
+            + float(b1) * float(max(0.0, spread_bps))
+            + float(b2) * float(max(0.0, ratio_adv_sqrt))
+            + float(b3) * float(max(0.0, ratio_depth))
+            + float(b4) * float(max(0.0, sigma))
+            + float(b5) * float(max(0.0, vpin_val))
+            + float(regime_term)
+            + float(shock_term)
+        )
+        try:
+            slip_min = float(os.environ.get("SLIP_MODEL_MIN_BPS", "0.0") or 0.0)
+        except Exception:
+            slip_min = 0.0
+        try:
+            slip_max = float(os.environ.get("SLIP_MODEL_MAX_BPS", "80.0") or 80.0)
+        except Exception:
+            slip_max = 80.0
+        slip_bps = float(max(float(slip_min), min(float(slip_max), float(max(0.0, slip_bps)))))
+        return {
+            "slip_bps": float(slip_bps),
+            "spread_bps": float(max(0.0, spread_bps)),
+            "ratio_adv": float(max(0.0, ratio_adv)),
+            "ratio_depth": float(max(0.0, ratio_depth)),
+            "adv_notional": float(max(0.0, adv_notional)),
+            "depth_notional": float(max(0.0, depth_notional)),
+            "sigma": float(max(0.0, sigma)),
+            "vpin": float(vpin_val),
+            "regime_term_bps": float(regime_term),
+            "shock_term_bps": float(shock_term),
+        }
+
+    def _extract_order_fill(self, order: dict | None, fallback_price: float | None, fallback_qty: float | None) -> tuple[float | None, float | None, float | None]:
+        od = order or {}
+        info = od.get("info") if isinstance(od.get("info"), dict) else {}
+
+        def _num(v):
+            try:
+                vv = float(v)
+                if math.isfinite(vv):
+                    return vv
+            except Exception:
+                return None
+            return None
+
+        def _pick(src: dict | None, keys: tuple[str, ...], *, positive: bool = True) -> float | None:
+            if not isinstance(src, dict):
+                return None
+            for k in keys:
+                vv = _num(src.get(k))
+                if vv is None:
+                    continue
+                if positive and vv <= 0:
+                    continue
+                return vv
+            return None
+
+        px = None
+        qty = None
+        fee_rate = None
+        fee_cost_total = 0.0
+
+        trades = od.get("trades")
+        if isinstance(trades, list) and trades:
+            w_notional = 0.0
+            w_qty = 0.0
+            for tr in trades:
+                if not isinstance(tr, dict):
+                    continue
+                tr_info = tr.get("info") if isinstance(tr.get("info"), dict) else {}
+                tr_qty = (
+                    _pick(tr, ("amount", "qty", "size", "filled"), positive=True)
+                    or _pick(tr_info, ("execQty", "execSize", "qty"), positive=True)
+                )
+                tr_px = (
+                    _pick(tr, ("price", "avgPrice", "lastTradePrice"), positive=True)
+                    or _pick(tr_info, ("execPrice", "price", "avgPrice"), positive=True)
+                )
+                if tr_qty is not None and tr_px is not None:
+                    w_qty += float(tr_qty)
+                    w_notional += float(tr_qty) * float(tr_px)
+                tr_fee_obj = tr.get("fee") if isinstance(tr.get("fee"), dict) else {}
+                tr_fee = _pick(tr_fee_obj, ("cost", "fee"), positive=True) or _pick(
+                    tr_info, ("execFee", "fee"), positive=True
+                )
+                if tr_fee is not None:
+                    fee_cost_total += float(tr_fee)
+            if w_qty > 0:
+                qty = float(w_qty)
+                if w_notional > 0:
+                    px = float(w_notional / w_qty)
+                    if fee_cost_total > 0:
+                        fee_rate = float(fee_cost_total / max(1e-12, w_notional))
+
+        px = px or _pick(od, ("average", "avgPrice", "price", "lastTradePrice"), positive=True)
+        px = px or _pick(info, ("avgPrice", "averagePrice", "lastPrice", "markPrice", "price"), positive=True)
+
+        cum_exec_qty = _pick(info, ("cumExecQty", "execQty", "cumFilledQty", "filledQty"), positive=True)
+        cum_exec_val = _pick(info, ("cumExecValue", "execValue", "cumFilledValue", "filledValue"), positive=True)
+        if qty is None:
+            qty = cum_exec_qty
+        if px is None and cum_exec_qty is not None and cum_exec_val is not None and cum_exec_qty > 0:
+            px = float(cum_exec_val / max(1e-12, cum_exec_qty))
+
+        if px is None and fallback_price is not None:
+            try:
+                fp = float(fallback_price)
+                if math.isfinite(fp) and fp > 0:
+                    px = fp
+            except Exception:
+                px = None
+        qty = qty or _pick(od, ("filled", "filledQty", "executedQty", "amount", "qty", "contracts"), positive=True)
+        qty = qty or _pick(info, ("cumExecQty", "execQty", "cumFilledQty", "filledQty", "qty"), positive=True)
+        if qty is None and fallback_qty is not None:
+            try:
+                fq = float(fallback_qty)
+                if math.isfinite(fq) and fq > 0:
+                    qty = fq
+            except Exception:
+                qty = None
+        if fee_rate is None:
+            try:
+                fee_obj = od.get("fee") or {}
+                fee_cost = _pick(fee_obj if isinstance(fee_obj, dict) else {}, ("cost", "fee"), positive=True)
+                if fee_cost is not None and px and qty:
+                    fee_rate = float(fee_cost / max(1e-12, float(px) * float(qty)))
+            except Exception:
+                fee_rate = None
+        if fee_rate is None:
+            try:
+                info_fee = _pick(info, ("cumExecFee", "execFee", "fee", "cumFee"), positive=True)
+                denom = None
+                if cum_exec_val is not None and cum_exec_val > 0:
+                    denom = float(cum_exec_val)
+                elif px and qty:
+                    denom = float(px) * float(qty)
+                if info_fee is not None and denom and denom > 0:
+                    fee_rate = float(info_fee / denom)
+            except Exception:
+                fee_rate = None
+        return px, qty, fee_rate
+
+    async def _resolve_order_fill(
+        self,
+        symbol: str,
+        order: dict | None,
+        fallback_price: float | None,
+        fallback_qty: float | None,
+    ) -> tuple[float | None, float | None, float | None, str]:
+        fill_px, fill_qty, fee_rate = self._extract_order_fill(order, fallback_price, fallback_qty)
+        fill_source = "order_payload"
+        try:
+            if fill_px is None or fill_qty is None:
+                fill_source = "fallback"
+            elif fallback_price is not None and float(fallback_price) > 0:
+                rel0 = abs(float(fill_px) - float(fallback_price)) / max(float(fallback_price), 1e-12)
+                if rel0 <= 1e-9 and fee_rate is None:
+                    fill_source = "fallback"
+        except Exception:
+            fill_source = "fallback"
+        try:
+            fetch_enabled = str(os.environ.get("LIVE_FETCH_FILLED_ORDER_FOR_SLIPPAGE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            fetch_enabled = True
+        if not fetch_enabled:
+            return fill_px, fill_qty, fee_rate, fill_source
+        if not hasattr(self.exchange, "fetch_order"):
+            return fill_px, fill_qty, fee_rate, fill_source
+
+        order_id = None
+        try:
+            if isinstance(order, dict):
+                order_id = order.get("id")
+        except Exception:
+            order_id = None
+        if not order_id:
+            return fill_px, fill_qty, fee_rate, fill_source
+
+        needs_refresh = False
+        try:
+            if fill_px is None or fill_qty is None:
+                needs_refresh = True
+            elif fallback_price is not None and float(fallback_price) > 0:
+                rel = abs(float(fill_px) - float(fallback_price)) / max(float(fallback_price), 1e-12)
+                if rel <= 1e-9:
+                    needs_refresh = True
+            if fee_rate is None:
+                needs_refresh = True
+        except Exception:
+            needs_refresh = True
+        if not needs_refresh:
+            return fill_px, fill_qty, fee_rate, fill_source
+
+        try:
+            fetch_delay = float(os.environ.get("LIVE_FETCH_ORDER_DELAY_SEC", 0.25) or 0.25)
+        except Exception:
+            fetch_delay = 0.25
+        fetch_delay = float(max(0.0, min(2.0, fetch_delay)))
+        if fetch_delay > 0:
+            try:
+                await asyncio.sleep(fetch_delay)
+            except Exception:
+                pass
+        try:
+            fetch_params = {}
+            try:
+                fetch_params = self._positions_fetch_params() or {}
+            except Exception:
+                fetch_params = {}
+            if fetch_params:
+                fetched = await self.exchange.fetch_order(order_id, symbol, fetch_params)
+            else:
+                fetched = await self.exchange.fetch_order(order_id, symbol)
+            px2, qty2, fee2 = self._extract_order_fill(
+                fetched if isinstance(fetched, dict) else order,
+                fallback_price,
+                fallback_qty,
+            )
+            if px2 is not None:
+                fill_px = px2
+            if qty2 is not None:
+                fill_qty = qty2
+            if fee2 is not None:
+                fee_rate = fee2
+            if (px2 is not None) or (qty2 is not None) or (fee2 is not None):
+                fill_source = "fetch_order"
+        except Exception:
+            pass
+        try:
+            still_suspicious = False
+            if fill_px is None or fill_qty is None:
+                still_suspicious = True
+            elif fallback_price is not None and float(fallback_price) > 0:
+                rel2 = abs(float(fill_px) - float(fallback_price)) / max(float(fallback_price), 1e-12)
+                if rel2 <= 1e-9:
+                    still_suspicious = True
+            if fee_rate is None:
+                still_suspicious = True
+            if still_suspicious and hasattr(self.exchange, "fetch_my_trades"):
+                lookback_sec = float(os.environ.get("LIVE_FETCH_MY_TRADES_LOOKBACK_SEC", 120.0) or 120.0)
+                trade_limit = int(os.environ.get("LIVE_FETCH_MY_TRADES_LIMIT", 50) or 50)
+                since_ms = int(now_ms() - max(5.0, lookback_sec) * 1000.0)
+                trade_limit = max(10, min(200, trade_limit))
+                fetch_params = {}
+                try:
+                    fetch_params = self._positions_fetch_params() or {}
+                except Exception:
+                    fetch_params = {}
+                if fetch_params:
+                    trows = await self.exchange.fetch_my_trades(symbol, since=since_ms, limit=trade_limit, params=fetch_params)
+                else:
+                    trows = await self.exchange.fetch_my_trades(symbol, since=since_ms, limit=trade_limit)
+                rows = trows if isinstance(trows, list) else []
+                matches = []
+                for tr in rows:
+                    if not isinstance(tr, dict):
+                        continue
+                    tr_order = tr.get("order")
+                    tr_info = tr.get("info") if isinstance(tr.get("info"), dict) else {}
+                    tr_oid = tr_order or tr_info.get("orderId") or tr_info.get("order_id")
+                    if tr_oid and str(tr_oid) == str(order_id):
+                        matches.append(tr)
+                if not matches:
+                    matches = rows[-3:] if len(rows) >= 3 else rows
+                w_notional = 0.0
+                w_qty = 0.0
+                fee_sum = 0.0
+                for tr in matches:
+                    tr_info = tr.get("info") if isinstance(tr.get("info"), dict) else {}
+                    tr_px = self._safe_float(
+                        tr.get("price"),
+                        self._safe_float(tr_info.get("execPrice"), None),
+                    )
+                    tr_qty = self._safe_float(
+                        tr.get("amount"),
+                        self._safe_float(tr_info.get("execQty"), None),
+                    )
+                    if tr_px is not None and tr_qty is not None and tr_px > 0 and tr_qty > 0:
+                        w_qty += float(tr_qty)
+                        w_notional += float(tr_px) * float(tr_qty)
+                    try:
+                        tr_fee = 0.0
+                        fee_obj = tr.get("fee") if isinstance(tr.get("fee"), dict) else {}
+                        tr_fee = float((fee_obj.get("cost") if isinstance(fee_obj, dict) else None) or 0.0)
+                        if tr_fee <= 0:
+                            tr_fee = float(tr_info.get("execFee") or 0.0)
+                        if tr_fee > 0:
+                            fee_sum += float(tr_fee)
+                    except Exception:
+                        pass
+                if w_qty > 0 and w_notional > 0:
+                    fill_px = float(w_notional / w_qty)
+                    fill_qty = float(w_qty)
+                    if fee_sum > 0:
+                        fee_rate = float(fee_sum / max(1e-12, w_notional))
+                    fill_source = "fetch_my_trades"
+        except Exception:
+            pass
+        return fill_px, fill_qty, fee_rate, fill_source
+
+    def _estimate_execution_profile(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        *,
+        reduce_only: bool = False,
+        position_side: str | None = None,
+        price_hint: float | None = None,
+        pos: dict | None = None,
+    ) -> dict[str, object]:
+        trade_side = str(side or "").upper()
+        if trade_side not in ("LONG", "SHORT"):
+            trade_side = "LONG"
+        order_side = "buy" if trade_side == "LONG" else "sell"
+        px = float(price_hint) if (price_hint is not None and float(price_hint) > 0) else float(self._entry_order_price_hint(symbol, trade_side) or 0.0)
+        if px <= 0:
+            px = float((self.market.get(symbol) or {}).get("price") or 0.0)
+        qty_f = float(max(0.0, qty))
+        notional = float(max(0.0, qty_f * max(px, 0.0)))
+        try:
+            maker_fee = float(os.environ.get("ENTRY_COST_MAKER_FEE_RATE", getattr(self, "fee_maker", 0.0002)) or 0.0002)
+        except Exception:
+            maker_fee = 0.0002
+        try:
+            taker_fee = float(os.environ.get("ENTRY_COST_TAKER_FEE_RATE", getattr(self, "fee_taker", 0.00055)) or 0.00055)
+        except Exception:
+            taker_fee = 0.00055
+        spread_bps = 0.0
+        try:
+            ob = self.orderbook.get(symbol) or {}
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if bids and asks:
+                bid = float(bids[0][0] or 0.0)
+                ask = float(asks[0][0] or 0.0)
+                mid = 0.5 * (bid + ask) if bid > 0 and ask > 0 else 0.0
+                if mid > 0:
+                    spread_bps = float(max(0.0, (ask - bid) / mid * 10000.0))
+        except Exception:
+            spread_bps = 0.0
+        sigma = 0.0
+        try:
+            closes = list(self.ohlcv_buffer.get(symbol, []))
+            _, s = self._compute_returns_and_vol(closes)
+            sigma = float(s or 0.0)
+        except Exception:
+            sigma = 0.0
+        vpin = None
+        regime = "chop"
+        if isinstance(pos, dict):
+            try:
+                vpin = self._safe_float(pos.get("alpha_vpin"), None)
+            except Exception:
+                vpin = None
+            try:
+                regime = str(pos.get("regime") or "chop")
+            except Exception:
+                regime = "chop"
+        vpin_val = float(max(0.0, min(1.0, vpin or 0.0)))
+        try:
+            shock_vpin_th = float(os.environ.get("ORDER_SHOCK_VPIN_THRESHOLD", 0.88) or 0.88)
+        except Exception:
+            shock_vpin_th = 0.88
+        shock = bool(self._normalize_regime_bucket(regime) == "volatile" or vpin_val >= float(shock_vpin_th))
+        slip = self._estimate_size_aware_slippage_bps(
+            symbol,
+            trade_side,
+            qty_f,
+            px,
+            sigma=sigma,
+            vpin=vpin_val,
+            regime_hint=regime,
+            shock=shock,
+            depth_levels=int(os.environ.get("ORDER_SLICE_DEPTH_LEVELS", "5") or 5),
+        )
+        spread_cross_rate = float(max(0.0, spread_bps) * 1e-4 * 0.5)
+        size_impact_rate = float(max(0.0, float(slip.get("slip_bps", 0.0))) * 1e-4)
+        taker_cost = float(max(0.0, taker_fee + spread_cross_rate + size_impact_rate))
+        try:
+            liq = float(self._liquidity_score(symbol))
+        except Exception:
+            liq = 1.0
+        ofi_abs = 0.0
+        try:
+            ofi = self._safe_float((pos or {}).get("ofi_score"), None)
+            if ofi is not None:
+                ofi_abs = float(abs(ofi))
+        except Exception:
+            ofi_abs = 0.0
+        p_fill = float(self._estimate_p_maker(spread_pct=float(max(0.0, spread_bps) * 1e-4), liq_score=float(max(1.0, liq)), ofi_z_abs=float(ofi_abs)))
+        p_fill = float(max(0.01, min(0.99, p_fill)))
+        try:
+            delay_sec = float(os.environ.get("MAKER_TIMEOUT_SEC", MAKER_TIMEOUT_SEC) or MAKER_TIMEOUT_SEC)
+        except Exception:
+            delay_sec = float(MAKER_TIMEOUT_SEC)
+        try:
+            delay_k = float(os.environ.get("ORDER_EXEC_DELAY_PENALTY_BPS_K", 2.4) or 2.4)
+        except Exception:
+            delay_k = 2.4
+        try:
+            adverse_k = float(os.environ.get("ORDER_EXEC_ADVERSE_BPS_K", 3.5) or 3.5)
+        except Exception:
+            adverse_k = 3.5
+        delay_adverse_bps = float(max(0.0, delay_k * max(0.0, sigma) * math.sqrt(max(0.0, delay_sec)) + adverse_k * max(0.0, vpin_val)))
+        delay_adverse_rate = float(delay_adverse_bps * 1e-4)
+        maker_cost = float(max(0.0, p_fill * maker_fee + (1.0 - p_fill) * taker_cost + delay_adverse_rate))
+        edge_rate = None
+        if isinstance(pos, dict):
+            for k in ("pred_ev", "entry_ev_side_net", "entry_ev_max_net", "entry_ev"):
+                try:
+                    if pos.get(k) is not None:
+                        edge_rate = float(pos.get(k))
+                        break
+                except Exception:
+                    continue
+        try:
+            edge_buffer = float(os.environ.get("ORDER_EXEC_EDGE_BUFFER", 0.0) or 0.0)
+        except Exception:
+            edge_buffer = 0.0
+        try:
+            require_edge = str(os.environ.get("ORDER_EXEC_REQUIRE_EDGE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            require_edge = True
+        try:
+            force_taker_shock_exit = str(os.environ.get("ORDER_EXIT_SHOCK_FORCE_TAKER", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            force_taker_shock_exit = True
+        if reduce_only and shock and force_taker_shock_exit:
+            selected = "market"
+            selected_cost = taker_cost
+        else:
+            if maker_cost <= taker_cost:
+                selected = "maker_dynamic"
+                selected_cost = maker_cost
+            else:
+                selected = "market"
+                selected_cost = taker_cost
+        edge_ok = True
+        if (not reduce_only) and require_edge and (edge_rate is not None):
+            # NOTE: edge_rate는 MC에서 fee_roundtrip_total이 이미 차감된 net EV.
+            # selected_cost에는 fee + spread + slippage + delay_adverse가 포함되어 있으나,
+            # MC가 이미 fee + spread + slippage를 차감했으므로, 추가 비용(delay_adverse)만 비교.
+            # edge_rate > delay_adverse_rate + edge_buffer 이면 실행 가능.
+            edge_ok = bool(float(edge_rate) > float(delay_adverse_rate + edge_buffer))
+        return {
+            "selected_exec_type": selected,
+            "selected_cost_rate": float(selected_cost),
+            "maker_cost_rate": float(maker_cost),
+            "taker_cost_rate": float(taker_cost),
+            "p_fill": float(p_fill),
+            "delay_adverse_bps": float(delay_adverse_bps),
+            "edge_rate": edge_rate,
+            "edge_ok": bool(edge_ok),
+            "spread_bps": float(spread_bps),
+            "size_impact_bps": float(slip.get("slip_bps", 0.0)),
+            "shock": bool(shock),
+            "notional": float(notional),
+            "price": float(px) if px > 0 else None,
+            "order_side": order_side,
+            "trade_side": trade_side,
+            "sigma": float(sigma),
+            "vpin": float(vpin_val),
+        }
+
+    def _split_order_quantities(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        *,
+        reduce_only: bool = False,
+        price_hint: float | None = None,
+        pos: dict | None = None,
+    ) -> tuple[list[float], dict[str, float]]:
+        qty = float(max(0.0, quantity))
+        if qty <= 0:
+            return [], {"max_slice_qty": 0.0, "depth_notional": 0.0}
+        try:
+            split_enabled = str(os.environ.get("ORDER_SPLIT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            split_enabled = True
+        if not split_enabled:
+            return [qty], {"max_slice_qty": qty, "depth_notional": 0.0}
+        try:
+            depth_levels = int(os.environ.get("ORDER_SLICE_DEPTH_LEVELS", 5) or 5)
+        except Exception:
+            depth_levels = 5
+        depth_levels = max(1, depth_levels)
+        depth_notional = self._orderbook_depth_notional(symbol, side, depth_levels=depth_levels)
+        px = float(price_hint) if (price_hint is not None and float(price_hint) > 0) else float(self._entry_order_price_hint(symbol, side) or 0.0)
+        if px <= 0:
+            px = float((self.market.get(symbol) or {}).get("price") or 0.0)
+        if px <= 0 or depth_notional <= 0:
+            return [qty], {"max_slice_qty": qty, "depth_notional": float(max(0.0, depth_notional))}
+        try:
+            ratio_min = float(os.environ.get("ORDER_SLICE_DEPTH_RATIO_MIN", 0.03) or 0.03)
+        except Exception:
+            ratio_min = 0.03
+        try:
+            ratio_max = float(os.environ.get("ORDER_SLICE_DEPTH_RATIO_MAX", 0.08) or 0.08)
+        except Exception:
+            ratio_max = 0.08
+        try:
+            ratio_exit = float(os.environ.get("ORDER_SLICE_DEPTH_RATIO_EXIT", 0.12) or 0.12)
+        except Exception:
+            ratio_exit = 0.12
+        if reduce_only:
+            depth_ratio = float(max(ratio_min, ratio_exit))
+        else:
+            conf = 0.5
+            if isinstance(pos, dict):
+                cands = [
+                    self._safe_float(pos.get("pred_mu_dir_conf"), None),
+                    self._safe_float(pos.get("entry_quality_score"), None),
+                    self._safe_float(pos.get("leverage_signal_score"), None),
+                ]
+                vals = [float(v) for v in cands if v is not None]
+                if vals:
+                    conf = float(sum(vals) / float(len(vals)))
+            conf = float(max(0.0, min(1.0, conf)))
+            depth_ratio = float(max(ratio_min, min(ratio_max, ratio_min + (ratio_max - ratio_min) * conf)))
+        max_slice_notional = float(max(0.0, depth_notional * depth_ratio))
+        max_slice_qty = float(max(0.0, max_slice_notional / max(px, 1e-12)))
+        if max_slice_qty <= 0 or qty <= max_slice_qty:
+            return [qty], {"max_slice_qty": float(max_slice_qty if max_slice_qty > 0 else qty), "depth_notional": float(depth_notional)}
+        try:
+            max_child = int(os.environ.get("ORDER_SLICE_MAX_CHILD_ORDERS", 12) or 12)
+        except Exception:
+            max_child = 12
+        max_child = max(2, max_child)
+        slices: list[float] = []
+        rem = float(qty)
+        while rem > 1e-12 and len(slices) < max_child:
+            child = min(rem, max_slice_qty)
+            if child <= 1e-12:
+                break
+            slices.append(float(child))
+            rem -= float(child)
+        if rem > 1e-12:
+            slices[-1] = float(slices[-1] + rem)
+        return slices, {"max_slice_qty": float(max_slice_qty), "depth_notional": float(depth_notional)}
+
+    def _record_order_slippage(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        exec_type: str,
+        target_price: float | None,
+        fill_price: float | None,
+        qty: float | None,
+        estimated_slippage_bps: float | None,
+        fee_rate: float | None = None,
+        volatility: float | None = None,
+        latency_ms: float | None = None,
+        selected_exec_type: str | None = None,
+        fill_source: str | None = None,
+    ) -> None:
+        if self.db is None:
+            return
+        try:
+            tp = float(target_price) if target_price is not None else None
+            fp = float(fill_price) if fill_price is not None else None
+            if tp is None or fp is None or tp <= 0 or fp <= 0:
+                return
+            src = str(fill_source or "").strip().lower()
+            if not src:
+                src = "unknown"
+            real_fill = bool(src in ("fetch_order", "fetch_my_trades"))
+            try:
+                require_real_fill = str(os.environ.get("SLIPPAGE_LOG_REQUIRE_REAL_FILL", "1")).strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+            except Exception:
+                require_real_fill = True
+            if require_real_fill and not real_fill:
+                return
+            spread_bps = None
+            bid_px = None
+            ask_px = None
+            try:
+                ob = self.orderbook.get(symbol) or {}
+                bids = ob.get("bids") or []
+                asks = ob.get("asks") or []
+                if bids:
+                    bid_px = float(bids[0][0] or 0.0)
+                if asks:
+                    ask_px = float(asks[0][0] or 0.0)
+                if bid_px and ask_px and bid_px > 0 and ask_px > 0:
+                    mid = 0.5 * (bid_px + ask_px)
+                    if mid > 0:
+                        spread_bps = float((ask_px - bid_px) / mid * 10000.0)
+            except Exception:
+                spread_bps = None
+            vol_24h = self._estimate_adv_notional(symbol, price_hint=tp)
+            self.db.log_slippage(
+                {
+                    "symbol": symbol,
+                    "timestamp_ms": int(now_ms()),
+                    "target_price": float(tp),
+                    "fill_price": float(fp),
+                    "estimated_slippage_bps": (float(estimated_slippage_bps) if estimated_slippage_bps is not None else None),
+                    "side": side,
+                    "exec_type": exec_type,
+                    "selected_exec_type": (str(selected_exec_type) if selected_exec_type else None),
+                    "spread_bps": spread_bps,
+                    "order_size": (float(qty) if qty is not None else None),
+                    "filled_qty": (float(qty) if qty is not None else None),
+                    "fee_rate": (float(fee_rate) if fee_rate is not None else None),
+                    "volatility": (float(volatility) if volatility is not None else None),
+                    "bid_price": bid_px,
+                    "ask_price": ask_px,
+                    "volume_24h": float(vol_24h) if vol_24h > 0 else None,
+                    "latency_ms": (float(latency_ms) if latency_ms is not None else None),
+                    "fill_source": src,
+                    "is_real_fill": 1 if real_fill else 0,
+                }
+            )
+        except Exception:
+            pass
 
     def _symbol_quality_state(self, sym: str, ts_ms: int | None = None) -> dict[str, object]:
         now_ts = int(ts_ms if ts_ms is not None else now_ms())
@@ -3176,8 +5264,11 @@ class LiveOrchestrator:
         exits_seen = 0
         reject_seen = 0
         roe_samples: list[float] = []
+        roe_weights: list[float] = []
         gross_roe_samples: list[float] = []
-        hit_count = 0
+        gross_roe_weights: list[float] = []
+        hit_count = 0.0
+        hit_weight_sum = 0.0
         exits_seen_time = 0
         reject_seen_time = 0
         roe_samples_time: list[float] = []
@@ -3197,7 +5288,32 @@ class LiveOrchestrator:
             dist = abs(int(rec_hour) - int(now_hour))
             dist = min(dist, 24 - dist)
             return bool(dist <= int(time_window_hours))
+        # ---------- Recency decay for SQ score (break circular dependency) ----------
+        # Older trades get exponentially decaying weight so that when exit/direction
+        # logic is improved, past bad trades gradually stop dominating the score.
+        try:
+            sq_recency_enabled = str(os.environ.get("SYMBOL_QUALITY_RECENCY_DECAY_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            sq_recency_enabled = True
+        try:
+            sq_recency_halflife_exits = int(os.environ.get("SYMBOL_QUALITY_RECENCY_HALFLIFE_EXITS", 80) or 80)
+        except Exception:
+            sq_recency_halflife_exits = 80
+        sq_recency_halflife_exits = int(max(10, sq_recency_halflife_exits))
+        sq_decay_lambda = float(math.log(2.0) / float(sq_recency_halflife_exits))
+
+        # ---------- Probation mode: unblock symbols after sustained block ----------
+        try:
+            sq_probation_enabled = str(os.environ.get("SYMBOL_QUALITY_PROBATION_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            sq_probation_enabled = True
+        try:
+            sq_probation_block_sec = int(os.environ.get("SYMBOL_QUALITY_PROBATION_BLOCK_SEC", 21600) or 21600)  # 6 hours
+        except Exception:
+            sq_probation_block_sec = 21600
+
         tape = list(self.trade_tape or [])
+        exit_order_idx = 0  # counts how many exits ago (0 = most recent)
         for rec in reversed(tape):
             if not isinstance(rec, dict):
                 continue
@@ -3222,14 +5338,20 @@ class LiveOrchestrator:
                     ):
                         continue
                     exits_seen += 1
+                    # Recency weight: w = exp(-lambda * exit_order_idx) 
+                    # Most recent exit (idx=0) gets weight=1.0, halflife exits ago gets 0.5
+                    recency_w = float(math.exp(-sq_decay_lambda * float(exit_order_idx))) if sq_recency_enabled else 1.0
+                    exit_order_idx += 1
                     roe_v = self._safe_float(rec.get("roe"), None)
                     if roe_v is None:
                         roe_v = self._safe_float(rec.get("realized_r"), None)
                     if roe_v is not None:
                         roe_f = float(roe_v)
                         roe_samples.append(roe_f)
+                        roe_weights.append(recency_w)
                         if roe_f > 0:
-                            hit_count += 1
+                            hit_count += recency_w
+                        hit_weight_sum += recency_w
                     gross_roe_val = None
                     try:
                         roe_net = self._safe_float(rec.get("roe"), None)
@@ -3254,6 +5376,7 @@ class LiveOrchestrator:
                         gross_roe_val = None
                     if gross_roe_val is not None:
                         gross_roe_samples.append(float(gross_roe_val))
+                        gross_roe_weights.append(recency_w)
                 if time_ok and exits_seen_time < exit_lookback:
                     reason_l_t = str(rec.get("reason") or "").strip().lower()
                     if (
@@ -3300,10 +5423,35 @@ class LiveOrchestrator:
                 break
 
         sample_n = int(len(roe_samples))
-        expectancy = float(sum(roe_samples) / sample_n) if sample_n > 0 else None
+        # Weighted expectancy: recent trades matter more
+        if sample_n > 0 and sq_recency_enabled and len(roe_weights) == sample_n:
+            w_total = float(sum(roe_weights))
+            if w_total > 1e-12:
+                expectancy = float(sum(r * w for r, w in zip(roe_samples, roe_weights)) / w_total)
+            else:
+                expectancy = float(sum(roe_samples) / sample_n)
+        elif sample_n > 0:
+            expectancy = float(sum(roe_samples) / sample_n)
+        else:
+            expectancy = None
         gross_sample_n = int(len(gross_roe_samples))
-        gross_expectancy = float(sum(gross_roe_samples) / gross_sample_n) if gross_sample_n > 0 else None
-        hit_rate = float(hit_count / sample_n) if sample_n > 0 else None
+        if gross_sample_n > 0 and sq_recency_enabled and len(gross_roe_weights) == gross_sample_n:
+            gw_total = float(sum(gross_roe_weights))
+            if gw_total > 1e-12:
+                gross_expectancy = float(sum(r * w for r, w in zip(gross_roe_samples, gross_roe_weights)) / gw_total)
+            else:
+                gross_expectancy = float(sum(gross_roe_samples) / gross_sample_n)
+        elif gross_sample_n > 0:
+            gross_expectancy = float(sum(gross_roe_samples) / gross_sample_n)
+        else:
+            gross_expectancy = None
+        # Weighted hit rate
+        if sample_n > 0 and sq_recency_enabled and hit_weight_sum > 1e-12:
+            hit_rate = float(hit_count / hit_weight_sum)
+        elif sample_n > 0:
+            hit_rate = float(int(hit_count) / sample_n)
+        else:
+            hit_rate = None
         denom = float(max(1, exits_seen + reject_seen))
         reject_ratio = float(reject_seen / denom)
         sample_n_time = int(len(roe_samples_time))
@@ -3391,10 +5539,36 @@ class LiveOrchestrator:
         ):
             if float(gross_expectancy_time) < float(gross_gate_floor_time):
                 quality_ok = False
+
+        # ---------- Probation mode: break circular dependency ----------
+        # If a symbol has been blocked for a long time, gradually unblock it
+        # so it can generate new trades and refresh its SQ score.
+        sq_probation = False
+        if sq_probation_enabled and quality_ok is not None and not quality_ok:
+            # Track block start time
+            if not hasattr(self, "_sq_block_start_ms"):
+                self._sq_block_start_ms = {}
+            block_start = self._sq_block_start_ms.get(sym)
+            if block_start is None:
+                self._sq_block_start_ms[sym] = int(now_ts)
+            else:
+                block_duration_sec = float(int(now_ts) - int(block_start)) / 1000.0
+                if block_duration_sec >= float(sq_probation_block_sec):
+                    # Enter probation: allow entry but with leverage cap
+                    quality_ok = None  # neutral — will not block entry
+                    sq_probation = True
+        elif quality_ok is not None and quality_ok:
+            # Clear block timer if quality is OK
+            if hasattr(self, "_sq_block_start_ms") and sym in self._sq_block_start_ms:
+                del self._sq_block_start_ms[sym]
+
         payload = {
             "ts": int(now_ts),
             "enabled": True,
             "ok": quality_ok,
+            "probation": sq_probation,
+            "recency_decay_enabled": sq_recency_enabled,
+            "recency_halflife_exits": int(sq_recency_halflife_exits),
             "score": float(max(0.0, min(1.0, score))),
             "sample_n": int(sample_n),
             "sample_exits": int(exits_seen),
@@ -3508,8 +5682,14 @@ class LiveOrchestrator:
             return False, "safety mode"
         if self.position_cap_enabled and len(self.positions) >= self.max_positions:
             return False, "max positions reached"
-        if self.exposure_cap_enabled and (self._total_open_notional() + notional) > (self._exposure_cap_balance() * self.max_notional_frac):
-            return False, "exposure capped"
+        if self.exposure_cap_enabled:
+            try:
+                cap_balance = float(self._exposure_cap_balance())
+            except Exception:
+                cap_balance = float(self.balance or 0.0)
+            cap_frac = self._effective_total_exposure_cap(cap_balance)
+            if cap_frac > 0 and (self._total_open_notional() + notional) > (cap_balance * cap_frac):
+                return False, "exposure capped"
         return True, ""
 
     def _min_filter_states(self, sym: str, decision: dict, ts_ms: int) -> dict:
@@ -3590,21 +5770,55 @@ class LiveOrchestrator:
         if unified_score is None:
             unified_score = decision.get("ev", 0.0) if decision else 0.0
 
-        # Thresholds
-        if hybrid_only:
+        # Thresholds — now using RegimePolicy for all regime-specific parameters
+        try:
+            from engines.mc.regime_policy import get_regime_policy
+        except ImportError:
+            from .regime_policy import get_regime_policy
+
+        # sigma from meta for volatility-normalized thresholds
+        _filter_sigma = self._decision_metric_float(decision, meta, ("sigma_annual", "sigma"), default=0.5)
+        _filter_rpol = get_regime_policy(regime or "chop", float(_filter_sigma))
+
+        try:
+            adaptive_floor_on = str(os.environ.get("ADAPTIVE_ENTRY_THRESHOLD_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            adaptive_floor_on = True
+        if adaptive_floor_on and self._hybrid_entry_floor_dyn is not None:
+            unified_floor = float(self._hybrid_entry_floor_dyn)
+        elif hybrid_only:
             unified_floor = self._get_hybrid_entry_floor()
         else:
-            unified_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+            # RegimePolicy가 제공하는 entry_floor 사용
+            unified_floor = float(_filter_rpol.entry_floor)
         if MIN_ENTRY_SCORE > 0:
             unified_floor = float(max(unified_floor, MIN_ENTRY_SCORE))
-        spread_cap_map = {"bull": 0.0020, "bear": 0.0020, "chop": 0.0012, "volatile": 0.0008}
-        spread_cap = spread_cap_map.get(regime, SPREAD_PCT_MAX)
-        cvar_floor_map = {"bull": -1.2, "bear": -1.2, "chop": -1.0, "volatile": -0.8}
-        cvar_floor_regime = cvar_floor_map.get(regime, -1.0)
+        # Regime-specific entry floor add (from RegimePolicy)
+        unified_floor = float(unified_floor) + float(_filter_rpol.entry_floor_add)
+
+        # Spread/CVaR caps from RegimePolicy (일관된 레짐별 값)
+        spread_cap = float(_filter_rpol.spread_cap)
+        cvar_floor_regime = float(_filter_rpol.cvar_floor)
 
         unified_ok = float(unified_score or 0.0) >= unified_floor
         spread_enabled = spread_pct is not None
         spread_ok = (float(spread_pct) <= float(spread_cap)) if spread_enabled else None
+
+        # ── Regime Policy metadata for dashboard visibility ──
+        if isinstance(meta, dict):
+            meta["regime_policy_regime"] = str(_filter_rpol.regime)
+            meta["regime_policy_obj_mode"] = str(_filter_rpol.objective_mode)
+            meta["regime_policy_lambda_var"] = float(_filter_rpol.lambda_var)
+            meta["regime_policy_entry_floor_eff"] = float(unified_floor)
+            meta["regime_policy_spread_cap"] = float(spread_cap)
+            meta["regime_policy_cvar_floor"] = float(cvar_floor_regime)
+            meta["regime_policy_tp_pct"] = float(_filter_rpol.tp_pct)
+            meta["regime_policy_sl_pct"] = float(_filter_rpol.sl_pct)
+            meta["regime_policy_max_leverage"] = float(_filter_rpol.max_leverage)
+            meta["regime_policy_allow_counter_trend"] = bool(_filter_rpol.allow_counter_trend)
+            meta["regime_policy_sigma_realized"] = float(_filter_sigma)
+            if isinstance(decision, dict):
+                decision["meta"] = meta
         if hybrid_only:
             event_cvar_ok = None
         else:
@@ -3872,28 +6086,7 @@ class LiveOrchestrator:
             cap_balance = float(self._exposure_cap_balance())
         except Exception:
             cap_balance = float(self.balance) if self.balance is not None else float(eff_balance or 0.0)
-        min_notional_floor = float(MIN_ENTRY_NOTIONAL) if MIN_ENTRY_NOTIONAL > 0 else 0.0
-        if MIN_ENTRY_NOTIONAL_PCT > 0:
-            try:
-                min_notional_floor = max(min_notional_floor, float(eff_balance) * float(MIN_ENTRY_NOTIONAL_PCT))
-            except Exception:
-                pass
-        try:
-            min_notional_hard_min = float(os.environ.get("MIN_ENTRY_NOTIONAL_HARD_MIN", 0.5) or 0.5)
-        except Exception:
-            min_notional_hard_min = 0.5
-        min_notional_floor = float(max(0.0, min_notional_hard_min, min_notional_floor)) if min_notional_floor > 0 else 0.0
-        try:
-            min_notional_cap_ratio = float(os.environ.get("MIN_ENTRY_NOTIONAL_BALANCE_CAP_RATIO", 0.15) or 0.15)
-        except Exception:
-            min_notional_cap_ratio = 0.15
-        if min_notional_floor > 0 and float(min_notional_cap_ratio) > 0:
-            try:
-                cap_floor = float(max(0.0, float(eff_balance) * float(min_notional_cap_ratio)))
-                if cap_floor > 0:
-                    min_notional_floor = float(max(min_notional_hard_min, min(min_notional_floor, cap_floor)))
-            except Exception:
-                pass
+        min_notional_floor = self._effective_min_entry_notional(float(eff_balance or 0.0), regime_hint=regime if is_entry else None)
         if min_notional_floor > 0:
             try:
                 min_notional_ok = float(est_notional) >= float(min_notional_floor)
@@ -3913,7 +6106,34 @@ class LiveOrchestrator:
                 tick_vol_ok = None
         if self.exposure_cap_enabled:
             try:
-                cap_exposure_ok = (self._total_open_notional() + float(est_notional)) <= (float(cap_balance) * float(self.max_notional_frac))
+                cap_frac = self._effective_total_exposure_cap(float(cap_balance))
+                total_open = self._total_open_notional()
+                cap_exposure_ok = (total_open + float(est_notional)) <= (float(cap_balance) * float(cap_frac))
+                
+                # [2026-02-14] Cap filter 동적 스케일링 (노출도 한계 시 포지션 축소 재시도)
+                if not cap_exposure_ok:
+                    cap_dynamic_enabled = _env_regime_bool("CAP_FILTER_DYNAMIC_SCALING_ENABLED", True)
+                    if cap_dynamic_enabled and is_entry:
+                        min_size_mult = _env_regime_float("CAP_FILTER_DYNAMIC_MIN_SIZE_MULT", 0.25)
+                        cap_hard_limit = float(cap_balance) * float(cap_frac)
+                        remaining_cap = max(0.0, cap_hard_limit - float(total_open))
+                        
+                        # remaining_cap이 최소 사이즈보다 크면, 축소된 사이즈로 재진입
+                        min_notional_for_scaling = float(est_notional) * float(min_size_mult)
+                        if remaining_cap >= min_notional_for_scaling:
+                            # 나머지 용량 내에서 최대한 진입
+                            scaled_notional = min(float(remaining_cap), float(est_notional))
+                            scaling_ratio = scaled_notional / (float(est_notional) + 1e-12)
+                            
+                            logger.info(
+                                f"[CAP_ADAPTIVE] {sym} remaining={remaining_cap:.2f}USD "
+                                f"scaled={scaled_notional:.2f}USD ({scaling_ratio*100:.1f}%) "
+                                f"from_est={float(est_notional):.2f}USD"
+                            )
+                            
+                            est_notional = scaled_notional
+                            cap_exposure_ok = True  # 동적 스케일링으로 해결
+                        # else: scaling 후에도 min_size_mult 이하면 진입 불가 유지
             except Exception:
                 cap_exposure_ok = None
         if is_entry:
@@ -3932,15 +6152,7 @@ class LiveOrchestrator:
             )
             long_edge = float(long_edge_raw) if long_edge_raw is not None else None
             short_edge = float(short_edge_raw) if short_edge_raw is not None else None
-            try:
-                base_fee = float(os.environ.get("HYBRID_BASE_FEE_RATE", 0.0002) or 0.0002)
-            except Exception:
-                base_fee = 0.0002
-            try:
-                slippage_bps = float(os.environ.get("HYBRID_SLIPPAGE_BPS", 0.0) or 0.0)
-            except Exception:
-                slippage_bps = 0.0
-            fee_est = float(2.0 * (base_fee + slippage_bps * 1e-4))
+            fee_est, fee_est_info = self._entry_roundtrip_cost(decision, meta, symbol=sym, side=side_now, leverage=lev_val)
             long_gross = float(long_edge + fee_est) if long_edge is not None else None
             short_gross = float(short_edge + fee_est) if short_edge is not None else None
             side_net = long_edge if side_now == "LONG" else short_edge if side_now == "SHORT" else None
@@ -3992,6 +6204,9 @@ class LiveOrchestrator:
                 meta["entry_ev_side_gross"] = float(side_gross) if side_gross is not None else None
                 meta["entry_ev_max_gross"] = float(max_gross) if max_gross is not None else None
                 meta["entry_ev_fee_est"] = float(fee_est)
+                meta["entry_ev_fee_mode"] = str(fee_est_info.get("exec_mode") or "")
+                meta["entry_ev_fee_rate"] = self._safe_float(fee_est_info.get("fee_rate"), None)
+                meta["entry_ev_slippage_bps"] = self._safe_float(fee_est_info.get("slippage_bps"), None)
                 meta["entry_both_ev_neg_filter_enabled"] = bool(both_ev_neg_on)
                 meta["entry_both_ev_neg_floor"] = float(both_ev_neg_floor)
                 meta["entry_both_ev_neg_ok"] = both_ev_neg_ok
@@ -4046,7 +6261,11 @@ class LiveOrchestrator:
                 if dir_conf_val is not None and float(conf_ref) > 1e-6 and float(dir_conf_val) < float(conf_ref):
                     conf_deficit = (float(conf_ref) - float(dir_conf_val)) / float(conf_ref)
                     floor_eff += float(max(0.0, conf_bump) * max(0.0, conf_deficit))
-                net_edge = None if edge_raw is None else float(edge_raw) - float(fee_est)
+                net_edge = None if edge_raw is None else float(edge_raw)
+                # NOTE: edge_raw (policy_ev_mix_long 등)은 이미 MC 시뮬레이션에서 fee_roundtrip_total이
+                # 차감된 net EV이므로 fee_est를 또 빼면 이중 차감이 됨.
+                # 따라서 net_edge = edge_raw (그 자체가 net expectancy).
+                # fee_est는 로그 목적으로만 보존.
                 require_signal = _env_regime_bool("ENTRY_NET_EXPECTANCY_REQUIRE_SIGNAL", False)
                 if net_edge is None:
                     net_expectancy_ok = (False if require_signal else None)
@@ -4057,6 +6276,7 @@ class LiveOrchestrator:
                     meta["net_expectancy_raw"] = float(edge_raw) if edge_raw is not None else None
                     meta["net_expectancy_fee_cost"] = float(fee_est)
                     meta["net_expectancy_effective"] = float(net_edge) if net_edge is not None else None
+                    meta["net_expectancy_fee_double_subtract_protected"] = True
                     meta["net_expectancy_min"] = float(floor_eff)
                     meta["net_expectancy_vpin"] = float(vpin_val) if vpin_val is not None else None
                     meta["net_expectancy_dir_conf"] = float(dir_conf_val) if dir_conf_val is not None else None
@@ -4076,6 +6296,7 @@ class LiveOrchestrator:
                     meta["symbol_quality_enabled"] = True
                     meta["symbol_quality_score"] = sq.get("score")
                     meta["symbol_quality_ok"] = sq.get("ok")
+                    meta["symbol_quality_probation"] = sq.get("probation", False)
                     meta["symbol_quality_sample_n"] = sq.get("sample_n")
                     meta["symbol_quality_expectancy"] = sq.get("expectancy")
                     meta["symbol_quality_gross_expectancy"] = sq.get("gross_expectancy")
@@ -4083,6 +6304,7 @@ class LiveOrchestrator:
                     meta["symbol_quality_reject_ratio"] = sq.get("reject_ratio")
                     meta["symbol_quality_min_exits"] = sq.get("min_exits")
                     meta["symbol_quality_min_score"] = sq.get("min_score")
+                    meta["symbol_quality_recency_decay"] = sq.get("recency_decay_enabled", False)
                     decision["meta"] = meta
             elif isinstance(meta, dict):
                 meta["symbol_quality_enabled"] = False
@@ -4130,6 +6352,11 @@ class LiveOrchestrator:
                     side_prob_boost = float(getattr(mc_config, "alpha_direction_gate_side_prob_boost", 0.03) or 0.03)
                 except Exception:
                     side_prob_boost = 0.03
+                try:
+                    confirm_ticks = int(round(_env_regime_float("ALPHA_DIRECTION_GATE_CONFIRM_TICKS", 1.0)))
+                except Exception:
+                    confirm_ticks = 1
+                confirm_ticks = max(1, int(confirm_ticks))
                 def _meta_or_decision_float(*keys: str, default: float = 0.0) -> float:
                     for k in keys:
                         try:
@@ -4194,10 +6421,67 @@ class LiveOrchestrator:
                 dir_conf_raw = _meta_or_decision_raw("mu_dir_conf")
                 dir_edge_raw = _meta_or_decision_raw("mu_dir_edge")
                 dir_prob_raw = _meta_or_decision_raw("mu_dir_prob_long")
+                dir_conf_ctx = float(dir_conf)
+                dir_prob_long = float(max(0.0, min(1.0, float(dir_prob_long))))
+                dir_conf_prob = float(max(float(dir_prob_long), 1.0 - float(dir_prob_long)))
+                try:
+                    conf_source = str(os.environ.get("ALPHA_DIRECTION_CONF_SOURCE", "auto")).strip().lower()
+                except Exception:
+                    conf_source = "auto"
+                try:
+                    conf_mismatch_tol = float(os.environ.get("ALPHA_DIRECTION_CONF_MISMATCH_TOL", 0.08) or 0.08)
+                except Exception:
+                    conf_mismatch_tol = 0.08
+                conf_mismatch_tol = float(max(0.0, min(0.5, conf_mismatch_tol)))
+                dir_conf_recomputed = False
+                if conf_source == "probability":
+                    dir_conf = float(dir_conf_prob)
+                    dir_conf_recomputed = True
+                elif conf_source == "context":
+                    dir_conf = float(dir_conf_ctx)
+                else:
+                    if (dir_conf_raw is None) or (not math.isfinite(float(dir_conf_ctx))) or (
+                        abs(float(dir_conf_ctx) - float(dir_conf_prob)) > float(conf_mismatch_tol)
+                    ):
+                        dir_conf = float(dir_conf_prob)
+                        dir_conf_recomputed = True
+                    else:
+                        dir_conf = float(dir_conf_ctx)
                 regime_now = str((meta or {}).get("regime") or regime or "").strip().lower()
                 conf_req = float(min_conf)
                 edge_req = float(min_edge)
                 side_prob_req = float(min_side_prob)
+                # Batch3/4/6 synthesis:
+                # use regime-specific thresholds first (trend/chop/volatile),
+                # then adaptive tightening/relaxing on top.
+                small_gap_thr = float(_env_regime_float("ALPHA_DIRECTION_GATE_SMALL_GAP", small_gap_thr))
+                conf_req = float(_env_regime_float("ALPHA_DIRECTION_GATE_MIN_CONF", conf_req))
+                edge_req = float(_env_regime_float("ALPHA_DIRECTION_GATE_MIN_EDGE", edge_req))
+                side_prob_req = float(_env_regime_float("ALPHA_DIRECTION_GATE_MIN_SIDE_PROB", side_prob_req))
+                weak_mu_thr = float(_env_regime_float("ALPHA_DIRECTION_GATE_WEAK_MU", weak_mu_thr))
+                weak_gap_thr = float(_env_regime_float("ALPHA_DIRECTION_GATE_WEAK_GAP", weak_gap_thr))
+                conf_boost = float(_env_regime_float("ALPHA_DIRECTION_GATE_CONF_BOOST", conf_boost))
+                edge_boost = float(_env_regime_float("ALPHA_DIRECTION_GATE_EDGE_BOOST", edge_boost))
+                side_prob_boost = float(_env_regime_float("ALPHA_DIRECTION_GATE_SIDE_PROB_BOOST", side_prob_boost))
+                # Conservative by default in trend, more permissive in chop to reduce false blocks from noisy confidence.
+                try:
+                    conf_adj_trend = float(os.environ.get("ALPHA_DIRECTION_GATE_CONF_ADJ_TREND", 0.005) or 0.005)
+                except Exception:
+                    conf_adj_trend = 0.005
+                try:
+                    conf_adj_chop = float(os.environ.get("ALPHA_DIRECTION_GATE_CONF_ADJ_CHOP", -0.010) or -0.010)
+                except Exception:
+                    conf_adj_chop = -0.010
+                try:
+                    conf_adj_volatile = float(os.environ.get("ALPHA_DIRECTION_GATE_CONF_ADJ_VOLATILE", -0.005) or -0.005)
+                except Exception:
+                    conf_adj_volatile = -0.005
+                if "trend" in regime_now:
+                    conf_req = float(conf_req + conf_adj_trend)
+                elif ("volatile" in regime_now) or ("random" in regime_now) or ("noise" in regime_now):
+                    conf_req = float(conf_req + conf_adj_volatile)
+                else:
+                    conf_req = float(conf_req + conf_adj_chop)
                 adaptive_strength = 0.0
                 adaptive_hit = None
                 adaptive_entry_issue = None
@@ -4246,9 +6530,9 @@ class LiveOrchestrator:
                     except Exception:
                         adapt_prob_gain = 0.03
                     try:
-                        adapt_max_tighten = float(os.environ.get("ALPHA_DIRECTION_ADAPTIVE_MAX_TIGHTEN", 0.30) or 0.30)
+                        adapt_max_tighten = float(os.environ.get("ALPHA_DIRECTION_ADAPTIVE_MAX_TIGHTEN", 0.10) or 0.10)
                     except Exception:
-                        adapt_max_tighten = 0.30
+                        adapt_max_tighten = 0.10
                     try:
                         adapt_max_relax = float(os.environ.get("ALPHA_DIRECTION_ADAPTIVE_MAX_RELAX", 0.20) or 0.20)
                     except Exception:
@@ -4294,16 +6578,14 @@ class LiveOrchestrator:
                             conf_req = float(conf_req + float(adapt_conf_gain) * adaptive_strength)
                             edge_req = float(edge_req + float(adapt_edge_gain) * adaptive_strength)
                             side_prob_req = float(side_prob_req + float(adapt_prob_gain) * adaptive_strength)
-                if regime_now in ("chop", "volatile"):
-                    conf_req = float(min(0.99, conf_req + 0.02))
-                    edge_req = float(min(0.99, edge_req + 0.01))
-                    side_prob_req = float(min(0.99, side_prob_req + 0.01))
                 weak_edge_zone = bool((mu_alpha_abs < max(0.0, weak_mu_thr)) and (abs(float(ev_gap)) < max(0.0, weak_gap_thr)))
                 if weak_edge_zone:
                     conf_req = float(min(0.99, conf_req + max(0.0, conf_boost)))
                     edge_req = float(min(0.99, edge_req + max(0.0, edge_boost)))
                     side_prob_req = float(min(0.99, side_prob_req + max(0.0, side_prob_boost)))
                 gate_needed = bool(abs(float(ev_gap)) < max(0.0, float(small_gap_thr)) or weak_edge_zone)
+                gate_pass = None
+                pass_streak = int(self._dir_gate_pass_streak.get(sym, 0))
                 dir_signal_available = bool(
                     (dir_conf_raw is not None)
                     or (dir_edge_raw is not None)
@@ -4315,6 +6597,8 @@ class LiveOrchestrator:
                     except Exception:
                         require_signal = False
                     if not dir_signal_available:
+                        self._dir_gate_pass_streak[sym] = 0
+                        pass_streak = 0
                         dir_gate_ok = False if require_signal else None
                     else:
                         side = str((decision or {}).get("action") or "").upper()
@@ -4324,12 +6608,22 @@ class LiveOrchestrator:
                             side_prob = float(1.0 - dir_prob_long)
                         else:
                             side_prob = 0.5
-                        dir_gate_ok = bool(
+                        gate_pass = bool(
                             (dir_conf >= float(conf_req))
                             and (abs(float(dir_edge)) >= float(edge_req))
                             and (float(side_prob) >= float(side_prob_req))
                         )
+                        if gate_pass:
+                            pass_streak = int(self._dir_gate_pass_streak.get(sym, 0)) + 1
+                            self._dir_gate_pass_streak[sym] = int(pass_streak)
+                            dir_gate_ok = bool(int(pass_streak) >= int(confirm_ticks))
+                        else:
+                            self._dir_gate_pass_streak[sym] = 0
+                            pass_streak = 0
+                            dir_gate_ok = False
                 else:
+                    self._dir_gate_pass_streak[sym] = 0
+                    pass_streak = 0
                     dir_gate_ok = True
                 if isinstance(meta, dict):
                     meta["dir_gate_small_gap_thr"] = float(small_gap_thr)
@@ -4341,6 +6635,10 @@ class LiveOrchestrator:
                     meta["dir_gate_min_edge"] = float(edge_req)
                     meta["dir_gate_min_side_prob"] = float(side_prob_req)
                     meta["dir_gate_prob_long"] = float(dir_prob_long)
+                    meta["dir_gate_conf_ctx"] = float(dir_conf_ctx)
+                    meta["dir_gate_conf_prob"] = float(dir_conf_prob)
+                    meta["dir_gate_conf_source"] = str(conf_source)
+                    meta["dir_gate_conf_recomputed"] = bool(dir_conf_recomputed)
                     meta["dir_gate_mu_alpha_abs"] = float(mu_alpha_abs)
                     meta["dir_gate_signal_available"] = bool(dir_signal_available)
                     meta["dir_gate_require_signal"] = bool(require_signal if gate_needed else False)
@@ -4350,6 +6648,9 @@ class LiveOrchestrator:
                     meta["dir_gate_adaptive_entry_issue_ratio"] = adaptive_entry_issue
                     meta["dir_gate_adaptive_direction_hit_delta"] = adaptive_hit_delta
                     meta["dir_gate_adaptive_entry_issue_delta"] = adaptive_entry_issue_delta
+                    meta["dir_gate_confirm_ticks"] = int(confirm_ticks)
+                    meta["dir_gate_pass_streak"] = int(pass_streak)
+                    meta["dir_gate_pass"] = (None if gate_pass is None else bool(gate_pass))
                     meta["dir_gate_ok"] = (None if dir_gate_ok is None else bool(dir_gate_ok))
                     decision["meta"] = meta
         # Fee/EV gate for short-term trading (optional)
@@ -4359,15 +6660,7 @@ class LiveOrchestrator:
             except Exception:
                 fee_filter_on = False
             if fee_filter_on:
-                try:
-                    base_fee = float(os.environ.get("HYBRID_BASE_FEE_RATE", 0.0002) or 0.0002)
-                except Exception:
-                    base_fee = 0.0002
-                try:
-                    slippage_bps = float(os.environ.get("HYBRID_SLIPPAGE_BPS", 0.0) or 0.0)
-                except Exception:
-                    slippage_bps = 0.0
-                fee_roundtrip = float(2.0 * (base_fee + slippage_bps * 1e-4))
+                fee_roundtrip, fee_rt_info = self._entry_roundtrip_cost(decision, meta, symbol=sym, side=str((decision or {}).get("action") or "").upper(), leverage=lev_val)
                 try:
                     fee_mult = float(os.environ.get("FEE_FILTER_MULT", 1.0) or 1.0)
                 except Exception:
@@ -4418,6 +6711,10 @@ class LiveOrchestrator:
                         meta["fee_filter_lev"] = lev_for_fee
                         meta["fee_filter_mult"] = fee_mult
                         meta["fee_filter_base"] = fee_roundtrip
+                        meta["fee_filter_mode"] = str(fee_rt_info.get("exec_mode") or "")
+                        meta["fee_filter_fee_rate"] = self._safe_float(fee_rt_info.get("fee_rate"), None)
+                        meta["fee_filter_slippage_bps"] = self._safe_float(fee_rt_info.get("slippage_bps"), None)
+                        meta["fee_filter_extra_slippage_bps"] = self._safe_float(fee_rt_info.get("extra_slippage_bps"), None)
                         decision["meta"] = meta
                 except Exception:
                     pass
@@ -4466,6 +6763,183 @@ class LiveOrchestrator:
             cap_ok = False
         if cap_exposure_ok is False:
             cap_ok = False
+
+        # [FIX 2026-02-09] Chop regime entry guard: weak mu_alpha + chop → 진입 차단
+        chop_guard_ok = None
+        if is_entry:
+            try:
+                chop_guard_enabled = str(os.environ.get("CHOP_ENTRY_GUARD_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                chop_guard_enabled = True
+            if chop_guard_enabled and regime in ("chop",):
+                try:
+                    chop_min_mu = float(os.environ.get("CHOP_ENTRY_MIN_MU_ALPHA", 0.2) or 0.2)
+                except Exception:
+                    chop_min_mu = 0.2
+                try:
+                    chop_min_conf = float(os.environ.get("CHOP_ENTRY_MIN_DIR_CONF", 0.55) or 0.55)
+                except Exception:
+                    chop_min_conf = 0.55
+
+                mu_alpha_abs_chop = abs(float(meta.get("mu_alpha") or meta.get("pred_mu_alpha") or 0.0))
+                dir_conf_chop = float(meta.get("mu_dir_conf") or 0.0)
+
+                if mu_alpha_abs_chop < chop_min_mu and dir_conf_chop < chop_min_conf:
+                    chop_guard_ok = False
+                    if isinstance(meta, dict):
+                        meta["chop_guard_blocked"] = True
+                        meta["chop_guard_mu_alpha"] = float(mu_alpha_abs_chop)
+                        meta["chop_guard_dir_conf"] = float(dir_conf_chop)
+                        meta["chop_guard_min_mu"] = float(chop_min_mu)
+                        meta["chop_guard_min_conf"] = float(chop_min_conf)
+                        decision["meta"] = meta
+                else:
+                    chop_guard_ok = True
+
+        # [FIX 2026-02-16] Chop VPIN Hard Filter: 높은 독성 유동성 환경에서 chop 진입 차단
+        # CF evidence: VPIN<=0.40 → PnL=+$22.47 (736 trades), VPIN>0.40 → PnL=-$40 (72h, 2911 trades)
+        chop_vpin_ok = None
+        if is_entry and regime in ("chop",):
+            try:
+                chop_vpin_enabled = str(os.environ.get("CHOP_VPIN_FILTER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                chop_vpin_enabled = True
+            if chop_vpin_enabled:
+                try:
+                    chop_vpin_max = float(os.environ.get("CHOP_VPIN_MAX", 0.40) or 0.40)
+                except Exception:
+                    chop_vpin_max = 0.40
+                vpin_val_chop = self._decision_metric_float(decision, meta, ("vpin", "alpha_vpin"), default=None)
+                if vpin_val_chop is not None and float(vpin_val_chop) > float(chop_vpin_max):
+                    chop_vpin_ok = False
+                    if isinstance(meta, dict):
+                        meta["chop_vpin_blocked"] = True
+                        meta["chop_vpin_value"] = float(vpin_val_chop)
+                        meta["chop_vpin_max"] = float(chop_vpin_max)
+                        decision["meta"] = meta
+                    self._log(f"[CHOP_VPIN] {sym} blocked: VPIN={vpin_val_chop:.3f} > max={chop_vpin_max:.2f}")
+                else:
+                    chop_vpin_ok = True
+
+        # [FIX 2026-02-01] mu_alpha Direction Alignment Gate
+        # CF evidence: 70.1% misaligned trades (mu<0 but LONG), WR(aligned)=47% vs WR(misaligned)=31.5%
+        # Savings from blocking misaligned: ~$46
+        mu_align_gate_ok = None
+        if is_entry:
+            try:
+                mu_align_enabled = str(os.environ.get("MU_ALPHA_DIRECTION_GATE", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                mu_align_enabled = True
+            if mu_align_enabled:
+                action_side = str((decision or {}).get("action") or "").upper()
+                _mu_val = float(meta.get("mu_alpha") or meta.get("pred_mu_alpha") or 0.0)
+                _mu_min_abs = float(os.environ.get("MU_ALIGN_MIN_ABS", "0.01") or 0.01)
+                if abs(_mu_val) >= _mu_min_abs:
+                    # mu_alpha > 0 → expect UP → only allow LONG
+                    # mu_alpha < 0 → expect DOWN → only allow SHORT
+                    if (_mu_val > 0 and action_side == "SHORT") or (_mu_val < 0 and action_side == "LONG"):
+                        mu_align_gate_ok = False
+                        if isinstance(meta, dict):
+                            meta["mu_align_gate_blocked"] = True
+                            meta["mu_align_gate_mu"] = float(_mu_val)
+                            meta["mu_align_gate_side"] = action_side
+                            decision["meta"] = meta
+                        self._log(f"[MU_ALIGN_GATE] {sym} blocked {action_side} with mu_alpha={_mu_val:.4f} (misaligned)")
+                    else:
+                        mu_align_gate_ok = True
+                else:
+                    mu_align_gate_ok = None  # mu too small to determine direction
+
+        # [FIX 2026-02-01] Time-of-Day Filter
+        # CF evidence: UTC 6,7,13,19 → total loss $-1373, WR<35%
+        tod_filter_ok = None
+        if is_entry:
+            try:
+                tod_filter_enabled = str(os.environ.get("TOD_FILTER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                tod_filter_enabled = True
+            if tod_filter_enabled:
+                import time as _time_mod
+                _utc_hour = int(datetime.utcnow().hour) if hasattr(datetime, 'utcnow') else int(_time_mod.gmtime().tm_hour)
+                _bad_hours_str = str(os.environ.get("TRADING_BAD_HOURS_UTC", "6,7") or "")
+                _bad_hours = set()
+                for _h in _bad_hours_str.split(","):
+                    _h = _h.strip()
+                    if _h.isdigit():
+                        _bad_hours.add(int(_h))
+                if _utc_hour in _bad_hours:
+                    tod_filter_ok = False
+                    if isinstance(meta, dict):
+                        meta["tod_filter_blocked"] = True
+                        meta["tod_filter_hour"] = _utc_hour
+                        decision["meta"] = meta
+                    self._log(f"[TOD_FILTER] {sym} blocked: UTC hour={_utc_hour} is in bad_hours={_bad_hours}")
+                else:
+                    tod_filter_ok = True
+
+        # [FIX 2026-02-15] Regime-Direction Gate: RegimePolicy.allow_counter_trend 사용
+        # BEAR+LONG / BULL+SHORT / CHOP+LONG 등 레짐 역방향 진입 차단
+        # [FIX 2026-02-01] Added chop_LONG blocking based on CF:
+        #   chop_LONG: n=3225, WR=31.8%, total=$-51.61 (worst combo)
+        #   chop_SHORT: n=1645, WR=41.4%, total=$-6.73 (much better)
+        regime_dir_gate_ok = None
+        if is_entry:
+            try:
+                regime_dir_gate_enabled = str(os.environ.get("REGIME_DIRECTION_GATE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                regime_dir_gate_enabled = True
+            if regime_dir_gate_enabled:
+                action_side = str((decision or {}).get("action") or "").upper()
+                _counter_allowed = _filter_rpol.allow_counter_trend
+                # Blocked combos from CF analysis
+                _block_list_str = str(os.environ.get("REGIME_SIDE_BLOCK_LIST", "") or "")
+                _block_set = set()
+                for _bl in _block_list_str.split(","):
+                    _bl = _bl.strip().lower()
+                    if _bl:
+                        _block_set.add(_bl)
+                _combo_key = f"{regime}_{action_side}".lower()
+                if _combo_key in _block_set:
+                    regime_dir_gate_ok = False
+                    _gate_reason = f"BLOCKED({_combo_key})"
+                    if isinstance(meta, dict):
+                        meta["regime_dir_gate_blocked"] = True
+                        meta["regime_dir_gate_reason"] = _gate_reason
+                        decision["meta"] = meta
+                    self._log(f"[REGIME_DIR_GATE] {sym} blocked {action_side} in {regime} (block_list)")
+                elif not _counter_allowed:
+                    # RegimePolicy가 역방향 진입을 금지
+                    is_counter = (
+                        (regime == "bear" and action_side == "LONG") or
+                        (regime == "bull" and action_side == "SHORT")
+                    )
+                    if is_counter:
+                        regime_dir_gate_ok = False
+                        _gate_reason = f"{regime.upper()}+{action_side}"
+                        if isinstance(meta, dict):
+                            meta["regime_dir_gate_blocked"] = True
+                            meta["regime_dir_gate_reason"] = _gate_reason
+                            decision["meta"] = meta
+                        self._log(f"[REGIME_DIR_GATE] {sym} blocked {action_side} in {regime.upper()} regime (policy: counter_trend={_counter_allowed})")
+                    else:
+                        regime_dir_gate_ok = True
+                elif regime == "bear" and action_side == "LONG":
+                    regime_dir_gate_ok = False
+                    if isinstance(meta, dict):
+                        meta["regime_dir_gate_blocked"] = True
+                        meta["regime_dir_gate_reason"] = "BEAR+LONG"
+                        decision["meta"] = meta
+                    self._log(f"[REGIME_DIR_GATE] {sym} blocked LONG in BEAR regime")
+                elif regime == "bull" and action_side == "SHORT":
+                    regime_dir_gate_ok = False
+                    if isinstance(meta, dict):
+                        meta["regime_dir_gate_blocked"] = True
+                        meta["regime_dir_gate_reason"] = "BULL+SHORT"
+                        decision["meta"] = meta
+                    self._log(f"[REGIME_DIR_GATE] {sym} blocked SHORT in BULL regime")
+                else:
+                    regime_dir_gate_ok = True
+
         out = {
             "unified": unified_ok,
             "spread": spread_ok,
@@ -4475,8 +6949,13 @@ class LiveOrchestrator:
             "gross_ev": gross_ev_ok,
             "net_expectancy": net_expectancy_ok,
             "dir_gate": dir_gate_ok,
+            "regime_dir_gate": regime_dir_gate_ok,
+            "mu_align_gate": mu_align_gate_ok,
+            "tod_filter": tod_filter_ok,
             "symbol_quality": symbol_quality_ok,
             "lev_floor_lock": lev_floor_lock_ok,
+            "chop_guard": chop_guard_ok,
+            "chop_vpin": chop_vpin_ok,
             "liq": liq_ok,
             "min_notional": min_notional_ok,
             "min_exposure": min_exposure_ok,
@@ -4491,7 +6970,7 @@ class LiveOrchestrator:
         }
         if not is_entry:
             # Entry-only filters shouldn't show as blocked for non-entry decisions.
-            for k in ("unified", "spread", "event_cvar", "event_exit", "both_ev_neg", "gross_ev", "net_expectancy", "dir_gate", "symbol_quality", "lev_floor_lock", "liq", "min_notional", "min_exposure", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
+            for k in ("unified", "spread", "event_cvar", "event_exit", "both_ev_neg", "gross_ev", "net_expectancy", "dir_gate", "regime_dir_gate", "mu_align_gate", "tod_filter", "symbol_quality", "lev_floor_lock", "chop_guard", "chop_vpin", "liq", "min_notional", "min_exposure", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
                 out[k] = None
         return out
 
@@ -4567,6 +7046,58 @@ class LiveOrchestrator:
             meta = dict(decision.get("meta") or {})
             meta["filter_states"] = fs
             decision["meta"] = meta
+        # Live-order balance guards (pre-permit): avoid repeated 110007 storms.
+        if self.enable_orders:
+            try:
+                block_nonpos_free = str(os.environ.get("LIVE_ORDER_BLOCK_ON_NONPOSITIVE_FREE", "1")).strip().lower() in (
+                    "1", "true", "yes", "on"
+                )
+            except Exception:
+                block_nonpos_free = True
+            if block_nonpos_free:
+                free_now = self._safe_float(self._live_free_balance, None)
+                if free_now is not None and float(free_now) <= 0:
+                    return False, "live_free_nonpositive"
+            try:
+                global_until_ms = int(self._balance_reject_global_until_ms or 0)
+            except Exception:
+                global_until_ms = 0
+            if global_until_ms > int(ts_ms):
+                return False, "balance_110007_global_cooldown"
+            try:
+                per_sym_block = str(os.environ.get("ENTRY_BLOCK_ON_110007", "1")).strip().lower() in (
+                    "1", "true", "yes", "on"
+                )
+            except Exception:
+                per_sym_block = True
+            if per_sym_block:
+                try:
+                    min_count = int(os.environ.get("ENTRY_BLOCK_ON_110007_MIN_COUNT", 1) or 1)
+                except Exception:
+                    min_count = 1
+                min_count = max(1, min_count)
+                try:
+                    cooldown_sec = float(
+                        os.environ.get(
+                            "ENTRY_BLOCK_ON_110007_COOLDOWN_SEC",
+                            os.environ.get("LEVERAGE_BALANCE_REJECT_COOLDOWN_SEC", 180.0),
+                        )
+                        or os.environ.get("LEVERAGE_BALANCE_REJECT_COOLDOWN_SEC", 180.0)
+                    )
+                except Exception:
+                    cooldown_sec = 180.0
+                st = self._balance_reject_110007_by_sym.get(sym) or {}
+                try:
+                    rej_count = int(st.get("count", 0) or 0)
+                except Exception:
+                    rej_count = 0
+                try:
+                    rej_ts = int(st.get("ts", 0) or 0)
+                except Exception:
+                    rej_ts = 0
+                if rej_count >= min_count and rej_ts > 0:
+                    if (int(ts_ms) - int(rej_ts)) <= int(max(1.0, cooldown_sec) * 1000.0):
+                        return False, "balance_110007_cooldown"
         if fs.get("spread") is False and "spread" not in overrides:
             return False, "spread_cap"
         if fs.get("event_cvar") is False and "event_cvar" not in overrides:
@@ -4581,7 +7112,16 @@ class LiveOrchestrator:
             return False, "net_expectancy"
         if fs.get("dir_gate") is False and "dir_gate" not in overrides:
             return False, "direction_conf"
-        if fs.get("symbol_quality") is False and "symbol_quality" not in overrides:
+        if fs.get("regime_dir_gate") is False and "regime_dir_gate" not in overrides:
+            return False, "regime_dir_gate"
+        if fs.get("mu_align_gate") is False and "mu_align_gate" not in overrides:
+            return False, "mu_align_gate"
+        if fs.get("tod_filter") is False and "tod_filter" not in overrides:
+            return False, "tod_filter"
+        if fs.get("chop_guard") is False and "chop_guard" not in overrides:
+            return False, "chop_guard"
+        sq_filter_enabled = str(os.environ.get("SYMBOL_QUALITY_FILTER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        if sq_filter_enabled and fs.get("symbol_quality") is False and "symbol_quality" not in overrides:
             return False, "symbol_quality"
         if fs.get("unified") is False and "unified" not in overrides:
             return False, "unified_floor"
@@ -4602,741 +7142,353 @@ class LiveOrchestrator:
         return True, ""
 
     def _calc_position_size(self, decision: dict, price: float, leverage: float, size_frac_override: float | None = None, symbol: str | None = None, use_cycle_reserve: bool = False, ignore_caps: bool = False) -> tuple[float, float, float]:
+        """통합 카운터팩추얼 포지션 사이징 — engines/mc/unified_sizing.py 기반.
+
+        기존 4중 deleveraging(EXPOSURE/CAPITAL/NOTIONAL_RECLAMP/LEVERAGE) + 
+        120+개 환경변수를 단일 패스 카운터팩추얼 최적화로 대체.
+        """
         meta = (decision or {}).get("meta", {}) or {}
-        size_frac = size_frac_override if size_frac_override is not None else decision.get("size_frac") or meta.get("size_fraction") or self.default_size_frac
         base_balance = self._cycle_available_balance() if use_cycle_reserve else self._sizing_balance()
 
-        # ---- Kelly 배분 적용 (psi/kelly 우선, 종목당 cap 미적용) ----
+        # Kelly fraction 조회
+        kelly_frac = None
         if USE_KELLY_ALLOCATION and symbol and symbol in self._kelly_allocations:
-            try:
-                total_cap = float(os.environ.get("KELLY_TOTAL_EXPOSURE", self.max_notional_frac or 1.0))
-            except Exception:
-                total_cap = float(self.max_notional_frac or 1.0)
-            lev_safe = float(leverage) if leverage and float(leverage) > 0 else 1.0
             kelly_frac = float(self._kelly_allocations[symbol])
-            # Total notional cap (e.g., 5.0 = 500%) distributed purely by Kelly weights.
-            size_frac = max(0.0, kelly_frac * total_cap / max(lev_safe, 1e-6))
-        else:
-            cap_frac = meta.get("regime_cap_frac")
-            if cap_frac is not None:
-                try:
-                    size_frac = min(size_frac, float(cap_frac))
-                except Exception:
-                    pass
-        
-        # 상한 제거: 신호가 강하면 엔진이 제시한 비중을 그대로 사용
-        size_frac = float(max(0.0, size_frac))
-        # Stage-4: dynamic exposure scaling (delever in toxic/low-confidence states).
+        # 방향 신뢰도 기반 Kelly 감쇠: 방향 확률이 낮을수록 노출 축소
         try:
-            dyn_exp_enabled = str(os.environ.get("EXPOSURE_DYNAMIC_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            if kelly_frac is not None and kelly_frac > 0:
+                side_now = str((decision or {}).get("action") or "").upper()
+                p_long_raw = self._safe_float(
+                    meta.get("mu_dir_prob_long"),
+                    self._safe_float(meta.get("pred_mu_dir_prob_long"), None),
+                )
+                if p_long_raw is not None and side_now in ("LONG", "SHORT"):
+                    p_long = float(max(0.0, min(1.0, p_long_raw)))
+                    side_prob = float(p_long if side_now == "LONG" else (1.0 - p_long))
+                    try:
+                        dir_ref = float(os.environ.get("KELLY_DIR_PROB_REF", 0.58) or 0.58)
+                    except Exception:
+                        dir_ref = 0.58
+                    try:
+                        dir_hard = float(os.environ.get("KELLY_DIR_PROB_HARD", 0.52) or 0.52)
+                    except Exception:
+                        dir_hard = 0.52
+                    try:
+                        dir_hard_mult = float(os.environ.get("KELLY_DIR_HARD_MULT", 0.12) or 0.12)
+                    except Exception:
+                        dir_hard_mult = 0.12
+                    try:
+                        dir_pow = float(os.environ.get("KELLY_DIR_PROB_POW", 1.6) or 1.6)
+                    except Exception:
+                        dir_pow = 1.6
+
+                    dir_ref = float(max(0.50, min(0.90, dir_ref)))
+                    dir_hard = float(max(0.45, min(dir_ref, dir_hard)))
+                    dir_hard_mult = float(max(0.01, min(1.0, dir_hard_mult)))
+                    dir_pow = float(max(0.5, min(4.0, dir_pow)))
+
+                    if side_prob <= dir_hard:
+                        dir_scale = float(dir_hard_mult)
+                    else:
+                        dir_scale = float((side_prob / max(dir_ref, 1e-6)) ** dir_pow)
+                        dir_scale = float(max(dir_hard_mult, min(1.25, dir_scale)))
+
+                    kelly_frac = float(max(0.0, kelly_frac) * dir_scale)
+                    if isinstance(meta, dict):
+                        meta["kelly_dir_side_prob"] = float(side_prob)
+                        meta["kelly_dir_scale"] = float(dir_scale)
+                        meta["kelly_dir_prob_ref"] = float(dir_ref)
+                        meta["kelly_dir_prob_hard"] = float(dir_hard)
+                        decision["meta"] = meta
         except Exception:
-            dyn_exp_enabled = True
-        if dyn_exp_enabled:
+            pass
+
+        # MC 결과에서 핵심 feature 추출
+        # NOTE: `or X` 패턴 금지 — 0.0이 falsy이므로 합법적인 0.0 값을 기본값으로 덮어씀.
+        # _safe_float이 이미 None → default 처리를 하므로 `or` 불필요.
+        ev = self._safe_float(decision.get("ev"), 0.0)
+        cvar = self._safe_float(meta.get("cvar05", decision.get("cvar")), 0.0)
+        p_sl = self._safe_float(meta.get("event_p_sl"), 0.3)
+        sigma = self._safe_float(meta.get("sigma", decision.get("sigma")), 0.5)
+        vpin = self._safe_float(meta.get("vpin"), 0.5)
+        confidence = self._safe_float(decision.get("confidence"), 0.5)
+        hurst = self._safe_float(meta.get("hurst_exp"), 0.5)
+        regime = str(meta.get("regime") or decision.get("regime") or "chop")
+        spread = self._safe_float(meta.get("spread_pct"), 0.0002)
+        fee_rt = self._safe_float(meta.get("fee_rt", meta.get("execution_cost")), 0.001)
+        p_tp = self._safe_float(meta.get("event_p_tp"), 0.5)
+        eq_score = self._safe_float(meta.get("entry_quality_score"), None)
+        ls_score = self._safe_float(meta.get("leverage_signal_score"), None)
+        conf_score = self._safe_float(confidence, 0.5)
+        if eq_score is not None and float(eq_score) > 0.0:
+            exposure_score = float(eq_score)
+        elif ls_score is not None and float(ls_score) > 0.0:
+            exposure_score = float(ls_score)
+        else:
+            exposure_score = float(conf_score if conf_score is not None else 0.5)
+        exposure_score = float(max(0.0, min(1.0, exposure_score)))
+
+        # 포트폴리오 상태
+        open_exposure = self._total_open_notional()
+        position_count = len(self.positions)
+
+        # SQ probation 확인
+        sq_probation = False
+        if symbol:
             try:
-                conf_soft = float(os.environ.get("EXPOSURE_CONF_SOFT", 0.56) or 0.56)
-            except Exception:
-                conf_soft = 0.56
-            try:
-                vpin_soft = float(os.environ.get("EXPOSURE_VPIN_SOFT", 0.70) or 0.70)
-            except Exception:
-                vpin_soft = 0.70
-            try:
-                vpin_hard = float(os.environ.get("EXPOSURE_VPIN_HARD", 0.90) or 0.90)
-            except Exception:
-                vpin_hard = 0.90
-            try:
-                gain_tox = float(os.environ.get("EXPOSURE_DELEV_GAIN_TOX", 0.55) or 0.55)
-            except Exception:
-                gain_tox = 0.55
-            try:
-                gain_conf = float(os.environ.get("EXPOSURE_DELEV_GAIN_CONF", 0.45) or 0.45)
-            except Exception:
-                gain_conf = 0.45
-            try:
-                hard_scale = float(os.environ.get("EXPOSURE_DELEV_HARD_SCALE", 0.70) or 0.70)
-            except Exception:
-                hard_scale = 0.70
-            try:
-                min_scale = float(os.environ.get("EXPOSURE_DYNAMIC_MIN_SCALE", 0.30) or 0.30)
-            except Exception:
-                min_scale = 0.30
-            min_scale = float(max(0.05, min(1.0, min_scale)))
-            try:
-                confidence = float(decision.get("confidence") if decision and decision.get("confidence") is not None else meta.get("confidence", 0.0))
-            except Exception:
-                confidence = 0.0
-            confidence = float(max(0.0, min(1.0, confidence)))
-            vpin_val = self._safe_float(meta.get("vpin"), None)
-            if vpin_val is None:
-                vpin_val = self._safe_float(meta.get("event_exit_dynamic_vpin"), None)
-            if vpin_val is None:
-                vpin_val = self._safe_float(meta.get("alpha_vpin"), None)
-            if vpin_val is not None:
-                vpin_val = float(max(0.0, min(1.0, vpin_val)))
-            tox = 0.0
-            if vpin_val is not None and float(vpin_val) > float(vpin_soft):
-                tox = float(max(0.0, float(vpin_val) - float(vpin_soft)) / max(1e-6, 1.0 - float(vpin_soft)))
-            conf_def = float(max(0.0, float(conf_soft) - float(confidence)) / max(1e-6, float(conf_soft)))
-            exp_scale = float((1.0 - gain_tox * tox) * (1.0 - gain_conf * conf_def))
-            if (vpin_val is not None and float(vpin_val) >= float(vpin_hard)) and confidence < conf_soft:
-                exp_scale *= float(max(0.10, min(1.0, hard_scale)))
-            exp_scale = float(max(min_scale, min(1.0, exp_scale)))
-            size_frac = float(size_frac * exp_scale)
-            try:
-                meta["exposure_dynamic_enabled"] = bool(dyn_exp_enabled)
-                meta["exposure_dynamic_scale"] = float(exp_scale)
-                meta["exposure_dynamic_vpin"] = vpin_val
-                meta["exposure_dynamic_confidence"] = float(confidence)
-                meta["exposure_dynamic_tox"] = float(tox)
-                meta["exposure_dynamic_conf_deficit"] = float(conf_def)
-                if isinstance(decision, dict):
-                    decision["meta"] = meta
+                sq_state = self._symbol_quality_state(symbol)
+                sq_probation = bool(sq_state.get("probation"))
             except Exception:
                 pass
-        # Cap-aware sizing for new entries: scale to remaining exposure capacity
-        if self.exposure_cap_enabled and use_cycle_reserve and (not ignore_caps):
+
+        cfg = get_unified_sizing_config()
+        # Debug log: sizing 입력 값 확인
+        # [2026-02-15] exposure_base: wallet_balance 기반으로 exposure 한도 계산
+        # free_balance(margin 차감 후)가 아닌 wallet_balance(총자산) 기준이어야
+        # 포지션이 늘어도 exposure 한도가 급감하지 않음
+        exposure_base = None
+        if self.enable_orders:
             try:
-                total_cap = float(os.environ.get("KELLY_TOTAL_EXPOSURE", self.max_notional_frac or 1.0))
+                wb = self._live_wallet_balance
+                if wb is not None:
+                    wb_val = float(wb)
+                    if math.isfinite(wb_val) and wb_val > 0:
+                        exposure_base = wb_val
             except Exception:
-                total_cap = float(self.max_notional_frac or 1.0)
-            try:
-                eff_cap = float(min(total_cap, float(self.max_notional_frac or total_cap)))
-            except Exception:
-                eff_cap = float(total_cap)
-            try:
-                cap_balance = float(self._exposure_cap_balance())
-            except Exception:
-                cap_balance = 0.0
-            if cap_balance > 0 and eff_cap > 0:
+                pass
+            if exposure_base is None:
                 try:
-                    open_notional = float(self._total_open_notional() or 0.0)
+                    eq = self._live_equity
+                    if eq is not None:
+                        eq_val = float(eq)
+                        if math.isfinite(eq_val) and eq_val > 0:
+                            exposure_base = eq_val
                 except Exception:
-                    open_notional = 0.0
-                remaining_frac = max(0.0, eff_cap - (open_notional / max(cap_balance, 1e-9)))
-                cap_size_frac = remaining_frac / max(float(leverage or 1.0), 1e-6)
-                if cap_size_frac < size_frac:
-                    size_frac = max(0.0, cap_size_frac)
-        # Order sizing uses available balance (live_free_balance) when live, with a safety haircut.
+                    pass
+        if exposure_base is None:
+            try:
+                exposure_base = float(self.balance)
+            except Exception:
+                exposure_base = base_balance
+
+        if symbol:
+            kelly_dir_side_prob_dbg = self._safe_float(meta.get("kelly_dir_side_prob"), None)
+            kelly_dir_scale_dbg = self._safe_float(meta.get("kelly_dir_scale"), None)
+            self._log(
+                f"[SIZING_INPUT] {symbol} ev={ev:.6f} cvar={cvar:.6f} p_tp={p_tp:.4f} p_sl={p_sl:.4f} "
+                f"sigma={sigma:.4f} vpin={vpin:.4f} conf={confidence:.4f} hurst={hurst:.4f} "
+                f"regime={regime} balance={base_balance:.2f} exposure_base={exposure_base:.2f} open_exp={open_exposure:.2f} "
+                f"exp_score={exposure_score:.4f} "
+                f"kelly={kelly_frac} kelly_dir_prob={kelly_dir_side_prob_dbg} kelly_dir_scale={kelly_dir_scale_dbg} "
+                f"price={price:.2f} lev_in={leverage:.2f}"
+            )
+        result = compute_unified_sizing(
+            ev=ev, cvar=cvar, p_tp=p_tp, p_sl=p_sl,
+            sigma=sigma, vpin=vpin, confidence=confidence,
+            hurst=hurst, regime=regime, spread=spread, fee_rt=fee_rt,
+            balance=base_balance, open_exposure=open_exposure,
+            position_count=position_count, price=price,
+            exposure_base=exposure_base,
+            exposure_score=exposure_score,
+            kelly_frac=kelly_frac, sq_probation=sq_probation,
+            cfg=cfg,
+        )
+
+        notional = float(result.get("notional", 0.0))
+        size_frac = float(result.get("size_frac", 0.0))
+        sizing_meta = result.get("meta", {})
+
+        # size_frac override 적용
+        if size_frac_override is not None:
+            size_frac = float(size_frac_override)
+            notional = float(base_balance * size_frac * max(1.0, leverage))
+
+        # ignore_caps가 아닌 경우 hard cap 적용
+        if not ignore_caps:
+            try:
+                hard_cap = float(os.environ.get("NOTIONAL_HARD_CAP_USD", cfg.hard_notional_cap) or cfg.hard_notional_cap)
+            except Exception:
+                hard_cap = cfg.hard_notional_cap
+            notional = min(notional, hard_cap)
+
+        # 정보를 meta에 기록
         try:
-            sizing_pad = float(os.environ.get("LIVE_ORDER_SAFETY_PAD", 0.98) or 0.98)
+            meta["sizing_method"] = "unified_cf"
+            meta["sizing_quality"] = float(result.get("quality", 0.0))
+            meta["sizing_binding"] = str(sizing_meta.get("binding_constraint", ""))
+            meta["sizing_kelly_frac"] = kelly_frac
+            meta["sizing_cf_best_lev"] = self._safe_float(sizing_meta.get("cf_best_lev"), None)
+            meta["sizing_cf_utility"] = self._safe_float(sizing_meta.get("cf_best_utility"), None)
+            meta["sizing_lev_max"] = self._safe_float(sizing_meta.get("lev_max"), None)
+            meta["sizing_regime_max"] = self._safe_float(sizing_meta.get("regime_max"), None)
+            meta["sizing_exposure_score"] = self._safe_float(sizing_meta.get("exposure_score"), exposure_score)
+            meta["sizing_high_exposure_mode"] = bool(sizing_meta.get("high_exposure_mode", False))
+            meta["sizing_high_exposure_threshold"] = self._safe_float(sizing_meta.get("high_exposure_threshold"), None)
+            meta["sizing_wallet_frac"] = self._safe_float(sizing_meta.get("sizing_base_wallet_frac"), None)
+            meta["sizing_base"] = self._safe_float(sizing_meta.get("sizing_base"), None)
+            meta["sizing_max_pos_frac_eff"] = self._safe_float(sizing_meta.get("max_pos_frac_eff"), None)
+            if isinstance(decision, dict):
+                decision["meta"] = meta
         except Exception:
-            sizing_pad = 0.98
-        sizing_pad = min(max(sizing_pad, 0.1), 1.0)
-        notional = float(max(0.0, base_balance * sizing_pad * size_frac * leverage))
+            pass
+
         qty = float(notional / price) if price and notional > 0 else 0.0
         return size_frac, notional, qty
 
+
     #def _dynamic_leverage_risk(self, decision: dict, ctx: dict) -> float:
     def _dynamic_leverage_risk(self, decision: dict, ctx: dict) -> float:
+        """통합 카운터팩추얼 레버리지 결정 — engines/mc/unified_sizing.py 기반.
+
+        기존 11단계 레버리지 캡 체인 + 4중 deleveraging을 단일 패스로 통합.
+        가용한 모든 데이터(자본금, 레짐, 독성흐름, VPIN, 신뢰도, Hurst 등)
+        활용하여 utility 최적화 기반으로 최적 레버리지를 결정한다.
+        """
         def _f(x, default=0.0):
             try:
-                if x is None:
-                    return float(default)
-                return float(x)
+                return float(x) if x is not None else float(default)
             except Exception:
                 return float(default)
 
-        regime = ctx.get("regime") or "chop"
+        regime = str(ctx.get("regime") or "chop")
         sym = ctx.get("symbol")
-        sigma_raw = _f(ctx.get("sigma"), 0.0)
-        try:
-            sigma_cap_for_lev = float(os.environ.get("LEVERAGE_SIGMA_CAP_FOR_RISK", 0.20) or 0.20)
-        except Exception:
-            sigma_cap_for_lev = 0.20
-        sigma_cap_for_lev = float(max(0.01, min(5.0, sigma_cap_for_lev)))
-        sigma = float(min(max(0.0, float(sigma_raw)), sigma_cap_for_lev))
         meta = decision.get("meta") or {}
+
+        # Feature extraction
         ev = _f(decision.get("ev"), 0.0)
         cvar = _f(meta.get("cvar05", decision.get("cvar")), 0.0)
-        event_p_sl = _f(meta.get("event_p_sl"), 0.0)
+        event_p_sl = _f(meta.get("event_p_sl"), 0.3)
+        event_p_tp = _f(meta.get("event_p_tp"), 0.5)
+        sigma = _f(ctx.get("sigma"), 0.5)
         spread_pct = _f(meta.get("spread_pct", ctx.get("spread_pct")), 0.0002)
-        execution_cost = _f(meta.get("execution_cost", meta.get("fee_rt")), 0.0)
-        slippage_pct = _f(meta.get("slippage_pct", 0.0), 0.0)
-        event_cvar_pct = _f(meta.get("event_cvar_pct"), 0.0)
-        confidence = float(max(0.0, min(1.0, _f(decision.get("confidence"), 0.0))))
-        unified_score = decision.get("unified_score")
-        if unified_score is None:
-            unified_score = meta.get("unified_score")
-        unified_score = _f(unified_score, 0.0)
-        action = str(decision.get("action") or "").upper()
-        side_sign = 1.0 if action == "LONG" else (-1.0 if action == "SHORT" else 0.0)
-        hmm_sign = _f(ctx.get("hmm_regime_sign", meta.get("hmm_regime_sign")), 0.0)
-        hmm_conf = float(max(0.0, min(1.0, _f(ctx.get("hmm_conf", meta.get("hmm_conf")), 0.0))))
+        execution_cost = _f(meta.get("execution_cost", meta.get("fee_rt")), 0.001)
+        slippage_pct = _f(meta.get("slippage_pct"), 0.0)
+        confidence = float(max(0.0, min(1.0, _f(decision.get("confidence"), 0.5))))
+        unified_score = _f(decision.get("unified_score") or meta.get("unified_score"), 0.0)
+
+        # VPIN
         vpin_val = self._safe_float(meta.get("vpin"), None)
         if vpin_val is None:
             vpin_val = self._safe_float(ctx.get("vpin"), None)
-        if vpin_val is None:
-            vpin_val = self._safe_float(meta.get("event_exit_dynamic_vpin"), None)
-        if vpin_val is not None:
-            vpin_val = float(max(0.0, min(1.0, vpin_val)))
-        hurst_val = self._safe_float(meta.get("hurst"), None)
+        vpin_val = float(vpin_val) if vpin_val is not None else 0.5
+
+        # Hurst
+        hurst_val = self._safe_float(meta.get("hurst_exp"), None)
         if hurst_val is None:
-            hurst_val = self._safe_float(ctx.get("hurst"), None)
-        if hurst_val is not None:
-            hurst_val = float(max(0.0, min(1.0, hurst_val)))
-        mu_align = self._safe_float(meta.get("event_exit_dynamic_mu_alignment"), None)
-        if mu_align is None and side_sign != 0.0:
-            mu_alpha = self._safe_float(meta.get("mu_adjusted"), None)
-            if mu_alpha is None:
-                mu_alpha = self._safe_float(meta.get("mu_alpha"), None)
-            if mu_alpha is None:
-                mu_alpha = self._safe_float(ctx.get("mu_alpha"), None)
-            if mu_alpha is None:
-                mu_alpha = self._safe_float(ctx.get("mu_base"), 0.0) or 0.0
-            mu_align = float(side_sign * float(mu_alpha or 0.0))
-        mu_align = float(mu_align or 0.0)
-        dir_conf = self._safe_float(meta.get("mu_dir_conf"), None)
-        if dir_conf is None:
-            dir_conf = self._safe_float(ctx.get("mu_dir_conf"), None)
-        dir_edge = self._safe_float(meta.get("mu_dir_edge"), None)
-        if dir_edge is None:
-            dir_edge = self._safe_float(ctx.get("mu_dir_edge"), None)
-        dir_prob_long = self._safe_float(meta.get("mu_dir_prob_long"), None)
-        if dir_prob_long is None:
-            dir_prob_long = self._safe_float(ctx.get("mu_dir_prob_long"), None)
-        ev_gap = self._safe_float(meta.get("policy_ev_gap"), None)
-        if ev_gap is None:
-            ev_gap = self._safe_float(meta.get("ev_gap"), None)
-        if ev_gap is None:
-            ev_gap = self._safe_float(ctx.get("ev_gap"), 0.0)
-        tick_trend = self._safe_float(meta.get("tick_trend"), None)
-        if tick_trend is None:
-            tick_trend = self._safe_float(ctx.get("tick_trend"), 0.0)
-        tick_breakout_active = bool(meta.get("tick_breakout_active", ctx.get("tick_breakout_active")))
-        tick_breakout_dir = self._safe_float(meta.get("tick_breakout_dir"), None)
-        if tick_breakout_dir is None:
-            tick_breakout_dir = self._safe_float(ctx.get("tick_breakout_dir"), 0.0)
-        tick_breakout_score = self._safe_float(meta.get("tick_breakout_score"), None)
-        if tick_breakout_score is None:
-            tick_breakout_score = self._safe_float(ctx.get("tick_breakout_score"), 0.0)
+            hurst_val = self._safe_float(ctx.get("hurst_exp", ctx.get("hurst")), None)
+        hurst_val = float(hurst_val) if hurst_val is not None else 0.5
 
-        def _clip01(x: float) -> float:
-            return float(max(0.0, min(1.0, float(x))))
+        # Balance
+        balance = self._sizing_balance()
 
-        try:
-            edge_ref = float(os.environ.get("LEVERAGE_ENTRY_QUALITY_EDGE_REF", 0.16) or 0.16)
-        except Exception:
-            edge_ref = 0.16
-        edge_ref = max(edge_ref, 1e-6)
-        try:
-            gap_ref = float(os.environ.get("LEVERAGE_ENTRY_QUALITY_EV_GAP_REF", 0.0030) or 0.0030)
-        except Exception:
-            gap_ref = 0.0030
-        gap_ref = max(gap_ref, 1e-6)
-        try:
-            mu_ref = float(os.environ.get("LEVERAGE_ENTRY_QUALITY_MU_ALIGN_REF", 0.0015) or 0.0015)
-        except Exception:
-            mu_ref = 0.0015
-        mu_ref = max(mu_ref, 1e-6)
-
-        conf_n = _clip01(confidence)
-        dir_conf_n = _clip01(dir_conf if dir_conf is not None else confidence)
-        edge_n = _clip01(abs(float(dir_edge or 0.0)) / edge_ref)
-        gap_n = _clip01(abs(float(ev_gap or 0.0)) / gap_ref)
-        mu_n = _clip01(max(0.0, math.tanh(float(mu_align) / mu_ref)))
-        entry_quality_score = float(
-            0.32 * conf_n
-            + 0.28 * dir_conf_n
-            + 0.18 * edge_n
-            + 0.12 * gap_n
-            + 0.10 * mu_n
-        )
-        entry_quality_score = _clip01(entry_quality_score)
-
-        try:
-            breakout_ref = float(os.environ.get("LEVERAGE_ONEWAY_BREAKOUT_REF", 0.0012) or 0.0012)
-        except Exception:
-            breakout_ref = 0.0012
-        breakout_ref = max(breakout_ref, 1e-8)
-        try:
-            trend_ref = float(os.environ.get("LEVERAGE_ONEWAY_TREND_REF", 1.5) or 1.5)
-        except Exception:
-            trend_ref = 1.5
-        trend_ref = max(trend_ref, 1e-6)
-        breakout_align = 0.0
-        if side_sign != 0.0 and tick_breakout_active:
-            breakout_sign = float(side_sign) * float(tick_breakout_dir or 0.0)
-            breakout_mag = min(2.0, abs(float(tick_breakout_score or 0.0)) / breakout_ref)
-            breakout_align = breakout_mag if breakout_sign > 0.0 else (-0.7 * breakout_mag)
-        breakout_n = _clip01(0.5 + 0.5 * breakout_align)
-        trend_n = _clip01(0.5 + 0.5 * math.tanh((float(side_sign) * float(tick_trend or 0.0)) / trend_ref))
-        hurst_trend_n = 0.5 if hurst_val is None else _clip01((float(hurst_val) - 0.45) / 0.20)
-        one_way_raw = float(0.45 * breakout_n + 0.35 * trend_n + 0.20 * hurst_trend_n)
-        tox_scale = 1.0
-        if vpin_val is not None:
-            tox_scale = float(max(0.40, 1.0 - 0.45 * _clip01((float(vpin_val) - 0.55) / 0.45)))
-        one_way_move_score = _clip01(one_way_raw * tox_scale)
-        try:
-            signal_quality_w = float(os.environ.get("LEVERAGE_SIGNAL_QUALITY_WEIGHT", 0.62) or 0.62)
-        except Exception:
-            signal_quality_w = 0.62
-        signal_quality_w = float(max(0.0, min(1.0, signal_quality_w)))
-        leverage_signal_score = _clip01(
-            signal_quality_w * float(entry_quality_score) + (1.0 - signal_quality_w) * float(one_way_move_score)
-        )
-
-        # risk = max(|CVaR|, |event_cvar_pct|) + 0.7*spread + 0.5*slippage + 0.5*sigma (+ p_sl 가중)
-        risk_score = max(abs(cvar), abs(event_cvar_pct)) + 0.7 * spread_pct + 0.5 * slippage_pct + 0.5 * sigma + 0.2 * event_p_sl
-        if risk_score <= 1e-6:
-            risk_score = 1e-6
-
-        try:
-            lev_regime_bull = float(os.environ.get("LEVERAGE_REGIME_MAX_BULL", self.max_leverage) or self.max_leverage)
-        except Exception:
-            lev_regime_bull = float(self.max_leverage)
-        try:
-            lev_regime_bear = float(os.environ.get("LEVERAGE_REGIME_MAX_BEAR", self.max_leverage) or self.max_leverage)
-        except Exception:
-            lev_regime_bear = float(self.max_leverage)
-        try:
-            lev_regime_chop = float(os.environ.get("LEVERAGE_REGIME_MAX_CHOP", min(self.max_leverage, 30.0)) or min(self.max_leverage, 30.0))
-        except Exception:
-            lev_regime_chop = float(min(self.max_leverage, 30.0))
-        try:
-            lev_regime_volatile = float(os.environ.get("LEVERAGE_REGIME_MAX_VOLATILE", min(self.max_leverage, 20.0)) or min(self.max_leverage, 20.0))
-        except Exception:
-            lev_regime_volatile = float(min(self.max_leverage, 20.0))
-        lev_max_map = {
-            "bull": min(float(self.max_leverage), max(1.0, lev_regime_bull)),
-            "bear": min(float(self.max_leverage), max(1.0, lev_regime_bear)),
-            "chop": min(float(self.max_leverage), max(1.0, lev_regime_chop)),
-            "volatile": min(float(self.max_leverage), max(1.0, lev_regime_volatile)),
-        }
-        lev_max = float(lev_max_map.get(regime, self.max_leverage))
-
-        # EV/risk 기반 기본 레버리지 + 신뢰도/점수/HMM 정렬 보정
-        lev_raw = (max(ev - execution_cost, 0.0) / risk_score) * K_LEV
-        try:
-            conf_gain = float(getattr(mc_config, "leverage_conf_gain", 0.8))
-        except Exception:
-            conf_gain = 0.8
-        lev_raw *= max(0.55, (1.0 + conf_gain * (confidence - 0.5)))
-
-        try:
-            score_ref = float(getattr(mc_config, "leverage_score_ref", 0.003) or 0.003)
-        except Exception:
-            score_ref = 0.003
-        score_ref = max(score_ref, 1e-6)
-        score_term = math.tanh(float(unified_score) / score_ref)
-        if score_term >= 0:
-            lev_raw *= (1.0 + 0.7 * score_term)
-        else:
-            lev_raw *= max(0.60, 1.0 + 0.4 * score_term)
-
-        try:
-            hmm_gain = float(getattr(mc_config, "leverage_hmm_gain", 0.5))
-        except Exception:
-            hmm_gain = 0.5
-        if side_sign != 0.0 and hmm_conf > 0.0:
-            hmm_align = side_sign * (1.0 if hmm_sign > 0 else (-1.0 if hmm_sign < 0 else 0.0))
-            if hmm_align > 0:
-                lev_raw *= (1.0 + hmm_gain * hmm_conf)
-            elif hmm_align < 0:
-                lev_raw *= max(0.50, 1.0 - 0.8 * hmm_gain * hmm_conf)
-
-        # tail risk guard
-        lev_raw *= max(0.40, 1.0 - 0.65 * max(event_p_sl, 0.0))
-
-        # Stage-4: confidence/toxicity/volatility aware deleveraging + liquidation-distance floor.
-        try:
-            dyn_lev_enabled = str(os.environ.get("LEVERAGE_DYNAMIC_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-        except Exception:
-            dyn_lev_enabled = True
-        try:
-            lev_target_min = float(os.environ.get("LEVERAGE_TARGET_MIN", max(1.0, LEVERAGE_MIN)) or max(1.0, LEVERAGE_MIN))
-        except Exception:
-            lev_target_min = max(1.0, float(LEVERAGE_MIN))
-        try:
-            lev_target_max = float(os.environ.get("LEVERAGE_TARGET_MAX", min(50.0, float(self.max_leverage))) or min(50.0, float(self.max_leverage)))
-        except Exception:
-            lev_target_max = min(50.0, float(self.max_leverage))
-        lev_target_min = max(1.0, float(lev_target_min))
-        lev_target_max = max(lev_target_min, min(float(lev_max), float(lev_target_max)))
-        lev_target_max_base = float(lev_target_max)
-        lev_signal_target = float(lev_target_min)
-        lev_raw_ev = float(lev_raw)
-        lev_signal_blend = 0.0
-        if action in ("LONG", "SHORT"):
-            try:
-                lev_signal_pow = float(os.environ.get("LEVERAGE_SIGNAL_SCORE_POW", 1.20) or 1.20)
-            except Exception:
-                lev_signal_pow = 1.20
-            lev_signal_pow = float(max(0.2, min(3.0, lev_signal_pow)))
-            lev_signal_target = float(
-                lev_target_min
-                + (lev_target_max - lev_target_min) * (float(leverage_signal_score) ** lev_signal_pow)
-            )
-            try:
-                lev_signal_blend = float(os.environ.get("LEVERAGE_SIGNAL_BLEND", 0.55) or 0.55)
-            except Exception:
-                lev_signal_blend = 0.55
-            lev_signal_blend = float(max(0.0, min(1.0, lev_signal_blend)))
-            lev_raw = float((1.0 - lev_signal_blend) * float(lev_raw_ev) + lev_signal_blend * float(lev_signal_target))
-        aggressive_open = False
-        if action in ("LONG", "SHORT"):
-            try:
-                aggressive_on = str(os.environ.get("LEVERAGE_AGGRESSIVE_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
-            except Exception:
-                aggressive_on = False
-            if aggressive_on:
-                try:
-                    aggressive_cap = float(os.environ.get("LEVERAGE_AGGRESSIVE_MAX", self.max_leverage) or self.max_leverage)
-                except Exception:
-                    aggressive_cap = float(self.max_leverage)
-                aggressive_cap = max(lev_target_max_base, min(float(self.max_leverage), float(aggressive_cap)))
-                try:
-                    aggressive_min_conf = float(os.environ.get("LEVERAGE_AGGRESSIVE_MIN_CONF", 0.72) or 0.72)
-                except Exception:
-                    aggressive_min_conf = 0.72
-                try:
-                    aggressive_min_score = float(os.environ.get("LEVERAGE_AGGRESSIVE_MIN_SCORE", 0.0012) or 0.0012)
-                except Exception:
-                    aggressive_min_score = 0.0012
-                try:
-                    aggressive_min_mu_align = float(os.environ.get("LEVERAGE_AGGRESSIVE_MIN_MU_ALIGN", 0.0) or 0.0)
-                except Exception:
-                    aggressive_min_mu_align = 0.0
-                try:
-                    aggressive_hurst_min = float(os.environ.get("LEVERAGE_AGGRESSIVE_HURST_MIN", 0.55) or 0.55)
-                except Exception:
-                    aggressive_hurst_min = 0.55
-                try:
-                    aggressive_vpin_max = float(os.environ.get("LEVERAGE_AGGRESSIVE_MAX_VPIN", 0.55) or 0.55)
-                except Exception:
-                    aggressive_vpin_max = 0.55
-                try:
-                    aggressive_event_psl_max = float(os.environ.get("LEVERAGE_AGGRESSIVE_MAX_EVENT_PSL", 0.30) or 0.30)
-                except Exception:
-                    aggressive_event_psl_max = 0.30
-                vpin_ok = True if vpin_val is None else float(vpin_val) <= float(aggressive_vpin_max)
-                hurst_ok = True if hurst_val is None else float(hurst_val) >= float(aggressive_hurst_min)
-                if (
-                    confidence >= float(aggressive_min_conf)
-                    and float(unified_score) >= float(aggressive_min_score)
-                    and float(mu_align) >= float(aggressive_min_mu_align)
-                    and vpin_ok
-                    and hurst_ok
-                    and float(event_p_sl) <= float(aggressive_event_psl_max)
-                ):
-                    aggressive_open = True
-                    lev_target_max = float(max(lev_target_max_base, min(float(lev_max), float(aggressive_cap))))
-        tox = 0.0
-        conf_def = 0.0
-        sigma_stress = 0.0
-        lev_scale = 1.0
-        if dyn_lev_enabled:
-            try:
-                vpin_soft = float(os.environ.get("LEVERAGE_VPIN_SOFT", 0.65) or 0.65)
-            except Exception:
-                vpin_soft = 0.65
-            try:
-                vpin_hard = float(os.environ.get("LEVERAGE_VPIN_HARD", 0.90) or 0.90)
-            except Exception:
-                vpin_hard = 0.90
-            try:
-                conf_soft = float(os.environ.get("LEVERAGE_CONF_SOFT", 0.56) or 0.56)
-            except Exception:
-                conf_soft = 0.56
-            try:
-                sigma_soft = float(os.environ.get("LEVERAGE_SIGMA_SOFT", 0.035) or 0.035)
-            except Exception:
-                sigma_soft = 0.035
-            try:
-                sigma_hard = float(os.environ.get("LEVERAGE_SIGMA_HARD", 0.080) or 0.080)
-            except Exception:
-                sigma_hard = 0.080
-            try:
-                delev_gain_tox = float(os.environ.get("LEVERAGE_DELEV_GAIN_TOX", 0.65) or 0.65)
-            except Exception:
-                delev_gain_tox = 0.65
-            try:
-                delev_gain_conf = float(os.environ.get("LEVERAGE_DELEV_GAIN_CONF", 0.50) or 0.50)
-            except Exception:
-                delev_gain_conf = 0.50
-            try:
-                delev_gain_sigma = float(os.environ.get("LEVERAGE_DELEV_GAIN_SIGMA", 0.55) or 0.55)
-            except Exception:
-                delev_gain_sigma = 0.55
-            try:
-                delev_hard_scale = float(os.environ.get("LEVERAGE_DELEV_HARD_SCALE", 0.55) or 0.55)
-            except Exception:
-                delev_hard_scale = 0.55
-            try:
-                min_scale = float(os.environ.get("LEVERAGE_DYNAMIC_MIN_SCALE", 0.20) or 0.20)
-            except Exception:
-                min_scale = 0.20
-            min_scale = float(max(0.05, min(1.0, min_scale)))
-            try:
-                vpin_cap_for_delev = float(os.environ.get("LEVERAGE_VPIN_CAP_FOR_DELEV", 0.92) or 0.92)
-            except Exception:
-                vpin_cap_for_delev = 0.92
-            vpin_cap_for_delev = float(max(0.50, min(1.0, vpin_cap_for_delev)))
-            vpin_for_lev = vpin_val
-            if vpin_for_lev is not None:
-                vpin_for_lev = float(min(float(vpin_for_lev), float(vpin_cap_for_delev)))
-            if vpin_for_lev is not None and vpin_for_lev > vpin_soft:
-                tox = float(max(0.0, vpin_for_lev - vpin_soft) / max(1e-6, 1.0 - vpin_soft))
-            conf_def = float(max(0.0, conf_soft - confidence) / max(1e-6, conf_soft))
-            if sigma > sigma_soft:
-                sigma_stress = float(max(0.0, sigma - sigma_soft) / max(1e-6, sigma_hard - sigma_soft))
-            try:
-                sigma_stress_clip = float(os.environ.get("LEVERAGE_SIGMA_STRESS_CLIP", 1.0) or 1.0)
-            except Exception:
-                sigma_stress_clip = 1.0
-            sigma_stress_clip = float(max(0.10, min(5.0, sigma_stress_clip)))
-            sigma_stress = float(max(0.0, min(sigma_stress, sigma_stress_clip)))
-            lev_scale = float((1.0 - delev_gain_tox * tox) * (1.0 - delev_gain_conf * conf_def) * (1.0 - delev_gain_sigma * sigma_stress))
-            if (vpin_for_lev is not None and vpin_for_lev >= vpin_hard) and (confidence < conf_soft):
-                lev_scale *= float(max(0.10, min(1.0, delev_hard_scale)))
-            # Trend+alignment boost is only allowed in non-toxic states.
-            try:
-                h_high = float(getattr(mc_config, "hurst_high", 0.55))
-            except Exception:
-                h_high = 0.55
-            try:
-                trend_boost = float(os.environ.get("LEVERAGE_TREND_ALIGN_BOOST", 0.10) or 0.10)
-            except Exception:
-                trend_boost = 0.10
-            if (hurst_val is not None and hurst_val >= h_high) and (mu_align > 0.0) and (confidence >= conf_soft) and ((vpin_for_lev is None) or (vpin_for_lev < vpin_soft)):
-                lev_scale *= float(1.0 + max(0.0, trend_boost))
-            lev_scale = float(max(min_scale, min(1.25, lev_scale)))
-            lev_raw = float(lev_raw * lev_scale)
-
-        # If recent entries are repeatedly rejected by available-balance (110007), temporarily de-leverage.
-        reject_scale = 1.0
-        reject_count = 0
+        # SQ probation 확인
+        sq_probation = False
         if sym:
             try:
-                reject_state = self._balance_reject_110007_by_sym.get(sym) or {}
-                reject_ts = int(reject_state.get("ts", 0) or 0)
-                reject_count = int(reject_state.get("count", 0) or 0)
+                sq_state = self._symbol_quality_state(sym)
+                sq_probation = bool(sq_state.get("probation"))
             except Exception:
-                reject_ts = 0
-                reject_count = 0
-            try:
-                reject_cooldown_sec = float(os.environ.get("LEVERAGE_BALANCE_REJECT_COOLDOWN_SEC", 300.0) or 300.0)
-            except Exception:
-                reject_cooldown_sec = 300.0
-            try:
-                reject_step_scale = float(os.environ.get("LEVERAGE_BALANCE_REJECT_SCALE", 0.82) or 0.82)
-            except Exception:
-                reject_step_scale = 0.82
-            try:
-                reject_min_count = int(os.environ.get("LEVERAGE_BALANCE_REJECT_MIN_COUNT", 2) or 2)
-            except Exception:
-                reject_min_count = 2
-            try:
-                reject_min_scale = float(os.environ.get("LEVERAGE_BALANCE_REJECT_MIN_SCALE", 0.45) or 0.45)
-            except Exception:
-                reject_min_scale = 0.45
-            try:
-                reject_relief_signal = float(os.environ.get("LEVERAGE_BALANCE_REJECT_RELIEF_SIGNAL", 0.60) or 0.60)
-            except Exception:
-                reject_relief_signal = 0.60
-            try:
-                reject_relief_conf = float(os.environ.get("LEVERAGE_BALANCE_REJECT_RELIEF_CONF", 0.66) or 0.66)
-            except Exception:
-                reject_relief_conf = 0.66
-            try:
-                reject_relief_pow = float(os.environ.get("LEVERAGE_BALANCE_REJECT_RELIEF_POW", 0.55) or 0.55)
-            except Exception:
-                reject_relief_pow = 0.55
-            reject_min_count = int(max(1, min(10, reject_min_count)))
-            reject_min_scale = float(max(0.10, min(1.0, reject_min_scale)))
-            reject_relief_signal = float(max(0.0, min(1.0, reject_relief_signal)))
-            reject_relief_conf = float(max(0.0, min(1.0, reject_relief_conf)))
-            reject_relief_pow = float(max(0.10, min(1.0, reject_relief_pow)))
-            if reject_ts > 0 and reject_count > 0:
-                age_ms = max(0, now_ms() - reject_ts)
-                if age_ms <= int(max(1.0, reject_cooldown_sec) * 1000.0):
-                    if reject_count >= reject_min_count:
-                        reject_step_scale = min(max(reject_step_scale, 0.10), 1.0)
-                        reject_scale = max(reject_min_scale, float(reject_step_scale) ** float(min(6, reject_count)))
-                        # High-quality signals get softer rejection de-leverage to avoid floor lock.
-                        if float(leverage_signal_score) >= reject_relief_signal and float(confidence) >= reject_relief_conf:
-                            reject_scale = max(reject_scale, float(reject_scale) ** float(reject_relief_pow))
-                    lev_raw = float(lev_raw * reject_scale)
-                else:
-                    try:
-                        self._balance_reject_110007_by_sym.pop(sym, None)
-                    except Exception:
-                        pass
+                pass
 
-        # Enforce minimum liquidation distance using leverage cap.
-        try:
-            maint_rate = float(os.environ.get("MAINT_MARGIN_RATE", MAINT_MARGIN_RATE) or MAINT_MARGIN_RATE)
-        except Exception:
-            maint_rate = float(MAINT_MARGIN_RATE)
-        try:
-            liq_buffer = float(os.environ.get("LIQUIDATION_BUFFER", LIQUIDATION_BUFFER) or LIQUIDATION_BUFFER)
-        except Exception:
-            liq_buffer = float(LIQUIDATION_BUFFER)
-        try:
-            min_liq_dist = float(os.environ.get("LEVERAGE_MIN_LIQ_DISTANCE", 0.015) or 0.015)
-        except Exception:
-            min_liq_dist = 0.015
-        min_liq_dist_base = float(min_liq_dist)
-        # High-quality / low-toxicity entries may use a tighter liquidation distance floor.
-        if action in ("LONG", "SHORT"):
-            try:
-                hq_conf = float(os.environ.get("LEVERAGE_HIGH_QUALITY_MIN_CONF", 0.74) or 0.74)
-            except Exception:
-                hq_conf = 0.74
-            try:
-                hq_signal = float(os.environ.get("LEVERAGE_HIGH_QUALITY_MIN_SIGNAL", 0.82) or 0.82)
-            except Exception:
-                hq_signal = 0.82
-            try:
-                hq_entry_q = float(os.environ.get("LEVERAGE_HIGH_QUALITY_MIN_ENTRY_Q", 0.80) or 0.80)
-            except Exception:
-                hq_entry_q = 0.80
-            try:
-                hq_vpin_cap = float(os.environ.get("LEVERAGE_HIGH_QUALITY_MAX_VPIN", 0.45) or 0.45)
-            except Exception:
-                hq_vpin_cap = 0.45
-            try:
-                min_liq_dist_hq = float(os.environ.get("LEVERAGE_MIN_LIQ_DISTANCE_HIGH_QUALITY", 0.010) or 0.010)
-            except Exception:
-                min_liq_dist_hq = 0.010
-            if (
-                float(confidence) >= float(hq_conf)
-                and float(leverage_signal_score) >= float(hq_signal)
-                and float(entry_quality_score) >= float(hq_entry_q)
-                and ((vpin_for_lev is None) or (float(vpin_for_lev) <= float(hq_vpin_cap)))
-            ):
-                min_liq_dist = min(float(min_liq_dist), float(min_liq_dist_hq))
-        min_liq_dist = float(max(0.001, min(0.20, min_liq_dist)))
-        liq_cap = float(lev_target_max)
-        denom = float(max(1e-6, maint_rate + liq_buffer + min_liq_dist))
-        if denom > 0:
-            liq_cap = min(float(lev_target_max), float(max(1.0, 1.0 / denom)))
+        cfg = get_unified_sizing_config()
 
-        lev_floor = float(max(1.0, min(lev_target_min, lev_max)))
-        lev_cap = float(max(lev_floor, min(float(lev_max), float(lev_target_max), float(liq_cap))))
-        lev_quality_cap = float(lev_cap)
-        lev_quality_low_conf = False
-        lev_quality_high_tox = False
-        if action in ("LONG", "SHORT"):
+        # Quality 계산
+        quality = unified_signal_quality(confidence, vpin_val, hurst_val, sigma, regime)
+
+        # 레짐별 상한
+        regime_max = unified_regime_max_lev(regime, cfg)
+        liq_cap = unified_liq_cap(cfg)
+        lev_max = min(regime_max, liq_cap, cfg.lev_global_max)
+        lev_min = cfg.lev_global_min
+
+        # SQ probation
+        if sq_probation:
+            lev_max = min(lev_max, cfg.sq_probation_cap)
+
+        # 카운터팩추얼 최적 레버리지
+        from engines.mc.unified_sizing import counterfactual_optimal_leverage
+        _tp_pct = float(os.environ.get("DEFAULT_TP_PCT", "0.006"))
+        _sl_pct = float(os.environ.get("DEFAULT_SL_PCT", "0.004"))
+        opt_lev, cf_meta = counterfactual_optimal_leverage(
+            ev=ev, cvar=cvar, p_sl=event_p_sl, sigma=sigma,
+            vpin=vpin_val, confidence=confidence, hurst=hurst_val,
+            spread=spread_pct, fee_rt=execution_cost, regime=regime,
+            balance=balance, quality=quality,
+            lev_min=lev_min, lev_max=lev_max, cfg=cfg,
+            p_tp=event_p_tp, tp_pct=_tp_pct, sl_pct=_sl_pct,
+        )
+
+        # 최종 클램프
+        lev = float(max(lev_min, min(lev_max, opt_lev)))
+
+        # Balance reject scaling (이 기능은 유지 — 거래소 잔고 부족 시 필수)
+        reject_scale = 1.0
+        if sym:
             try:
-                low_conf_thr = float(os.environ.get("LEVERAGE_LOW_CONF_THRESHOLD", 0.58) or 0.58)
+                reject_count = self._balance_reject_counts.get(sym, 0) or 0
+                reject_last_ts = self._balance_reject_last_ts.get(sym, 0) or 0
+                cooldown_sec = 180.0
+                if reject_count >= 2 and (now_ms() - reject_last_ts) < cooldown_sec * 1000:
+                    reject_scale = max(0.55, 0.90 ** min(6, reject_count))
+                    lev *= reject_scale
+                    lev = max(lev_min, lev)
             except Exception:
-                low_conf_thr = 0.58
-            try:
-                low_signal_thr = float(os.environ.get("LEVERAGE_LOW_SIGNAL_THRESHOLD", 0.48) or 0.48)
-            except Exception:
-                low_signal_thr = 0.48
-            try:
-                high_vpin_thr = float(os.environ.get("LEVERAGE_HIGH_VPIN_THRESHOLD", 0.82) or 0.82)
-            except Exception:
-                high_vpin_thr = 0.82
-            try:
-                low_conf_cap = float(os.environ.get("LEVERAGE_LOW_CONF_CAP", 3.0) or 3.0)
-            except Exception:
-                low_conf_cap = 3.0
-            try:
-                high_vpin_cap = float(os.environ.get("LEVERAGE_HIGH_VPIN_CAP", 2.0) or 2.0)
-            except Exception:
-                high_vpin_cap = 2.0
-            lev_quality_low_conf = bool(
-                float(confidence) < float(low_conf_thr)
-                or float(leverage_signal_score) < float(low_signal_thr)
-            )
-            lev_quality_high_tox = bool(
-                (vpin_for_lev is not None)
-                and float(vpin_for_lev) >= float(high_vpin_thr)
-            )
-            if lev_quality_low_conf:
-                lev_quality_cap = min(float(lev_quality_cap), max(1.0, float(low_conf_cap)))
-            if lev_quality_high_tox:
-                lev_quality_cap = min(float(lev_quality_cap), max(1.0, float(high_vpin_cap)))
-        if lev_quality_cap < lev_floor:
-            lev_floor = float(max(1.0, lev_quality_cap))
-        lev_cap = float(max(lev_floor, min(lev_cap, lev_quality_cap)))
-        lev = float(max(lev_floor, min(lev_cap, lev_raw)))
+                pass
+
+        # Meta 기록
         try:
-            meta["lev_dynamic_enabled"] = bool(dyn_lev_enabled)
-            meta["lev_target_min"] = float(lev_floor)
-            meta["lev_target_max"] = float(lev_target_max)
-            meta["lev_target_max_base"] = float(lev_target_max_base)
-            meta["lev_aggressive_open"] = bool(aggressive_open)
-            meta["lev_liq_cap"] = float(liq_cap)
-            meta["lev_raw_before_caps"] = float(lev_raw)
-            meta["lev_raw_ev_component"] = float(lev_raw_ev)
-            meta["lev_signal_target"] = float(lev_signal_target)
-            meta["lev_signal_blend"] = float(lev_signal_blend)
-            meta["entry_quality_score"] = float(entry_quality_score)
-            meta["one_way_move_score"] = float(one_way_move_score)
-            meta["leverage_signal_score"] = float(leverage_signal_score)
-            meta["lev_dynamic_scale"] = float(lev_scale)
-            meta["lev_dynamic_tox"] = float(tox)
-            meta["lev_dynamic_conf_deficit"] = float(conf_def)
-            meta["lev_dynamic_sigma_stress"] = float(sigma_stress)
-            meta["lev_balance_reject_scale"] = float(reject_scale)
-            meta["lev_balance_reject_count"] = int(reject_count)
-            meta["lev_balance_reject_min_count"] = int(reject_min_count if "reject_min_count" in locals() else 0)
-            meta["lev_balance_reject_min_scale"] = float(reject_min_scale if "reject_min_scale" in locals() else 0.0)
-            meta["lev_balance_reject_relief_signal"] = float(reject_relief_signal if "reject_relief_signal" in locals() else 0.0)
-            meta["lev_balance_reject_relief_conf"] = float(reject_relief_conf if "reject_relief_conf" in locals() else 0.0)
-            meta["lev_balance_reject_relief_pow"] = float(reject_relief_pow if "reject_relief_pow" in locals() else 0.0)
-            meta["lev_dynamic_vpin"] = vpin_val
-            meta["lev_dynamic_vpin_for_lev"] = vpin_for_lev if "vpin_for_lev" in locals() else vpin_val
-            meta["lev_dynamic_hurst"] = hurst_val
-            meta["lev_dynamic_mu_align"] = float(mu_align)
-            meta["lev_sigma_raw"] = float(sigma_raw)
+            meta["lev_method"] = "unified_cf"
+            meta["lev_quality"] = float(quality)
+            meta["lev_raw_cf"] = float(opt_lev)
+            meta["lev_final"] = float(lev)
+            meta["lev_min"] = float(lev_min)
+            meta["lev_max_regime"] = float(regime_max)
+            meta["lev_max_liq"] = float(liq_cap)
+            meta["lev_max_effective"] = float(lev_max)
+            meta["lev_reject_scale"] = float(reject_scale)
+            meta["lev_sq_probation"] = bool(sq_probation)
+            meta["lev_cf_best"] = self._safe_float(cf_meta.get("cf_best_lev"), None)
+            meta["lev_cf_utility"] = self._safe_float(cf_meta.get("cf_best_utility"), None)
+            meta["lev_cf_eq_scale"] = self._safe_float(cf_meta.get("cf_eq_scale"), None)
+            meta["lev_cf_band_min"] = self._safe_float(cf_meta.get("cf_band_min"), None)
+            meta["lev_cf_band_max"] = self._safe_float(cf_meta.get("cf_band_max"), None)
+            meta["lev_vpin"] = float(vpin_val)
+            meta["lev_hurst"] = float(hurst_val)
             meta["lev_sigma_used"] = float(sigma)
-            meta["lev_sigma_stress_clip"] = float(sigma_stress_clip if "sigma_stress_clip" in locals() else 1.0)
-            meta["lev_min_liq_dist_base"] = float(min_liq_dist_base)
-            meta["lev_min_liq_dist_used"] = float(min_liq_dist)
-            meta["lev_quality_cap"] = float(lev_quality_cap)
-            meta["lev_quality_low_conf"] = bool(lev_quality_low_conf)
-            meta["lev_quality_high_tox"] = bool(lev_quality_high_tox)
             decision["meta"] = meta
         except Exception:
             pass
+
+        # Diagnostics
         if sym:
-            floor_sticky = int(self._lev_floor_sticky_counts.get(sym, 0) or 0)
-            if action in ("LONG", "SHORT"):
-                if float(lev) <= float(lev_floor) + 1e-9:
-                    floor_sticky = min(10_000, floor_sticky + 1)
-                else:
-                    floor_sticky = max(0, floor_sticky - 1)
-            else:
-                floor_sticky = 0
-            self._lev_floor_sticky_counts[sym] = int(floor_sticky)
             try:
-                meta = decision.get("meta") or {}
-                meta["lev_floor_sticky_count"] = int(floor_sticky)
-                decision["meta"] = meta
+                action = str(decision.get("action") or "").upper()
+                if action in ("LONG", "SHORT"):
+                    floor_sticky = int(self._lev_floor_sticky_counts.get(sym, 0) or 0)
+                    if float(lev) <= float(lev_min) + 1e-9:
+                        floor_sticky = min(10_000, floor_sticky + 1)
+                    else:
+                        floor_sticky = max(0, floor_sticky - 1)
+                    self._lev_floor_sticky_counts[sym] = int(floor_sticky)
+                    meta["lev_floor_sticky_count"] = int(floor_sticky)
+                    decision["meta"] = meta
+                    # Periodic diagnostic log
+                    now_diag_ms = now_ms()
+                    prev_diag_ms = int(self._lev_diag_last_ms_by_sym.get(sym, 0) or 0)
+                    if now_diag_ms - prev_diag_ms >= 120_000:
+                        if floor_sticky >= 3 or float(lev) <= float(lev_min) + 1e-9:
+                            self._log(
+                                f"[LEV_DIAG] {sym} lev={lev:.2f}x quality={quality:.3f} "
+                                f"cf_best={opt_lev:.2f} lev_max={lev_max:.1f} "
+                                f"conf={confidence:.3f} vpin={vpin_val:.3f} "
+                                f"hurst={hurst_val:.3f} reject={reject_scale:.3f} "
+                                f"sq_prob={sq_probation} floor_sticky={floor_sticky}"
+                            )
+                        self._lev_diag_last_ms_by_sym[sym] = int(now_diag_ms)
             except Exception:
                 pass
-            try:
-                lev_diag_on = str(os.environ.get("LEVERAGE_DIAG_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
-            except Exception:
-                lev_diag_on = True
-            if lev_diag_on and action in ("LONG", "SHORT"):
-                try:
-                    lev_diag_interval_sec = float(os.environ.get("LEVERAGE_DIAG_INTERVAL_SEC", 120.0) or 120.0)
-                except Exception:
-                    lev_diag_interval_sec = 120.0
-                try:
-                    lev_diag_floor_sticky = int(os.environ.get("LEVERAGE_DIAG_FLOOR_STICKY", 3) or 3)
-                except Exception:
-                    lev_diag_floor_sticky = 3
-                now_diag_ms = now_ms()
-                prev_diag_ms = int(self._lev_diag_last_ms_by_sym.get(sym, 0) or 0)
-                if now_diag_ms - prev_diag_ms >= int(max(5.0, lev_diag_interval_sec) * 1000.0):
-                    if floor_sticky >= max(1, lev_diag_floor_sticky) or float(lev) <= float(lev_floor) + 1e-9:
-                        self._log(
-                            f"[LEV_DIAG] {sym} lev={float(lev):.2f}x floor={float(lev_floor):.2f} cap={float(lev_cap):.2f} "
-                            f"raw={float(lev_raw):.3f} conf={float(confidence):.3f} score={float(unified_score):.6f} "
-                            f"entry_q={float(entry_quality_score):.3f} oneway={float(one_way_move_score):.3f} "
-                            f"lev_sig={float(leverage_signal_score):.3f} "
-                            f"vpin={float(vpin_val) if vpin_val is not None else -1.0:.3f} "
-                            f"hurst={float(hurst_val) if hurst_val is not None else -1.0:.3f} "
-                            f"mu_align={float(mu_align):.6f} reject_scale={float(reject_scale):.3f} floor_sticky={int(floor_sticky)}"
-                        )
-                    self._lev_diag_last_ms_by_sym[sym] = int(now_diag_ms)
             self._dyn_leverage[sym] = lev
+
         return lev
 
     def _direction_bias(self, closes) -> int:
@@ -5374,25 +7526,154 @@ class LiveOrchestrator:
         return bias
 
     def _infer_regime(self, closes) -> str:
+        """[FIX 2026-02-13] Ensemble regime detection: SMA + ADX + HMM 통합.
+        
+        3개의 독립적 신호를 통합하여 레짐을 판단합니다:
+        1. SMA Cross + Slope (기존 로직, 개선)
+        2. ADX (Average Directional Index) - 추세 강도 측정
+        3. HMM posterior (Online Gaussian HMM state)
+        
+        Returns: "bull", "bear", "chop", "volatile" 중 하나
+        """
         if not closes or len(closes) < 30:
             return "chop"
-        fast_period = min(80, len(closes))
-        slow_period = min(200, len(closes))
+        
+        price = closes[-1]
+        n = len(closes)
+        
+        # ── Signal 1: SMA Cross + Slope ──
+        fast_period = min(80, n)
+        slow_period = min(200, n)
         fast = sum(closes[-fast_period:]) / fast_period
         slow = sum(closes[-slow_period:]) / slow_period
-        slope_short = closes[-1] - closes[max(0, len(closes) - 6)]
-        slope_long = closes[-1] - closes[max(0, len(closes) - 40)]
-        rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, min(len(closes), 180))]
-        vol = float(np.std(rets)) if rets else 0.0
-        # 변동성 높고 추세 약하면 volatile
-        if vol > 0.01 and abs(slope_short) < closes[-1] * 0.0015:
-            return "volatile"
-        # 강한 상승/하락을 더 민감하게
+        slope_short = closes[-1] - closes[max(0, n - 6)]
+        slope_long = closes[-1] - closes[max(0, n - 40)]
+        
+        sma_vote = 0  # -1=bear, 0=neutral, +1=bull
         if fast > slow and slope_long > 0 and slope_short > 0:
-            return "bull"
-        if fast < slow and slope_long < 0 and slope_short < 0:
-            return "bear"
+            sma_vote = 1
+        elif fast < slow and slope_long < 0 and slope_short < 0:
+            sma_vote = -1
+        
+        # ── Signal 2: ADX (추세 강도) ──
+        adx_val = 0.0
+        try:
+            adx_period = min(14, n - 1)
+            if adx_period >= 5:
+                rets = np.array([closes[i] - closes[i-1] for i in range(max(1, n - adx_period * 3), n)])
+                pos_dm = np.maximum(rets, 0.0)
+                neg_dm = np.maximum(-rets, 0.0)
+                # Smoothed via EMA
+                alpha_adx = 2.0 / (adx_period + 1)
+                atr_val = np.mean(np.abs(rets)) if len(rets) > 0 else 1e-8
+                if atr_val > 1e-12:
+                    di_pos = np.mean(pos_dm) / atr_val
+                    di_neg = np.mean(neg_dm) / atr_val
+                    dx = abs(di_pos - di_neg) / max(di_pos + di_neg, 1e-12)
+                    adx_val = float(dx * 100.0)
+        except Exception:
+            adx_val = 0.0
+        
+        # ── Signal 3: Volatility ──
+        rets_log = [math.log(closes[i] / closes[i - 1]) for i in range(max(1, n - 180), n) if closes[i-1] > 0]
+        vol = float(np.std(rets_log)) if rets_log else 0.0
+        
+        # ── Signal 4: HMM (기존 alpha_state에서 가져오기) ──
+        hmm_vote = 0  # -1=down, 0=chop, +1=up
+        hmm_conf = 0.0
+        # _infer_regime은 심볼 없이 호출되므로 HMM은 보조적으로만 사용
+        
+        # ── Ensemble 결정 ──
+        # Volatile: 높은 변동성 + 약한 추세
+        if vol > 0.008 and adx_val < 20 and abs(slope_short) < price * 0.003:
+            return "volatile"
+        
+        # 강한 추세: ADX > 20 또는 SMA cross + slope 확인
+        if adx_val > 20 and sma_vote != 0:
+            return "bull" if sma_vote > 0 else "bear"
+        
+        if adx_val > 12 and sma_vote != 0:
+            # 중간 강도 추세: SMA + slope 동의 필요
+            slope_pct = abs(slope_long) / max(price, 1e-8)
+            if slope_pct > 0.002:  # 0.2% 이상 이동
+                return "bull" if sma_vote > 0 else "bear"
+        
+        # SMA cross 있고 방향 일치 시 bull/bear (ADX 없이도)
+        if sma_vote != 0 and abs(slope_long) / max(price, 1e-8) > 0.005:
+            return "bull" if sma_vote > 0 else "bear"
+        
         return "chop"
+    
+    def _infer_regime_with_hmm(self, sym: str, closes) -> tuple[str, dict]:
+        """심볼별 HMM 상태를 활용한 정교한 레짐 판단.
+        
+        Returns: (regime_str, debug_dict)
+        """
+        base_regime = self._infer_regime(closes)
+        debug = {"base_regime": base_regime, "hmm_override": False}
+        
+        # HMM state 조회
+        try:
+            alpha_st = self._alpha_state.get(sym)
+            if alpha_st is None:
+                return base_regime, debug
+            hmm_state = alpha_st.get("hmm")
+            if hmm_state is None:
+                return base_regime, debug
+            
+            hmm_probs = hmm_state.probs
+            hmm_means = hmm_state.means
+            if hmm_probs is None or hmm_means is None:
+                return base_regime, debug
+            
+            # HMM confidence
+            hmm_conf = float(np.max(hmm_probs))
+            hmm_idx = int(np.argmax(hmm_probs))
+            order = np.argsort(hmm_means)
+            n_states = len(hmm_means)
+            
+            if n_states >= 3:
+                down_idx = int(order[0])
+                up_idx = int(order[-1])
+            else:
+                down_idx = int(order[0])
+                up_idx = int(order[-1])
+            
+            debug["hmm_conf"] = hmm_conf
+            debug["hmm_idx"] = hmm_idx
+            debug["hmm_means"] = [float(x) for x in hmm_means]
+            
+            # HMM 신뢰도가 높을 때만 override 고려 (>0.7)
+            if hmm_conf < 0.7:
+                return base_regime, debug
+            
+            # Ensemble: base_regime과 HMM이 동의하면 강화
+            # HMM이 강하게 down을 가리키는데 base가 bull이면 → chop으로 중재
+            if hmm_idx == down_idx and base_regime == "bull" and hmm_conf > 0.8:
+                debug["hmm_override"] = True
+                debug["hmm_override_reason"] = "HMM_down_vs_bull"
+                return "chop", debug
+            
+            if hmm_idx == up_idx and base_regime == "bear" and hmm_conf > 0.8:
+                debug["hmm_override"] = True
+                debug["hmm_override_reason"] = "HMM_up_vs_bear"
+                return "chop", debug
+            
+            # HMM이 강하게 한 방향이고 base가 chop이면 → 추세로 승격
+            if hmm_idx == up_idx and base_regime == "chop" and hmm_conf > 0.85:
+                debug["hmm_override"] = True
+                debug["hmm_override_reason"] = "HMM_up_promote"
+                return "bull", debug
+            
+            if hmm_idx == down_idx and base_regime == "chop" and hmm_conf > 0.85:
+                debug["hmm_override"] = True
+                debug["hmm_override_reason"] = "HMM_down_promote"
+                return "bear", debug
+            
+        except Exception:
+            pass
+        
+        return base_regime, debug
 
     def _compute_ofi_score(self, sym: str) -> float:
         ob = self.orderbook.get(sym)
@@ -5508,15 +7789,41 @@ class LiveOrchestrator:
         except Exception:
             return default
 
-    def _effective_min_hold_sec(self, pos: dict | None) -> float:
+    def _effective_min_hold_sec(self, pos: dict | None, regime: str | None = None) -> float:
         """
-        Base min-hold + optional opt_hold ratio floor.
-        Useful to reduce premature exits before the modeled hold horizon.
+        Regime-aware min-hold + optional opt_hold ratio floor.
+        RegimePolicy에서 레짐별 min_hold_sec 기본값을 가져온다.
         """
+        # --- Regime-specific base (RegimePolicy 우선) ---
+        regime_l = str(regime or (pos.get("regime") if isinstance(pos, dict) else "") or "").strip().lower()
+        
+        # RegimePolicy에서 기본값 가져오기
         try:
-            base_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+            from engines.mc.regime_policy import get_regime_policy
+            _rpol_hold = get_regime_policy(regime_l or "chop")
+            rpol_base = float(_rpol_hold.min_hold_sec)
         except Exception:
-            base_sec = float(POSITION_HOLD_MIN_SEC)
+            rpol_base = 120.0
+
+        regime_env_map = {
+            "bull":  "EXIT_MIN_HOLD_SEC_BULL",
+            "trend": "EXIT_MIN_HOLD_SEC_BULL",
+            "bear":  "EXIT_MIN_HOLD_SEC_BEAR",
+            "chop":  "EXIT_MIN_HOLD_SEC_CHOP",
+            "volatile": "EXIT_MIN_HOLD_SEC_VOLATILE",
+        }
+        env_key = regime_env_map.get(regime_l)
+        try:
+            fallback_base = float(os.environ.get("EXIT_MIN_HOLD_SEC", rpol_base) or rpol_base)
+        except Exception:
+            fallback_base = float(rpol_base)
+        if env_key:
+            try:
+                base_sec = float(os.environ.get(env_key, fallback_base) or fallback_base)
+            except Exception:
+                base_sec = fallback_base
+        else:
+            base_sec = fallback_base
         base_sec = max(0.0, float(base_sec))
 
         if not isinstance(pos, dict):
@@ -5532,7 +7839,10 @@ class LiveOrchestrator:
             return base_sec
 
         opt_hold = (
-            pos.get("opt_hold_curr_sec")
+            pos.get("target_hold_curr_sec")
+            or pos.get("target_hold_entry_sec")
+            or pos.get("target_hold_sec")
+            or pos.get("opt_hold_curr_sec")
             or pos.get("opt_hold_entry_sec")
             or pos.get("opt_hold_sec")
         )
@@ -5549,6 +7859,124 @@ class LiveOrchestrator:
         if dyn_cap > 0:
             dyn_sec = min(float(dyn_sec), float(dyn_cap))
         return max(base_sec, float(dyn_sec))
+
+    def _classify_hold_regime(self, regime_hint: str | None, hurst_hint: float | None = None) -> str:
+        txt = str(regime_hint or "").strip().lower()
+        if ("trend" in txt) or (txt in ("bull", "bear")):
+            return "TREND"
+        if ("vol" in txt) or ("noise" in txt) or ("random" in txt):
+            return "VOLATILE"
+        if txt in ("chop", "mean_revert", "range"):
+            return "CHOP"
+        h = self._safe_float(hurst_hint, None)
+        if h is not None:
+            try:
+                h_low = float(getattr(mc_config, "hurst_low", 0.45))
+                h_high = float(getattr(mc_config, "hurst_high", 0.55))
+            except Exception:
+                h_low, h_high = 0.45, 0.55
+            if float(h) > float(h_high):
+                return "TREND"
+            if float(h) < float(h_low):
+                return "CHOP"
+            return "VOLATILE"
+        return "CHOP"
+
+    def _resolve_target_hold_sec(
+        self,
+        *,
+        pos: dict | None = None,
+        meta: dict | None = None,
+        regime_hint: str | None = None,
+        hurst_hint: float | None = None,
+        include_min_hold_fallback: bool = True,
+    ) -> tuple[float | None, str, str, float]:
+        """
+        Resolve a single target hold horizon used by both entry and exit policy paths.
+        Returns (target_hold_sec, source_key, regime_key, applied_scale).
+        """
+        p = pos if isinstance(pos, dict) else {}
+        m = meta if isinstance(meta, dict) else {}
+
+        h_hint = self._safe_float(
+            hurst_hint,
+            self._safe_float(
+                m.get("event_exit_dynamic_hurst"),
+                self._safe_float(m.get("hurst"), self._safe_float(m.get("alpha_hurst"), None)),
+            ),
+        )
+        reg_hint = regime_hint
+        if not reg_hint:
+            reg_hint = str(m.get("regime") or p.get("regime") or "")
+        regime_key = self._classify_hold_regime(reg_hint, h_hint)
+
+        def _pick_valid(cands: list[tuple[str, Any]]) -> tuple[float | None, str]:
+            for key, raw in cands:
+                v = self._safe_float(raw, None)
+                if v is None:
+                    continue
+                if not math.isfinite(float(v)):
+                    continue
+                if float(v) <= 0:
+                    continue
+                return float(v), str(key)
+            return None, "none"
+
+        target_hold, src = _pick_valid(
+            [
+                ("pos.target_hold_curr_sec", p.get("target_hold_curr_sec")),
+                ("pos.target_hold_entry_sec", p.get("target_hold_entry_sec")),
+                ("pos.target_hold_sec", p.get("target_hold_sec")),
+                ("pos.opt_hold_curr_sec", p.get("opt_hold_curr_sec")),
+                ("pos.opt_hold_entry_sec", p.get("opt_hold_entry_sec")),
+                ("pos.opt_hold_sec", p.get("opt_hold_sec")),
+                ("pos.event_hold_target_sec", p.get("event_hold_target_sec")),
+                ("meta.target_hold_sec", m.get("target_hold_sec")),
+                ("meta.opt_hold_sec", m.get("opt_hold_sec")),
+                ("meta.unified_t_star", m.get("unified_t_star")),
+                ("meta.policy_horizon_eff_sec", m.get("policy_horizon_eff_sec")),
+                ("meta.best_h", m.get("best_h")),
+                ("meta.event_hold_target_sec", m.get("event_hold_target_sec")),
+            ]
+        )
+
+        if (target_hold is None or target_hold <= 0) and include_min_hold_fallback:
+            fallback = self._safe_float(p.get("policy_min_hold_eff_sec"), None)
+            if fallback is None or fallback <= 0:
+                fallback = self._safe_float(self._effective_min_hold_sec(p), None)
+            if fallback is not None and fallback > 0:
+                target_hold = float(fallback)
+                src = "fallback.min_hold"
+
+        scale_default = 1.0
+        try:
+            raw_scale = os.environ.get(f"TARGET_HOLD_SEC_SCALE_{regime_key}")
+            if raw_scale is None or str(raw_scale).strip() == "":
+                raw_scale = os.environ.get("TARGET_HOLD_SEC_SCALE", scale_default)
+            scale = float(raw_scale)
+        except Exception:
+            scale = float(scale_default)
+        scale = float(max(0.20, min(3.00, scale)))
+
+        def _env_regime_float(base: str, default: float) -> float:
+            try:
+                raw = os.environ.get(f"{base}_{regime_key}")
+                if raw is None or str(raw).strip() == "":
+                    raw = os.environ.get(base, default)
+                return float(raw)
+            except Exception:
+                return float(default)
+
+        min_hold = float(max(0.0, _env_regime_float("TARGET_HOLD_SEC_MIN", 0.0)))
+        max_hold = float(max(0.0, _env_regime_float("TARGET_HOLD_SEC_MAX", 0.0)))
+        if target_hold is None or target_hold <= 0:
+            return None, str(src), str(regime_key), float(scale)
+        target_hold = float(target_hold) * float(scale)
+        if min_hold > 0:
+            target_hold = max(float(target_hold), float(min_hold))
+        if max_hold > 0:
+            target_hold = min(float(target_hold), float(max_hold))
+        return float(target_hold), str(src), str(regime_key), float(scale)
 
     def _advance_exit_confirmation(
         self,
@@ -5614,12 +8042,24 @@ class LiveOrchestrator:
             shock_thr = float(os.environ.get(shock_threshold_env, shock_threshold_default) or shock_threshold_default)
         except Exception:
             shock_thr = float(shock_threshold_default)
+        try:
+            shock_margin = float(os.environ.get("EVENT_EXIT_SHOCK_MODE_MARGIN", 0.20) or 0.20)
+        except Exception:
+            shock_margin = 0.20
+        try:
+            shock_hard_margin = float(os.environ.get("EVENT_EXIT_SHOCK_HARD_MARGIN", 0.45) or 0.45)
+        except Exception:
+            shock_hard_margin = 0.45
+        shock_margin = float(max(0.0, min(1.50, shock_margin)))
+        shock_hard_margin = float(max(float(shock_margin), min(2.50, shock_hard_margin)))
         if mode_hint not in ("shock", "normal", "noise"):
             mode = "noise" if noise_mode else "normal"
         else:
             mode = mode_hint
-        # Always prioritize adverse shock branch when score crosses threshold.
-        if float(shock_score) >= float(shock_thr):
+        # Narrow the shock bucket: require clear margin (or hard margin) over threshold.
+        if float(shock_score) >= float(shock_thr + shock_hard_margin):
+            mode = "shock"
+        elif (mode_hint == "shock") and (float(shock_score) >= float(shock_thr + shock_margin)):
             mode = "shock"
         elif mode == "normal" and noise_mode:
             mode = "noise"
@@ -5628,6 +8068,8 @@ class LiveOrchestrator:
             "shock_score": float(shock_score),
             "noise_mode": bool(noise_mode),
             "shock_threshold": float(shock_thr),
+            "shock_margin": float(shock_margin),
+            "shock_hard_margin": float(shock_hard_margin),
         }
 
     def _event_exit_strict_mode_enabled(self) -> bool:
@@ -5728,12 +8170,47 @@ class LiveOrchestrator:
         cvar_hit = bool(metrics_available and (abs(float(event_cvar_pct)) >= float(cvar_thr)))
         psl_hit = bool(metrics_available and (float(event_p_sl) >= float(psl_thr)))
         ptp_hit = bool(metrics_available and (float(event_p_tp) <= float(ptp_thr)))
+        hit_count = int(bool(score_hit)) + int(bool(cvar_hit)) + int(bool(psl_hit)) + int(bool(ptp_hit))
+        shock_demoted = False
+        if event_mode == "shock":
+            try:
+                shock_require_adverse = str(os.environ.get("EVENT_EXIT_SHOCK_REQUIRE_ADVERSE", "1")).strip().lower() in (
+                    "1", "true", "yes", "on"
+                )
+            except Exception:
+                shock_require_adverse = True
+            if shock_require_adverse:
+                try:
+                    shock_min_psl = float(os.environ.get("EVENT_EXIT_SHOCK_MIN_PSL", 0.88) or 0.88)
+                except Exception:
+                    shock_min_psl = 0.88
+                try:
+                    shock_min_cvar = float(os.environ.get("EVENT_EXIT_SHOCK_MIN_CVAR", 0.025) or 0.025)
+                except Exception:
+                    shock_min_cvar = 0.025
+                try:
+                    shock_min_hits = int(os.environ.get("EVENT_EXIT_SHOCK_MIN_HITS", 2) or 2)
+                except Exception:
+                    shock_min_hits = 2
+                shock_min_psl = float(max(0.0, min(0.999, shock_min_psl)))
+                shock_min_cvar = float(max(0.0, min(1.0, shock_min_cvar)))
+                shock_min_hits = int(max(1, min(4, shock_min_hits)))
+                adverse_ok = bool(
+                    (float(event_p_sl) >= float(shock_min_psl))
+                    or (abs(float(event_cvar_pct)) >= float(shock_min_cvar))
+                    or (int(hit_count) >= int(shock_min_hits))
+                )
+                if not adverse_ok:
+                    shock_demoted = True
+                    event_mode = "noise" if bool(noise_mode_now) else "normal"
         event_exit_hit = bool(score_hit or cvar_hit or psl_hit or ptp_hit)
         return {
             "mode": str(event_mode),
             "shock_score": float(shock_score_now),
             "noise_mode": bool(noise_mode_now),
             "strict_mode": bool(strict_mode),
+            "shock_demoted": bool(shock_demoted),
+            "hit_count": int(hit_count),
             "threshold_score": float(score_thr),
             "threshold_cvar": float(cvar_thr),
             "threshold_psl": float(psl_thr),
@@ -5849,6 +8326,12 @@ class LiveOrchestrator:
             fast_only_shock = str(os.environ.get("EXIT_FAST_ONLY_SHOCK", "1")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             fast_only_shock = True
+        try:
+            allow_nonshock_guard_bypass = str(
+                os.environ.get("EVENT_MC_TSTAR_ALLOW_NONSHOCK_SEVERE_BYPASS", "0")
+            ).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            allow_nonshock_guard_bypass = False
 
         # Default idle confirm state
         confirm_ticks_normal, confirm_reset_sec, confirm_ticks_map = self._get_exit_confirmation_rule(
@@ -5894,6 +8377,14 @@ class LiveOrchestrator:
             tstar_guard_enabled = str(os.environ.get("EVENT_MC_TSTAR_GUARD_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             tstar_guard_enabled = True
+        try:
+            tstar_guard_strict = str(os.environ.get("EVENT_MC_TSTAR_GUARD_STRICT_ENFORCE", "1")).strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+        except Exception:
+            tstar_guard_strict = True
+        if bool(tstar_guard_strict) and mode_norm != "shock":
+            tstar_guard_enabled = True
         if tstar_guard_enabled:
             try:
                 h_low = float(getattr(mc_config, "hurst_low", 0.45))
@@ -5901,53 +8392,39 @@ class LiveOrchestrator:
             except Exception:
                 h_low, h_high = 0.45, 0.55
             try:
-                prog_trend = float(os.environ.get("EVENT_MC_TSTAR_MIN_PROGRESS_TREND", 0.45) or 0.45)
+                prog_trend = float(os.environ.get("EVENT_MC_TSTAR_MIN_PROGRESS_TREND", 0.60) or 0.60)
             except Exception:
-                prog_trend = 0.45
+                prog_trend = 0.60
             try:
-                prog_random = float(os.environ.get("EVENT_MC_TSTAR_MIN_PROGRESS_RANDOM", 0.60) or 0.60)
+                prog_random = float(os.environ.get("EVENT_MC_TSTAR_MIN_PROGRESS_RANDOM", 0.78) or 0.78)
             except Exception:
-                prog_random = 0.60
+                prog_random = 0.78
             try:
-                prog_mr = float(os.environ.get("EVENT_MC_TSTAR_MIN_PROGRESS_MEAN_REVERT", 0.70) or 0.70)
+                prog_mr = float(os.environ.get("EVENT_MC_TSTAR_MIN_PROGRESS_MEAN_REVERT", 0.86) or 0.86)
             except Exception:
-                prog_mr = 0.70
+                prog_mr = 0.86
             try:
-                bypass_shock = float(os.environ.get("EVENT_MC_TSTAR_BYPASS_SHOCK", 1.20) or 1.20)
+                bypass_shock = float(os.environ.get("EVENT_MC_TSTAR_BYPASS_SHOCK", 1.60) or 1.60)
             except Exception:
-                bypass_shock = 1.20
+                bypass_shock = 1.60
             try:
-                bypass_psl = float(os.environ.get("EVENT_MC_TSTAR_BYPASS_PSL", 0.92) or 0.92)
+                bypass_psl = float(os.environ.get("EVENT_MC_TSTAR_BYPASS_PSL", 0.97) or 0.97)
             except Exception:
-                bypass_psl = 0.92
+                bypass_psl = 0.97
             try:
                 entry_ts_ms = self._normalize_entry_time_ms((pos or {}).get("entry_time"), default=ts_ms)
                 age_sec = max(0.0, (int(ts_ms) - int(entry_ts_ms)) / 1000.0)
             except Exception:
                 age_sec = 0.0
-            hold_target_sec = None
-            try:
-                hold_target_sec = float(
-                    (pos or {}).get("opt_hold_curr_sec")
-                    or (pos or {}).get("opt_hold_entry_sec")
-                    or (pos or {}).get("opt_hold_sec")
-                    or m.get("event_hold_target_sec")
-                    or m.get("policy_horizon_eff_sec")
-                    or m.get("best_h")
-                    or 0.0
-                )
-            except Exception:
+            hold_target_sec, hold_target_src, hold_target_regime, hold_target_scale = self._resolve_target_hold_sec(
+                pos=(pos or {}),
+                meta=m,
+                regime_hint=str(m.get("regime") or (pos or {}).get("regime") or ""),
+                hurst_hint=self._safe_float(m.get("event_exit_dynamic_hurst"), self._safe_float(m.get("hurst"), None)),
+                include_min_hold_fallback=True,
+            )
+            if hold_target_sec is None:
                 hold_target_sec = 0.0
-            if not hold_target_sec or hold_target_sec <= 0:
-                try:
-                    hold_target_sec = float(
-                        (pos or {}).get("policy_min_hold_eff_sec")
-                        or self._effective_min_hold_sec(pos or {})
-                        or os.environ.get("EXIT_MIN_HOLD_SEC", 0.0)
-                        or 0.0
-                    )
-                except Exception:
-                    hold_target_sec = 0.0
             try:
                 fallback_floor = float(os.environ.get("EVENT_MC_TSTAR_MIN_HOLD_FALLBACK_SEC", 0.0) or 0.0)
             except Exception:
@@ -5966,7 +8443,11 @@ class LiveOrchestrator:
                     regime_req = prog_mr
                 remaining_sec = max(0.0, float(hold_target_sec) - float(age_sec))
                 severe_adverse_guard = bool(float(p_sl_evt) >= float(bypass_psl) or bool(ptp_low_adverse))
-                if (float(progress) < float(regime_req)) and (float(shock_score) < float(bypass_shock)) and (not severe_adverse_guard):
+                guard_bypass = bool(
+                    (float(shock_score) >= float(bypass_shock))
+                    or (bool(severe_adverse_guard) and (mode_norm == "shock" or bool(allow_nonshock_guard_bypass)))
+                )
+                if (float(progress) < float(regime_req)) and (not guard_bypass):
                     _confirmed, _cnt = self._advance_exit_confirmation(
                         pos,
                         str(confirm_key or "event_exit"),
@@ -5991,12 +8472,18 @@ class LiveOrchestrator:
                         "guard_progress": float(progress),
                         "guard_required": float(regime_req),
                         "guard_hold_target_sec": float(hold_target_sec),
+                        "guard_hold_target_src": str(hold_target_src or "none"),
+                        "guard_hold_target_regime": str(hold_target_regime or ""),
+                        "guard_hold_target_scale": float(hold_target_scale or 1.0),
                         "guard_age_sec": float(age_sec),
                         "guard_remaining_sec": float(remaining_sec),
                     }
 
-        confirm_mode = str(mode_norm)
-        if (not fast_only_shock) and (float(shock_score) >= float(shock_fast_threshold) or bool(severe_adverse)):
+        # Fast exit is shock-only by default. Non-shock severe bypass is explicitly opt-in.
+        confirm_mode = "shock" if mode_norm == "shock" else str(mode_norm)
+        if (confirm_mode != "shock") and (not fast_only_shock) and (
+            float(shock_score) >= float(shock_fast_threshold) or bool(severe_adverse)
+        ):
             confirm_mode = "shock"
 
         confirm_required, confirm_reset_sec, _ticks = self._get_exit_confirmation_rule(
@@ -6009,13 +8496,13 @@ class LiveOrchestrator:
         )
         if confirm_mode != "shock":
             try:
-                non_shock_min = int(os.environ.get("EVENT_EXIT_MIN_CONFIRM_NON_SHOCK", 3) or 3)
+                non_shock_min = int(os.environ.get("EVENT_EXIT_MIN_CONFIRM_NON_SHOCK", 4) or 4)
             except Exception:
-                non_shock_min = 3
+                non_shock_min = 4
             try:
-                noise_min = int(os.environ.get("EVENT_EXIT_MIN_CONFIRM_NOISE", non_shock_min) or non_shock_min)
+                noise_min = int(os.environ.get("EVENT_EXIT_MIN_CONFIRM_NOISE", max(5, non_shock_min)) or max(5, non_shock_min))
             except Exception:
-                noise_min = non_shock_min
+                noise_min = max(5, non_shock_min)
             if confirm_mode == "noise":
                 confirm_required = int(max(confirm_required, max(1, noise_min)))
             else:
@@ -6037,6 +8524,7 @@ class LiveOrchestrator:
             "severe_adverse": bool(severe_adverse),
             "severe_adverse_ptp_low": bool(ptp_low_adverse),
             "fast_only_shock": bool(fast_only_shock),
+            "allow_nonshock_guard_bypass": bool(allow_nonshock_guard_bypass),
             "confirm_mode": str(confirm_mode),
             "confirm_required": int(max(1, confirm_required)),
             "confirm_count": int(confirm_cnt),
@@ -6045,6 +8533,9 @@ class LiveOrchestrator:
             "guard_progress": None,
             "guard_required": None,
             "guard_hold_target_sec": None,
+            "guard_hold_target_src": None,
+            "guard_hold_target_regime": None,
+            "guard_hold_target_scale": None,
             "guard_age_sec": None,
             "guard_remaining_sec": None,
         }
@@ -6102,10 +8593,9 @@ class LiveOrchestrator:
                     return bool(bv)
             return None
 
-        regime = _pick_str(ctx.get("regime"), meta.get("regime"), pos.get("regime"))
+        regime = _pick_str(ctx.get("regime"), meta.get("regime"), pos.get("regime")) or "chop"
         session = _pick_str(ctx.get("session"), meta.get("session"), pos.get("session"))
-        if regime is not None:
-            pos["regime"] = regime
+        pos["regime"] = regime  # always set to prevent empty-regime trades
         if session is not None:
             pos["session"] = session
         entry_id = _pick_str(pos.get("entry_id"), pos.get("entry_link_id"))
@@ -6139,6 +8629,13 @@ class LiveOrchestrator:
             meta.get("event_exit_dynamic_mu_alpha"),
             pos.get("pred_mu_alpha"),
         )
+        try:
+            mu_cap_obs = float(os.environ.get("MU_ALPHA_CAP", 15.0) or 15.0)
+        except Exception:
+            mu_cap_obs = 15.0
+        mu_cap_obs = float(max(0.1, abs(mu_cap_obs)))
+        if mu_alpha is not None:
+            mu_alpha = float(max(-mu_cap_obs, min(mu_cap_obs, float(mu_alpha))))
         mu_alpha_raw = _pick_float(
             meta.get("mu_alpha_raw"),
             (decision or {}).get("mu_alpha_raw") if isinstance(decision, dict) else None,
@@ -6162,6 +8659,14 @@ class LiveOrchestrator:
             pos["pred_mu_dir_conf"] = mu_dir_conf
         if mu_dir_edge is not None:
             pos["pred_mu_dir_edge"] = mu_dir_edge
+        # direction_model_raw_conf: Platt scaling 전 원시 확신도 (calibration feedback용)
+        _dm_raw_conf = _pick_float(
+            meta.get("direction_model_raw_conf"),
+            (decision or {}).get("direction_model_raw_conf") if isinstance(decision, dict) else None,
+            pos.get("direction_model_raw_conf"),
+        )
+        if _dm_raw_conf is not None:
+            pos["direction_model_raw_conf"] = float(_dm_raw_conf)
         try:
             mu_dir_prob_long = _pick_float(
                 meta.get("mu_dir_prob_long"),
@@ -6187,12 +8692,145 @@ class LiveOrchestrator:
             (decision or {}).get("leverage_signal_score") if isinstance(decision, dict) else None,
             pos.get("leverage_signal_score"),
         )
+        leverage_signal_score_legacy = _pick_float(
+            meta.get("leverage_signal_score_legacy"),
+            (decision or {}).get("leverage_signal_score_legacy") if isinstance(decision, dict) else None,
+            pos.get("leverage_signal_score_legacy"),
+        )
+        pre_roe_proxy_score = _pick_float(
+            meta.get("pre_roe_proxy_score"),
+            (decision or {}).get("pre_roe_proxy_score") if isinstance(decision, dict) else None,
+            pos.get("pre_roe_proxy_score"),
+        )
+        pre_roe_proxy_blend = _pick_float(
+            meta.get("pre_roe_proxy_blend"),
+            (decision or {}).get("pre_roe_proxy_blend") if isinstance(decision, dict) else None,
+            pos.get("pre_roe_proxy_blend"),
+        )
+        capital_signal_score = _pick_float(
+            meta.get("capital_signal_score"),
+            (decision or {}).get("capital_signal_score") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_score"),
+        )
+        capital_signal_score_base = _pick_float(
+            meta.get("capital_signal_score_base"),
+            (decision or {}).get("capital_signal_score_base") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_score_base"),
+        )
+        capital_signal_pre_roe = _pick_float(
+            meta.get("capital_signal_pre_roe"),
+            (decision or {}).get("capital_signal_pre_roe") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_pre_roe"),
+        )
+        capital_signal_lev_sig = _pick_float(
+            meta.get("capital_signal_lev_sig"),
+            (decision or {}).get("capital_signal_lev_sig") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_lev_sig"),
+        )
+        capital_signal_entry_q = _pick_float(
+            meta.get("capital_signal_entry_q"),
+            (decision or {}).get("capital_signal_entry_q") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_entry_q"),
+        )
+        capital_signal_dir_conf = _pick_float(
+            meta.get("capital_signal_dir_conf"),
+            (decision or {}).get("capital_signal_dir_conf") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_dir_conf"),
+        )
+        capital_signal_net = _pick_float(
+            meta.get("capital_signal_net"),
+            (decision or {}).get("capital_signal_net") if isinstance(decision, dict) else None,
+            pos.get("capital_signal_net"),
+        )
+        capital_scale_target = _pick_float(
+            meta.get("capital_scale_target"),
+            (decision or {}).get("capital_scale_target") if isinstance(decision, dict) else None,
+            pos.get("capital_scale_target"),
+        )
+        capital_scale = _pick_float(
+            meta.get("capital_scale"),
+            (decision or {}).get("capital_scale") if isinstance(decision, dict) else None,
+            pos.get("capital_scale"),
+        )
+        capital_scale_vpin = _pick_float(
+            meta.get("capital_scale_vpin"),
+            (decision or {}).get("capital_scale_vpin") if isinstance(decision, dict) else None,
+            pos.get("capital_scale_vpin"),
+        )
+        capital_scale_tox = _pick_float(
+            meta.get("capital_scale_tox"),
+            (decision or {}).get("capital_scale_tox") if isinstance(decision, dict) else None,
+            pos.get("capital_scale_tox"),
+        )
+        capital_scale_conf_deficit = _pick_float(
+            meta.get("capital_scale_conf_deficit"),
+            (decision or {}).get("capital_scale_conf_deficit") if isinstance(decision, dict) else None,
+            pos.get("capital_scale_conf_deficit"),
+        )
+        capital_scale_conf_ref = _pick_float(
+            meta.get("capital_scale_conf_ref"),
+            (decision or {}).get("capital_scale_conf_ref") if isinstance(decision, dict) else None,
+            pos.get("capital_scale_conf_ref"),
+        )
+        capital_scale_mu_align = _pick_float(
+            meta.get("capital_scale_mu_align"),
+            (decision or {}).get("capital_scale_mu_align") if isinstance(decision, dict) else None,
+            pos.get("capital_scale_mu_align"),
+        )
+        lev_high_guard_cap = _pick_float(
+            meta.get("lev_high_guard_cap"),
+            (decision or {}).get("lev_high_guard_cap") if isinstance(decision, dict) else None,
+            pos.get("lev_high_guard_cap"),
+        )
+        lev_high_guard_hit = meta.get("lev_high_guard_hit")
+        if lev_high_guard_hit is None and isinstance(decision, dict):
+            lev_high_guard_hit = (decision.get("lev_high_guard_hit") if isinstance(decision, dict) else None)
+        if lev_high_guard_hit is None:
+            lev_high_guard_hit = pos.get("lev_high_guard_hit")
         if entry_quality_score is not None:
             pos["entry_quality_score"] = float(max(0.0, min(1.0, entry_quality_score)))
         if one_way_move_score is not None:
             pos["one_way_move_score"] = float(max(0.0, min(1.0, one_way_move_score)))
         if leverage_signal_score is not None:
             pos["leverage_signal_score"] = float(max(0.0, min(1.0, leverage_signal_score)))
+        if leverage_signal_score_legacy is not None:
+            pos["leverage_signal_score_legacy"] = float(max(0.0, min(1.0, leverage_signal_score_legacy)))
+        if pre_roe_proxy_score is not None:
+            pos["pre_roe_proxy_score"] = float(max(0.0, min(1.0, pre_roe_proxy_score)))
+        if pre_roe_proxy_blend is not None:
+            pos["pre_roe_proxy_blend"] = float(max(0.0, min(1.0, pre_roe_proxy_blend)))
+        if capital_signal_score is not None:
+            pos["capital_signal_score"] = float(max(0.0, min(1.0, capital_signal_score)))
+        if capital_signal_score_base is not None:
+            pos["capital_signal_score_base"] = float(max(0.0, min(1.0, capital_signal_score_base)))
+        if capital_signal_pre_roe is not None:
+            pos["capital_signal_pre_roe"] = float(max(0.0, min(1.0, capital_signal_pre_roe)))
+        if capital_signal_lev_sig is not None:
+            pos["capital_signal_lev_sig"] = float(max(0.0, min(1.0, capital_signal_lev_sig)))
+        if capital_signal_entry_q is not None:
+            pos["capital_signal_entry_q"] = float(max(0.0, min(1.0, capital_signal_entry_q)))
+        if capital_signal_dir_conf is not None:
+            pos["capital_signal_dir_conf"] = float(max(0.0, min(1.0, capital_signal_dir_conf)))
+        if capital_signal_net is not None:
+            pos["capital_signal_net"] = float(max(0.0, min(1.0, capital_signal_net)))
+        if capital_scale_target is not None:
+            pos["capital_scale_target"] = float(max(0.0, capital_scale_target))
+        if capital_scale is not None:
+            pos["capital_scale"] = float(max(0.0, capital_scale))
+        if capital_scale_vpin is not None:
+            pos["capital_scale_vpin"] = float(max(0.0, min(1.0, capital_scale_vpin)))
+        if capital_scale_tox is not None:
+            pos["capital_scale_tox"] = float(max(0.0, capital_scale_tox))
+        if capital_scale_conf_deficit is not None:
+            pos["capital_scale_conf_deficit"] = float(max(0.0, capital_scale_conf_deficit))
+        if capital_scale_conf_ref is not None:
+            pos["capital_scale_conf_ref"] = float(max(0.0, min(1.0, capital_scale_conf_ref)))
+        if capital_scale_mu_align is not None:
+            pos["capital_scale_mu_align"] = float(capital_scale_mu_align)
+        if lev_high_guard_cap is not None:
+            pos["lev_high_guard_cap"] = float(max(1.0, lev_high_guard_cap))
+        if lev_high_guard_hit is not None:
+            pos["lev_high_guard_hit"] = bool(lev_high_guard_hit)
 
         # Exit policy thresholds (dynamic 포함)
         score_th = _pick_float(
@@ -6211,12 +8849,42 @@ class LiveOrchestrator:
             (decision or {}).get("unrealized_dd_floor_dyn") if isinstance(decision, dict) else None,
             pos.get("policy_unrealized_dd_floor"),
         )
+        prelev_floor_dyn = _pick_float(
+            meta.get("prelev_stop2_floor"),
+            meta.get("policy_prelev_stop2_floor"),
+            (decision or {}).get("policy_prelev_stop2_floor") if isinstance(decision, dict) else None,
+            pos.get("policy_prelev_stop2_floor"),
+        )
         if score_th is not None:
             pos["policy_score_threshold"] = score_th
         if event_min_score is not None:
             pos["policy_event_exit_min_score"] = event_min_score
         if dd_floor_dyn is not None:
             pos["policy_unrealized_dd_floor"] = dd_floor_dyn
+        if prelev_floor_dyn is not None:
+            pos["policy_prelev_stop2_floor"] = float(prelev_floor_dyn)
+
+        prelev_ret = _pick_float(meta.get("prelev_stop2_ret"), pos.get("prelev_stop2_ret"))
+        prelev_vpin = _pick_float(meta.get("prelev_stop2_vpin"), pos.get("prelev_stop2_vpin"))
+        prelev_dir_conf = _pick_float(meta.get("prelev_stop2_dir_conf"), pos.get("prelev_stop2_dir_conf"))
+        prelev_gate_hits = _pick_float(meta.get("prelev_stop2_gate_hits"), pos.get("prelev_stop2_gate_hits"))
+        prelev_mode = _pick_str(meta.get("prelev_stop2_mode"), pos.get("prelev_stop2_mode"))
+        prelev_triggered = _pick_bool(meta.get("prelev_stop2_triggered"), pos.get("prelev_stop2_triggered"))
+        prelev_confirmed = _pick_bool(meta.get("prelev_stop2_confirmed"), pos.get("prelev_stop2_confirmed"))
+        if prelev_ret is not None:
+            pos["prelev_stop2_ret"] = float(prelev_ret)
+        if prelev_vpin is not None:
+            pos["prelev_stop2_vpin"] = float(max(0.0, min(1.0, prelev_vpin)))
+        if prelev_dir_conf is not None:
+            pos["prelev_stop2_dir_conf"] = float(max(0.0, min(1.0, prelev_dir_conf)))
+        if prelev_gate_hits is not None:
+            pos["prelev_stop2_gate_hits"] = int(max(0, round(float(prelev_gate_hits))))
+        if prelev_mode is not None:
+            pos["prelev_stop2_mode"] = str(prelev_mode)
+        if prelev_triggered is not None:
+            pos["prelev_stop2_triggered"] = bool(prelev_triggered)
+        if prelev_confirmed is not None:
+            pos["prelev_stop2_confirmed"] = bool(prelev_confirmed)
 
         # Event exit snapshots (precheck/runtime). Keep latest values for ENTER↔EXIT consistency analysis.
         event_score = _pick_float(meta.get("event_exit_score"), pos.get("event_exit_score"))
@@ -6398,6 +9066,11 @@ class LiveOrchestrator:
                 pos["policy_unrealized_dd_floor"] = float(os.environ.get("UNREALIZED_DD_EXIT_ROE", -0.02) or -0.02)
             except Exception:
                 pos["policy_unrealized_dd_floor"] = -0.02
+        if pos.get("policy_prelev_stop2_floor") is None:
+            try:
+                pos["policy_prelev_stop2_floor"] = float(os.environ.get("PRELEV_STOP2_THRESHOLD", -0.02) or -0.02)
+            except Exception:
+                pos["policy_prelev_stop2_floor"] = -0.02
         if not pos.get("entry_id") and pos.get("entry_link_id"):
             pos["entry_id"] = str(pos.get("entry_link_id"))
         if not pos.get("entry_link_id") and pos.get("entry_id"):
@@ -7171,6 +9844,16 @@ class LiveOrchestrator:
             st["last_kline_ts"] = kline_ts
             if closes is not None and len(closes) >= 2:
                 ret = float(math.log(max(closes[-1], 1e-12) / max(closes[-2], 1e-12)))
+                # Warmup: 첫 kline에서 preloaded closes 전체의 log-returns로 hurst_rets 채우기
+                if len(st.get("hurst_rets", [])) == 0 and len(closes) >= 20:
+                    try:
+                        _ca = np.asarray(closes, dtype=np.float64)
+                        _log_rets = np.diff(np.log(np.maximum(_ca, 1e-12)))
+                        for _r in _log_rets[-120:]:  # maxlen=120에 맞춤
+                            st["hurst_rets"].append(float(_r))
+                        print(f"[ALPHA_WARMUP] {sym} hurst_rets bootstrapped with {len(_log_rets[-120:])} returns from preloaded closes")
+                    except Exception as _e:
+                        print(f"[ALPHA_WARMUP_ERR] {sym} {_e}")
                 # training samples (one-step ahead)
                 if str(os.environ.get("ALPHA_WEIGHT_COLLECT", "0")).strip().lower() in ("1", "true", "yes", "on"):
                     prev_vec = st.get("mlofi_last_vec")
@@ -7318,7 +10001,28 @@ class LiveOrchestrator:
                         st["vpin"] = vpin_state
                         st["vpin_last"] = float(vpin_val)
                         st["last_vpin_ts"] = int(kline_ts)
-                    out["vpin"] = float(st.get("vpin_last") or 0.0)
+                        # Diagnostic: VPIN 갱신 로그 (throttle: 첫 3회 또는 5분 주기)
+                        _vpin_log_count = int(st.get("_vpin_log_count", 0))
+                        _vpin_log_last = int(st.get("_vpin_log_last_ts", 0))
+                        if _vpin_log_count < 3 or (int(kline_ts) - _vpin_log_last) >= 300_000:
+                            n_buckets = len(vpin_state.bucket_oi)
+                            print(
+                                f"[ALPHA_VPIN] {sym} vpin={vpin_val:.4f} "
+                                f"dp={dp:.4f} vol={vol:.1f} sigma={sigma:.6f} "
+                                f"bucket_size={vpin_state.bucket_size:.2f} "
+                                f"n_buckets={n_buckets}"
+                            )
+                            st["_vpin_log_count"] = _vpin_log_count + 1
+                            st["_vpin_log_last_ts"] = int(kline_ts)
+                    _vpin_cached = st.get("vpin_last")
+                    _vpin_raw = float(_vpin_cached) if _vpin_cached is not None else 0.0
+                    # Cold-start 방어: bucket 수가 적으면 VPIN 신뢰도 감쇄 → 0.5(중립)으로 수렴
+                    _vpin_n_buckets = len((st.get("vpin") or type('', (), {'bucket_oi': []})()).bucket_oi) if st.get("vpin") else 0
+                    _vpin_min_buckets = int(getattr(mc_config, "vpin_bucket_count", 50)) // 2  # 최소 25개
+                    if _vpin_n_buckets < _vpin_min_buckets:
+                        _vpin_trust = _vpin_n_buckets / max(_vpin_min_buckets, 1)
+                        _vpin_raw = 0.5 * (1.0 - _vpin_trust) + _vpin_raw * _vpin_trust
+                    out["vpin"] = float(_vpin_raw)
 
                 # Hidden Markov Model regime (online Gaussian filter)
                 if bool(getattr(mc_config, "alpha_use_hmm", False)):
@@ -7987,6 +10691,24 @@ class LiveOrchestrator:
         mu_bar, sigma_bar = self._compute_returns_and_vol(closes)
         if sigma_bar is not None and float(sigma_bar) > float(VOLATILITY_MARKET_THRESHOLD):
             return True
+
+        # [2026-02-14] VPIN adverse selection guard: VPIN 높으면 maker 사용 금지
+        if VPIN_MAKER_CANCEL_ENABLED:
+            try:
+                vpin_val = None
+                meta = getattr(self, "_last_meta", {})
+                if isinstance(meta, dict):
+                    vpin_val = meta.get(sym, {}).get("vpin") if isinstance(meta.get(sym), dict) else None
+                if vpin_val is None:
+                    ctx = self._decision_ctx.get(sym) if hasattr(self, "_decision_ctx") else None
+                    if ctx and isinstance(ctx, dict):
+                        vpin_val = ctx.get("vpin")
+                if vpin_val is not None and float(vpin_val) >= VPIN_MAKER_CANCEL_THRESHOLD:
+                    self._log(f"[VPIN_MAKER_CANCEL] {sym} vpin={float(vpin_val):.4f} >= {VPIN_MAKER_CANCEL_THRESHOLD} → force market order")
+                    return True
+            except Exception:
+                pass
+
         return False
 
     def _maybe_place_order(
@@ -8017,6 +10739,10 @@ class LiveOrchestrator:
             return
         if "110007" in str(err_text):
             try:
+                now_rej = int(now_ms())
+            except Exception:
+                now_rej = 0
+            try:
                 lev = float(pos.get("leverage", self.leverage) or self.leverage)
             except Exception:
                 lev = float(self.leverage)
@@ -8042,6 +10768,35 @@ class LiveOrchestrator:
                     "live_free_balance": self._live_free_balance,
                 },
             )
+            try:
+                # Stop further entries in this cycle when exchange already says free balance is insufficient.
+                self._cycle_free_balance = 0.0
+            except Exception:
+                pass
+            try:
+                # Global short cooldown to prevent immediate multi-symbol retry storms.
+                global_block_sec = float(os.environ.get("LIVE_110007_GLOBAL_BLOCK_SEC", 20.0) or 20.0)
+            except Exception:
+                global_block_sec = 20.0
+            if now_rej > 0 and global_block_sec > 0:
+                try:
+                    self._balance_reject_global_until_ms = int(
+                        max(int(self._balance_reject_global_until_ms or 0), now_rej + int(global_block_sec * 1000.0))
+                    )
+                except Exception:
+                    pass
+            try:
+                st = self._balance_reject_110007_by_sym.get(symbol) or {}
+                prev_count = int(st.get("count", 0) or 0)
+                prev_ts = int(st.get("ts", 0) or 0)
+                if prev_ts > 0 and now_rej > 0 and (now_rej - prev_ts) > 600_000:
+                    prev_count = 0
+                self._balance_reject_110007_by_sym[symbol] = {
+                    "count": int(min(20, prev_count + 1)),
+                    "ts": int(now_rej if now_rej > 0 else prev_ts),
+                }
+            except Exception:
+                pass
         try:
             pos["order_status"] = "failed"
             pos["order_error"] = err_text
@@ -8102,6 +10857,29 @@ class LiveOrchestrator:
             return None
         return float(px)
 
+    def _estimate_p_maker(self, *, spread_pct: float, liq_score: float, ofi_z_abs: float) -> float:
+        """
+        Approximate maker fill probability during a short maker timeout window.
+        """
+        try:
+            fixed = os.environ.get("P_MAKER_FIXED")
+            if fixed is not None and str(fixed).strip() != "":
+                return float(max(0.0, min(1.0, float(fixed))))
+        except Exception:
+            pass
+
+        sp = float(max(0.0, spread_pct))
+        liq = float(max(1.0, liq_score))
+        ofi = float(max(0.0, ofi_z_abs))
+        liq_term = math.log(liq)
+        x = 0.35 + 0.12 * liq_term - 900.0 * sp - 0.25 * ofi
+        if x >= 0:
+            p = 1.0 / (1.0 + math.exp(-x))
+        else:
+            ex = math.exp(x)
+            p = ex / (1.0 + ex)
+        return float(max(0.05, min(0.95, p)))
+
     @staticmethod
     def _normalize_regime_bucket(regime: str | None) -> str:
         s = str(regime or "").strip().lower()
@@ -8142,6 +10920,24 @@ class LiveOrchestrator:
             base = float(os.environ.get("LIVE_ENTRY_MIN_NOTIONAL", os.environ.get("MIN_ENTRY_NOTIONAL", 0.0)) or 0.0)
         except Exception:
             base = 0.0
+        try:
+            bal_for_pct = float(self._sizing_balance())
+        except Exception:
+            bal_for_pct = float(self.balance or 0.0)
+        try:
+            min_pct = float(MIN_ENTRY_NOTIONAL_PCT or 0.0)
+        except Exception:
+            min_pct = 0.0
+        if min_pct > 0 and bal_for_pct > 0:
+            try:
+                base = float(max(float(base), float(bal_for_pct) * float(min_pct)))
+            except Exception:
+                pass
+        base_floor_before_tier = float(max(0.0, base))
+        try:
+            strict_base_floor = str(os.environ.get("MIN_ENTRY_NOTIONAL_STRICT_BASE_FLOOR", "0")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            strict_base_floor = False
         bucket = self._normalize_regime_bucket(regime_hint)
         env_key_map = {
             "trend": "LIVE_ENTRY_MIN_NOTIONAL_TREND",
@@ -8157,6 +10953,38 @@ class LiveOrchestrator:
                     base = float(raw)
             except Exception:
                 pass
+        try:
+            tier_enabled = str(os.environ.get("CAPITAL_TIER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            apply_min = str(os.environ.get("CAPITAL_TIER_APPLY_MIN_NOTIONAL", "1")).strip().lower() in ("1", "true", "yes", "on")
+            tier_override_base = str(os.environ.get("CAPITAL_TIER_MIN_NOTIONAL_OVERRIDE_BASE", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            tier_enabled = True
+            apply_min = True
+            tier_override_base = True
+        if tier_enabled and apply_min:
+            try:
+                bal = float(self._sizing_balance())
+            except Exception:
+                bal = float(self.balance or 0.0)
+            tiers = self._parse_env_float_list("CAPITAL_TIER_USDT", [500.0, 1500.0, 3000.0, 6000.0, 9000.0])
+            vals = self._parse_env_float_list("CAPITAL_TIER_MIN_NOTIONAL", [0.1, 0.2, 0.5, 1.0, 2.0, 4.0])
+            if len(vals) < (len(tiers) + 1):
+                vals.extend([vals[-1]] * (len(tiers) + 1 - len(vals)))
+            idx = 0
+            for th in tiers:
+                if float(bal) < float(th):
+                    break
+                idx += 1
+            try:
+                tier_floor = float(vals[min(idx, len(vals) - 1)])
+                if tier_override_base:
+                    base = float(tier_floor)
+                else:
+                    base = float(max(float(base), float(tier_floor)))
+            except Exception:
+                pass
+        if strict_base_floor and base_floor_before_tier > 0:
+            base = float(max(float(base), float(base_floor_before_tier)))
         return float(max(0.0, base)), bucket
 
     def _symbol_amount_constraints(self, symbol: str) -> dict:
@@ -8361,6 +11189,16 @@ class LiveOrchestrator:
         except Exception:
             free_bal = 0.0
         if free_bal <= 0:
+            try:
+                block_nonpos_free = str(os.environ.get("LIVE_ORDER_BLOCK_ON_NONPOSITIVE_FREE", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                block_nonpos_free = True
+            if block_nonpos_free:
+                self._log(
+                    f"[ORDER_GUARD] {symbol} qty blocked by non-positive free balance "
+                    f"(free={free_bal:.8f}, qty={qty:.6f})"
+                )
+                return 0.0
             return qty
         try:
             guard = float(os.environ.get("LIVE_ORDER_BALANCE_GUARD", 0.90) or 0.90)
@@ -8443,23 +11281,36 @@ class LiveOrchestrator:
         reduce_only: bool = False,
         position_side: str | None = None,
         execution_type: str | None = None,
+        _allow_split: bool = True,
+        _enforce_edge_gate: bool = True,
     ):
         """
         실 주문 호출. ENABLE_LIVE_ORDERS가 True일 때만 create_order를 호출한다.
         """
+        # [FIX 2026-02-14] SYMBOL_BLACKLIST 체크 — 상장폐지/금지 심볼 주문 차단
+        try:
+            _bl_raw = str(os.environ.get("SYMBOL_BLACKLIST", "") or "")
+            if _bl_raw:
+                _bl_set = {s.strip() for s in _bl_raw.split(",") if s.strip()}
+                if symbol in _bl_set:
+                    self._log(f"[ORDER] BLOCKED by SYMBOL_BLACKLIST: {symbol}")
+                    return
+        except Exception:
+            pass
         order_side = "buy" if side == "LONG" else "sell"
         exec_type = execution_type or EXECUTION_MODE
         pos_side = position_side or side
         lev_for_order = float(self._dyn_leverage.get(symbol, self.leverage) or self.leverage)
+        submit_start_ms = now_ms()
         params = {
             "reduceOnly": reduce_only,
             "positionIdx": self._position_idx_for_side(pos_side),
         }
         try:
+            pos = self.positions.get(symbol)
             if not reduce_only:
                 try:
                     target_lev = None
-                    pos = self.positions.get(symbol)
                     if pos is not None:
                         target_lev = pos.get("leverage")
                     if target_lev is None:
@@ -8525,6 +11376,74 @@ class LiveOrchestrator:
                 if quantity <= 0:
                     self._handle_entry_order_failure(symbol, side, quantity, "insufficient_balance_or_min_qty")
                     return
+            try:
+                px_hint = self._entry_order_price_hint(symbol, side)
+            except Exception:
+                px_hint = None
+            exec_profile = self._estimate_execution_profile(
+                symbol,
+                side,
+                float(quantity),
+                reduce_only=bool(reduce_only),
+                position_side=pos_side,
+                price_hint=px_hint,
+                pos=pos,
+            )
+            if execution_type is None:
+                exec_type = str(exec_profile.get("selected_exec_type") or exec_type or EXECUTION_MODE)
+            if (not reduce_only) and _enforce_edge_gate and (not bool(exec_profile.get("edge_ok", True))):
+                edge_rate = exec_profile.get("edge_rate")
+                sel_cost = exec_profile.get("selected_cost_rate")
+                self._log(
+                    f"[ORDER_GUARD] {symbol} blocked by exec edge gate "
+                    f"(edge={edge_rate}, cost={sel_cost}, exec={exec_type})"
+                )
+                self._handle_entry_order_failure(symbol, side, quantity, "exec_edge_insufficient")
+                return
+            if isinstance(pos, dict):
+                try:
+                    pos["entry_exec_selected"] = str(exec_type)
+                    pos["entry_exec_cost_rate"] = float(exec_profile.get("selected_cost_rate") or 0.0)
+                    pos["entry_exec_maker_cost_rate"] = float(exec_profile.get("maker_cost_rate") or 0.0)
+                    pos["entry_exec_taker_cost_rate"] = float(exec_profile.get("taker_cost_rate") or 0.0)
+                    pos["entry_exec_p_fill"] = float(exec_profile.get("p_fill") or 0.0)
+                    pos["entry_exec_edge_rate"] = self._safe_float(exec_profile.get("edge_rate"), None)
+                    pos["slippage_est_bps"] = float(exec_profile.get("size_impact_bps") or 0.0)
+                except Exception:
+                    pass
+            if _allow_split:
+                slices, split_meta = self._split_order_quantities(
+                    symbol,
+                    side,
+                    float(quantity),
+                    reduce_only=bool(reduce_only),
+                    price_hint=self._safe_float(exec_profile.get("price"), None),
+                    pos=pos,
+                )
+                if len(slices) > 1:
+                    try:
+                        twap_wait = float(os.environ.get("ORDER_SLICE_TWAP_INTERVAL_SEC", 0.35) or 0.35)
+                    except Exception:
+                        twap_wait = 0.35
+                    twap_wait = float(max(0.0, min(5.0, twap_wait)))
+                    self._log(
+                        f"[ORDER_SPLIT] {symbol} {order_side} qty={float(quantity):.6f} -> {len(slices)} slices "
+                        f"(max_slice={float(split_meta.get('max_slice_qty', 0.0)):.6f}, depth_notional={float(split_meta.get('depth_notional', 0.0)):.2f})"
+                    )
+                    for i, q_child in enumerate(slices):
+                        await self._execute_order(
+                            symbol,
+                            side,
+                            float(q_child),
+                            reduce_only=reduce_only,
+                            position_side=position_side,
+                            execution_type=exec_type,
+                            _allow_split=False,
+                            _enforce_edge_gate=False,
+                        )
+                        if i < len(slices) - 1 and twap_wait > 0:
+                            await asyncio.sleep(twap_wait)
+                    return
             if exec_type == "maker_dynamic" and not self._should_force_market(symbol):
                 ob = self.orderbook.get(symbol)
                 bids = ob.get("bids") if ob else []
@@ -8537,6 +11456,13 @@ class LiveOrchestrator:
                 if price is not None and price > 0:
                     limit_order = await self.exchange.create_order(symbol, "limit", order_side, quantity, price, params)
                     order_id = limit_order.get("id") if isinstance(limit_order, dict) else None
+                    if isinstance(pos, dict) and order_id:
+                        try:
+                            pos["last_order_id"] = str(order_id)
+                            if not reduce_only:
+                                pos["order_id"] = str(order_id)
+                        except Exception:
+                            pass
                     self._log(f"[ORDER] maker {symbol} {order_side} qty={quantity:.6f} px={price:.4f} reduce_only={reduce_only}")
                     await asyncio.sleep(MAKER_TIMEOUT_SEC)
                     if order_id:
@@ -8545,15 +11471,41 @@ class LiveOrchestrator:
                             remaining = float(fetched.get("remaining", 0.0) or 0.0)
                             status = str(fetched.get("status", ""))
                         except Exception:
-                            remaining = float(quantity)
-                            status = "unknown"
-                        if status.lower() == "closed" or remaining <= 0:
+                            # reduce-only 주문에서 fetch 실패 시 이미 체결된 것으로 간주
+                            # (이중 주문 방지 — position is zero 에러 615건 원인)
+                            if reduce_only:
+                                remaining = 0.0
+                                status = "assumed_filled"
+                                self._log(f"[ORDER] maker fetch failed (reduce_only): {symbol} — assumed filled, skip taker fallback")
+                            else:
+                                remaining = float(quantity)
+                                status = "unknown"
+                        if status.lower() in ("closed", "assumed_filled") or remaining <= 0:
                             self._log(f"[ORDER] maker filled: {symbol} {order_side} id={order_id}")
+                            fill_px, fill_qty, fee_rate = self._extract_order_fill(fetched if 'fetched' in locals() else limit_order, price, quantity)
+                            self._record_order_slippage(
+                                symbol=symbol,
+                                side=side,
+                                exec_type="maker_dynamic",
+                                selected_exec_type=str(exec_type) if exec_type is not None else None,
+                                target_price=price,
+                                fill_price=fill_px,
+                                qty=fill_qty if fill_qty is not None else quantity,
+                                estimated_slippage_bps=self._safe_float(exec_profile.get("size_impact_bps"), None),
+                                fee_rate=fee_rate,
+                                volatility=self._safe_float(exec_profile.get("sigma"), None),
+                                latency_ms=float(max(0, now_ms() - submit_start_ms)),
+                                fill_source="fetch_order",
+                            )
                             if not reduce_only:
                                 pos = self.positions.get(symbol)
                                 if pos is not None:
                                     pos["order_status"] = "ack"
                                     pos["order_ack_ts"] = now_ms()
+                                    pos["exec_type"] = "maker_dynamic"
+                                    pos["exec_fill_price"] = fill_px
+                                    if fee_rate is not None:
+                                        pos["fee_rate"] = float(fee_rate)
                                 try:
                                     self._balance_reject_110007_by_sym.pop(symbol, None)
                                 except Exception:
@@ -8563,26 +11515,96 @@ class LiveOrchestrator:
                             await self.exchange.cancel_order(order_id, symbol)
                         except Exception as cancel_err:
                             self._log_err(f"[ORDER] maker cancel failed: {symbol} id={order_id} err={cancel_err}")
+                            # cancel 실패 = 이미 체결/만료 → reduce-only에서는 taker fallback 생략
+                            if reduce_only:
+                                self._log(f"[ORDER] reduce_only cancel fail → skip taker fallback: {symbol}")
+                                return
                         if remaining > 0:
-                            await self.exchange.create_order(symbol, "market", order_side, remaining, None, params)
+                            mkt_order = await self.exchange.create_order(symbol, "market", order_side, remaining, None, params)
+                            if isinstance(pos, dict):
+                                try:
+                                    mkt_order_id = mkt_order.get("id") if isinstance(mkt_order, dict) else None
+                                    if mkt_order_id:
+                                        pos["last_order_id"] = str(mkt_order_id)
+                                        if not reduce_only:
+                                            pos["order_id"] = str(mkt_order_id)
+                                except Exception:
+                                    pass
                             self._log(f"[ORDER] taker fallback: {symbol} {order_side} qty={remaining:.6f} reduce_only={reduce_only}")
+                            fill_px, fill_qty, fee_rate, fill_source = await self._resolve_order_fill(
+                                symbol,
+                                mkt_order if isinstance(mkt_order, dict) else None,
+                                price,
+                                remaining,
+                            )
+                            self._record_order_slippage(
+                                symbol=symbol,
+                                side=side,
+                                exec_type="maker_fallback_market",
+                                selected_exec_type=str(exec_type) if exec_type is not None else None,
+                                target_price=price,
+                                fill_price=fill_px,
+                                qty=fill_qty if fill_qty is not None else remaining,
+                                estimated_slippage_bps=self._safe_float(exec_profile.get("size_impact_bps"), None),
+                                fee_rate=fee_rate,
+                                volatility=self._safe_float(exec_profile.get("sigma"), None),
+                                latency_ms=float(max(0, now_ms() - submit_start_ms)),
+                                fill_source=fill_source,
+                            )
                             if not reduce_only:
                                 pos = self.positions.get(symbol)
                                 if pos is not None:
                                     pos["order_status"] = "ack"
                                     pos["order_ack_ts"] = now_ms()
+                                    pos["exec_type"] = "maker_fallback_market"
+                                    pos["exec_fill_price"] = fill_px
+                                    if fee_rate is not None:
+                                        pos["fee_rate"] = float(fee_rate)
                                 try:
                                     self._balance_reject_110007_by_sym.pop(symbol, None)
                                 except Exception:
                                     pass
                             return
-            await self.exchange.create_order(symbol, "market", order_side, quantity, None, params)
+            mkt_order = await self.exchange.create_order(symbol, "market", order_side, quantity, None, params)
+            if isinstance(pos, dict):
+                try:
+                    mkt_order_id = mkt_order.get("id") if isinstance(mkt_order, dict) else None
+                    if mkt_order_id:
+                        pos["last_order_id"] = str(mkt_order_id)
+                        if not reduce_only:
+                            pos["order_id"] = str(mkt_order_id)
+                except Exception:
+                    pass
             self._log(f"[ORDER] {symbol} {order_side} {quantity:.6f} reduce_only={reduce_only}")
+            fill_px, fill_qty, fee_rate, fill_source = await self._resolve_order_fill(
+                symbol,
+                mkt_order if isinstance(mkt_order, dict) else None,
+                self._safe_float(exec_profile.get("price"), None),
+                quantity,
+            )
+            self._record_order_slippage(
+                symbol=symbol,
+                side=side,
+                exec_type="market",
+                selected_exec_type=str(exec_type) if exec_type is not None else None,
+                target_price=self._safe_float(exec_profile.get("price"), None),
+                fill_price=fill_px,
+                qty=fill_qty if fill_qty is not None else quantity,
+                estimated_slippage_bps=self._safe_float(exec_profile.get("size_impact_bps"), None),
+                fee_rate=fee_rate,
+                volatility=self._safe_float(exec_profile.get("sigma"), None),
+                latency_ms=float(max(0, now_ms() - submit_start_ms)),
+                fill_source=fill_source,
+            )
             if not reduce_only:
                 pos = self.positions.get(symbol)
                 if pos is not None:
                     pos["order_status"] = "ack"
                     pos["order_ack_ts"] = now_ms()
+                    pos["exec_type"] = "market"
+                    pos["exec_fill_price"] = fill_px
+                    if fee_rate is not None:
+                        pos["fee_rate"] = float(fee_rate)
                 try:
                     self._balance_reject_110007_by_sym.pop(symbol, None)
                 except Exception:
@@ -8616,15 +11638,47 @@ class LiveOrchestrator:
                     if retry_qty_curr <= 0 or retry_qty_curr >= retry_qty_prev:
                         break
                     try:
-                        await self.exchange.create_order(symbol, "market", order_side, retry_qty_curr, None, params)
+                        retry_order = await self.exchange.create_order(symbol, "market", order_side, retry_qty_curr, None, params)
+                        if isinstance(self.positions.get(symbol), dict):
+                            try:
+                                retry_order_id = retry_order.get("id") if isinstance(retry_order, dict) else None
+                                if retry_order_id:
+                                    self.positions[symbol]["last_order_id"] = str(retry_order_id)
+                                    self.positions[symbol]["order_id"] = str(retry_order_id)
+                            except Exception:
+                                pass
                         self._log(
                             f"[ORDER_RETRY_110007] {symbol} {order_side} retry success "
                             f"attempt={retry_idx + 1}/{retry_max_attempts} qty={float(quantity):.6f}->{float(retry_qty_curr):.6f}"
+                        )
+                        fill_px, fill_qty, fee_rate, fill_source = await self._resolve_order_fill(
+                            symbol,
+                            retry_order if isinstance(retry_order, dict) else None,
+                            self._safe_float(exec_profile.get("price"), None) if "exec_profile" in locals() else None,
+                            retry_qty_curr,
+                        )
+                        self._record_order_slippage(
+                            symbol=symbol,
+                            side=side,
+                            exec_type="market_retry_110007",
+                            selected_exec_type=str(exec_type) if "exec_type" in locals() else None,
+                            target_price=self._safe_float(exec_profile.get("price"), None) if "exec_profile" in locals() else None,
+                            fill_price=fill_px,
+                            qty=fill_qty if fill_qty is not None else retry_qty_curr,
+                            estimated_slippage_bps=self._safe_float(exec_profile.get("size_impact_bps"), None) if "exec_profile" in locals() else None,
+                            fee_rate=fee_rate,
+                            volatility=self._safe_float(exec_profile.get("sigma"), None) if "exec_profile" in locals() else None,
+                            latency_ms=float(max(0, now_ms() - submit_start_ms)),
+                            fill_source=fill_source,
                         )
                         pos = self.positions.get(symbol)
                         if pos is not None:
                             pos["order_status"] = "ack"
                             pos["order_ack_ts"] = now_ms()
+                            pos["exec_type"] = "market_retry_110007"
+                            pos["exec_fill_price"] = fill_px
+                            if fee_rate is not None:
+                                pos["fee_rate"] = float(fee_rate)
                         try:
                             self._balance_reject_110007_by_sym.pop(symbol, None)
                         except Exception:
@@ -8650,6 +11704,17 @@ class LiveOrchestrator:
                 if retry_last_err is not None:
                     err_text = f"{err_text} | retry_err={retry_last_err}"
             self._log_err(f"[ERR] order {symbol} {order_side}: {err_text}")
+            # [FIX 2026-02-14] 30228 (delisting) 에러 시 자동 블랙리스트
+            if "30228" in err_text or "delisting" in err_text.lower():
+                try:
+                    bl_raw = str(os.environ.get("SYMBOL_BLACKLIST", "") or "")
+                    bl_set = {s.strip() for s in bl_raw.split(",") if s.strip()}
+                    if symbol not in bl_set:
+                        bl_set.add(symbol)
+                        os.environ["SYMBOL_BLACKLIST"] = ",".join(bl_set)
+                        self._log(f"[BLACKLIST] {symbol} auto-blacklisted (delisting detected)")
+                except Exception:
+                    pass
             if not reduce_only:
                 self._handle_entry_order_failure(symbol, side, quantity, err_text)
 
@@ -8868,6 +11933,13 @@ class LiveOrchestrator:
             use_cycle_reserve=True,
             ignore_caps=ignore_caps,
         )
+        # Update lev to use CF-optimal leverage from compute_unified_sizing
+        try:
+            cf_lev = self._safe_float((decision.get("meta") or {}).get("sizing_cf_best_lev"), None)
+            if cf_lev is not None and cf_lev >= 1.0:
+                lev = float(cf_lev)
+        except Exception:
+            pass
         qty = self._precision_aware_entry_quantity(
             sym,
             side,
@@ -8931,6 +12003,8 @@ class LiveOrchestrator:
         leverage_signal_score = None
         opt_hold_sec = None
         opt_hold_src = None
+        opt_hold_regime = None
+        opt_hold_scale = None
         if decision:
             entry_score = decision.get("unified_score")
             if entry_score is None:
@@ -8945,20 +12019,20 @@ class LiveOrchestrator:
                 entry_floor = meta.get("hybrid_entry_floor")
             if entry_floor is None:
                 entry_floor = meta.get("score_threshold")
-            opt_hold_sec = meta.get("opt_hold_sec")
-            if opt_hold_sec is None:
-                opt_hold_sec = meta.get("unified_t_star")
-            if opt_hold_sec is None:
-                opt_hold_sec = meta.get("policy_horizon_eff_sec") or meta.get("best_h")
-            try:
+            opt_hold_sec, opt_hold_src, opt_hold_regime, opt_hold_scale = self._resolve_target_hold_sec(
+                pos=None,
+                meta=meta,
+                regime_hint=((ctx or {}).get("regime") or _dget("regime")),
+                hurst_hint=self._safe_float((ctx or {}).get("hurst"), None),
+                include_min_hold_fallback=False,
+            )
+            if isinstance(meta, dict):
                 if opt_hold_sec is not None:
-                    opt_hold_sec = float(opt_hold_sec)
-                    if not math.isfinite(opt_hold_sec) or opt_hold_sec <= 0:
-                        opt_hold_sec = None
-            except Exception:
-                opt_hold_sec = None
-            if opt_hold_sec is not None:
-                opt_hold_src = "entry_meta"
+                    meta["target_hold_sec"] = float(opt_hold_sec)
+                meta["target_hold_src"] = str(opt_hold_src or "none")
+                meta["target_hold_regime"] = str(opt_hold_regime or "")
+                if opt_hold_scale is not None:
+                    meta["target_hold_scale"] = float(opt_hold_scale)
             entry_quality_score = _dget("entry_quality_score")
             one_way_move_score = _dget("one_way_move_score")
             leverage_signal_score = _dget("leverage_signal_score")
@@ -8978,12 +12052,81 @@ class LiveOrchestrator:
                 gap_ref = 0.0030
             gap_ref = max(gap_ref, 1e-6)
             conf_v = float(max(0.0, min(1.0, self._safe_float(decision.get("confidence") if decision else 0.0, 0.0) or 0.0)))
-            dir_conf_v = float(max(0.0, min(1.0, self._safe_float(_dget("mu_dir_conf"), conf_v) or conf_v)))
+            dir_prob_long_v = self._safe_float(_dget("mu_dir_prob_long"), None)
+            dir_conf_ctx_v = self._safe_float(_dget("mu_dir_conf"), None)
+            dir_conf_prob_v = None
+            if dir_prob_long_v is not None:
+                try:
+                    dir_prob_long_v = float(max(0.0, min(1.0, float(dir_prob_long_v))))
+                    dir_conf_prob_v = float(max(dir_prob_long_v, 1.0 - dir_prob_long_v))
+                except Exception:
+                    dir_conf_prob_v = None
+            try:
+                conf_source_v = str(os.environ.get("ALPHA_DIRECTION_CONF_SOURCE", "auto")).strip().lower()
+            except Exception:
+                conf_source_v = "auto"
+            try:
+                conf_mismatch_tol_v = float(os.environ.get("ALPHA_DIRECTION_CONF_MISMATCH_TOL", 0.08) or 0.08)
+            except Exception:
+                conf_mismatch_tol_v = 0.08
+            conf_mismatch_tol_v = float(max(0.0, min(0.5, conf_mismatch_tol_v)))
+            if dir_conf_prob_v is not None:
+                if conf_source_v == "probability":
+                    dir_conf_eff_v = float(dir_conf_prob_v)
+                elif conf_source_v == "context":
+                    dir_conf_eff_v = self._safe_float(dir_conf_ctx_v, float(dir_conf_prob_v))
+                else:
+                    if (dir_conf_ctx_v is None) or (not math.isfinite(float(dir_conf_ctx_v))) or (
+                        abs(float(dir_conf_ctx_v) - float(dir_conf_prob_v)) > float(conf_mismatch_tol_v)
+                    ):
+                        dir_conf_eff_v = float(dir_conf_prob_v)
+                    else:
+                        dir_conf_eff_v = float(dir_conf_ctx_v)
+            else:
+                dir_conf_eff_v = self._safe_float(dir_conf_ctx_v, conf_v)
+            dir_conf_v = float(max(0.0, min(1.0, dir_conf_eff_v if dir_conf_eff_v is not None else conf_v)))
             dir_edge_v = abs(float(self._safe_float(_dget("mu_dir_edge"), 0.0) or 0.0))
             ev_gap_v = abs(float(self._safe_float(_dget("policy_ev_gap", _dget("ev_gap", 0.0)), 0.0) or 0.0))
             edge_n = _clip01(dir_edge_v / edge_ref)
             gap_n = _clip01(ev_gap_v / gap_ref)
-            entry_quality_score = _clip01(0.45 * conf_v + 0.30 * dir_conf_v + 0.15 * edge_n + 0.10 * gap_n)
+            reg_now = str((ctx or {}).get("regime") or _dget("regime") or "chop").strip().lower()
+            if ("vol" in reg_now) or ("random" in reg_now) or ("noise" in reg_now):
+                reg_key = "VOLATILE"
+            elif "trend" in reg_now:
+                reg_key = "TREND"
+            else:
+                reg_key = "CHOP"
+            if reg_key == "TREND":
+                w_conf, w_dir_conf, w_edge, w_gap = 0.36, 0.32, 0.20, 0.12
+            elif reg_key == "VOLATILE":
+                w_conf, w_dir_conf, w_edge, w_gap = 0.44, 0.22, 0.22, 0.12
+            else:
+                w_conf, w_dir_conf, w_edge, w_gap = 0.50, 0.16, 0.20, 0.14
+            def _w_env(name: str, default: float) -> float:
+                try:
+                    raw = os.environ.get(f"{name}_{reg_key}")
+                    if raw is None or str(raw).strip() == "":
+                        raw = os.environ.get(name)
+                    if raw is None or str(raw).strip() == "":
+                        return float(default)
+                    return float(raw)
+                except Exception:
+                    return float(default)
+            w_conf = _w_env("ENTRY_QUALITY_W_CONF", w_conf)
+            w_dir_conf = _w_env("ENTRY_QUALITY_W_DIR_CONF", w_dir_conf)
+            w_edge = _w_env("ENTRY_QUALITY_W_EDGE", w_edge)
+            w_gap = _w_env("ENTRY_QUALITY_W_GAP", w_gap)
+            w_sum = max(1e-9, float(w_conf + w_dir_conf + w_edge + w_gap))
+            w_conf /= w_sum
+            w_dir_conf /= w_sum
+            w_edge /= w_sum
+            w_gap /= w_sum
+            entry_quality_score = _clip01(
+                float(w_conf) * conf_v
+                + float(w_dir_conf) * dir_conf_v
+                + float(w_edge) * edge_n
+                + float(w_gap) * gap_n
+            )
         else:
             entry_quality_score = _clip01(self._safe_float(entry_quality_score, 0.0) or 0.0)
 
@@ -9032,6 +12175,14 @@ class LiveOrchestrator:
             )
         opt_hold_entry_sec = int(round(opt_hold_sec)) if opt_hold_sec is not None else None
         entry_link_id = self._new_trade_uid()
+        try:
+            mu_cap_obs = float(os.environ.get("MU_ALPHA_CAP", 15.0) or 15.0)
+        except Exception:
+            mu_cap_obs = 15.0
+        mu_cap_obs = float(max(0.1, abs(mu_cap_obs)))
+        mu_alpha_entry = self._safe_float(_dget("mu_alpha"), None)
+        if mu_alpha_entry is not None:
+            mu_alpha_entry = float(max(-mu_cap_obs, min(mu_cap_obs, float(mu_alpha_entry))))
         pos = {
             "symbol": sym,
             "side": side,
@@ -9058,7 +12209,7 @@ class LiveOrchestrator:
             "pred_event_ev_r": _dget("event_ev_r"),
             "pred_event_p_tp": _dget("event_p_tp"),
             "pred_event_p_sl": _dget("event_p_sl"),
-            "pred_mu_alpha": _dget("mu_alpha"),
+            "pred_mu_alpha": mu_alpha_entry,
             "pred_mu_alpha_raw": _dget("mu_alpha_raw"),
             "pred_mu_dir_conf": _dget("mu_dir_conf"),
             "pred_mu_dir_edge": _dget("mu_dir_edge"),
@@ -9077,6 +12228,7 @@ class LiveOrchestrator:
             "policy_score_threshold": _dget("policy_score_threshold_eff", _dget("policy_score_threshold")),
             "policy_event_exit_min_score": _dget("event_exit_min_score"),
             "policy_unrealized_dd_floor": _dget("unrealized_dd_floor_dyn"),
+            "policy_prelev_stop2_floor": _dget("prelev_stop2_floor", _dget("policy_prelev_stop2_floor")),
             "lev_source": _dget("lev_source"),
             "lev_raw_before_caps": _dget("lev_raw_before_caps"),
             "lev_raw_ev_component": _dget("lev_raw_ev_component"),
@@ -9111,6 +12263,12 @@ class LiveOrchestrator:
             "opt_hold_curr_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
             "opt_hold_curr_remaining_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
             "opt_hold_curr_src": opt_hold_src,
+            "target_hold_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
+            "target_hold_src": opt_hold_src,
+            "target_hold_entry_sec": opt_hold_entry_sec,
+            "target_hold_curr_sec": int(round(opt_hold_sec)) if opt_hold_sec is not None else None,
+            "target_hold_regime": opt_hold_regime,
+            "target_hold_scale": float(opt_hold_scale) if opt_hold_scale is not None else None,
         }
         self._capture_position_observability(pos, decision=decision, ctx=ctx)
         # 진입 수수료 선반영
@@ -9408,13 +12566,97 @@ class LiveOrchestrator:
             return
         lev = leverage_override if leverage_override is not None else pos.get("leverage", self.leverage)
         target_size_frac, target_notional, target_qty = self._calc_position_size(decision, price, lev, symbol=sym)
-        if target_notional <= 0:
-            # 목표 노출이 0이면 전량 청산
-            self._close_position(sym, price, "rebalance to zero")
-            self._last_rebalance_ts[sym] = time.time()
-            return
         curr_notional = float(pos.get("notional", 0.0))
+        # If we're no longer in a zero-target regime, clear any previous partial-zero anchor so future
+        # rebalances don't inherit stale anchors.
+        if target_notional and float(target_notional) > 0.0:
+            try:
+                pos.pop("rebalance_zero_partial_anchor_notional", None)
+            except Exception:
+                pass
         now = time.time()
+        if target_notional <= 0:
+            # 비리스크 상황에서는 전량청산 대신 부분 축소로 보수적으로 디레버리징한다.
+            try:
+                zero_partial_enabled = str(
+                    os.environ.get("REBALANCE_ZERO_PARTIAL_ENABLED", "1")
+                ).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                zero_partial_enabled = True
+            try:
+                zero_partial_retain_frac = float(os.environ.get("REBALANCE_ZERO_PARTIAL_RETAIN_FRAC", 0.20) or 0.20)
+            except Exception:
+                zero_partial_retain_frac = 0.20
+            try:
+                zero_partial_min_notional = float(
+                    os.environ.get("REBALANCE_ZERO_PARTIAL_MIN_NOTIONAL", REBALANCE_MIN_NOTIONAL) or REBALANCE_MIN_NOTIONAL
+                )
+            except Exception:
+                zero_partial_min_notional = float(REBALANCE_MIN_NOTIONAL or 0.0)
+            try:
+                risk_shock_min = float(os.environ.get("REBALANCE_ZERO_RISK_SHOCK_MIN", 1.20) or 1.20)
+            except Exception:
+                risk_shock_min = 1.20
+            meta_zero = (decision or {}).get("meta") if isinstance(decision, dict) else {}
+            meta_zero = meta_zero if isinstance(meta_zero, dict) else {}
+            reason_zero = str((decision or {}).get("reason") or "").strip().lower() if isinstance(decision, dict) else ""
+            event_mode_zero = str(meta_zero.get("event_exit_mode") or meta_zero.get("event_exit_confirm_mode") or "").strip().lower()
+            shock_score_zero = self._safe_float(
+                meta_zero.get("event_exit_shock_score"),
+                self._safe_float(meta_zero.get("shock_score"), 0.0),
+            ) or 0.0
+            risk_zero = bool(
+                bool(self.safety_mode)
+                or ("risk" in reason_zero)
+                or ("liquidat" in reason_zero)
+                or ("drawdown" in reason_zero)
+                or ("emergency" in reason_zero)
+                or ("kill" in reason_zero)
+                or (event_mode_zero == "shock")
+                or (float(shock_score_zero) >= float(risk_shock_min))
+            )
+            if zero_partial_enabled and (not risk_zero) and curr_notional > 0:
+                zero_partial_retain_frac = float(np.clip(zero_partial_retain_frac, 0.02, 0.95))
+                # IMPORTANT: avoid geometric decay (20% of 20% of ...) across repeated ticks.
+                # Anchor the retain target to the *first* partial-zero notional.
+                anchor_notional = None
+                try:
+                    anchor_notional = float(pos.get("rebalance_zero_partial_anchor_notional"))
+                except Exception:
+                    anchor_notional = None
+                if anchor_notional is None or anchor_notional <= 0 or (not bool(pos.get("rebalance_zero_partial_applied"))):
+                    anchor_notional = float(curr_notional)
+
+                retain_notional = float(anchor_notional) * float(zero_partial_retain_frac)
+                retain_notional = float(max(retain_notional, float(max(0.0, zero_partial_min_notional))))
+                # If we're already at/under the anchored retain target, do not keep shrinking.
+                if float(curr_notional) <= float(retain_notional) * 1.001:
+                    target_notional = float(curr_notional)
+                # 목표값과 동일/상회하면 전량청산 fallback으로 되돌린다.
+                elif retain_notional < float(curr_notional) * 0.999:
+                    target_notional = float(retain_notional)
+                    target_qty = float(target_notional / price) if price and target_notional > 0 else 0.0
+                    try:
+                        base_balance = float(self._sizing_balance())
+                    except Exception:
+                        base_balance = float(self.balance or 0.0)
+                    if base_balance > 0 and lev:
+                        target_size_frac = float(target_notional) / max(base_balance * max(float(lev), 1e-6), 1e-6)
+                    try:
+                        pos["rebalance_zero_partial_applied"] = True
+                        pos["rebalance_zero_partial_anchor_notional"] = float(anchor_notional)
+                        pos["rebalance_zero_partial_retain_frac"] = float(zero_partial_retain_frac)
+                        pos["rebalance_zero_partial_target_notional"] = float(target_notional)
+                    except Exception:
+                        pass
+                else:
+                    target_notional = 0.0
+            if target_notional <= 0:
+                # 리스크 또는 최소잔량 불가 케이스: 전량 정리.
+                close_reason = "rebalance to zero_risk" if risk_zero else "rebalance to zero"
+                self._close_position(sym, price, close_reason)
+                self._last_rebalance_ts[sym] = time.time()
+                return
         cap_forced_reduce = False
         # Enforce total exposure cap during rebalances as well
         if self.exposure_cap_enabled:
@@ -9423,7 +12665,8 @@ class LiveOrchestrator:
             except Exception:
                 cap_balance = float(self.balance or 0.0)
             try:
-                cap_total = float(cap_balance) * float(self.max_notional_frac)
+                cap_frac = float(self._effective_total_exposure_cap(float(cap_balance)))
+                cap_total = float(cap_balance) * float(cap_frac)
             except Exception:
                 cap_total = float(cap_balance) * float(self.max_notional_frac or 0.0)
             try:
@@ -9658,10 +12901,113 @@ class LiveOrchestrator:
                 default_noise=3,
                 default_reset_sec=180.0,
             )
+            # Strengthen event-driven shock exits: require consecutive ticks unless the shock is severe.
+            # (prevents single-tick noisy shock demotions from forcing early exits.)
+            try:
+                decision_reason_raw = str((decision or {}).get("reason") or "").strip()
+            except Exception:
+                decision_reason_raw = ""
+            is_event_exit_reason = False
+            try:
+                is_event_exit_reason = bool(self._is_event_exit_reason(decision_reason_raw))
+            except Exception:
+                is_event_exit_reason = False
+            if confirm_mode == "shock" and is_event_exit_reason:
+                try:
+                    severe_score_min = float(os.environ.get("EVENT_EXIT_SHOCK_SEVERE_SCORE_MIN", 1.60) or 1.60)
+                except Exception:
+                    severe_score_min = 1.60
+                shock_score_evt = float(hybrid_mode_state.get("shock_score") or 0.0)
+                severe_evt = bool(shock_score_evt >= float(severe_score_min))
+                if not severe_evt:
+                    try:
+                        evt_min_ticks = int(os.environ.get("EVENT_EXIT_CONFIRM_TICKS_SHOCK", 2) or 2)
+                    except Exception:
+                        evt_min_ticks = 2
+                    confirm_required = int(max(confirm_required, max(2, int(evt_min_ticks))))
+            if confirm_mode != "shock":
+                try:
+                    hybrid_non_shock_min = int(os.environ.get("HYBRID_EXIT_MIN_CONFIRM_NON_SHOCK", 4) or 4)
+                except Exception:
+                    hybrid_non_shock_min = 4
+                try:
+                    hybrid_noise_min = int(os.environ.get("HYBRID_EXIT_MIN_CONFIRM_NOISE", max(5, hybrid_non_shock_min)) or max(5, hybrid_non_shock_min))
+                except Exception:
+                    hybrid_noise_min = max(5, hybrid_non_shock_min)
+                if confirm_mode == "noise":
+                    confirm_required = int(max(confirm_required, max(1, hybrid_noise_min)))
+                else:
+                    confirm_required = int(max(confirm_required, max(1, hybrid_non_shock_min)))
+
+            hybrid_guarded = False
+            hybrid_guard_progress = None
+            hybrid_guard_required = None
+            hybrid_guard_hold_target_sec = None
+            if confirm_mode != "shock":
+                try:
+                    hybrid_guard_enabled = str(os.environ.get("HYBRID_EXIT_TSTAR_GUARD_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    hybrid_guard_enabled = True
+                if hybrid_guard_enabled:
+                    try:
+                        h_low = float(getattr(mc_config, "hurst_low", 0.45))
+                        h_high = float(getattr(mc_config, "hurst_high", 0.55))
+                    except Exception:
+                        h_low, h_high = 0.45, 0.55
+                    try:
+                        hyb_prog_trend = float(os.environ.get("HYBRID_EXIT_MIN_PROGRESS_TREND", 0.62) or 0.62)
+                    except Exception:
+                        hyb_prog_trend = 0.62
+                    try:
+                        hyb_prog_random = float(os.environ.get("HYBRID_EXIT_MIN_PROGRESS_RANDOM", 0.86) or 0.86)
+                    except Exception:
+                        hyb_prog_random = 0.86
+                    try:
+                        hyb_prog_mr = float(os.environ.get("HYBRID_EXIT_MIN_PROGRESS_MEAN_REVERT", 0.92) or 0.92)
+                    except Exception:
+                        hyb_prog_mr = 0.92
+                    try:
+                        hyb_bypass_shock = float(os.environ.get("HYBRID_EXIT_TSTAR_BYPASS_SHOCK", 1.35) or 1.35)
+                    except Exception:
+                        hyb_bypass_shock = 1.35
+                    try:
+                        hyb_hold_fallback = float(os.environ.get("HYBRID_EXIT_MIN_HOLD_FALLBACK_SEC", 60.0) or 60.0)
+                    except Exception:
+                        hyb_hold_fallback = 60.0
+                    hold_target_hyb, hold_target_hyb_src, hold_target_hyb_regime, hold_target_hyb_scale = self._resolve_target_hold_sec(
+                        pos=pos,
+                        meta=meta,
+                        regime_hint=str(meta.get("regime") or pos.get("regime") or ""),
+                        hurst_hint=self._safe_float(exit_diag.get("hurst"), None),
+                        include_min_hold_fallback=True,
+                    )
+                    if hold_target_hyb is None:
+                        hold_target_hyb = 0.0
+                    if hyb_hold_fallback > 0:
+                        hold_target_hyb = float(max(float(hold_target_hyb or 0.0), float(hyb_hold_fallback)))
+                    if hold_target_hyb > 0:
+                        age_sec_hyb = max(0.0, float(age_sec))
+                        progress_hyb = float(age_sec_hyb / max(float(hold_target_hyb), 1e-6))
+                        hurst_hyb = self._safe_float(exit_diag.get("hurst"), None)
+                        req_progress_hyb = float(hyb_prog_random)
+                        if hurst_hyb is not None and float(hurst_hyb) > h_high:
+                            req_progress_hyb = float(hyb_prog_trend)
+                        elif hurst_hyb is not None and float(hurst_hyb) < h_low:
+                            req_progress_hyb = float(hyb_prog_mr)
+                        shock_hyb = float(hybrid_mode_state.get("shock_score") or 0.0)
+                        if (progress_hyb < float(req_progress_hyb)) and (shock_hyb < float(hyb_bypass_shock)):
+                            hybrid_guarded = True
+                            hybrid_guard_progress = float(progress_hyb)
+                            hybrid_guard_required = float(req_progress_hyb)
+                            hybrid_guard_hold_target_sec = float(hold_target_hyb)
+                            meta["hybrid_exit_guard_hold_target_src"] = str(hold_target_hyb_src or "none")
+                            meta["hybrid_exit_guard_hold_target_regime"] = str(hold_target_hyb_regime or "")
+                            meta["hybrid_exit_guard_hold_target_scale"] = float(hold_target_hyb_scale or 1.0)
+
             confirm_ok, confirm_cnt = self._advance_exit_confirmation(
                 pos,
                 "hybrid_exit",
-                triggered=True,
+                triggered=bool(not hybrid_guarded),
                 ts_ms=int(ts),
                 required_ticks=confirm_required,
                 reset_sec=float(max(0.0, confirm_reset_sec)),
@@ -9672,10 +13018,40 @@ class LiveOrchestrator:
             meta["hybrid_exit_confirmed"] = bool(confirm_ok)
             meta["hybrid_exit_shock_score"] = float(hybrid_mode_state.get("shock_score") or 0.0)
             meta["hybrid_exit_noise_mode"] = bool(hybrid_mode_state.get("noise_mode"))
+            meta["hybrid_exit_guarded_by_tstar"] = bool(hybrid_guarded)
+            if hybrid_guarded:
+                meta["hybrid_exit_guard_progress"] = float(hybrid_guard_progress or 0.0)
+                meta["hybrid_exit_guard_required"] = float(hybrid_guard_required or 0.0)
+                meta["hybrid_exit_guard_hold_target_sec"] = float(hybrid_guard_hold_target_sec or 0.0)
             decision["meta"] = meta
             if not confirm_ok:
                 return
-            self._close_position(sym, price, "hybrid_exit")
+            # [2026-02-12] Hybrid exit score floor — 71건 25% WR -$13.54 방지
+            # 현재 EV가 아직 양수이면 hybrid_exit를 억제한다.
+            try:
+                hyb_exit_score_floor = float(os.environ.get("HYBRID_EXIT_SCORE_FLOOR", 0.0) or 0.0)
+            except Exception:
+                hyb_exit_score_floor = 0.0
+            if hyb_exit_score_floor != 0.0:
+                cur_ev = self._safe_float(
+                    meta.get("hybrid_score") or meta.get("unified_score") or (decision or {}).get("ev"),
+                    None,
+                )
+                if cur_ev is not None and float(cur_ev) > float(hyb_exit_score_floor):
+                    meta["hybrid_exit_blocked_by_score_floor"] = True
+                    meta["hybrid_exit_cur_ev"] = float(cur_ev)
+                    meta["hybrid_exit_score_floor"] = float(hyb_exit_score_floor)
+                    decision["meta"] = meta
+                    return
+            # Preserve event-exit reasons (if present) so batch reports/tuners don't lose attribution.
+            close_reason = "hybrid_exit"
+            if decision_reason_raw:
+                try:
+                    if bool(self._is_event_exit_reason(decision_reason_raw)):
+                        close_reason = decision_reason_raw
+                except Exception:
+                    pass
+            self._close_position(sym, price, close_reason)
             return
         else:
             confirm_ticks_normal, confirm_reset_sec, _hybrid_ticks_idle = self._get_exit_confirmation_rule(
@@ -9748,14 +13124,14 @@ class LiveOrchestrator:
         entry_quality_score = float(max(0.0, min(1.0, self._safe_float(pos.get("entry_quality_score"), 0.0) or 0.0)))
         one_way_move_score = float(max(0.0, min(1.0, self._safe_float(pos.get("one_way_move_score"), 0.0) or 0.0)))
         leverage_signal_score = float(max(0.0, min(1.0, self._safe_float(pos.get("leverage_signal_score"), 0.0) or 0.0)))
-        try:
-            opt_hold_sec = float(
-                pos.get("opt_hold_curr_sec")
-                or pos.get("opt_hold_entry_sec")
-                or pos.get("opt_hold_sec")
-                or 0.0
-            )
-        except Exception:
+        opt_hold_sec, opt_hold_src_now, opt_hold_regime_now, opt_hold_scale_now = self._resolve_target_hold_sec(
+            pos=pos,
+            meta=(decision.get("meta") if isinstance(decision, dict) else None),
+            regime_hint=str((decision.get("meta") or {}).get("regime") if isinstance(decision, dict) else (pos.get("regime") or "")),
+            hurst_hint=self._safe_float(exit_diag.get("hurst"), None),
+            include_min_hold_fallback=True,
+        )
+        if opt_hold_sec is None:
             opt_hold_sec = 0.0
         hold_progress = 1.0
         if opt_hold_sec > 0:
@@ -9890,6 +13266,19 @@ class LiveOrchestrator:
                     default_noise=4,
                     default_reset_sec=180.0,
                 )
+                if flip_confirm_mode != "shock":
+                    try:
+                        flip_non_shock_min = int(os.environ.get("UNIFIED_FLIP_MIN_CONFIRM_NON_SHOCK", 5) or 5)
+                    except Exception:
+                        flip_non_shock_min = 5
+                    try:
+                        flip_noise_min = int(os.environ.get("UNIFIED_FLIP_MIN_CONFIRM_NOISE", max(6, flip_non_shock_min)) or max(6, flip_non_shock_min))
+                    except Exception:
+                        flip_noise_min = max(6, flip_non_shock_min)
+                    if flip_confirm_mode == "noise":
+                        flip_confirm_required = int(max(flip_confirm_required, max(1, flip_noise_min)))
+                    else:
+                        flip_confirm_required = int(max(flip_confirm_required, max(1, flip_non_shock_min)))
                 try:
                     flip_min_reverse_edge = float(os.environ.get("UNIFIED_FLIP_MIN_REVERSE_EDGE", 0.0008) or 0.0008)
                 except Exception:
@@ -9944,41 +13333,34 @@ class LiveOrchestrator:
                         except Exception:
                             h_low, h_high = 0.45, 0.55
                         try:
-                            flip_prog_trend = float(os.environ.get("UNIFIED_FLIP_MIN_PROGRESS_TREND", 0.55) or 0.55)
+                            flip_prog_trend = float(os.environ.get("UNIFIED_FLIP_MIN_PROGRESS_TREND", 0.62) or 0.62)
                         except Exception:
-                            flip_prog_trend = 0.55
+                            flip_prog_trend = 0.62
                         try:
-                            flip_prog_random = float(os.environ.get("UNIFIED_FLIP_MIN_PROGRESS_RANDOM", 0.75) or 0.75)
+                            flip_prog_random = float(os.environ.get("UNIFIED_FLIP_MIN_PROGRESS_RANDOM", 0.86) or 0.86)
                         except Exception:
-                            flip_prog_random = 0.75
+                            flip_prog_random = 0.86
                         try:
-                            flip_prog_mr = float(os.environ.get("UNIFIED_FLIP_MIN_PROGRESS_MEAN_REVERT", 0.85) or 0.85)
+                            flip_prog_mr = float(os.environ.get("UNIFIED_FLIP_MIN_PROGRESS_MEAN_REVERT", 0.92) or 0.92)
                         except Exception:
-                            flip_prog_mr = 0.85
+                            flip_prog_mr = 0.92
                         try:
-                            flip_bypass_shock = float(os.environ.get("UNIFIED_FLIP_BYPASS_SHOCK", 1.15) or 1.15)
+                            flip_bypass_shock = float(os.environ.get("UNIFIED_FLIP_BYPASS_SHOCK", 1.35) or 1.35)
                         except Exception:
-                            flip_bypass_shock = 1.15
+                            flip_bypass_shock = 1.35
                         try:
                             flip_hold_fallback = float(os.environ.get("UNIFIED_FLIP_MIN_HOLD_FALLBACK_SEC", 60) or 60)
                         except Exception:
                             flip_hold_fallback = 60.0
-                        hold_target = None
-                        try:
-                            hold_target = float(
-                                pos.get("opt_hold_curr_sec")
-                                or pos.get("opt_hold_entry_sec")
-                                or pos.get("opt_hold_sec")
-                                or pos.get("policy_min_hold_eff_sec")
-                                or 0.0
-                            )
-                        except Exception:
+                        hold_target, hold_target_src, hold_target_regime, hold_target_scale = self._resolve_target_hold_sec(
+                            pos=pos,
+                            meta=(decision.get("meta") if isinstance(decision, dict) else None),
+                            regime_hint=str((decision.get("meta") or {}).get("regime") if isinstance(decision, dict) else (pos.get("regime") or "")),
+                            hurst_hint=self._safe_float(exit_diag.get("hurst"), None),
+                            include_min_hold_fallback=True,
+                        )
+                        if hold_target is None:
                             hold_target = 0.0
-                        if not hold_target or hold_target <= 0:
-                            try:
-                                hold_target = float(self._effective_min_hold_sec(pos))
-                            except Exception:
-                                hold_target = 0.0
                         if flip_hold_fallback > 0:
                             hold_target = float(max(float(hold_target or 0.0), float(flip_hold_fallback)))
                         if hold_target > 0:
@@ -10025,6 +13407,13 @@ class LiveOrchestrator:
                         meta["unified_flip_guard_progress"] = float(flip_guard_progress)
                         meta["unified_flip_guard_required"] = float(flip_guard_required or 0.0)
                         meta["unified_flip_guard_hold_target_sec"] = float(flip_guard_hold_target_sec or 0.0)
+                        meta["unified_flip_guard_hold_target_src"] = str(hold_target_src or "none")
+                        meta["unified_flip_guard_hold_target_regime"] = str(hold_target_regime or "")
+                        meta["unified_flip_guard_hold_target_scale"] = float(hold_target_scale or 1.0)
+                    meta["target_hold_sec_effective"] = float(opt_hold_sec) if opt_hold_sec > 0 else None
+                    meta["target_hold_src_effective"] = str(opt_hold_src_now or "none")
+                    meta["target_hold_regime_effective"] = str(opt_hold_regime_now or "")
+                    meta["target_hold_scale_effective"] = float(opt_hold_scale_now or 1.0)
                     decision["meta"] = meta
                 if flip_confirm_ok:
                     if _respect_entry_guard("unified_flip", reverse_edge=reverse_edge):
@@ -10132,6 +13521,143 @@ class LiveOrchestrator:
                 meta["unified_cash_exit_confirm_count"] = int(_cash_cnt)
                 meta["unified_cash_exit_confirmed"] = bool(_cash_ok)
                 decision["meta"] = meta
+        # Pre-leverage -2% conditional stop.
+        # Apply only when at least one risk gate (shock/toxicity/low confidence) is active.
+        if hold_ok:
+            prelev_enabled = str(os.environ.get("PRELEV_STOP2_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            prelev_floor = float(self._safe_float(os.environ.get("PRELEV_STOP2_THRESHOLD"), -0.02) or -0.02)
+            prelev_shock_min = float(self._safe_float(os.environ.get("PRELEV_STOP2_SHOCK_MIN"), 1.15) or 1.15)
+            prelev_vpin_min = float(self._safe_float(os.environ.get("PRELEV_STOP2_VPIN_MIN"), 0.82) or 0.82)
+            prelev_conf_max = float(self._safe_float(os.environ.get("PRELEV_STOP2_DIR_CONF_MAX"), 0.58) or 0.58)
+            prelev_min_hits = int(max(1, int(self._safe_float(os.environ.get("PRELEV_STOP2_MIN_GATE_HITS"), 1) or 1)))
+            prelev_severe_mult = float(self._safe_float(os.environ.get("PRELEV_STOP2_SEVERE_MULT"), 1.40) or 1.40)
+            prelev_ret = None
+            prelev_vpin = self._safe_float(exit_diag.get("vpin"), None)
+            if prelev_vpin is None:
+                prelev_vpin = self._safe_float(pos.get("alpha_vpin"), None)
+            prelev_dir_conf = self._safe_float(_decision_metric_float("mu_dir_conf", default=None), None)
+            if prelev_dir_conf is None:
+                prelev_dir_conf = self._safe_float(pos.get("pred_mu_dir_conf"), None)
+            prelev_dir_conf = float(max(0.0, min(1.0, prelev_dir_conf))) if prelev_dir_conf is not None else 0.0
+            prelev_shock_hit = bool(shock_mode_now == "shock" or float(shock_score_now) >= float(prelev_shock_min))
+            prelev_tox_hit = bool(prelev_vpin is not None and float(prelev_vpin) >= float(prelev_vpin_min))
+            prelev_conf_hit = bool(float(prelev_dir_conf) <= float(prelev_conf_max))
+            prelev_gate_hits = int(prelev_shock_hit) + int(prelev_tox_hit) + int(prelev_conf_hit)
+            prelev_mode = "shock" if prelev_shock_hit else ("noise" if bool(cash_mode_state.get("noise_mode")) else "normal")
+            prelev_triggered = False
+            prelev_guarded = False
+            prelev_guard_progress = None
+            prelev_guard_required = None
+            prelev_confirm_required = 1
+            prelev_confirm_cnt = 0
+            prelev_confirm_ok = False
+            prelev_severe = False
+            prelev_guard_hold_target_sec = None
+            if prelev_enabled and abs(float(notional or 0.0)) > 1e-9:
+                prelev_ret = float(pnl_unreal) / max(abs(float(notional)), 1e-9)
+                prelev_severe = bool(prelev_ret <= (float(prelev_floor) * max(1.0, float(prelev_severe_mult))))
+                prelev_triggered = bool(
+                    float(prelev_ret) <= float(prelev_floor)
+                    and int(prelev_gate_hits) >= int(prelev_min_hits)
+                )
+                if prelev_triggered and prelev_mode != "shock":
+                    prelev_guard_enabled = str(os.environ.get("PRELEV_STOP2_TSTAR_GUARD_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+                    if prelev_guard_enabled:
+                        try:
+                            h_low = float(getattr(mc_config, "hurst_low", 0.45))
+                            h_high = float(getattr(mc_config, "hurst_high", 0.55))
+                        except Exception:
+                            h_low, h_high = 0.45, 0.55
+                        prelev_prog_trend = float(self._safe_float(os.environ.get("PRELEV_STOP2_MIN_PROGRESS_TREND"), 0.40) or 0.40)
+                        prelev_prog_random = float(self._safe_float(os.environ.get("PRELEV_STOP2_MIN_PROGRESS_RANDOM"), 0.55) or 0.55)
+                        prelev_prog_mr = float(self._safe_float(os.environ.get("PRELEV_STOP2_MIN_PROGRESS_MEAN_REVERT"), 0.65) or 0.65)
+                        prelev_req_progress = prelev_prog_random
+                        hurst_now_prelev = self._safe_float(exit_diag.get("hurst"), None)
+                        if hurst_now_prelev is not None and float(hurst_now_prelev) > h_high:
+                            prelev_req_progress = prelev_prog_trend
+                        elif hurst_now_prelev is not None and float(hurst_now_prelev) < h_low:
+                            prelev_req_progress = prelev_prog_mr
+                        prelev_guard_progress = float(max(0.0, hold_progress))
+                        prelev_guard_required = float(max(0.0, prelev_req_progress))
+                        prelev_guard_hold_target_sec = float(opt_hold_sec) if float(opt_hold_sec or 0.0) > 0 else None
+                        if (prelev_guard_progress < prelev_guard_required) and (not prelev_severe):
+                            prelev_triggered = False
+                            prelev_guarded = True
+
+                prelev_confirm_required, prelev_confirm_reset_sec, _pre_ticks = self._get_exit_confirmation_rule(
+                    "PRELEV_STOP2",
+                    prelev_mode,
+                    default_normal=2,
+                    default_shock=1,
+                    default_noise=3,
+                    default_reset_sec=180.0,
+                )
+                if prelev_mode != "shock":
+                    prelev_non_shock_min = int(max(1, int(self._safe_float(os.environ.get("PRELEV_STOP2_MIN_CONFIRM_NON_SHOCK"), 3) or 3)))
+                    prelev_noise_min = int(max(1, int(self._safe_float(os.environ.get("PRELEV_STOP2_MIN_CONFIRM_NOISE"), prelev_non_shock_min) or prelev_non_shock_min)))
+                    if prelev_mode == "noise":
+                        prelev_confirm_required = int(max(prelev_confirm_required, prelev_noise_min))
+                    else:
+                        prelev_confirm_required = int(max(prelev_confirm_required, prelev_non_shock_min))
+                prelev_confirm_ok, prelev_confirm_cnt = self._advance_exit_confirmation(
+                    pos,
+                    "prelev_stop2_exit",
+                    triggered=bool(prelev_triggered),
+                    ts_ms=int(ts),
+                    required_ticks=int(max(1, prelev_confirm_required)),
+                    reset_sec=float(max(0.0, prelev_confirm_reset_sec)),
+                )
+                if prelev_triggered and prelev_confirm_ok:
+                    if _respect_entry_guard(f"prelev_stop2_{prelev_mode}", reverse_edge=None) and (prelev_mode != "shock") and (not prelev_severe):
+                        if isinstance(decision, dict):
+                            meta = dict(decision.get("meta") or {})
+                            meta["entry_respect_guard_blocked"] = f"prelev_stop2_{prelev_mode}"
+                            decision["meta"] = meta
+                    else:
+                        exit_reasons.append(f"prelev_stop2_{prelev_mode}")
+            else:
+                prelev_confirm_ok, prelev_confirm_cnt = self._advance_exit_confirmation(
+                    pos,
+                    "prelev_stop2_exit",
+                    triggered=False,
+                    ts_ms=int(ts),
+                    required_ticks=2,
+                    reset_sec=180.0,
+                )
+            if isinstance(pos, dict):
+                pos["policy_prelev_stop2_floor"] = float(prelev_floor)
+                if prelev_ret is not None:
+                    pos["prelev_stop2_ret"] = float(prelev_ret)
+                pos["prelev_stop2_gate_hits"] = int(prelev_gate_hits)
+                pos["prelev_stop2_mode"] = str(prelev_mode)
+                pos["prelev_stop2_triggered"] = bool(prelev_triggered)
+                pos["prelev_stop2_confirmed"] = bool(prelev_confirm_ok)
+                if prelev_vpin is not None:
+                    pos["prelev_stop2_vpin"] = float(max(0.0, min(1.0, prelev_vpin)))
+                pos["prelev_stop2_dir_conf"] = float(prelev_dir_conf)
+            if isinstance(decision, dict):
+                meta = dict(decision.get("meta") or {})
+                meta["policy_prelev_stop2_floor"] = float(prelev_floor)
+                meta["prelev_stop2_enabled"] = bool(prelev_enabled)
+                meta["prelev_stop2_ret"] = float(prelev_ret) if prelev_ret is not None else None
+                meta["prelev_stop2_vpin"] = float(max(0.0, min(1.0, prelev_vpin))) if prelev_vpin is not None else None
+                meta["prelev_stop2_dir_conf"] = float(prelev_dir_conf)
+                meta["prelev_stop2_gate_shock"] = bool(prelev_shock_hit)
+                meta["prelev_stop2_gate_toxicity"] = bool(prelev_tox_hit)
+                meta["prelev_stop2_gate_low_conf"] = bool(prelev_conf_hit)
+                meta["prelev_stop2_gate_hits"] = int(prelev_gate_hits)
+                meta["prelev_stop2_triggered"] = bool(prelev_triggered)
+                meta["prelev_stop2_mode"] = str(prelev_mode if prelev_triggered else "idle")
+                meta["prelev_stop2_confirm_required"] = int(max(1, prelev_confirm_required))
+                meta["prelev_stop2_confirm_count"] = int(prelev_confirm_cnt)
+                meta["prelev_stop2_confirmed"] = bool(prelev_confirm_ok)
+                meta["prelev_stop2_guarded_by_tstar"] = bool(prelev_guarded)
+                meta["prelev_stop2_severe"] = bool(prelev_severe)
+                if prelev_guarded:
+                    meta["prelev_stop2_guard_progress"] = float(prelev_guard_progress or 0.0)
+                    meta["prelev_stop2_guard_required"] = float(prelev_guard_required or 0.0)
+                    meta["prelev_stop2_guard_hold_target_sec"] = float(prelev_guard_hold_target_sec or 0.0)
+                decision["meta"] = meta
         # 공격적 손실 컷 (미실현 ROE 기준)
         if hold_ok:
             try:
@@ -10195,25 +13721,30 @@ class LiveOrchestrator:
                             dd_floor *= float(os.environ.get("UNREALIZED_DD_MULT_NORMAL", 1.00) or 1.00)
                         except Exception:
                             pass
-                    # Regime-aware DD multiplier (auto-tuner can drive *_TREND/*_CHOP/*_VOLATILE).
+                    # Regime-aware DD multiplier (RegimePolicy 통합).
                     try:
                         reg_bucket = str(exit_diag.get("regime_bucket") or "").strip().lower()
                     except Exception:
                         reg_bucket = ""
                     dd_reg_mult = 1.0
                     try:
+                        from engines.mc.regime_policy import get_regime_policy as _grp_dd
+                        _dd_regime = {"trend": "bull", "mean_revert": "chop"}.get(reg_bucket, reg_bucket or "chop")
+                        _rpol_dd = _grp_dd(_dd_regime)
+                        dd_reg_mult = float(_rpol_dd.dd_regime_mult)
+                        # 환경변수 override 여전히 지원
                         if reg_bucket == "trend":
-                            dd_reg_mult = float(os.environ.get("UNREALIZED_DD_REGIME_MULT_TREND", 1.0) or 1.0)
+                            _env_dd = os.environ.get("UNREALIZED_DD_REGIME_MULT_TREND")
+                            if _env_dd is not None and str(_env_dd).strip():
+                                dd_reg_mult = float(_env_dd)
                         elif reg_bucket == "mean_revert":
-                            raw = os.environ.get("UNREALIZED_DD_REGIME_MULT_MEAN_REVERT")
-                            if raw is None or str(raw).strip() == "":
-                                raw = os.environ.get("UNREALIZED_DD_REGIME_MULT_CHOP", "1.0")
-                            dd_reg_mult = float(raw or 1.0)
+                            _env_dd = os.environ.get("UNREALIZED_DD_REGIME_MULT_MEAN_REVERT") or os.environ.get("UNREALIZED_DD_REGIME_MULT_CHOP")
+                            if _env_dd is not None and str(_env_dd).strip():
+                                dd_reg_mult = float(_env_dd)
                         else:
-                            raw = os.environ.get("UNREALIZED_DD_REGIME_MULT_RANDOM")
-                            if raw is None or str(raw).strip() == "":
-                                raw = os.environ.get("UNREALIZED_DD_REGIME_MULT_VOLATILE", "1.0")
-                            dd_reg_mult = float(raw or 1.0)
+                            _env_dd = os.environ.get("UNREALIZED_DD_REGIME_MULT_RANDOM") or os.environ.get("UNREALIZED_DD_REGIME_MULT_VOLATILE")
+                            if _env_dd is not None and str(_env_dd).strip():
+                                dd_reg_mult = float(_env_dd)
                     except Exception:
                         dd_reg_mult = 1.0
                     dd_floor = float(dd_floor * dd_reg_mult)
@@ -10244,6 +13775,26 @@ class LiveOrchestrator:
                 dd_floor = float(dd_floor_base)
                 dd_mode = "normal"
             dd_triggered = bool(roe_unreal <= dd_floor)
+            # Shock gate 강화: shock 모드에서는 (1) severe 손실 조건을 만족해야 하고,
+            # (2) 기본적으로 2틱 이상 연속 확인 후 청산하도록 강제한다(초과 severe는 1틱 bypass 가능).
+            try:
+                dd_severe_mult = float(os.environ.get("UNREALIZED_DD_SEVERE_MULT", 1.40) or 1.40)
+            except Exception:
+                dd_severe_mult = 1.40
+            severe_loss = bool(roe_unreal <= float(dd_floor) * float(max(1.0, dd_severe_mult)))
+            try:
+                dd_shock_min_confirm = int(os.environ.get("UNREALIZED_DD_SHOCK_MIN_CONFIRM_TICKS", 2) or 2)
+            except Exception:
+                dd_shock_min_confirm = 2
+            try:
+                dd_shock_bypass_mult = float(os.environ.get("UNREALIZED_DD_SHOCK_BYPASS_SEVERE_MULT", 2.20) or 2.20)
+            except Exception:
+                dd_shock_bypass_mult = 2.20
+            super_severe_loss = bool(roe_unreal <= float(dd_floor) * float(max(1.0, dd_shock_bypass_mult)))
+            dd_shock_gated_by_severe = False
+            if dd_triggered and dd_mode == "shock" and (not severe_loss) and (not super_severe_loss):
+                dd_triggered = False
+                dd_shock_gated_by_severe = True
             dd_guard_progress = None
             dd_guard_required = None
             dd_guard_hold_target_sec = None
@@ -10284,22 +13835,15 @@ class LiveOrchestrator:
                         age_sec_dd = max(0.0, (int(ts) - int(entry_ts_ms)) / 1000.0)
                     except Exception:
                         age_sec_dd = 0.0
-                    hold_target_dd = None
-                    try:
-                        hold_target_dd = float(
-                            pos.get("opt_hold_curr_sec")
-                            or pos.get("opt_hold_entry_sec")
-                            or pos.get("opt_hold_sec")
-                            or pos.get("policy_min_hold_eff_sec")
-                            or 0.0
-                        )
-                    except Exception:
+                    hold_target_dd, hold_target_dd_src, hold_target_dd_regime, hold_target_dd_scale = self._resolve_target_hold_sec(
+                        pos=pos,
+                        meta=(decision.get("meta") if isinstance(decision, dict) else None),
+                        regime_hint=str((decision.get("meta") or {}).get("regime") if isinstance(decision, dict) else (pos.get("regime") or "")),
+                        hurst_hint=self._safe_float(exit_diag.get("hurst"), None),
+                        include_min_hold_fallback=True,
+                    )
+                    if hold_target_dd is None:
                         hold_target_dd = 0.0
-                    if not hold_target_dd or hold_target_dd <= 0:
-                        try:
-                            hold_target_dd = float(self._effective_min_hold_sec(pos))
-                        except Exception:
-                            hold_target_dd = 0.0
                     try:
                         dd_fallback_floor = float(os.environ.get("UNREALIZED_DD_TSTAR_MIN_HOLD_FALLBACK_SEC", 0.0) or 0.0)
                     except Exception:
@@ -10332,6 +13876,11 @@ class LiveOrchestrator:
                 default_noise=3,
                 default_reset_sec=180.0,
             )
+            if dd_mode == "shock":
+                if super_severe_loss:
+                    dd_confirm_required = 1
+                else:
+                    dd_confirm_required = int(max(dd_confirm_required, max(2, int(dd_shock_min_confirm))))
             if dd_mode != "shock":
                 try:
                     dd_non_shock_min = int(os.environ.get("UNREALIZED_DD_MIN_CONFIRM_NON_SHOCK", 3) or 3)
@@ -10360,18 +13909,20 @@ class LiveOrchestrator:
                 meta["unrealized_dd_confirm_required"] = int(dd_confirm_required)
                 meta["unrealized_dd_confirm_count"] = int(dd_confirm_cnt)
                 meta["unrealized_dd_confirmed"] = bool(dd_confirm_ok)
+                meta["unrealized_dd_severe_loss"] = bool(severe_loss)
+                meta["unrealized_dd_super_severe_loss"] = bool(super_severe_loss)
+                meta["unrealized_dd_shock_min_confirm_ticks"] = int(max(1, dd_shock_min_confirm))
+                meta["unrealized_dd_shock_gated_by_severe"] = bool(dd_shock_gated_by_severe)
                 meta["unrealized_dd_guarded_by_tstar"] = bool(dd_guarded)
                 if dd_guarded:
                     meta["unrealized_dd_guard_progress"] = dd_guard_progress
                     meta["unrealized_dd_guard_required"] = dd_guard_required
                     meta["unrealized_dd_guard_hold_target_sec"] = dd_guard_hold_target_sec
+                    meta["unrealized_dd_guard_hold_target_src"] = str(hold_target_dd_src or "none")
+                    meta["unrealized_dd_guard_hold_target_regime"] = str(hold_target_dd_regime or "")
+                    meta["unrealized_dd_guard_hold_target_scale"] = float(hold_target_dd_scale or 1.0)
                 decision["meta"] = meta
             if dd_triggered and dd_confirm_ok:
-                try:
-                    dd_severe_mult = float(os.environ.get("UNREALIZED_DD_SEVERE_MULT", 1.40) or 1.40)
-                except Exception:
-                    dd_severe_mult = 1.40
-                severe_loss = bool(roe_unreal <= float(dd_floor) * float(max(1.0, dd_severe_mult)))
                 if _respect_entry_guard(f"unrealized_dd_{dd_mode}", reverse_edge=None) and (dd_mode != "shock") and (not severe_loss):
                     if isinstance(decision, dict):
                         meta = dict(decision.get("meta") or {})
@@ -10381,7 +13932,41 @@ class LiveOrchestrator:
                 else:
                     exit_reasons.append(f"unrealized_dd_{dd_mode}")
         if exit_reasons:
-            self._close_position(sym, price, ", ".join(exit_reasons))
+            def _exit_reason_priority(tag: str) -> tuple[int, int]:
+                t = str(tag or "").strip().lower()
+                # Lower tuple = higher priority.
+                if t.startswith("unrealized_dd_shock"):
+                    return (0, 0)
+                if t.startswith("unrealized_dd_noise"):
+                    return (1, 0)
+                if t.startswith("unrealized_dd"):
+                    return (2, 0)
+                if t.startswith("prelev_stop2_shock"):
+                    return (3, 0)
+                if t.startswith("prelev_stop2_noise"):
+                    return (4, 0)
+                if t.startswith("prelev_stop2"):
+                    return (5, 0)
+                if t == "unified_flip":
+                    return (6, 0)
+                if t == "unified_cash":
+                    return (7, 0)
+                # Fallback: keep deterministic ordering by tag.
+                return (50, 0)
+
+            # Single reason selector: keep attribution clean (DB/report/tuner) and avoid multi-reason spam.
+            selected = sorted(list(exit_reasons), key=_exit_reason_priority)[0]
+            if isinstance(decision, dict):
+                meta = dict(decision.get("meta") or {})
+                meta["exit_reason_candidates"] = [str(x) for x in exit_reasons]
+                meta["exit_reason_selected"] = str(selected)
+                decision["meta"] = meta
+            try:
+                pos["exit_reason_candidates"] = [str(x) for x in exit_reasons]
+                pos["exit_reason_selected"] = str(selected)
+            except Exception:
+                pass
+            self._close_position(sym, price, str(selected))
 
     def _record_trade(
         self,
@@ -10503,6 +14088,15 @@ class LiveOrchestrator:
                         roe_val = pnl_total / base_notional
                     except Exception:
                         pass
+        entry_confidence_val = self._safe_float(
+            pos.get("entry_confidence"),
+            self._safe_float(pos.get("pred_mu_dir_conf"), None),
+        )
+        if entry_confidence_val is not None:
+            try:
+                entry_confidence_val = float(max(0.0, min(1.0, float(entry_confidence_val))))
+            except Exception:
+                entry_confidence_val = None
 
         entry = {
             "time": ts,
@@ -10529,6 +14123,7 @@ class LiveOrchestrator:
             "exit_kind": exit_kind,
             "pred_win": pos.get("pred_win"),
             "pred_ev": pos.get("pred_ev"),
+            "entry_confidence": entry_confidence_val,
             "pred_event_ev_r": pos.get("pred_event_ev_r"),
             "pred_event_p_tp": pos.get("pred_event_p_tp"),
             "pred_event_p_sl": pos.get("pred_event_p_sl"),
@@ -10576,6 +14171,7 @@ class LiveOrchestrator:
             "pred_mu_alpha_raw": pos.get("pred_mu_alpha_raw"),
             "pred_mu_dir_conf": pos.get("pred_mu_dir_conf"),
             "pred_mu_dir_edge": pos.get("pred_mu_dir_edge"),
+            "pred_mu_dir_prob_long": pos.get("pred_mu_dir_prob_long"),
             "pred_hmm_state": pos.get("pred_hmm_state"),
             "pred_hmm_conf": pos.get("pred_hmm_conf"),
             "regime": pos.get("regime"),
@@ -10584,6 +14180,7 @@ class LiveOrchestrator:
             "policy_score_threshold": pos.get("policy_score_threshold"),
             "policy_event_exit_min_score": pos.get("policy_event_exit_min_score"),
             "policy_unrealized_dd_floor": pos.get("policy_unrealized_dd_floor"),
+            "policy_prelev_stop2_floor": pos.get("policy_prelev_stop2_floor"),
             "policy_min_hold_eff_sec": pos.get("policy_min_hold_eff_sec"),
             "consensus_used": pos.get("consensus_used"),
             "realized_r": float(realized_r) if realized_r is not None else (pnl_total / base_notional if (pnl_total is not None and base_notional) else None),
@@ -10600,6 +14197,25 @@ class LiveOrchestrator:
             "entry_quality_score": pos.get("entry_quality_score"),
             "one_way_move_score": pos.get("one_way_move_score"),
             "leverage_signal_score": pos.get("leverage_signal_score"),
+            "leverage_signal_score_legacy": pos.get("leverage_signal_score_legacy"),
+            "pre_roe_proxy_score": pos.get("pre_roe_proxy_score"),
+            "pre_roe_proxy_blend": pos.get("pre_roe_proxy_blend"),
+            "capital_signal_score": pos.get("capital_signal_score"),
+            "capital_signal_score_base": pos.get("capital_signal_score_base"),
+            "capital_signal_pre_roe": pos.get("capital_signal_pre_roe"),
+            "capital_signal_lev_sig": pos.get("capital_signal_lev_sig"),
+            "capital_signal_entry_q": pos.get("capital_signal_entry_q"),
+            "capital_signal_dir_conf": pos.get("capital_signal_dir_conf"),
+            "capital_signal_net": pos.get("capital_signal_net"),
+            "capital_scale": pos.get("capital_scale"),
+            "capital_scale_target": pos.get("capital_scale_target"),
+            "capital_scale_vpin": pos.get("capital_scale_vpin"),
+            "capital_scale_tox": pos.get("capital_scale_tox"),
+            "capital_scale_conf_deficit": pos.get("capital_scale_conf_deficit"),
+            "capital_scale_conf_ref": pos.get("capital_scale_conf_ref"),
+            "capital_scale_mu_align": pos.get("capital_scale_mu_align"),
+            "lev_high_guard_hit": pos.get("lev_high_guard_hit"),
+            "lev_high_guard_cap": pos.get("lev_high_guard_cap"),
             "lev_source": pos.get("lev_source"),
             "lev_raw_before_caps": pos.get("lev_raw_before_caps"),
             "lev_raw_ev_component": pos.get("lev_raw_ev_component"),
@@ -10627,6 +14243,11 @@ class LiveOrchestrator:
             "lev_sigma_raw": pos.get("lev_sigma_raw"),
             "lev_sigma_used": pos.get("lev_sigma_used"),
             "lev_sigma_stress_clip": pos.get("lev_sigma_stress_clip"),
+            "prelev_stop2_ret": pos.get("prelev_stop2_ret"),
+            "prelev_stop2_gate_hits": pos.get("prelev_stop2_gate_hits"),
+            "prelev_stop2_mode": pos.get("prelev_stop2_mode"),
+            "prelev_stop2_triggered": pos.get("prelev_stop2_triggered"),
+            "prelev_stop2_confirmed": pos.get("prelev_stop2_confirmed"),
         }
         self.trade_tape.append(entry)
         if self._is_exit_trade_record(entry):
@@ -10656,6 +14277,9 @@ class LiveOrchestrator:
                 "fill_price": float(price),
                 "qty": float(qty),
                 "notional": notional,
+                "fee_rate": pos.get("fee_rate"),
+                "exec_type": pos.get("exec_type") or pos.get("entry_exec_selected"),
+                "order_id": pos.get("order_id") or pos.get("last_order_id"),
                 "leverage": lev_for_roe if lev_for_roe not in (None, 0) else lev,
                 "leverage_effective": lev,
                 "entry_leverage": lev_for_roe if lev_for_roe not in (None, 0) else None,
@@ -10669,6 +14293,7 @@ class LiveOrchestrator:
                 "entry_link_id": entry_link_id,
                 "entry_ev": pos.get("pred_ev"),
                 "entry_kelly": pos.get("kelly"),
+                "entry_confidence": entry_confidence_val,
                 "entry_reason": reason,
                 "regime": pos.get("regime"),
                 "alpha_vpin": pos.get("alpha_vpin"),
@@ -10678,6 +14303,7 @@ class LiveOrchestrator:
                 "policy_score_threshold": pos.get("policy_score_threshold"),
                 "policy_event_exit_min_score": pos.get("policy_event_exit_min_score"),
                 "policy_unrealized_dd_floor": pos.get("policy_unrealized_dd_floor"),
+                "policy_prelev_stop2_floor": pos.get("policy_prelev_stop2_floor"),
                 "policy_min_hold_eff_sec": pos.get("policy_min_hold_eff_sec"),
                 "entry_event_exit_ok": pos.get("entry_event_exit_ok"),
                 "event_exit_hit": pos.get("event_exit_hit"),
@@ -10726,6 +14352,25 @@ class LiveOrchestrator:
                 "entry_quality_score": pos.get("entry_quality_score"),
                 "one_way_move_score": pos.get("one_way_move_score"),
                 "leverage_signal_score": pos.get("leverage_signal_score"),
+                "leverage_signal_score_legacy": pos.get("leverage_signal_score_legacy"),
+                "pre_roe_proxy_score": pos.get("pre_roe_proxy_score"),
+                "pre_roe_proxy_blend": pos.get("pre_roe_proxy_blend"),
+                "capital_signal_score": pos.get("capital_signal_score"),
+                "capital_signal_score_base": pos.get("capital_signal_score_base"),
+                "capital_signal_pre_roe": pos.get("capital_signal_pre_roe"),
+                "capital_signal_lev_sig": pos.get("capital_signal_lev_sig"),
+                "capital_signal_entry_q": pos.get("capital_signal_entry_q"),
+                "capital_signal_dir_conf": pos.get("capital_signal_dir_conf"),
+                "capital_signal_net": pos.get("capital_signal_net"),
+                "capital_scale": pos.get("capital_scale"),
+                "capital_scale_target": pos.get("capital_scale_target"),
+                "capital_scale_vpin": pos.get("capital_scale_vpin"),
+                "capital_scale_tox": pos.get("capital_scale_tox"),
+                "capital_scale_conf_deficit": pos.get("capital_scale_conf_deficit"),
+                "capital_scale_conf_ref": pos.get("capital_scale_conf_ref"),
+                "capital_scale_mu_align": pos.get("capital_scale_mu_align"),
+                "lev_high_guard_hit": pos.get("lev_high_guard_hit"),
+                "lev_high_guard_cap": pos.get("lev_high_guard_cap"),
                 "lev_source": pos.get("lev_source"),
                 "lev_raw_before_caps": pos.get("lev_raw_before_caps"),
                 "lev_raw_ev_component": pos.get("lev_raw_ev_component"),
@@ -10753,6 +14398,11 @@ class LiveOrchestrator:
                 "lev_sigma_raw": pos.get("lev_sigma_raw"),
                 "lev_sigma_used": pos.get("lev_sigma_used"),
                 "lev_sigma_stress_clip": pos.get("lev_sigma_stress_clip"),
+                "prelev_stop2_ret": pos.get("prelev_stop2_ret"),
+                "prelev_stop2_gate_hits": pos.get("prelev_stop2_gate_hits"),
+                "prelev_stop2_mode": pos.get("prelev_stop2_mode"),
+                "prelev_stop2_triggered": pos.get("prelev_stop2_triggered"),
+                "prelev_stop2_confirmed": pos.get("prelev_stop2_confirmed"),
             }
             self.db.log_trade_background(trade_data, mode=self._trading_mode)
         except Exception as e:
@@ -10770,6 +14420,16 @@ class LiveOrchestrator:
                     )
             else:
                 self._loss_streak = 0
+            # [FIX 2026-02-16] DirectionModel 확신도 보정 - 거래 결과 피드백
+            try:
+                from engines.mc.direction_model import get_direction_model
+                _dir_model = get_direction_model()
+                _raw_conf = self._safe_float(pos.get("direction_model_raw_conf"), None)
+                if _raw_conf is not None:
+                    _was_correct = pnl_val > 0
+                    _dir_model.update_calibration(float(_raw_conf), _was_correct)
+            except Exception:
+                pass
         if reason:
             reason_l = str(reason).lower()
             if "liquidat" in reason_l or "emergency_stop" in reason_l or "drawdown" in reason_l or "kill" in reason_l:
@@ -11009,9 +14669,8 @@ class LiveOrchestrator:
             return None
 
         mu_bar, sigma_bar = self._compute_returns_and_vol(closes)
-        regime = self._infer_regime(closes)
-
-        # Orderbook spread
+        # [FIX 2026-02-13] HMM 통합 regime 감지
+        regime, _regime_debug = self._infer_regime_with_hmm(sym, closes)
         spread_pct = None
         ob = self.orderbook.get(sym)
         if ob and ob.get("ready"):
@@ -11097,6 +14756,9 @@ class LiveOrchestrator:
             "sigma": float(max(sigma, 0.0)),
             "regime_params": regime_params,
             "session": session,
+            "pmaker_entry": float(getattr(config, "pmaker_prob", 0.9) or 0.9),
+            "pmaker_entry_short": float(getattr(config, "pmaker_prob", 0.9) or 0.9),
+            "pmaker_entry_delay_sec": 0.0,
             "spread_pct": spread_pct,
             "use_torch": True,
             "use_jax": False,
@@ -11170,7 +14832,8 @@ class LiveOrchestrator:
 
             # Compute mu/sigma directly into pre-allocated arrays
             mu_bar, sigma_bar = self._compute_returns_and_vol(closes)
-            regime = self._infer_regime(closes)
+            # [FIX 2026-02-13] HMM 통합 regime 감지
+            regime, _regime_debug = self._infer_regime_with_hmm(sym, closes)
 
             # Annualized μ/σ
             mu_base, sigma = (0.0, 0.0)
@@ -11255,6 +14918,9 @@ class LiveOrchestrator:
                 "sigma": float(max(sigma, 0.0)),
                 "equity": float(self.balance),
                 "session": session,
+                "pmaker_entry": float(getattr(config, "pmaker_prob", 0.9) or 0.9),
+                "pmaker_entry_short": float(getattr(config, "pmaker_prob", 0.9) or 0.9),
+                "pmaker_entry_delay_sec": 0.0,
                 "use_torch": True,
                 "use_jax": False,
                 "ev": None,
@@ -11617,6 +15283,66 @@ class LiveOrchestrator:
             has_pos = pos_qty_now != 0.0
             is_entry = (decision.get("action") in ("LONG", "SHORT")) and (not has_pos)
 
+            # Entry decision은 유지하고 size/leverage만 공격적으로 증폭 (optional)
+            if is_entry:
+                try:
+                    aggr_on = str(os.environ.get("ENTRY_CAPITAL_AGGRESSIVE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    aggr_on = True
+                if aggr_on:
+                    try:
+                        size_mult_base = float(os.environ.get("ENTRY_CAPITAL_SIZE_MULT", 1.35) or 1.35)
+                    except Exception:
+                        size_mult_base = 1.35
+                    try:
+                        lev_mult_base = float(os.environ.get("ENTRY_CAPITAL_LEV_MULT", 1.20) or 1.20)
+                    except Exception:
+                        lev_mult_base = 1.20
+                    try:
+                        size_cap = float(os.environ.get("ENTRY_CAPITAL_SIZE_CAP", 0.60) or 0.60)
+                    except Exception:
+                        size_cap = 0.60
+                    try:
+                        lev_cap_mult = float(os.environ.get("ENTRY_CAPITAL_LEV_CAP_MULT", 1.60) or 1.60)
+                    except Exception:
+                        lev_cap_mult = 1.60
+
+                    mu_cap = float(getattr(config, "mu_alpha_cap", 5.0) or 5.0)
+                    mu_alpha_now = self._safe_float(decision_meta.get("mu_alpha"), 0.0) or 0.0
+                    mu_strength = float(max(0.0, min(1.0, abs(float(mu_alpha_now)) / max(1e-6, abs(mu_cap)))))
+                    side_now = str(decision.get("action") or "").upper()
+                    ev_side = self._decision_metric_float(
+                        decision,
+                        decision_meta,
+                        ("entry_ev_side_net", "policy_ev_mix", "event_ev_r", "ev"),
+                        default=0.0,
+                    )
+                    ev_side = float(ev_side or 0.0)
+                    try:
+                        net_floor_ref = float(os.environ.get("ENTRY_NET_EXPECTANCY_MIN", -0.0008) or -0.0008)
+                    except Exception:
+                        net_floor_ref = -0.0008
+                    ev_strength = float(max(0.0, min(1.5, (ev_side - net_floor_ref) / max(1e-6, abs(net_floor_ref)))))
+                    strength = float(max(0.35, min(1.5, 0.5 * mu_strength + 0.5 * ev_strength)))
+
+                    size_before = self._safe_float(decision.get("size_frac"), self.default_size_frac) or float(self.default_size_frac)
+                    lev_before = self._safe_float(decision.get("leverage"), self._dyn_leverage.get(sym, self.leverage)) or float(self.leverage)
+                    size_after = float(min(float(size_cap), max(0.0, float(size_before) * (1.0 + (size_mult_base - 1.0) * strength))))
+                    lev_after = float(max(1.0, float(lev_before) * (1.0 + (lev_mult_base - 1.0) * strength)))
+                    lev_hard_cap = float(max(1.0, min(float(self.max_leverage or lev_after), float(lev_before) * float(lev_cap_mult))))
+                    lev_after = float(min(lev_after, lev_hard_cap))
+
+                    decision["size_frac"] = float(size_after)
+                    decision["leverage"] = float(lev_after)
+                    decision_meta["entry_capital_aggressive"] = True
+                    decision_meta["entry_capital_strength"] = float(strength)
+                    decision_meta["entry_capital_size_before"] = float(size_before)
+                    decision_meta["entry_capital_size_after"] = float(size_after)
+                    decision_meta["entry_capital_lev_before"] = float(lev_before)
+                    decision_meta["entry_capital_lev_after"] = float(lev_after)
+                    decision_meta["entry_capital_side"] = side_now
+                    decision["meta"] = decision_meta
+
             # Attach tick-level diagnostics for UI/debug
             try:
                 decision_meta.setdefault("tick_ret", ctx.get("tick_ret"))
@@ -11679,7 +15405,18 @@ class LiveOrchestrator:
             if hybrid_only:
                 entry_floor = self._get_hybrid_entry_floor()
             else:
-                entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+                # RegimePolicy의 entry_floor 사용 (env 미설정 시 레짐별 기본값)
+                try:
+                    from engines.mc.regime_policy import get_regime_policy as _grp_ef
+                except ImportError:
+                    _grp_ef = None
+                if _grp_ef is not None:
+                    _ef_regime = str(decision.get("regime") or regime or "").strip().lower()
+                    _ef_sigma = float(decision.get("sigma") or 0.5)
+                    _ef_rpol = _grp_ef(_ef_regime, _ef_sigma)
+                    entry_floor = float(_ef_rpol.entry_floor)
+                else:
+                    entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
             entry_floor_eff = float(max(entry_floor, MIN_ENTRY_SCORE)) if MIN_ENTRY_SCORE > 0 else float(entry_floor)
 
             decision_meta["unified_entry_floor"] = float(entry_floor)
@@ -11719,12 +15456,14 @@ class LiveOrchestrator:
             except Exception:
                 est_notional = None
             decision_meta["est_notional"] = float(est_notional) if est_notional is not None else None
-            min_notional_floor = float(MIN_ENTRY_NOTIONAL) if MIN_ENTRY_NOTIONAL > 0 else 0.0
-            if MIN_ENTRY_NOTIONAL_PCT > 0:
-                try:
-                    min_notional_floor = max(min_notional_floor, float(self.balance) * float(MIN_ENTRY_NOTIONAL_PCT))
-                except Exception:
-                    pass
+            try:
+                eff_bal_for_floor = float(self._sizing_balance())
+            except Exception:
+                eff_bal_for_floor = float(self.balance or 0.0)
+            min_notional_floor = self._effective_min_entry_notional(
+                float(eff_bal_for_floor),
+                regime_hint=(decision_meta.get("regime") or regime if is_entry else None),
+            )
             decision_meta["min_entry_notional"] = float(min_notional_floor) if min_notional_floor > 0 else None
             decision_meta["min_entry_notional_pct"] = float(MIN_ENTRY_NOTIONAL_PCT) if MIN_ENTRY_NOTIONAL_PCT > 0 else None
             min_exposure_floor = float(MIN_ENTRY_EXPOSURE_PCT) if MIN_ENTRY_EXPOSURE_PCT > 0 else 0.0
@@ -11747,7 +15486,9 @@ class LiveOrchestrator:
                 decision_meta["total_open_notional"] = None
             if self.exposure_cap_enabled:
                 try:
-                    decision_meta["exposure_cap_limit"] = float(self._exposure_cap_balance()) * float(self.max_notional_frac)
+                    cap_bal = float(self._exposure_cap_balance())
+                    cap_frac = float(self._effective_total_exposure_cap(cap_bal))
+                    decision_meta["exposure_cap_limit"] = float(cap_bal) * float(cap_frac)
                 except Exception:
                     decision_meta["exposure_cap_limit"] = None
             else:
@@ -11790,7 +15531,8 @@ class LiveOrchestrator:
                     blocked.append("net_expectancy")
                 if fs.get("dir_gate") is False:
                     blocked.append("direction_conf")
-                if fs.get("symbol_quality") is False:
+                sq_filter_enabled = str(os.environ.get("SYMBOL_QUALITY_FILTER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+                if sq_filter_enabled and fs.get("symbol_quality") is False:
                     blocked.append("symbol_quality")
                 if fs.get("lev_floor_lock") is False:
                     blocked.append("lev_floor_lock")
@@ -11852,10 +15594,7 @@ class LiveOrchestrator:
                 exit_policy_dyn, exit_diag = self._build_dynamic_exit_policy(sym, pos, decision, ctx=ctx)
                 self._attach_dynamic_exit_meta(meta, exit_policy_dyn, exit_diag)
                 decision["meta"] = meta
-                try:
-                    min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
-                except Exception:
-                    min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+                min_hold_sec = self._effective_min_hold_sec(pos, regime=regime)
                 if min_hold_sec > 0 and age_sec < float(min_hold_sec):
                     do_exit, reason = False, "min_hold"
                 else:
@@ -11902,6 +15641,8 @@ class LiveOrchestrator:
                             meta["event_eval_source"] = "exit_policy_shared"
                             meta["event_exit_mode"] = str(gate_pol.get("event_mode") or core_pol.get("mode") or "normal")
                             meta["event_exit_hit"] = bool(core_pol.get("event_exit_hit"))
+                            meta["event_exit_shock_demoted"] = bool(core_pol.get("shock_demoted"))
+                            meta["event_exit_hit_count"] = int(core_pol.get("hit_count") or 0)
                             meta["event_exit_guard"] = str(gate_pol.get("guard_reason") or "")
                             meta["event_exit_confirm_mode"] = str(gate_pol.get("confirm_mode") or "idle")
                             meta["event_exit_confirm_required"] = int(gate_pol.get("confirm_required") or 1)
@@ -11947,11 +15688,21 @@ class LiveOrchestrator:
 
             if not exited_by_event:
                 if pos_managed and REBALANCE_ENABLED and sym in self.positions:
-                    if decision.get("action") in ("LONG", "SHORT") or bool(getattr(self, "_force_rebalance_cycle", False)):
+                    action_now = str(decision.get("action") or "").upper()
+                    should_rebalance = bool(action_now in ("LONG", "SHORT") or bool(getattr(self, "_force_rebalance_cycle", False)))
+                    if (not should_rebalance) and REBALANCE_ON_HOLD_TOPN:
+                        in_active_top = bool(getattr(self, "_top_n_symbols", None) and sym in self._top_n_symbols)
+                        has_kelly_weight = bool(getattr(self, "_kelly_allocations", None) and sym in self._kelly_allocations)
+                        should_rebalance = bool(in_active_top and has_kelly_weight)
+                    if should_rebalance:
                         self._rebalance_position(sym, float(price), decision, leverage_override=dyn_leverage)
 
+                # mu_alpha sign-flip fast exit (direction reversal detection)
+                if pos_managed and sym in self.positions and not exited_by_event:
+                    exited_by_event = self._check_mu_sign_flip_exit(sym, decision, regime, price, ts)
+
                 # EV drop exit
-                if pos_managed and sym in self.positions:
+                if pos_managed and sym in self.positions and not exited_by_event:
                     exited_by_event = self._check_ev_drop_exit(sym, decision, regime, price, ts)
 
                 if decision.get("action") in ("LONG", "SHORT") and sym not in self.positions:
@@ -12001,10 +15752,8 @@ class LiveOrchestrator:
 
     def _evaluate_event_exit(self, sym: str, pos: dict, decision: dict, ctx: dict, ts: int, price: float) -> bool:
         """Event-based MC exit evaluation. Returns True if exited."""
-        try:
-            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
-        except Exception:
-            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        _regime = str(ctx.get("regime") or pos.get("regime") or "chop")
+        min_hold_sec = self._effective_min_hold_sec(pos, regime=_regime)
         try:
             entry_ts = int(pos.get("entry_time") or 0)
         except Exception:
@@ -12013,6 +15762,89 @@ class LiveOrchestrator:
             age_sec = (ts - entry_ts) / 1000.0
             if age_sec < float(min_hold_sec):
                 return False
+
+        # [FIX 2026-02-13] Regime-Direction Conflict Exit: 보유 포지션이 레짐과 반대 방향이면 즉시 청산
+        try:
+            regime_exit_enabled = str(os.environ.get("REGIME_DIRECTION_EXIT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            regime_exit_enabled = True
+        if regime_exit_enabled:
+            pos_side = str(pos.get("side") or pos.get("direction") or "").upper()
+            regime_now_early = str(ctx.get("regime", "chop"))
+            regime_conflict = False
+            if regime_now_early == "bear" and pos_side == "LONG":
+                regime_conflict = True
+            elif regime_now_early == "bull" and pos_side == "SHORT":
+                regime_conflict = True
+            if regime_conflict:
+                # ── [FIX 2026-02-16] allow_counter_trend 체크 ──
+                # DirectionModel이 consensus 기반으로 counter-trend 진입을 결정했을 수 있음.
+                # regime policy에서 allow_counter_trend=True이면 exit 차단.
+                try:
+                    from engines.mc.regime_policy import get_regime_policy as _grp_rde
+                    _sigma_rde = float(ctx.get("sigma", ctx.get("sigma_sim", 0.0)) or 0.0)
+                    _rpol_rde = _grp_rde(regime_now_early, _sigma_rde)
+                    if getattr(_rpol_rde, "allow_counter_trend", False):
+                        regime_conflict = False  # counter-trend 허용 → exit 차단
+                except Exception:
+                    pass  # fallback: regime_conflict 유지
+
+            if regime_conflict:
+                # Check minimum age to avoid exit on first tick of new regime
+                try:
+                    regime_exit_min_age = float(os.environ.get("REGIME_EXIT_MIN_AGE_SEC", 30) or 30)
+                except Exception:
+                    regime_exit_min_age = 30.0
+                pos_age = (ts - entry_ts) / 1000.0 if entry_ts else 9999
+                if pos_age >= regime_exit_min_age:
+                    self._log(
+                        f"[REGIME_DIR_EXIT] {sym} exit {pos_side} in {regime_now_early} regime "
+                        f"(age={pos_age:.0f}s, roe={pos.get('roe', 'N/A')})"
+                    )
+                    exit_ok = self._close_position(
+                        sym, price,
+                        reason=f"regime_dir_conflict_{regime_now_early}_{pos_side}",
+                        exit_kind="REGIME_DIR_EXIT",
+                    )
+                    return True
+
+        # ── [2026-02-14] Volatility Breakout Kill Switch ──
+        # Chop 레짐에서 보유 중인 포지션이 있을 때 변동성 폭발을 감지하면 즉시 청산
+        if VOL_BREAKOUT_ENABLED:
+            try:
+                closes_vb = list(self.ohlcv_buffer.get(sym, []))
+                if len(closes_vb) >= 60:
+                    lr_vb = np.diff(np.log(np.array(closes_vb[-60:], dtype=np.float64) + 1e-12))
+                    rv_short = float(np.std(lr_vb[-10:]))   # 10-bar short-term rv
+                    rv_long = float(np.std(lr_vb[-60:]))    # 60-bar long-term rv
+                    regime_vb = str(ctx.get("regime", "chop"))
+
+                    # OFI (Order Flow Imbalance) 체크
+                    ofi_val = float(ctx.get("ofi_z", 0.0) or 0.0)
+
+                    # VPIN 체크
+                    vpin_val = float(ctx.get("vpin", 0.0) or 0.0)
+
+                    # 조건: rv_short가 rv_long의 N배 이상 + (OFI 쏠림 또는 VPIN 독성)
+                    rv_breakout = rv_long > 1e-10 and rv_short > rv_long * VOL_BREAKOUT_RV_MULT
+                    ofi_extreme = abs(ofi_val) >= VOL_BREAKOUT_OFI_THRESHOLD
+                    vpin_toxic = vpin_val >= VOL_BREAKOUT_VPIN_THRESHOLD
+
+                    if rv_breakout and (ofi_extreme or vpin_toxic):
+                        self._log(
+                            f"[VOL_BREAKOUT_EXIT] {sym} rv_short={rv_short:.6f} rv_long={rv_long:.6f} "
+                            f"ratio={rv_short/rv_long:.2f}x ofi={ofi_val:.4f} vpin={vpin_val:.4f} "
+                            f"regime={regime_vb} → emergency close"
+                        )
+                        self._close_position(
+                            sym, price,
+                            reason=f"vol_breakout_rv={rv_short/rv_long:.1f}x_vpin={vpin_val:.2f}",
+                            exit_kind="VOL_BREAKOUT_EXIT",
+                        )
+                        return True
+            except Exception as e:
+                logger.warning(f"[VOL_BREAKOUT] {sym} check failed: {e}")
+
         meta = decision.get("meta") or {}
         if not meta:
             for d in decision.get("details", []):
@@ -12090,26 +15922,16 @@ class LiveOrchestrator:
             use_tstar = True
         hold_target_sec = None
         if use_tstar:
-            try:
-                hold_target_sec = float(
-                    pos.get("opt_hold_curr_sec")
-                    or pos.get("opt_hold_sec")
-                    or pos.get("opt_hold_entry_sec")
-                    or 0.0
-                )
-            except Exception:
-                hold_target_sec = 0.0
-            if not hold_target_sec:
-                try:
-                    hold_target_sec = float(
-                        meta.get("opt_hold_sec")
-                        or meta.get("unified_t_star")
-                        or meta.get("policy_horizon_eff_sec")
-                        or meta.get("best_h")
-                        or 0.0
-                    )
-                except Exception:
-                    hold_target_sec = 0.0
+            hold_target_sec, hold_target_src, hold_target_regime, hold_target_scale = self._resolve_target_hold_sec(
+                pos=pos,
+                meta=meta,
+                regime_hint=str(ctx.get("regime") or meta.get("regime") or ""),
+                hurst_hint=self._safe_float(ctx.get("hurst"), self._safe_float(meta.get("hurst"), None)),
+                include_min_hold_fallback=False,
+            )
+            meta["event_hold_target_src"] = str(hold_target_src or "none")
+            meta["event_hold_target_regime"] = str(hold_target_regime or "")
+            meta["event_hold_target_scale"] = float(hold_target_scale or 1.0)
             if hold_target_sec and entry_ts:
                 try:
                     age_sec = (ts - entry_ts) / 1000.0
@@ -12118,6 +15940,7 @@ class LiveOrchestrator:
                 remaining_sec = max(1.0, float(hold_target_sec) - float(age_sec))
                 max_horizon_sec = float(remaining_sec)
                 meta["event_hold_target_sec"] = float(hold_target_sec)
+                meta["target_hold_sec"] = float(hold_target_sec)
                 meta["event_hold_remaining_sec"] = float(remaining_sec)
         if max_horizon_sec and step_sec > 0:
             max_steps_evt = max(1, int(round(float(max_horizon_sec) / float(step_sec))))
@@ -12198,6 +16021,8 @@ class LiveOrchestrator:
         ptp_hit = bool(core_eval.get("hit_ptp"))
         event_exit_hit = bool(core_eval.get("event_exit_hit"))
         meta["event_exit_hit"] = bool(event_exit_hit)
+        meta["event_exit_shock_demoted"] = bool(core_eval.get("shock_demoted"))
+        meta["event_exit_hit_count"] = int(core_eval.get("hit_count") or 0)
         meta["event_exit_hit_score"] = bool(score_hit)
         meta["event_exit_hit_cvar"] = bool(cvar_hit)
         meta["event_exit_hit_psl"] = bool(psl_hit)
@@ -12489,21 +16314,23 @@ class LiveOrchestrator:
             shock_threshold_default=self._safe_float(os.environ.get("EVENT_EXIT_SHOCK_FAST_THRESHOLD"), 1.0) or 1.0,
         )
         ts_eval_ms = int(now_ms())
-        try:
-            hold_target_pre = float(
-                meta.get("opt_hold_sec")
-                or meta.get("unified_t_star")
-                or meta.get("policy_horizon_eff_sec")
-                or meta.get("best_h")
-                or 0.0
-            )
-        except Exception:
+        hold_target_pre, hold_target_pre_src, hold_target_pre_regime, hold_target_pre_scale = self._resolve_target_hold_sec(
+            pos=None,
+            meta=meta,
+            regime_hint=str(meta.get("regime") or ""),
+            hurst_hint=self._safe_float(meta.get("hurst"), None),
+            include_min_hold_fallback=False,
+        )
+        if hold_target_pre is None:
             hold_target_pre = 0.0
         shadow_pos = {
             "entry_time": int(ts_eval_ms),
             "opt_hold_curr_sec": float(hold_target_pre) if hold_target_pre > 0 else None,
             "opt_hold_entry_sec": float(hold_target_pre) if hold_target_pre > 0 else None,
             "policy_min_hold_eff_sec": float(hold_target_pre) if hold_target_pre > 0 else None,
+            "target_hold_curr_sec": float(hold_target_pre) if hold_target_pre > 0 else None,
+            "target_hold_entry_sec": float(hold_target_pre) if hold_target_pre > 0 else None,
+            "target_hold_sec": float(hold_target_pre) if hold_target_pre > 0 else None,
         }
         precheck_gate = self._event_exit_gate_decision(
             pos=shadow_pos,
@@ -12561,6 +16388,9 @@ class LiveOrchestrator:
             "event_precheck_guard_hold_target_sec": precheck_gate.get("guard_hold_target_sec"),
             "event_precheck_guard_age_sec": precheck_gate.get("guard_age_sec"),
             "event_precheck_guard_remaining_sec": precheck_gate.get("guard_remaining_sec"),
+            "event_precheck_hold_target_src": str(hold_target_pre_src or "none"),
+            "event_precheck_hold_target_regime": str(hold_target_pre_regime or ""),
+            "event_precheck_hold_target_scale": float(hold_target_pre_scale or 1.0),
             "event_exit_confirm_mode": str(precheck_gate.get("confirm_mode") or "idle"),
             "event_exit_confirm_required": int(precheck_gate.get("confirm_required") or 1),
             "event_exit_confirm_count": int(precheck_gate.get("confirm_count") or 0),
@@ -12585,12 +16415,9 @@ class LiveOrchestrator:
 
     def _check_ema_ev_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
         """EMA-based EV/PSL deterioration exit. Returns True if exited."""
-        try:
-            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
-        except Exception:
-            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        pos = self.positions.get(sym) or {}
+        min_hold_sec = self._effective_min_hold_sec(pos, regime=regime)
         if min_hold_sec > 0:
-            pos = self.positions.get(sym) or {}
             try:
                 entry_ts = int(pos.get("entry_time") or 0)
             except Exception:
@@ -12621,14 +16448,218 @@ class LiveOrchestrator:
             return True
         return False
 
+    def _check_mu_sign_flip_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
+        """[2026-02-13] mu_alpha 부호 반전 감지 → 빠른 청산.
+
+        mu_alpha가 매 사이클 재계산되므로, 포지션 방향과 mu_alpha 부호가
+        연속 N틱 반대이면 방향 전환으로 간주하고 청산합니다.
+        ev_drop_exit보다 먼저 실행되어, 방향 전환에 민감하게 반응합니다.
+        """
+        try:
+            enabled = str(os.environ.get("MU_SIGN_FLIP_EXIT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            enabled = True
+        if not enabled:
+            return False
+
+        pos = self.positions.get(sym)
+        if not pos:
+            return False
+
+        meta = decision.get("meta") or {}
+        mu_alpha = self._safe_float(
+            meta.get("mu_alpha"),
+            self._safe_float(meta.get("pred_mu_alpha"), self._safe_float(meta.get("mu_adjusted"), None))
+        )
+        if mu_alpha is None:
+            return False
+        try:
+            mu_cap_obs = float(os.environ.get("MU_ALPHA_CAP", 15.0) or 15.0)
+        except Exception:
+            mu_cap_obs = 15.0
+        mu_cap_obs = float(max(0.1, abs(mu_cap_obs)))
+        mu_alpha = float(max(-mu_cap_obs, min(mu_cap_obs, float(mu_alpha))))
+
+        side = str(pos.get("side") or "").upper()
+        if side not in ("LONG", "SHORT"):
+            return False
+
+        # Determine if mu_alpha opposes position direction
+        mu_opposes = False
+        try:
+            mu_min_magnitude = float(os.environ.get("MU_SIGN_FLIP_MIN_MAGNITUDE", 0.05) or 0.05)
+        except Exception:
+            mu_min_magnitude = 0.05
+
+        p_long = self._safe_float(
+            meta.get("mu_dir_prob_long"),
+            self._safe_float(meta.get("pred_mu_dir_prob_long"), None),
+        )
+        opp_conf = None
+        if p_long is not None and side in ("LONG", "SHORT"):
+            p_long = float(max(0.0, min(1.0, p_long)))
+            opp_conf = float((1.0 - p_long) if side == "LONG" else p_long)
+
+        shock_score = self._safe_float(
+            decision.get("shock_score"),
+            self._safe_float(meta.get("shock_score"), 0.0),
+        )
+        shock_score = float(shock_score or 0.0)
+
+        if side == "LONG" and float(mu_alpha) < -mu_min_magnitude:
+            mu_opposes = True
+        elif side == "SHORT" and float(mu_alpha) > mu_min_magnitude:
+            mu_opposes = True
+
+        # ── [FIX 2026-02-16] DirectionModel consensus가 포지션과 같은 방향이면 exit 차단 ──
+        # mu_alpha 부호만으로 판단하면 consensus 기반 진입 직후 즉시 exit 발동
+        if mu_opposes:
+            try:
+                _use_dm = str(os.environ.get("USE_DIRECTION_MODEL", "1")).strip().lower() in ("1", "true", "yes", "on")
+                if _use_dm:
+                    from engines.mc.direction_model import compute_direction_override
+                    _dm_result = compute_direction_override(
+                        mu_alpha=float(mu_alpha),
+                        meta=meta,
+                        ctx=meta,  # use meta as ctx fallback
+                        score_long=0.0, score_short=0.0,
+                        ev_long=0.0, ev_short=0.0,
+                    )
+                    _dm_dir = int(_dm_result.get("direction", 0))
+                    _pos_dir = 1 if side == "LONG" else -1
+                    if _dm_dir == _pos_dir:
+                        # Consensus still agrees with position → suppress exit
+                        mu_opposes = False
+                        if isinstance(pos, dict):
+                            pos["mu_sign_flip_consensus_override"] = True
+            except Exception as _dm_err:
+                pass  # fallback to mu_alpha-only logic
+
+        try:
+            base_min_age = float(os.environ.get("MU_SIGN_FLIP_MIN_AGE_SEC", 30) or 30)
+        except Exception:
+            base_min_age = 30.0
+        try:
+            fast_min_age = float(os.environ.get("MU_SIGN_FLIP_FAST_MIN_AGE_SEC", 10) or 10)
+        except Exception:
+            fast_min_age = 10.0
+        try:
+            fast_mag = float(os.environ.get("MU_SIGN_FLIP_FAST_MAGNITUDE", 0.12) or 0.12)
+        except Exception:
+            fast_mag = 0.12
+        try:
+            fast_opp_conf = float(os.environ.get("MU_SIGN_FLIP_FAST_OPP_CONF", 0.62) or 0.62)
+        except Exception:
+            fast_opp_conf = 0.62
+        try:
+            shock_fast_th = float(os.environ.get("MU_SIGN_FLIP_SHOCK_FAST_THRESHOLD", 1.0) or 1.0)
+        except Exception:
+            shock_fast_th = 1.0
+
+        regime_l = str(regime or "").lower()
+        chop_mode = regime_l == "chop"
+        mu_abs = abs(float(mu_alpha))
+        strong_by_mu = bool(mu_opposes and (mu_abs >= fast_mag))
+        strong_by_conf = bool((opp_conf is not None) and (opp_conf >= fast_opp_conf))
+        strong_by_regime = regime_l in ("bull", "bear")
+        strong_by_shock = bool(shock_score >= shock_fast_th)
+        fast_mode = bool(strong_by_mu and (strong_by_conf or strong_by_regime or strong_by_shock))
+        try:
+            disable_fast_in_chop = str(os.environ.get("MU_SIGN_FLIP_DISABLE_FAST_IN_CHOP", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            disable_fast_in_chop = True
+        if chop_mode and disable_fast_in_chop:
+            fast_mode = False
+
+        min_age = float(base_min_age)
+        if fast_mode:
+            min_age = float(min(base_min_age, fast_min_age))
+        if chop_mode:
+            try:
+                chop_min_age = float(os.environ.get("MU_SIGN_FLIP_CHOP_MIN_AGE_SEC", min_age) or min_age)
+            except Exception:
+                chop_min_age = min_age
+            min_age = float(max(min_age, chop_min_age))
+
+        # ── [CF 2026-02-15] regime min_hold를 mu_sign_flip의 floor로 적용 ──
+        # mu_sign_flip이 EXIT_MIN_HOLD_SEC_* 보다 빨리 발동하는 것을 방지
+        regime_min_hold = float(self._effective_min_hold_sec(pos, regime=regime_l))
+        min_age = float(max(min_age, regime_min_hold))
+
+        try:
+            entry_ts = int(pos.get("entry_time") or 0)
+        except Exception:
+            entry_ts = 0
+        age_sec = 0.0
+        if entry_ts:
+            age_sec = (ts - entry_ts) / 1000.0
+            if age_sec < min_age:
+                return False
+
+        state = self._mu_sign_state.setdefault(sym, {"prev_sign": 0, "streak": 0})
+        if mu_opposes:
+            cur_sign = 1 if float(mu_alpha) >= 0 else -1
+            prev_sign = int(state.get("prev_sign", 0) or 0)
+            if prev_sign in (0, cur_sign):
+                state["streak"] = int(state.get("streak", 0) or 0) + 1
+            else:
+                state["streak"] = 1
+            state["prev_sign"] = cur_sign
+            if fast_mode:
+                state["streak"] = int(state.get("streak", 0) or 0) + 1
+        else:
+            state["streak"] = 0
+            state["prev_sign"] = 0
+
+        # Required consecutive ticks
+        try:
+            needed = int(os.environ.get("MU_SIGN_FLIP_CONFIRM_TICKS", 2) or 2)
+        except Exception:
+            needed = 2
+        try:
+            fast_needed = int(os.environ.get("MU_SIGN_FLIP_FAST_CONFIRM_TICKS", 1) or 1)
+        except Exception:
+            fast_needed = 1
+        if fast_mode:
+            needed = min(int(needed), int(fast_needed))
+        if chop_mode:
+            try:
+                chop_needed = int(os.environ.get("MU_SIGN_FLIP_CHOP_CONFIRM_TICKS", needed) or needed)
+            except Exception:
+                chop_needed = needed
+            needed = max(int(needed), int(chop_needed))
+        needed = max(1, needed)
+
+        # Store diagnostics on position
+        if isinstance(pos, dict):
+            pos["mu_sign_flip_streak"] = int(state.get("streak", 0))
+            pos["mu_sign_flip_needed"] = int(needed)
+            pos["mu_sign_flip_mu_alpha"] = float(mu_alpha)
+            pos["mu_sign_flip_opposes"] = bool(mu_opposes)
+            pos["mu_sign_flip_opp_conf"] = self._safe_float(opp_conf, None)
+            pos["mu_sign_flip_age_sec"] = float(age_sec)
+            pos["mu_sign_flip_min_age_sec"] = float(min_age)
+            pos["mu_sign_flip_fast_mode"] = bool(fast_mode)
+            pos["mu_sign_flip_chop_mode"] = bool(chop_mode)
+
+        if int(state.get("streak", 0)) >= needed:
+            roe = pos.get("roe", "N/A")
+            self._log(
+                f"[MU_SIGN_FLIP_EXIT] {sym} exit {side} — mu_alpha={mu_alpha:.4f} "
+                f"opposes for {state['streak']} ticks (need={needed}, fast={int(fast_mode)}, "
+                f"age={age_sec:.1f}s, regime={regime_l}, roe={roe})"
+            )
+            self._close_position(sym, float(price), "mu_sign_flip_exit", exit_kind="RISK")
+            state["streak"] = 0
+            state["prev_sign"] = 0
+            return True
+        return False
+
     def _check_ev_drop_exit(self, sym: str, decision: dict, regime: str, price: float, ts: int) -> bool:
         """EV drop exit logic. Returns True if exited."""
-        try:
-            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
-        except Exception:
-            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+        pos = self.positions.get(sym) or {}
+        min_hold_sec = self._effective_min_hold_sec(pos, regime=regime)
         if min_hold_sec > 0:
-            pos = self.positions.get(sym) or {}
             try:
                 entry_ts = int(pos.get("entry_time") or 0)
             except Exception:
@@ -12640,20 +16671,190 @@ class LiveOrchestrator:
         ev_now = float(decision.get("unified_score", decision.get("ev", 0.0)) or 0.0)
         meta_now = decision.get("meta") or {}
         ev_floor = float(meta_now.get("ev_entry_threshold_dyn") or meta_now.get("ev_entry_threshold") or 0.0)
-        prev_ev = self._ev_drop_state[sym].get("prev")
+        state = self._ev_drop_state.setdefault(
+            sym,
+            {"prev": None, "streak": 0, "prev_opp_conf": None, "prev_opp_edge": None},
+        )
+        prev_ev = state.get("prev")
         delta_ev = None
         if prev_ev is not None:
             delta_ev = ev_now - prev_ev
 
-        strong_signal = decision.get("confidence", 0.0) >= 0.65
-        needed_ticks = 1 if strong_signal else 2
-        if ev_now < ev_floor and (delta_ev is not None) and (delta_ev < -EV_DROP_THRESHOLD):
-            self._ev_drop_state[sym]["streak"] += 1
-        else:
-            self._ev_drop_state[sym]["streak"] = 0
-        self._ev_drop_state[sym]["prev"] = ev_now
+        # Opposite-side confirmation must rise together with score drop.
+        side = str((self.positions.get(sym) or {}).get("side") or "").upper()
+        p_long = self._safe_float(
+            meta_now.get("mu_dir_prob_long"),
+            self._safe_float(meta_now.get("pred_mu_dir_prob_long"), None),
+        )
+        opp_conf_now = None
+        if p_long is not None and side in ("LONG", "SHORT"):
+            p_long = float(max(0.0, min(1.0, p_long)))
+            opp_conf_now = float((1.0 - p_long) if side == "LONG" else p_long)
+        score_long = self._safe_float(
+            meta_now.get("hybrid_score_long"),
+            self._safe_float(meta_now.get("unified_score_long"), self._safe_float(meta_now.get("policy_ev_score_long"), None)),
+        )
+        score_short = self._safe_float(
+            meta_now.get("hybrid_score_short"),
+            self._safe_float(meta_now.get("unified_score_short"), self._safe_float(meta_now.get("policy_ev_score_short"), None)),
+        )
+        opp_edge_now = None
+        if side == "LONG" and score_long is not None and score_short is not None:
+            opp_edge_now = float(score_short - score_long)
+        elif side == "SHORT" and score_long is not None and score_short is not None:
+            opp_edge_now = float(score_long - score_short)
 
-        if self._ev_drop_state[sym]["streak"] >= needed_ticks:
+        prev_opp_conf = self._safe_float(state.get("prev_opp_conf"), None)
+        prev_opp_edge = self._safe_float(state.get("prev_opp_edge"), None)
+        opp_conf_rise = None
+        if opp_conf_now is not None and prev_opp_conf is not None:
+            opp_conf_rise = float(opp_conf_now - prev_opp_conf)
+        opp_edge_rise = None
+        if opp_edge_now is not None and prev_opp_edge is not None:
+            opp_edge_rise = float(opp_edge_now - prev_opp_edge)
+
+        try:
+            need_opp_confirm = str(os.environ.get("EV_DROP_REQUIRE_OPP_CONFIRM", "1")).strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+        except Exception:
+            need_opp_confirm = True
+        try:
+            opp_conf_min = float(os.environ.get("EV_DROP_OPP_CONF_MIN", 0.58) or 0.58)
+        except Exception:
+            opp_conf_min = 0.58
+        try:
+            opp_conf_rise_min = float(os.environ.get("EV_DROP_OPP_CONF_RISE_MIN", 0.010) or 0.010)
+        except Exception:
+            opp_conf_rise_min = 0.010
+        try:
+            opp_edge_min = float(os.environ.get("EV_DROP_OPP_EDGE_MIN", 0.0004) or 0.0004)
+        except Exception:
+            opp_edge_min = 0.0004
+        try:
+            opp_edge_rise_min = float(os.environ.get("EV_DROP_OPP_EDGE_RISE_MIN", 0.0002) or 0.0002)
+        except Exception:
+            opp_edge_rise_min = 0.0002
+        opp_conf_hit = bool(
+            opp_conf_now is not None
+            and float(opp_conf_now) >= float(opp_conf_min)
+            and (opp_conf_rise is None or float(opp_conf_rise) >= float(opp_conf_rise_min))
+        )
+        opp_edge_hit = bool(
+            opp_edge_now is not None
+            and float(opp_edge_now) >= float(opp_edge_min)
+            and (opp_edge_rise is None or float(opp_edge_rise) >= float(opp_edge_rise_min))
+        )
+        opp_confirm_hit = bool(opp_conf_hit and opp_edge_hit)
+
+        # Non-shock regimes must respect minimum hold progress for ev_drop exits.
+        try:
+            event_mode_now = str(meta_now.get("event_exit_mode") or "normal").strip().lower()
+        except Exception:
+            event_mode_now = "normal"
+        if event_mode_now not in ("shock", "normal", "noise"):
+            event_mode_now = "normal"
+        shock_score_now = float(self._safe_float(meta_now.get("event_exit_shock_score"), 0.0) or 0.0)
+        try:
+            ev_drop_bypass_shock = float(os.environ.get("EV_DROP_BYPASS_SHOCK_SCORE", 1.70) or 1.70)
+        except Exception:
+            ev_drop_bypass_shock = 1.70
+        try:
+            ev_prog_trend = float(os.environ.get("EV_DROP_MIN_PROGRESS_TREND", 0.70) or 0.70)
+        except Exception:
+            ev_prog_trend = 0.70
+        try:
+            ev_prog_random = float(os.environ.get("EV_DROP_MIN_PROGRESS_RANDOM", 0.80) or 0.80)
+        except Exception:
+            ev_prog_random = 0.80
+        try:
+            ev_prog_mr = float(os.environ.get("EV_DROP_MIN_PROGRESS_MEAN_REVERT", 0.88) or 0.88)
+        except Exception:
+            ev_prog_mr = 0.88
+        try:
+            h_low = float(getattr(mc_config, "hurst_low", 0.45))
+            h_high = float(getattr(mc_config, "hurst_high", 0.55))
+        except Exception:
+            h_low, h_high = 0.45, 0.55
+        hold_target_sec, hold_target_src, hold_target_regime, hold_target_scale = self._resolve_target_hold_sec(
+            pos=(self.positions.get(sym) or {}),
+            meta=meta_now,
+            regime_hint=str(meta_now.get("regime") or (self.positions.get(sym) or {}).get("regime") or regime or ""),
+            hurst_hint=self._safe_float(meta_now.get("event_exit_dynamic_hurst"), self._safe_float(meta_now.get("hurst"), None)),
+            include_min_hold_fallback=True,
+        )
+        if hold_target_sec is None:
+            hold_target_sec = float(min_hold_sec or 0.0)
+        hold_progress = None
+        hold_req = None
+        guard_hold = False
+        if hold_target_sec > 0:
+            hold_progress = float(max(0.0, age_sec) / max(float(hold_target_sec), 1e-6))
+            hurst_now = self._safe_float(meta_now.get("event_exit_dynamic_hurst"), self._safe_float(meta_now.get("hurst"), None))
+            hold_req = float(ev_prog_random)
+            if hurst_now is not None and float(hurst_now) > float(h_high):
+                hold_req = float(ev_prog_trend)
+            elif hurst_now is not None and float(hurst_now) < float(h_low):
+                hold_req = float(ev_prog_mr)
+            guard_hold = bool(
+                event_mode_now != "shock"
+                and float(hold_progress) < float(hold_req)
+                and float(shock_score_now) < float(ev_drop_bypass_shock)
+            )
+
+        score_drop_hit = bool(ev_now < ev_floor and (delta_ev is not None) and (delta_ev < -EV_DROP_THRESHOLD))
+        confidence_now = float(decision.get("confidence", 0.0) or 0.0)
+        strong_signal = bool(confidence_now >= 0.70 and (opp_conf_now is not None and float(opp_conf_now) >= float(opp_conf_min + 0.02)))
+        try:
+            needed_ticks = int(os.environ.get("EV_DROP_CONFIRM_TICKS_STRONG", 2) or 2) if strong_signal else int(
+                os.environ.get("EV_DROP_CONFIRM_TICKS_WEAK", 3) or 3
+            )
+        except Exception:
+            needed_ticks = 2 if strong_signal else 3
+        needed_ticks = int(max(1, needed_ticks))
+        if event_mode_now != "shock":
+            try:
+                ev_drop_nonshock_min = int(os.environ.get("EV_DROP_MIN_CONFIRM_NON_SHOCK", 3) or 3)
+            except Exception:
+                ev_drop_nonshock_min = 3
+            try:
+                ev_drop_noise_min = int(os.environ.get("EV_DROP_MIN_CONFIRM_NOISE", max(ev_drop_nonshock_min, 4)) or max(ev_drop_nonshock_min, 4))
+            except Exception:
+                ev_drop_noise_min = max(ev_drop_nonshock_min, 4)
+            if event_mode_now == "noise":
+                needed_ticks = int(max(needed_ticks, ev_drop_noise_min))
+            else:
+                needed_ticks = int(max(needed_ticks, ev_drop_nonshock_min))
+
+        trigger_now = bool(score_drop_hit and ((not need_opp_confirm) or opp_confirm_hit) and (not guard_hold))
+        if trigger_now:
+            state["streak"] = int(state.get("streak", 0) or 0) + 1
+        else:
+            state["streak"] = 0
+        state["prev"] = float(ev_now)
+        state["prev_opp_conf"] = float(opp_conf_now) if opp_conf_now is not None else None
+        state["prev_opp_edge"] = float(opp_edge_now) if opp_edge_now is not None else None
+
+        if isinstance(self.positions.get(sym), dict):
+            p = self.positions.get(sym) or {}
+            p["ev_drop_score_drop_hit"] = bool(score_drop_hit)
+            p["ev_drop_opp_confirm_hit"] = bool(opp_confirm_hit)
+            p["ev_drop_opp_conf"] = float(opp_conf_now) if opp_conf_now is not None else None
+            p["ev_drop_opp_conf_rise"] = float(opp_conf_rise) if opp_conf_rise is not None else None
+            p["ev_drop_opp_edge"] = float(opp_edge_now) if opp_edge_now is not None else None
+            p["ev_drop_opp_edge_rise"] = float(opp_edge_rise) if opp_edge_rise is not None else None
+            p["ev_drop_hold_guarded"] = bool(guard_hold)
+            p["ev_drop_hold_progress"] = float(hold_progress) if hold_progress is not None else None
+            p["ev_drop_hold_required"] = float(hold_req) if hold_req is not None else None
+            p["ev_drop_hold_target_sec"] = float(hold_target_sec) if hold_target_sec is not None else None
+            p["ev_drop_hold_target_src"] = str(hold_target_src or "none")
+            p["ev_drop_hold_target_regime"] = str(hold_target_regime or "")
+            p["ev_drop_hold_target_scale"] = float(hold_target_scale or 1.0)
+            p["ev_drop_confirm_required"] = int(needed_ticks)
+            p["ev_drop_confirm_count"] = int(state.get("streak", 0) or 0)
+            p["ev_drop_event_mode"] = str(event_mode_now)
+
+        if int(state.get("streak", 0) or 0) >= int(needed_ticks):
             self._close_position(sym, float(price), "ev_drop_exit", exit_kind="RISK")
             return True
         return False
@@ -12798,8 +16999,15 @@ class LiveOrchestrator:
         if risk < 1e-9:
             risk = 1e-9
 
-        # leverage bounds per regime
-        lev_max = {"bull": 20.0, "bear": 18.0, "chop": 10.0, "volatile": 8.0}.get(regime, 10.0)
+        # leverage bounds per regime — [2026-02-14] env 기반으로 교체 (하드코딩 제거)
+        _lev_env_map = {
+            "bull": float(os.environ.get("UNI_LEV_MAX_TREND", 40)),
+            "trend": float(os.environ.get("UNI_LEV_MAX_TREND", 40)),
+            "bear": float(os.environ.get("UNI_LEV_MAX_BEAR", 30)),
+            "chop": float(os.environ.get("UNI_LEV_MAX_CHOP", 25)),
+            "volatile": float(os.environ.get("UNI_LEV_MAX_VOLATILE", 15)),
+        }
+        lev_max = _lev_env_map.get(regime, float(os.environ.get("UNI_LEV_MAX_CHOP", 25)))
         lev_raw = (max(ev1, 0.0) / risk) * K_LEV
         lev = float(max(1.0, min(lev_max, lev_raw)))
 
@@ -13041,6 +17249,32 @@ class LiveOrchestrator:
 
     def _set_exchange_positions_view(self, positions: list[dict], now_ts: int, source: str) -> None:
         view = list(positions or [])
+        raw_count = int(len(view))
+        try:
+            filter_universe = str(os.environ.get("DASHBOARD_EXCHANGE_VIEW_FILTER_UNIVERSE", "0")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            filter_universe = False
+        if filter_universe:
+            universe = set()
+            try:
+                if isinstance(getattr(self, "_runtime_universe", None), set):
+                    universe = set(self._runtime_universe or set())
+            except Exception:
+                universe = set()
+            if not universe:
+                try:
+                    universe = set(str(s) for s in (SYMBOLS or []))
+                except Exception:
+                    universe = set()
+            if universe:
+                filtered: list[dict] = []
+                for p in view:
+                    if not isinstance(p, dict):
+                        continue
+                    sym = _normalize_sym_key(p.get("symbol"))
+                    if sym and sym in universe:
+                        filtered.append(p)
+                view = filtered
         by_symbol: dict[str, dict] = {}
         for p in view:
             if not isinstance(p, dict):
@@ -13053,6 +17287,9 @@ class LiveOrchestrator:
         self._exchange_positions_by_symbol = by_symbol
         self._exchange_positions_ts = int(now_ts)
         self._exchange_positions_source = str(source or "rest")
+        self._exchange_positions_raw_count = int(raw_count)
+        self._exchange_positions_view_count = int(len(view))
+        self._exchange_positions_filter_universe = bool(filter_universe)
 
     def _extract_exchange_position_risk_metrics(
         self,
@@ -13312,6 +17549,10 @@ class LiveOrchestrator:
             size_abs = abs(size)
             if size_abs < 1e-12:
                 self._ws_positions_cache.pop(sym, None)
+                try:
+                    self._last_exchange_pos.pop(sym, None)
+                except Exception:
+                    pass
                 continue
             ex = {
                 "symbol": sym,
@@ -13332,9 +17573,15 @@ class LiveOrchestrator:
                 "info": item,
             }
             self._ws_positions_cache[sym] = ex
+            try:
+                self._last_exchange_pos[sym] = dict(ex)
+            except Exception:
+                pass
         try:
+            merged_pos_map = dict(self._last_exchange_pos or {})
+            merged_pos_map.update(self._ws_positions_cache or {})
             self._set_exchange_positions_view(
-                self._build_exchange_positions_view(self._ws_positions_cache, now_ts),
+                self._build_exchange_positions_view(merged_pos_map, now_ts),
                 now_ts,
                 "ws",
             )
@@ -13445,7 +17692,7 @@ class LiveOrchestrator:
         if sym not in self._cvar_hist:
             self._cvar_hist[sym] = deque(maxlen=400)
         if sym not in self._ev_drop_state:
-            self._ev_drop_state[sym] = {"prev": None, "streak": 0}
+            self._ev_drop_state[sym] = {"prev": None, "streak": 0, "prev_opp_conf": None, "prev_opp_edge": None}
         if sym not in self._exit_bad_ticks:
             self._exit_bad_ticks[sym] = 0
         if sym not in self._dyn_leverage:
@@ -13478,6 +17725,15 @@ class LiveOrchestrator:
             if base is not None and last is not None:
                 v = float(base) * float(last)
         return v
+
+    def _parse_symbols_csv_value(self, raw: str | None) -> list[str]:
+        if not raw:
+            return []
+        try:
+            parts = [p.strip() for p in str(raw).split(",")]
+        except Exception:
+            return []
+        return [p for p in parts if p]
 
     def _apply_dynamic_universe(self, new_syms: list[str], *, reason: str = "top_volume") -> None:
         global SYMBOLS, TOP_N_SYMBOLS
@@ -13580,6 +17836,7 @@ class LiveOrchestrator:
                     else:
                         raise
             pos_map = self._normalize_exchange_positions(raw if isinstance(raw, list) else [])
+            self._last_exchange_pos = dict(pos_map)
         except Exception as e:
             self._log_err(f"[SYNC_POS] fetch_positions failed: {e}")
             return
@@ -13645,6 +17902,12 @@ class LiveOrchestrator:
             except Exception:
                 size_frac = 0.0
 
+            # [FIX 2026-02-13] Exchange sync에 regime 즉시 부여 (closes로 추론)
+            try:
+                _sync_closes = list(self.ohlcv_buffer.get(sym, []))
+                _sync_regime = self._infer_regime_with_hmm(sym, _sync_closes)[0] if _sync_closes else "chop"
+            except Exception:
+                _sync_regime = "chop"
             pos = {
                 "symbol": sym,
                 "side": side,
@@ -13662,6 +17925,7 @@ class LiveOrchestrator:
                 "order_status": "ack",
                 "order_ack_ts": int(now_ts),
                 "pos_source": "exchange_sync",
+                "regime": _sync_regime,
                 "liq_price": float(liq_px) if liq_px is not None else None,
                 "margin": float(margin) if margin is not None else None,
                 "unrealized_pnl": float(unrealized_pnl) if unrealized_pnl is not None else None,
@@ -13744,6 +18008,12 @@ class LiveOrchestrator:
                     "policy_score_threshold",
                     "policy_event_exit_min_score",
                     "policy_unrealized_dd_floor",
+                    "policy_prelev_stop2_floor",
+                    "prelev_stop2_ret",
+                    "prelev_stop2_gate_hits",
+                    "prelev_stop2_mode",
+                    "prelev_stop2_triggered",
+                    "prelev_stop2_confirmed",
                     "regime",
                     "session",
                 ):
@@ -13963,12 +18233,19 @@ class LiveOrchestrator:
             except Exception:
                 interval = 10.0
             try:
+                include_all_fetch = bool(getattr(config, "SYNC_POSITIONS_ALL", True))
                 fetch_params = self._positions_fetch_params()
                 try:
-                    if fetch_params:
-                        raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS, fetch_params)
+                    if include_all_fetch:
+                        if fetch_params:
+                            raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, None, fetch_params)
+                        else:
+                            raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions)
                     else:
-                        raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS)
+                        if fetch_params:
+                            raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS, fetch_params)
+                        else:
+                            raw = await self._ccxt_call("fetch_positions", self.exchange.fetch_positions, SYMBOLS)
                 except Exception as e:
                     msg = str(e)
                     # Bybit: fetchPositions does not accept an array with more than one symbol.
@@ -13980,6 +18257,7 @@ class LiveOrchestrator:
                     else:
                         raise
                 pos_map = self._normalize_exchange_positions(raw if isinstance(raw, list) else [])
+                self._last_exchange_pos = dict(pos_map)
                 now_ts = now_ms()
                 try:
                     self._set_exchange_positions_view(
@@ -14201,6 +18479,12 @@ class LiveOrchestrator:
             except Exception:
                 top_n = 30
             top_n = max(1, top_n)
+            core_syms = self._parse_symbols_csv_value(os.environ.get("TOP_VOLUME_CORE_SYMBOLS_CSV", ""))
+            try:
+                rotate_n = int(os.environ.get("TOP_VOLUME_ROTATION_COUNT", max(0, top_n - len(core_syms))) or max(0, top_n - len(core_syms)))
+            except Exception:
+                rotate_n = max(0, top_n - len(core_syms))
+            rotate_n = max(0, rotate_n)
             try:
                 suffix = str(os.environ.get("TOP_VOLUME_SYMBOL_SUFFIX", ":USDT") or ":USDT").strip()
             except Exception:
@@ -14228,7 +18512,23 @@ class LiveOrchestrator:
                     candidates.append((float(vol), str(sym)))
                 if candidates:
                     candidates.sort(key=lambda x: x[0], reverse=True)
-                    new_syms = [s for _, s in candidates[:top_n]]
+                    ranked = [s for _, s in candidates]
+                    # Hybrid universe: fixed core + rotating hot symbols.
+                    if core_syms:
+                        core = [s for s in core_syms if (not suffix or suffix in s)]
+                        core = core[:top_n]
+                        if len(core) >= top_n:
+                            new_syms = core[:top_n]
+                        else:
+                            remain_cap = max(0, top_n - len(core))
+                            sat_cap = min(remain_cap, rotate_n if rotate_n > 0 else remain_cap)
+                            sat = [s for s in ranked if s not in set(core)]
+                            new_syms = core + sat[:sat_cap]
+                            if len(new_syms) < top_n:
+                                fill = [s for s in ranked if s not in set(new_syms)]
+                                new_syms.extend(fill[: max(0, top_n - len(new_syms))])
+                    else:
+                        new_syms = ranked[:top_n]
                     # If a symbol drops from top volume but still has an open position,
                     # delay replacement until that position is closed.
                     try:
@@ -14252,10 +18552,130 @@ class LiveOrchestrator:
                     except Exception:
                         pass
                     self._apply_dynamic_universe(new_syms, reason="top_volume")
+                    # ---- [FIX 2026-02-13] 전체 candidate list 캐시 (evict용) ----
+                    self._top_volume_candidate_pool = ranked  # 거래량 순서 전체
             except Exception as e:
                 self._log_err(f"[UNIVERSE] top_volume update failed: {e}")
 
-            await asyncio.sleep(refresh_sec)
+            # ---- [FIX 2026-02-13] Symbol quality eviction: refresh_sec 대기 중 60초마다 품질 체크 ----
+            evict_interval = 60.0  # 60초마다 품질 체크
+            elapsed = 0.0
+            while elapsed < refresh_sec:
+                await asyncio.sleep(min(evict_interval, refresh_sec - elapsed))
+                elapsed += evict_interval
+                try:
+                    evict_enabled = str(os.environ.get("SYMBOL_QUALITY_EVICT_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+                except Exception:
+                    evict_enabled = True
+                if not evict_enabled:
+                    continue
+                try:
+                    evict_min_exits = int(os.environ.get("SYMBOL_QUALITY_EVICT_MIN_EXITS", 30) or 30)
+                except Exception:
+                    evict_min_exits = 30
+                try:
+                    evict_max_score = float(os.environ.get("SYMBOL_QUALITY_EVICT_MAX_SCORE", 0.30) or 0.30)
+                except Exception:
+                    evict_max_score = 0.30
+                try:
+                    evict_cooldown_sec = float(os.environ.get("SYMBOL_QUALITY_EVICT_COOLDOWN_SEC", 600.0) or 600.0)
+                except Exception:
+                    evict_cooldown_sec = 600.0
+                try:
+                    evict_max_per_cycle = int(os.environ.get("SYMBOL_QUALITY_EVICT_MAX_PER_CYCLE", 3) or 3)
+                except Exception:
+                    evict_max_per_cycle = 3
+
+                now_ts = now_ms()
+                current_syms = list(SYMBOLS)
+                core_set = set(self._parse_symbols_csv_value(os.environ.get("TOP_VOLUME_CORE_SYMBOLS_CSV", "")))
+                pool = getattr(self, "_top_volume_candidate_pool", [])
+                if not pool:
+                    continue
+
+                evict_list = []
+                for sym in current_syms:
+                    if sym in core_set:
+                        continue  # 코어 심볼 보호
+                    # 포지션 열려있으면 skip
+                    try:
+                        pos = self.positions.get(sym) or {}
+                        qty = float(pos.get("quantity", 0.0) or 0.0)
+                        if abs(qty) > 1e-9:
+                            continue
+                    except Exception:
+                        continue
+                    # 쿨다운 체크
+                    last_evict_ts = getattr(self, "_sym_evict_ts", {}).get(sym, 0)
+                    if (now_ts - last_evict_ts) < evict_cooldown_sec * 1000:
+                        continue
+                    try:
+                        sq = self._symbol_quality_state(sym, int(now_ts))
+                        sq_ok = sq.get("ok")
+                        sq_score = sq.get("score")
+                        sq_n = sq.get("sample_n", 0)
+                        if sq_ok is False and sq_n is not None and int(sq_n) >= evict_min_exits:
+                            if sq_score is not None and float(sq_score) < evict_max_score:
+                                evict_list.append((sym, float(sq_score), int(sq_n)))
+                    except Exception:
+                        continue
+
+                if not evict_list:
+                    continue
+
+                # 점수 낮은 순으로 정렬, 최대 N개
+                evict_list.sort(key=lambda x: x[1])
+                evict_list = evict_list[:evict_max_per_cycle]
+
+                # ── [FIX 2026-02-13] 퇴출 블랙리스트: 핑퐁 방지 ──
+                if not hasattr(self, "_evicted_blacklist"):
+                    self._evicted_blacklist: dict[str, int] = {}  # sym → evict_ts_ms
+                try:
+                    blacklist_hours = float(os.environ.get("SYMBOL_EVICT_BLACKLIST_HOURS", 6.0) or 6.0)
+                except Exception:
+                    blacklist_hours = 6.0
+                blacklist_ms = int(max(1.0, blacklist_hours) * 3_600_000)
+                # 만료된 블랙리스트 항목 제거
+                expired = [s for s, ts in self._evicted_blacklist.items() if (now_ts - ts) >= blacklist_ms]
+                for s in expired:
+                    del self._evicted_blacklist[s]
+
+                # 교체 후보: pool에서 현재 universe에 없고 블랙리스트에도 없는 것
+                current_set = set(current_syms)
+                blacklisted_set = set(self._evicted_blacklist.keys())
+                replacements = [s for s in pool if s not in current_set and s not in blacklisted_set]
+
+                new_syms = list(current_syms)
+                evicted = []
+                if not hasattr(self, "_sym_evict_ts"):
+                    self._sym_evict_ts = {}
+
+                for sym, score, n in evict_list:
+                    if not replacements:
+                        break
+                    replacement = replacements.pop(0)
+                    try:
+                        new_syms.remove(sym)
+                    except ValueError:
+                        continue
+                    new_syms.append(replacement)
+                    self._sym_evict_ts[sym] = now_ts
+                    # 퇴출된 심볼을 블랙리스트에 등록 (재입장 차단)
+                    self._evicted_blacklist[sym] = now_ts
+                    evicted.append((sym, score, n, replacement))
+                    self._log(
+                        f"[UNIVERSE_EVICT] {sym} (score={score:.3f}, n={n}) → {replacement} "
+                        f"[blacklisted {blacklist_hours:.0f}h]"
+                    )
+
+                if evicted:
+                    self._apply_dynamic_universe(new_syms, reason="quality_eviction")
+                    bl_count = len(self._evicted_blacklist)
+                    self._log(
+                        f"[UNIVERSE_EVICT] evicted {len(evicted)} symbols: "
+                        + ", ".join(f"{e[0]}→{e[3]}" for e in evicted)
+                        + f" | blacklist={bl_count}"
+                    )
 
     async def hold_eval_loop(self):
         """Background hold-eval refresh for open positions (async, eval-only)."""
@@ -14765,6 +19185,21 @@ class LiveOrchestrator:
         return [p for p in parts if p]
 
     def _refresh_runtime_universe(self) -> None:
+        try:
+            runtime_override_enabled = str(os.environ.get("UNIVERSE_RUNTIME_OVERRIDE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            runtime_override_enabled = True
+        if not runtime_override_enabled:
+            return
+        try:
+            dynamic_top_volume_enabled = str(os.environ.get("DYNAMIC_UNIVERSE_TOP_VOLUME", "0")).strip().lower() in ("1", "true", "yes", "on")
+            allow_with_dynamic = str(os.environ.get("UNIVERSE_RUNTIME_ALLOW_WITH_DYNAMIC", "0")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            dynamic_top_volume_enabled = False
+            allow_with_dynamic = False
+        # Prevent dual universe controllers from fighting each other.
+        if dynamic_top_volume_enabled and (not allow_with_dynamic):
+            return
         now = now_ms()
         if (now - int(self._last_universe_refresh_ms or 0)) < int(self._universe_refresh_sec * 1000):
             return
@@ -15242,9 +19677,10 @@ class LiveOrchestrator:
             return False
 
         try:
-            min_hold_sec = float(os.environ.get("EXIT_MIN_HOLD_SEC", POSITION_HOLD_MIN_SEC) or POSITION_HOLD_MIN_SEC)
+            _regime_hint = str(ctx.get("regime") or pos.get("regime") or "chop")
         except Exception:
-            min_hold_sec = float(POSITION_HOLD_MIN_SEC)
+            _regime_hint = "chop"
+        min_hold_sec = self._effective_min_hold_sec(pos, regime=_regime_hint)
         try:
             entry_ts = int(pos.get("entry_time") or 0)
         except Exception:
@@ -15396,6 +19832,11 @@ class LiveOrchestrator:
             pos["opt_hold_src"] = "hold_eval"
             pos["opt_hold_curr_sec"] = int(round(float(tstar_cur)))
             pos["opt_hold_curr_src"] = "hold_eval"
+            if pos.get("target_hold_entry_sec") is None:
+                pos["target_hold_entry_sec"] = int(round(float(tstar_cur)))
+            pos["target_hold_sec"] = int(round(float(tstar_cur)))
+            pos["target_hold_curr_sec"] = int(round(float(tstar_cur)))
+            pos["target_hold_src"] = "hold_eval"
             pos["opt_hold_curr_remaining_sec"] = (
                 int(round(max(0.0, float(tstar_cur) - float(age_sec))))
                 if age_sec is not None
@@ -15416,6 +19857,34 @@ class LiveOrchestrator:
                 hold_progress_min = 0.85
             hold_progress_min = float(max(0.0, min(1.5, hold_progress_min)))
             try:
+                h_low = float(getattr(mc_config, "hurst_low", 0.45))
+                h_high = float(getattr(mc_config, "hurst_high", 0.55))
+            except Exception:
+                h_low, h_high = 0.45, 0.55
+            try:
+                hold_prog_trend = float(os.environ.get("HOLD_EVAL_MIN_PROGRESS_TO_EXIT_TREND", 0.90) or 0.90)
+            except Exception:
+                hold_prog_trend = 0.90
+            try:
+                hold_prog_random = float(os.environ.get("HOLD_EVAL_MIN_PROGRESS_TO_EXIT_RANDOM", 0.94) or 0.94)
+            except Exception:
+                hold_prog_random = 0.94
+            try:
+                hold_prog_mr = float(os.environ.get("HOLD_EVAL_MIN_PROGRESS_TO_EXIT_MEAN_REVERT", 0.97) or 0.97)
+            except Exception:
+                hold_prog_mr = 0.97
+            hurst_now = self._safe_float(ctx_eval.get("hurst"), None)
+            if hurst_now is None:
+                hurst_now = self._safe_float(meta.get("event_exit_dynamic_hurst"), None)
+            if hurst_now is None:
+                hurst_now = self._safe_float(meta.get("hurst"), None)
+            regime_hold_req = float(hold_prog_random)
+            if hurst_now is not None and float(hurst_now) > h_high:
+                regime_hold_req = float(hold_prog_trend)
+            elif hurst_now is not None and float(hurst_now) < h_low:
+                regime_hold_req = float(hold_prog_mr)
+            hold_progress_min = float(max(float(hold_progress_min), float(regime_hold_req)))
+            try:
                 hold_progress = float(age_sec) / max(float(tstar_cur), 1e-6)
             except Exception:
                 hold_progress = 0.0
@@ -15424,6 +19893,7 @@ class LiveOrchestrator:
                 try:
                     pos["hold_eval_exit_guard_progress"] = float(hold_progress)
                     pos["hold_eval_exit_guard_required"] = float(hold_progress_min)
+                    pos["hold_eval_exit_guard_hurst"] = float(hurst_now) if hurst_now is not None else None
                 except Exception:
                     pass
 
@@ -15529,6 +19999,19 @@ class LiveOrchestrator:
                 default_noise=3,
                 default_reset_sec=300.0,
             )
+            if confirm_mode != "shock":
+                try:
+                    hold_non_shock_min = int(os.environ.get("HOLD_EVAL_EXIT_MIN_CONFIRM_NON_SHOCK", 4) or 4)
+                except Exception:
+                    hold_non_shock_min = 4
+                try:
+                    hold_noise_min = int(os.environ.get("HOLD_EVAL_EXIT_MIN_CONFIRM_NOISE", max(5, hold_non_shock_min)) or max(5, hold_non_shock_min))
+                except Exception:
+                    hold_noise_min = max(5, hold_non_shock_min)
+                if confirm_mode == "noise":
+                    confirm_required = int(max(confirm_required, max(1, hold_noise_min)))
+                else:
+                    confirm_required = int(max(confirm_required, max(1, hold_non_shock_min)))
             confirm_ok, confirm_cnt = self._advance_exit_confirmation(
                 pos,
                 "hold_eval_exit",
@@ -15691,6 +20174,10 @@ class LiveOrchestrator:
                     "record_mode": getattr(self._trading_mode, "value", None),
                     "record_db": getattr(self, "_db_path", None),
                     "outside_universe_positions": list(self._outside_universe_positions.values()),
+                    "exchange_positions_raw_count": int(self._exchange_positions_raw_count or 0),
+                    "exchange_positions_view_count": int(self._exchange_positions_view_count or 0),
+                    "exchange_positions_filter_universe": bool(self._exchange_positions_filter_universe),
+                    "ws_positions_cache_count": int(len(self._ws_positions_cache or {})),
                     "mc_last_ms": self._last_mc_ms,
                     "mc_last_ts": self._last_mc_ts,
                     "mc_last_ctxs": self._last_mc_ctxs,
@@ -15705,6 +20192,10 @@ class LiveOrchestrator:
                 "auto_reval": self._auto_reval_status(ts),
                 "auto_tune": self._auto_tune_status(ts),
                 "event_alignment": self._event_alignment_status(),
+                "mc_health": self._mc_health_snapshot or {},
+                "mc_sanity": self._mc_sanity_snapshot.get("mc_sanity", {}) if self._mc_sanity_snapshot else {},
+                "adaptive_entry": self._adaptive_entry_snapshot or {},
+                "auto_diag": self._auto_diag_snapshot or {},
                 "feed": feed,
                 "market": market_rows,
                 "portfolio": {
@@ -15720,6 +20211,8 @@ class LiveOrchestrator:
                         else ("exchange" if (self.enable_orders and self._exchange_positions_ts is not None) else "engine")
                     ),
                     "positions_sync_ts": self._exchange_positions_ts,
+                    "positions_raw_count": int(self._exchange_positions_raw_count or 0),
+                    "positions_view_count": int(self._exchange_positions_view_count or 0),
                     "history": eq_history,
                     "live_wallet_balance": self._live_wallet_balance,
                     "live_equity": self._live_equity,
@@ -16202,8 +20695,15 @@ class LiveOrchestrator:
                                 entry_floor = self._get_hybrid_entry_floor()
                                 label = "HYBRID_ENTRY_FLOOR"
                             else:
-                                entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
-                                label = "UNIFIED_ENTRY_FLOOR"
+                                # RegimePolicy floor (가장 흔한 레짐 기준)
+                                entry_floor = 0.00001  # RegimePolicy default
+                                label = "REGIME_POLICY_FLOOR"
+                                try:
+                                    from engines.mc.regime_policy import get_regime_policy as _grp_stats
+                                    _stat_rpol = _grp_stats("chop", 0.5)
+                                    entry_floor = float(_stat_rpol.entry_floor)
+                                except Exception:
+                                    pass
                             pass_count = (scores_arr >= entry_floor).sum()
                             pass_rate = (pass_count / len(scores_arr)) * 100
                             self._log(f"  Current {label}={entry_floor:.6f}: {pass_count}/{len(scores_arr)} ({pass_rate:.1f}% pass)")
@@ -16216,6 +20716,97 @@ class LiveOrchestrator:
                             top_debug = [f"{s}:Act={v[0]}/Score={v[1]:.5f}/EV={v[2]:.5f}" for s, v in sorted_by_score]
                             self._log(f"  Top Symbols: {top_debug}")
 
+                        # ── [FIX 2026-02-13] mu_alpha pegging 재발 방지 모니터 ──
+                        try:
+                            mu_alpha_vals = []
+                            for dec in batch_decisions:
+                                m = dec.get("meta") or {}
+                                ma = m.get("mu_alpha") or m.get("pred_mu_alpha")
+                                if ma is not None:
+                                    mu_alpha_vals.append(float(ma))
+                            if mu_alpha_vals:
+                                ma_arr = np.asarray(mu_alpha_vals)
+                                try:
+                                    ma_cap = float(os.environ.get("MU_ALPHA_CAP", 5.0) or 5.0)
+                                except Exception:
+                                    ma_cap = 5.0
+                                # pegged = cap 이상이거나 cap에 ±0.01 이내
+                                pegged_count = int(np.sum(
+                                    (np.abs(ma_arr) >= (ma_cap - 0.01))
+                                ))
+                                peg_ratio = pegged_count / len(ma_arr)
+                                # 총 dampening 모니터 (1 - |mu_alpha|/cap에서 유추)
+                                mean_abs = float(np.mean(np.abs(ma_arr)))
+                                self._log(
+                                    f"[MU_ALPHA_HEALTH] n={len(ma_arr)} | "
+                                    f"mean={float(np.mean(ma_arr)):.4f} | "
+                                    f"|mean|={mean_abs:.4f} | "
+                                    f"std={float(np.std(ma_arr)):.4f} | "
+                                    f"pegged={pegged_count}/{len(ma_arr)} ({peg_ratio*100:.1f}%)"
+                                )
+                                if peg_ratio >= 0.60:
+                                    self._log(
+                                        f"[MU_ALPHA_ALERT] ⚠ {peg_ratio*100:.0f}% pegged at cap! "
+                                        f"Possible compound dampening issue. "
+                                        f"Check: MU_ALPHA_CAP={ma_cap}, HURST_RANDOM_DAMPEN, KAMA_ER dampening"
+                                    )
+                                if mean_abs < 0.05:
+                                    self._log(
+                                        f"[MU_ALPHA_ALERT] ⚠ Mean |mu_alpha|={mean_abs:.4f} near zero — "
+                                        f"signal may be over-dampened. Check divergence gate / alpha_scaling."
+                                    )
+                                # ── [2026-02-13] collect rolling mu_alpha samples for auto-calibration ──
+                                ts_now = now_ms()
+                                for dec in batch_decisions:
+                                    m = dec.get("meta") or {}
+                                    ma_val = m.get("mu_alpha") or m.get("pred_mu_alpha")
+                                    dconf = m.get("mu_dir_conf") or m.get("pred_mu_dir_conf")
+                                    reg = m.get("regime") or m.get("detected_regime") or ""
+                                    if ma_val is not None:
+                                        self._mu_alpha_rolling.append((
+                                            int(ts_now),
+                                            float(ma_val),
+                                            str(reg),
+                                            float(dconf) if dconf is not None else None,
+                                        ))
+                                # Run auto-calibration periodically
+                                if self._mu_alpha_calibrate_enabled:
+                                    elapsed_cal = (ts_now - self._mu_alpha_calibrate_last_ms) / 1000.0
+                                    if elapsed_cal >= self._mu_alpha_calibrate_interval_sec and len(self._mu_alpha_rolling) >= 50:
+                                        self._run_mu_alpha_auto_calibration(ts_now)
+                                        self._mu_alpha_calibrate_last_ms = ts_now
+                        except Exception:
+                            pass
+
+                # ── [2026-02-13] MC Health Watchdog (periodic) ──
+                if batch_decisions:
+                    try:
+                        _adapt_ts = now_ms()
+                        _adapt_elapsed = (_adapt_ts - self._adaptive_entry_last_ms) / 1000.0
+                        if _adapt_elapsed >= self._adaptive_entry_interval_sec:
+                            self._run_adaptive_entry_threshold_controller(batch_decisions, _adapt_ts)
+                            self._adaptive_entry_last_ms = _adapt_ts
+                    except Exception as _ae:
+                        self._log(f"[ADAPTIVE_ENTRY] controller error: {_ae}")
+                    try:
+                        _health_ts = now_ms()
+                        _health_elapsed = (_health_ts - self._mc_health_last_ms) / 1000.0
+                        if _health_elapsed >= self._mc_health_interval_sec:
+                            self._run_mc_health_watchdog(batch_decisions)
+                            self._mc_health_last_ms = _health_ts
+                    except Exception as _he:
+                        self._log(f"[MC_HEALTH] watchdog error: {_he}")
+
+                # ── [2026-02-15] Auto Diagnostics (periodic, every _auto_diag_interval_sec) ──
+                try:
+                    _diag_ts = now_ms()
+                    _diag_elapsed = (_diag_ts - self._auto_diag_last_ms) / 1000.0
+                    if _diag_elapsed >= self._auto_diag_interval_sec:
+                        self._run_auto_diagnostics()
+                        self._auto_diag_last_ms = _diag_ts
+                except Exception as _de:
+                    self._log(f"[AUTO_DIAG] engine error: {_de}")
+
                 if batch_decisions and USE_KELLY_ALLOCATION:
                     try:
                         # 2.5.1 — 모든 심볼의 UnifiedScore 수집
@@ -16225,7 +20816,13 @@ class LiveOrchestrator:
                         if hybrid_only:
                             entry_floor = self._get_hybrid_entry_floor()
                         else:
-                            entry_floor = float(os.environ.get("UNIFIED_ENTRY_FLOOR", 0.0) or 0.0)
+                            # RegimePolicy floor
+                            entry_floor = 0.00001
+                            try:
+                                from engines.mc.regime_policy import get_regime_policy as _grp_kelly
+                                entry_floor = float(_grp_kelly("chop", 0.5).entry_floor)
+                            except Exception:
+                                pass
                         for i, dec in enumerate(batch_decisions):
                             sym = ctx_list[i]["symbol"]
                             if hybrid_only:
@@ -16256,6 +20853,10 @@ class LiveOrchestrator:
                         # 2.5.3 — Kelly 배분 계산 (UnifiedScore 비례 배분)
                         if self._top_n_symbols:
                             n_top = len(self._top_n_symbols)
+                            dec_by_symbol = {
+                                str(ctx_list[i].get("symbol")): (batch_decisions[i] if i < len(batch_decisions) else {})
+                                for i in range(min(len(ctx_list), len(batch_decisions)))
+                            }
                             
                             scores = np.array([sym_score_map[s] for s in self._top_n_symbols])
                             self._log(f"[KELLY_DEBUG] Scores for TOP {n_top}: {dict(zip(self._top_n_symbols, scores.tolist()))}")
@@ -16317,14 +20918,152 @@ class LiveOrchestrator:
                             else:
                                 # 점수가 모두 0이거나 음수면 균등 배분
                                 kelly_norm = np.ones(n_top) / n_top
+
+                            # [FOCUS 2026-02-14] Chop 레짐에서 고확률 소수 종목으로 자본 집중
+                            try:
+                                chop_focus_enabled = str(os.environ.get("CHOP_CAPITAL_FOCUS_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+                            except Exception:
+                                chop_focus_enabled = True
+                            if chop_focus_enabled and n_top > 1:
+                                try:
+                                    chop_focus_topk = int(float(os.environ.get("CHOP_CAPITAL_FOCUS_TOPK", 3) or 3))
+                                except Exception:
+                                    chop_focus_topk = 3
+                                try:
+                                    chop_focus_power = float(os.environ.get("CHOP_CAPITAL_FOCUS_POWER", 2.0) or 2.0)
+                                except Exception:
+                                    chop_focus_power = 2.0
+                                try:
+                                    chop_focus_min_prob = float(os.environ.get("CHOP_CAPITAL_FOCUS_MIN_PROB", 0.53) or 0.53)
+                                except Exception:
+                                    chop_focus_min_prob = 0.53
+                                try:
+                                    chop_focus_tail_mult = float(os.environ.get("CHOP_CAPITAL_FOCUS_TAIL_MULT", 0.25) or 0.25)
+                                except Exception:
+                                    chop_focus_tail_mult = 0.25
+                                try:
+                                    chop_focus_trigger_ratio = float(os.environ.get("CHOP_CAPITAL_FOCUS_TRIGGER_RATIO", 0.55) or 0.55)
+                                except Exception:
+                                    chop_focus_trigger_ratio = 0.55
+                                try:
+                                    chop_focus_non_chop_mult = float(os.environ.get("CHOP_CAPITAL_FOCUS_NON_CHOP_MULT", 0.35) or 0.35)
+                                except Exception:
+                                    chop_focus_non_chop_mult = 0.35
+                                try:
+                                    chop_focus_dir_prob_ref = float(os.environ.get("CHOP_CAPITAL_FOCUS_DIR_PROB_REF", 0.58) or 0.58)
+                                except Exception:
+                                    chop_focus_dir_prob_ref = 0.58
+                                try:
+                                    chop_focus_dir_prob_hard = float(os.environ.get("CHOP_CAPITAL_FOCUS_DIR_PROB_HARD", 0.52) or 0.52)
+                                except Exception:
+                                    chop_focus_dir_prob_hard = 0.52
+                                try:
+                                    chop_focus_dir_hard_mult = float(os.environ.get("CHOP_CAPITAL_FOCUS_DIR_HARD_MULT", 0.12) or 0.12)
+                                except Exception:
+                                    chop_focus_dir_hard_mult = 0.12
+                                try:
+                                    chop_focus_max_active = int(float(os.environ.get("CHOP_CAPITAL_FOCUS_MAX_ACTIVE", 8) or 8))
+                                except Exception:
+                                    chop_focus_max_active = 8
+                                try:
+                                    chop_focus_active_topk_only = str(os.environ.get("CHOP_CAPITAL_FOCUS_ACTIVE_TOPK_ONLY", "1")).strip().lower() in ("1", "true", "yes", "on")
+                                except Exception:
+                                    chop_focus_active_topk_only = True
+
+                                chop_focus_topk = max(1, min(n_top, chop_focus_topk))
+                                chop_focus_power = max(1.0, min(chop_focus_power, 6.0))
+                                chop_focus_min_prob = max(0.45, min(chop_focus_min_prob, 0.80))
+                                chop_focus_tail_mult = max(0.0, min(chop_focus_tail_mult, 1.0))
+                                chop_focus_trigger_ratio = max(0.20, min(chop_focus_trigger_ratio, 1.0))
+                                chop_focus_non_chop_mult = max(0.0, min(chop_focus_non_chop_mult, 1.0))
+                                chop_focus_dir_prob_ref = max(0.50, min(chop_focus_dir_prob_ref, 0.90))
+                                chop_focus_dir_prob_hard = max(0.45, min(chop_focus_dir_prob_hard, chop_focus_dir_prob_ref))
+                                chop_focus_dir_hard_mult = max(0.01, min(chop_focus_dir_hard_mult, 1.0))
+                                chop_focus_max_active = max(chop_focus_topk, min(n_top, chop_focus_max_active))
+
+                                focus_mult = np.ones(n_top, dtype=np.float64)
+                                chop_count = 0
+                                q_list = []
+                                dir_side_prob_list = []
+                                for i, sym in enumerate(self._top_n_symbols):
+                                    dec = dec_by_symbol.get(sym) or {}
+                                    meta = dec.get("meta") or {}
+                                    # RegimePolicy regime 우선 사용 (MC 엔진 기반, 더 정확)
+                                    reg = str(meta.get("regime_policy_regime") or meta.get("regime") or "").strip().lower()
+                                    action_now = str(dec.get("action") or "").upper()
+                                    p_long = self._safe_float(
+                                        meta.get("mu_dir_prob_long"),
+                                        self._safe_float(meta.get("pred_mu_dir_prob_long"), self._safe_float(dec.get("confidence"), 0.5)),
+                                    )
+                                    if p_long is None:
+                                        p_long = 0.5
+                                    p_long = float(max(0.0, min(1.0, p_long)))
+                                    side_prob = float(p_long if action_now == "LONG" else (1.0 - p_long) if action_now == "SHORT" else 0.5)
+                                    dir_side_prob_list.append((sym, side_prob))
+                                    if reg in ("chop", "mean_revert", "range"):
+                                        chop_count += 1
+                                        p_tp = self._safe_float(meta.get("event_p_tp"), self._safe_float(dec.get("confidence"), 0.5))
+                                        dir_conf = self._safe_float(meta.get("mu_dir_conf"), self._safe_float(dec.get("confidence"), 0.5))
+                                        quality = max(0.0, min(1.0, 0.65 * float(p_tp) + 0.35 * float(dir_conf)))
+                                        q_list.append((sym, quality))
+                                        edge = max(0.0, quality - chop_focus_min_prob)
+                                        if i >= chop_focus_topk:
+                                            focus_mult[i] *= chop_focus_tail_mult
+                                        if edge > 0.0:
+                                            focus_mult[i] *= (1.0 + edge) ** chop_focus_power
+                                        else:
+                                            focus_mult[i] *= 0.4
+                                        if side_prob <= chop_focus_dir_prob_hard:
+                                            focus_mult[i] *= chop_focus_dir_hard_mult
+                                        elif side_prob < chop_focus_dir_prob_ref:
+                                            prob_rel = (side_prob - chop_focus_dir_prob_hard) / max(1e-6, chop_focus_dir_prob_ref - chop_focus_dir_prob_hard)
+                                            focus_mult[i] *= (0.55 + 0.45 * max(0.0, min(1.0, prob_rel)))
+                                    else:
+                                        focus_mult[i] *= chop_focus_non_chop_mult
+
+                                chop_ratio = float(chop_count) / float(max(1, n_top))
+                                if chop_count > 0 and chop_ratio >= chop_focus_trigger_ratio:
+                                    kelly_focus = kelly_norm * focus_mult
+                                    focus_sum = float(np.sum(kelly_focus))
+                                    if focus_sum > 0:
+                                        kelly_norm = kelly_focus / focus_sum
+                                        if chop_focus_active_topk_only and n_top > chop_focus_max_active:
+                                            keep_idx = np.argsort(-kelly_norm)[:chop_focus_max_active]
+                                            keep_mask = np.zeros(n_top, dtype=bool)
+                                            keep_mask[keep_idx] = True
+                                            kelly_norm = np.where(keep_mask, kelly_norm, 0.0)
+                                            keep_sum = float(np.sum(kelly_norm))
+                                            if keep_sum > 0:
+                                                kelly_norm = kelly_norm / keep_sum
+                                                kept_symbols = [self._top_n_symbols[i] for i in range(n_top) if keep_mask[i]]
+                                                kept_weights = [float(kelly_norm[i]) for i in range(n_top) if keep_mask[i]]
+                                                self._top_n_symbols = kept_symbols
+                                                kelly_norm = np.asarray(kept_weights, dtype=np.float64)
+                                                n_top = len(self._top_n_symbols)
+                                        top_q = sorted(q_list, key=lambda x: x[1], reverse=True)[:chop_focus_topk]
+                                        dir_q = sorted(dir_side_prob_list, key=lambda x: x[1], reverse=True)[:chop_focus_topk]
+                                        self._log(
+                                            f"[KELLY_CHOP_FOCUS] chop={chop_count}/{n_top} ratio={chop_ratio:.2f} topk={chop_focus_topk} "
+                                            f"power={chop_focus_power:.2f} min_prob={chop_focus_min_prob:.3f} "
+                                            f"tail_mult={chop_focus_tail_mult:.2f} non_chop_mult={chop_focus_non_chop_mult:.2f} "
+                                            f"dir_ref={chop_focus_dir_prob_ref:.2f} dir_hard={chop_focus_dir_prob_hard:.2f} "
+                                            f"active_max={chop_focus_max_active} active_now={n_top} "
+                                            f"top_quality={[(s, round(q, 4)) for s, q in top_q]} "
+                                            f"top_side_prob={[(s, round(q, 4)) for s, q in dir_q]}"
+                                        )
                             
-                            self._kelly_allocations = {s: float(kelly_norm[i]) for i, s in enumerate(self._top_n_symbols)}
+                            self._kelly_allocations = {
+                                s: float(kelly_norm[i])
+                                for i, s in enumerate(self._top_n_symbols)
+                                if i < len(kelly_norm)
+                            }
                             
                             # Always log Kelly allocations (critical for debugging)
                             alloc_info = [(s, f"{self._kelly_allocations[s]:.2%}") for s in self._top_n_symbols]
                             self._log(f"[KELLY] Allocations: {alloc_info}")
                         
                         # 2.5.4 — TOP N에 없는 심볼의 진입 차단 (action을 WAIT로 변경)
+                        effective_top_n = len(self._top_n_symbols)
                         for i, dec in enumerate(batch_decisions):
                             sym = ctx_list[i]["symbol"]
                             action = dec.get("action", "WAIT")
@@ -16334,9 +21073,18 @@ class LiveOrchestrator:
                                 pos = self.positions.get(sym, {})
                                 if pos.get("qty", 0) == 0:
                                     dec["action"] = "WAIT"
-                                    dec["reason"] = f"NOT_IN_TOP_{TOP_N_SYMBOLS}"
-                                    # Always log blocked symbols (critical for debugging)
-                                    self._log(f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT (not in TOP {TOP_N_SYMBOLS})")
+                                    if effective_top_n < TOP_N_SYMBOLS:
+                                        dec["reason"] = f"NOT_IN_ACTIVE_TOP_{effective_top_n}"
+                                        self._log(
+                                            f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT "
+                                            f"(not in ACTIVE TOP {effective_top_n}; configured TOP {TOP_N_SYMBOLS})"
+                                        )
+                                    else:
+                                        dec["reason"] = f"NOT_IN_TOP_{TOP_N_SYMBOLS}"
+                                        self._log(
+                                            f"[PORTFOLIO] {sym} rank={self._symbol_ranks.get(sym)} → WAIT "
+                                            f"(not in TOP {TOP_N_SYMBOLS})"
+                                        )
 
                         # Optional: portfolio joint + rebalance pre-sim (background)
                         try:
@@ -16423,11 +21171,42 @@ class LiveOrchestrator:
                                     switch_margin = float(os.environ.get("SWITCH_EV_MARGIN", 0.0) or 0.0)
                                 except Exception:
                                     switch_margin = 0.0
-                                if best_score > (worst_score + switch_margin):
+                                best_dec = dec_by_sym.get(best_sym) if isinstance(dec_by_sym.get(best_sym), dict) else {}
+                                worst_dec = dec_by_sym.get(worst_sym) if isinstance(dec_by_sym.get(worst_sym), dict) else {}
+                                best_meta = (best_dec or {}).get("meta") or {}
+                                worst_meta = (worst_dec or {}).get("meta") or {}
+                                try:
+                                    switch_default_fee = float(os.environ.get("SWITCH_DEFAULT_FEE_RT", 0.0010) or 0.0010)
+                                except Exception:
+                                    switch_default_fee = 0.0010
+                                try:
+                                    switch_cost_buffer = float(os.environ.get("SWITCH_COST_BUFFER", 0.0005) or 0.0005)
+                                except Exception:
+                                    switch_cost_buffer = 0.0005
+                                best_fee_rt = self._safe_float(best_meta.get("fee_rt", best_meta.get("execution_cost")), switch_default_fee)
+                                worst_fee_rt = self._safe_float(worst_meta.get("fee_rt", worst_meta.get("execution_cost")), switch_default_fee)
+                                best_spread = abs(self._safe_float(best_meta.get("spread_pct"), 0.0))
+                                worst_spread = abs(self._safe_float(worst_meta.get("spread_pct"), 0.0))
+                                switch_cost_est = float(max(0.0, best_fee_rt) + max(0.0, worst_fee_rt) + 0.5 * (best_spread + worst_spread) + max(0.0, switch_cost_buffer))
+                                required_margin = float(max(0.0, switch_margin) + switch_cost_est)
+
+                                # [FIX 2026-02-15] 최소 신규 점수 체크: near-zero 후보로 교체 방지
+                                try:
+                                    switch_min_new = float(os.environ.get("SWITCH_MIN_NEW_SCORE", 0.0) or 0.0)
+                                except Exception:
+                                    switch_min_new = 0.0
+                                if best_score < switch_min_new:
+                                    if log_this_cycle:
+                                        self._log(
+                                            f"[HOLD] {worst_sym} kept — new {best_sym} score={best_score:.5f} "
+                                            f"below min_new={switch_min_new:.5f}"
+                                        )
+                                elif best_score > (worst_score + required_margin):
                                     if log_this_cycle:
                                         self._log(
                                             f"[SWITCH] {worst_sym}(hold={worst_score:.5f}) → "
-                                            f"{best_sym}(new={best_score:.5f}) margin={switch_margin:.5f}"
+                                            f"{best_sym}(new={best_score:.5f}) margin={switch_margin:.5f} "
+                                            f"cost_est={switch_cost_est:.5f} req={required_margin:.5f}"
                                         )
                                     # close worst
                                     for i, dec in enumerate(batch_decisions):
@@ -16444,7 +21223,8 @@ class LiveOrchestrator:
                                     if log_this_cycle:
                                         self._log(
                                             f"[HOLD] {worst_sym}(hold={worst_score:.5f}) kept vs "
-                                            f"{best_sym}(new={best_score:.5f})"
+                                            f"{best_sym}(new={best_score:.5f}) margin={switch_margin:.5f} "
+                                            f"cost_est={switch_cost_est:.5f} req={required_margin:.5f}"
                                         )
                     except Exception as e:
                         import traceback
@@ -16688,6 +21468,37 @@ async def safety_mode_handler(request):
         return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
+async def api_restart_live_handler(request: web.Request) -> web.Response:
+    """
+    Provides restart command for live mode with environment variables loaded.
+    Returns the command that should be run in shell to restart engine with proper API keys.
+    """
+    orch = request.app.get("orchestrator")
+    if not orch:
+        return web.json_response({"ok": False, "error": "orchestrator not ready"}, status=500)
+    
+    cwd = os.getcwd()
+    restart_cmd = (
+        f"cd {cwd} && "
+        f"pkill -f main_engine_mc_v2_final.py && "
+        f"sleep 2 && "
+        f"source state/bybit.env && "
+        f"ENABLE_LIVE_ORDERS=1 nohup python3 main_engine_mc_v2_final.py > /tmp/engine.log 2>&1 &"
+    )
+    
+    return web.json_response({
+        "ok": True,
+        "message": "Engine restart command ready",
+        "command": restart_cmd,
+        "hint": "Run command in terminal to restart engine with LIVE_ORDERS enabled",
+        "manual_steps": [
+            "1. Open terminal",
+            "2. Copy and paste the 'command' from response",
+            "3. Press Enter to restart"
+        ]
+    })
+
+
 async def main():
     ex_cfg = {
         "enableRateLimit": True,
@@ -16747,6 +21558,7 @@ async def main():
             web.post("/api/liquidate_all_safety", liquidate_all_safety_handler),
             web.post("/api/close_limit", close_limit_handler),
             web.post("/api/safety_mode", safety_mode_handler),
+            web.post("/api/restart_live", api_restart_live_handler),
         ])
 
         runner = web.AppRunner(app)

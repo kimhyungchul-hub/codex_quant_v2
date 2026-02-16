@@ -34,9 +34,11 @@ def compute_horizon_metrics_torch(
     tp_target_roe: float,
     sl_target_roe: float,
     cvar_alpha: float = 0.95,
+    direction: int = 1,
 ) -> Dict[str, float]:
     """
-    단일 horizon에 대한 메트릭을 PyTorch로 계산
+    단일 horizon에 대한 메트릭을 PyTorch로 계산.
+    direction=1 (LONG), direction=-1 (SHORT).
     
     Returns:
         Dict with ev, std, cvar, tp_prob, sl_prob
@@ -45,6 +47,8 @@ def compute_horizon_metrics_torch(
         return {'ev': 0.0, 'std': 0.0, 'cvar': 0.0, 'tp_prob': 0.0, 'sl_prob': 0.0}
     
     device_local = price_paths.device
+    abs_lev = abs(float(leverage))
+    dir_sign = float(direction)  # +1 or -1
     
     # Initial and horizon prices
     s0 = price_paths[:, 0]  # (n_paths,)
@@ -52,7 +56,7 @@ def compute_horizon_metrics_torch(
     
     # Calculate raw returns and ROE
     raw_ret = (st - s0) / s0  # (n_paths,)
-    roe = leverage * raw_ret - fee_roundtrip  # (n_paths,)
+    roe = dir_sign * abs_lev * raw_ret - fee_roundtrip  # (n_paths,)
     
     # Basic statistics
     ev = float(torch.mean(roe))
@@ -70,16 +74,23 @@ def compute_horizon_metrics_torch(
         cvar = ev
     
     # TP/SL probabilities (path-based check)
-    if price_paths.shape[1] > 1:
+    if price_paths.shape[1] > 1 and abs_lev > 0:
         path_segment = price_paths[:, :horizon_idx+1]  # (n_paths, horizon_idx+1)
         path_max = torch.max(path_segment, dim=1)[0]  # (n_paths,)
         path_min = torch.min(path_segment, dim=1)[0]  # (n_paths,)
         
-        tp_threshold = s0 * (1.0 + tp_target_roe / leverage)
-        sl_threshold = s0 * (1.0 - sl_target_roe / leverage)
-        
-        tp_hit = (path_max >= tp_threshold).float()
-        sl_hit = (path_min <= sl_threshold).float()
+        if direction == 1:
+            # LONG: TP when price rises, SL when price drops
+            tp_threshold = s0 * (1.0 + tp_target_roe / abs_lev)
+            sl_threshold = s0 * (1.0 - sl_target_roe / abs_lev)
+            tp_hit = (path_max >= tp_threshold).float()
+            sl_hit = (path_min <= sl_threshold).float()
+        else:
+            # SHORT: TP when price drops, SL when price rises
+            tp_threshold = s0 * (1.0 - tp_target_roe / abs_lev)
+            sl_threshold = s0 * (1.0 + sl_target_roe / abs_lev)
+            tp_hit = (path_min <= tp_threshold).float()
+            sl_hit = (path_max >= sl_threshold).float()
         
         tp_prob = float(torch.mean(tp_hit))
         sl_prob = float(torch.mean(sl_hit))
@@ -229,15 +240,28 @@ class GlobalBatchEvaluator:
                 )
                 
                 results["ev_long"][i, j] = metrics["ev"]
-                results["ev_short"][i, j] = -metrics["ev"] 
                 results["p_pos_long"][i, j] = metrics["tp_prob"] 
-                results["p_pos_short"][i, j] = metrics["sl_prob"]
                 results["cvar_long"][i, j] = metrics["cvar"]
-                results["cvar_short"][i, j] = -metrics["ev"] 
                 results["p_tp_long"][i, j] = metrics["tp_prob"]
                 results["p_sl_long"][i, j] = metrics["sl_prob"]
-                results["p_tp_short"][i, j] = metrics["sl_prob"] 
-                results["p_sl_short"][i, j] = metrics["tp_prob"]
+
+                # ── Short direction: re-compute with flipped direction ──
+                # Short ROE = -leverage * raw_ret - fee, TP when price drops, SL when price rises
+                metrics_short = compute_horizon_metrics_torch(
+                    price_paths=symbol_paths,
+                    horizon_idx=horizon,
+                    leverage=lev,
+                    fee_roundtrip=fee,
+                    tp_target_roe=tp_target,
+                    sl_target_roe=sl_target,
+                    cvar_alpha=cvar_alpha,
+                    direction=-1,
+                )
+                results["ev_short"][i, j] = metrics_short["ev"]
+                results["p_pos_short"][i, j] = metrics_short["tp_prob"]
+                results["cvar_short"][i, j] = metrics_short["cvar"]
+                results["p_tp_short"][i, j] = metrics_short["tp_prob"]
+                results["p_sl_short"][i, j] = metrics_short["sl_prob"]
                 
         return results
 

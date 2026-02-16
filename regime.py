@@ -315,9 +315,10 @@ def adjust_mu_sigma(
 
     # Regime-based multipliers
     regime_mult = {
-        "bull": (1.2, 0.9),    # Higher drift, lower vol in bull
-        "bear": (0.7, 1.3),    # Lower drift, higher vol in bear
-        "chop": (0.8, 1.5),    # Choppy market: lower drift, much higher vol
+        "bull": (1.2, 0.9),      # Higher drift, lower vol in bull
+        "bear": (0.7, 1.3),      # Lower drift, higher vol in bear
+        "chop": (0.90, 1.25),    # [FIX 2026-02-14] Chop: mu×0.80→0.90, σ×1.5→1.25 완화
+        "volatile": (0.6, 1.8),  # [FIX 2026-02-13] Volatile: drift suppressed, vol amplified
         "neutral": (1.0, 1.0),
     }
     mu_mult, sigma_mult = regime_mult.get(regime, (1.0, 1.0))
@@ -386,7 +387,7 @@ def get_regime_mu_sigma(
     regime_params = {
         "bull": (0.50, adjusted_base_sigma * 0.9),    # Positive drift, lower vol
         "bear": (-0.20, adjusted_base_sigma * 1.3),   # Negative drift, higher vol
-        "chop": (0.00, adjusted_base_sigma * 1.5),    # Zero drift, high vol
+        "chop": (0.00, adjusted_base_sigma * 1.25),   # [FIX 2026-02-14] Zero drift, moderate vol
         "neutral": (0.10, adjusted_base_sigma),        # Slight positive drift
     }
 

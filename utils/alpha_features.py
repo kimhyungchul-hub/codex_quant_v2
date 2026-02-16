@@ -236,6 +236,130 @@ def safe_z(x: np.ndarray, eps: float = 1e-8) -> np.ndarray:
     return (x - m) / (s + eps)
 
 
+# ── Hurst Exponent (R/S method) ──
+def calculate_hurst_exponent(
+    prices: np.ndarray,
+    window: int = 120,
+    taus: Optional[List[int]] = None,
+) -> float:
+    """
+    Rescaled Range (R/S) 기반 Hurst Exponent.
+    H < 0.5: 강한 평균 회귀 (mean-reversion)
+    H ≈ 0.5: Random Walk
+    H > 0.5: 추세 지속 (trending)
+    """
+    if taus is None:
+        taus = [2, 4, 8, 16, 32]
+
+    prices_arr = np.asarray(prices, dtype=np.float64)
+    if prices_arr.size < max(taus) + 2:
+        return 0.5  # insufficient data → neutral
+
+    # Use log returns
+    lr = np.diff(np.log(np.clip(prices_arr[-window:], 1e-12, None)))
+    if lr.size < max(taus):
+        return 0.5
+
+    rs_values = []
+    valid_taus = []
+    for tau in taus:
+        if tau > lr.size:
+            continue
+        n_chunks = lr.size // tau
+        if n_chunks < 1:
+            continue
+        rs_list = []
+        for i in range(n_chunks):
+            chunk = lr[i * tau : (i + 1) * tau]
+            m = np.mean(chunk)
+            cumdev = np.cumsum(chunk - m)
+            R = float(np.max(cumdev) - np.min(cumdev))
+            S = float(np.std(chunk, ddof=1)) if tau > 1 else 1e-12
+            if S > 1e-12:
+                rs_list.append(R / S)
+        if rs_list:
+            rs_values.append(np.log(np.mean(rs_list)))
+            valid_taus.append(np.log(tau))
+
+    if len(valid_taus) < 2:
+        return 0.5
+
+    # Linear regression: log(R/S) = H * log(tau) + c
+    x = np.array(valid_taus)
+    y = np.array(rs_values)
+    A = np.vstack([x, np.ones(len(x))]).T
+    try:
+        result = np.linalg.lstsq(A, y, rcond=None)
+        H = float(result[0][0])
+        return max(0.0, min(1.0, H))
+    except Exception:
+        return 0.5
+
+
+# ── Bollinger Band %B ──
+def bollinger_pct_b(closes: np.ndarray, window: int = 20, n_std: float = 2.0) -> float:
+    """
+    현재 가격이 볼린저 밴드 내 어디에 있는지 [0, 1] 범위로 반환.
+    %B = (Price - Lower) / (Upper - Lower)
+    %B > 1.0: 상단 돌파 (과매수)
+    %B < 0.0: 하단 돌파 (과매도)
+    """
+    if len(closes) < window:
+        return 0.5
+    recent = closes[-window:]
+    ma = float(np.mean(recent))
+    std = float(np.std(recent))
+    if std < 1e-12:
+        return 0.5
+    upper = ma + n_std * std
+    lower = ma - n_std * std
+    band_width = upper - lower
+    if band_width < 1e-12:
+        return 0.5
+    pct_b = (float(closes[-1]) - lower) / band_width
+    return float(np.clip(pct_b, -0.5, 1.5))
+
+
+# ── RSI (Relative Strength Index) ──
+def calculate_rsi(closes: np.ndarray, period: int = 14) -> float:
+    """
+    RSI = 100 - 100 / (1 + RS), RS = avg_gain / avg_loss
+    RSI < 30: 과매도 (반등 기대)
+    RSI > 70: 과매수 (하락 기대)
+    반환값: 0~100
+    """
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = np.diff(closes[-(period + 1):])
+    gains = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_gain = float(np.mean(gains))
+    avg_loss = float(np.mean(losses))
+    if avg_loss < 1e-12:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return float(100.0 - 100.0 / (1.0 + rs))
+
+
+# ── 이동평균 이격도 Z-Score ──
+def ma_zscore(closes: np.ndarray, ma_window: int = 20, lookback: int = 60) -> float:
+    """
+    현재 가격과 이동평균의 괴리를 Z-Score로 정규화.
+    양수: 이동평균보다 위 (과매수 방향)
+    음수: 이동평균보다 아래 (과매도 방향)
+    """
+    if len(closes) < max(ma_window, lookback):
+        return 0.0
+    ma = np.convolve(closes[-lookback:], np.ones(ma_window) / ma_window, mode='valid')
+    if len(ma) < 2:
+        return 0.0
+    deviations = closes[-len(ma):] - ma
+    std = float(np.std(deviations))
+    if std < 1e-12:
+        return 0.0
+    return float(deviations[-1] / std)
+
+
 def build_alpha_features(
     closes: np.ndarray,      # [T]
     vols: np.ndarray,        # [T]
@@ -279,6 +403,12 @@ def build_alpha_features(
     rv_30 = float(np.std(lr[-30:]) + 1e-8)
     rv_120 = float(np.std(lr[-120:]) + 1e-8)
 
+    # ── Chop-specific alpha features ──
+    bb_pct_b = bollinger_pct_b(closes, window=20, n_std=2.0)
+    rsi_14 = calculate_rsi(closes, period=14) / 100.0  # normalize to [0, 1]
+    ma_z = ma_zscore(closes, ma_window=20, lookback=60)
+    hurst = calculate_hurst_exponent(closes, window=120)
+
     f = [
         mom(5), mom(15), mom(30), mom(60), mom(120),
         rv_30, rv_120,
@@ -287,6 +417,11 @@ def build_alpha_features(
         float(pmaker_entry),
         float(pmaker_delay_sec),
         float(regime_id),
+        # New chop-regime features
+        float(bb_pct_b),      # Bollinger %B: 0~1 (박스권 위치)
+        float(rsi_14),        # RSI normalized: 0~1
+        float(ma_z),          # MA Z-Score: 이격도
+        float(hurst),         # Hurst Exponent: 0~1
     ]
     return np.asarray(f, dtype=np.float32)
 
