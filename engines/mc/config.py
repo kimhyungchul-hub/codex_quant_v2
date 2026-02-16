@@ -68,6 +68,118 @@ class MCConfig:
     mu_alpha_vol_long_bars: int = field(default_factory=lambda: get_env_int("MU_ALPHA_VOL_LONG_BARS", 120))
     mu_alpha_ema_alpha: float = field(default_factory=lambda: get_env_float("MU_ALPHA_EMA_ALPHA", 0.0))
     sigma_lr_cap: float = field(default_factory=lambda: get_env_float("SIGMA_LR_CAP", 0.02))
+
+    # --- Advanced mu_alpha components (optional; default disabled) ---
+    alpha_use_mlofi: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_MLOFI", False))
+    alpha_use_vpin: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_VPIN", False))
+    alpha_use_kf: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_KF", False))
+    alpha_use_hurst: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_HURST", False))
+    alpha_use_garch: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_GARCH", False))
+    alpha_use_bayes: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_BAYES", False))
+    alpha_use_arima: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_ARIMA", False))
+    alpha_use_ml: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_ML", False))
+    alpha_use_hawkes: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_HAWKES", False))
+    alpha_use_pf: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_PF", False))
+    alpha_use_causal: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_CAUSAL", False))
+    alpha_use_hmm: bool = field(default_factory=lambda: get_env_bool("ALPHA_USE_HMM", False))
+    # Directional correction layer (logistic / tree-style classifier output)
+    alpha_direction_use: bool = field(default_factory=lambda: get_env_bool("ALPHA_DIRECTION_USE", False))
+    alpha_direction_model_path: str = field(default_factory=lambda: str(os.environ.get("ALPHA_DIRECTION_MODEL_PATH", "state/mu_direction_model.json")).strip())
+    alpha_direction_reload_sec: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_RELOAD_SEC", 60.0))
+    alpha_direction_strength: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_STRENGTH", 0.6))
+    alpha_direction_min_confidence: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_MIN_CONFIDENCE", 0.55))
+    alpha_direction_confidence_floor: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_CONFIDENCE_FLOOR", 0.45))
+    alpha_direction_gate_weak_mu: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_GATE_WEAK_MU", 0.02))
+    alpha_direction_gate_weak_gap: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_GATE_WEAK_GAP", 0.0020))
+    alpha_direction_gate_conf_boost: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_GATE_CONF_BOOST", 0.05))
+    alpha_direction_gate_edge_boost: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_GATE_EDGE_BOOST", 0.03))
+    alpha_direction_gate_side_prob_boost: float = field(default_factory=lambda: get_env_float("ALPHA_DIRECTION_GATE_SIDE_PROB_BOOST", 0.03))
+
+    # MLOFI
+    mlofi_levels: int = field(default_factory=lambda: get_env_int("MLOFI_LEVELS", 5))
+    mlofi_decay_lambda: float = field(default_factory=lambda: get_env_float("MLOFI_DECAY_LAMBDA", 0.4))
+    mlofi_weight: float = field(default_factory=lambda: get_env_float("MLOFI_WEIGHT", 0.20))
+    mlofi_scale: float = field(default_factory=lambda: get_env_float("MLOFI_SCALE", 8.0))
+    mlofi_weight_path: str = field(default_factory=lambda: str(os.environ.get("MLOFI_WEIGHT_PATH", "")).strip())
+
+    # VPIN
+    vpin_bucket_count: int = field(default_factory=lambda: get_env_int("VPIN_BUCKET_COUNT", 50))
+    vpin_window: int = field(default_factory=lambda: get_env_int("VPIN_WINDOW", 50))
+    vpin_gamma: float = field(default_factory=lambda: get_env_float("VPIN_GAMMA", 0.6))
+    vpin_sigma_k: float = field(default_factory=lambda: get_env_float("VPIN_SIGMA_K", 0.8))
+    vpin_damp_floor: float = field(default_factory=lambda: get_env_float("VPIN_DAMP_FLOOR", 0.10))
+    vpin_extreme_threshold: float = field(default_factory=lambda: get_env_float("VPIN_EXTREME_THRESHOLD", 0.90))
+    vpin_extreme_ou_weight: float = field(default_factory=lambda: get_env_float("VPIN_EXTREME_OU_WEIGHT", 0.85))
+    vpin_sigma_cap_mult: float = field(default_factory=lambda: get_env_float("VPIN_SIGMA_CAP_MULT", 2.5))
+
+    # Kalman filter (constant velocity)
+    kf_q: float = field(default_factory=lambda: get_env_float("KF_Q", 1e-6))
+    kf_r: float = field(default_factory=lambda: get_env_float("KF_R", 1e-4))
+    kf_weight: float = field(default_factory=lambda: get_env_float("KF_WEIGHT", 0.20))
+
+    # Hurst / regime switching
+    hurst_window: int = field(default_factory=lambda: get_env_int("HURST_WINDOW", 120))
+    hurst_taus: str = field(default_factory=lambda: str(os.environ.get("HURST_TAUS", "2,4,8,16")))
+    hurst_low: float = field(default_factory=lambda: get_env_float("HURST_LOW", 0.45))
+    hurst_high: float = field(default_factory=lambda: get_env_float("HURST_HIGH", 0.55))
+    hurst_trend_boost: float = field(default_factory=lambda: get_env_float("HURST_TREND_BOOST", 1.15))
+    hurst_random_dampen: float = field(default_factory=lambda: get_env_float("HURST_RANDOM_DAMPEN", 0.25))
+    ou_theta: float = field(default_factory=lambda: get_env_float("OU_THETA", 0.3))
+    ou_weight: float = field(default_factory=lambda: get_env_float("OU_WEIGHT", 0.7))
+    ou_mean_window: int = field(default_factory=lambda: get_env_int("OU_MEAN_WINDOW", 60))
+    # HMM regime filter
+    hmm_states: int = field(default_factory=lambda: get_env_int("HMM_STATES", 3))
+    hmm_adapt_lr: float = field(default_factory=lambda: get_env_float("HMM_ADAPT_LR", 0.02))
+    hmm_weight: float = field(default_factory=lambda: get_env_float("HMM_WEIGHT", 0.10))
+    hmm_min_confidence: float = field(default_factory=lambda: get_env_float("HMM_MIN_CONFIDENCE", 0.55))
+    hmm_trend_boost: float = field(default_factory=lambda: get_env_float("HMM_TREND_BOOST", 1.10))
+    hmm_chop_dampen: float = field(default_factory=lambda: get_env_float("HMM_CHOP_DAMPEN", 0.85))
+
+    # GARCH
+    garch_omega: float = field(default_factory=lambda: get_env_float("GARCH_OMEGA", 1e-6))
+    garch_alpha: float = field(default_factory=lambda: get_env_float("GARCH_ALPHA", 0.05))
+    garch_beta: float = field(default_factory=lambda: get_env_float("GARCH_BETA", 0.90))
+    garch_sigma_weight: float = field(default_factory=lambda: get_env_float("GARCH_SIGMA_WEIGHT", 0.5))
+
+    # Bayesian mean
+    bayes_obs_var: float = field(default_factory=lambda: get_env_float("BAYES_OBS_VAR", 1e-4))
+    bayes_weight: float = field(default_factory=lambda: get_env_float("BAYES_WEIGHT", 0.10))
+
+    # AR(1) / ARIMA proxy
+    arima_weight: float = field(default_factory=lambda: get_env_float("ARIMA_WEIGHT", 0.10))
+
+    # ML model (optional)
+    ml_weight: float = field(default_factory=lambda: get_env_float("ML_WEIGHT", 0.15))
+    ml_model_path: str = field(default_factory=lambda: str(os.environ.get("ML_MODEL_PATH", "")).strip())
+
+    # Hawkes
+    hawkes_alpha: float = field(default_factory=lambda: get_env_float("HAWKES_ALPHA", 0.5))
+    hawkes_beta: float = field(default_factory=lambda: get_env_float("HAWKES_BETA", 2.0))
+    hawkes_boost_k: float = field(default_factory=lambda: get_env_float("HAWKES_BOOST_K", 0.3))
+
+    # Particle filter
+    pf_particles: int = field(default_factory=lambda: get_env_int("PF_PARTICLES", 128))
+    pf_weight: float = field(default_factory=lambda: get_env_float("PF_WEIGHT", 0.10))
+    alpha_hurst_update_sec: float = field(default_factory=lambda: get_env_float("ALPHA_HURST_UPDATE_SEC", 60.0))
+    alpha_pf_update_sec: float = field(default_factory=lambda: get_env_float("ALPHA_PF_UPDATE_SEC", 60.0))
+    alpha_vpin_update_sec: float = field(default_factory=lambda: get_env_float("ALPHA_VPIN_UPDATE_SEC", 60.0))
+    alpha_hmm_update_sec: float = field(default_factory=lambda: get_env_float("ALPHA_HMM_UPDATE_SEC", 60.0))
+    alpha_garch_update_sec: float = field(default_factory=lambda: get_env_float("ALPHA_GARCH_UPDATE_SEC", 60.0))
+    alpha_ml_update_sec: float = field(default_factory=lambda: get_env_float("ALPHA_ML_UPDATE_SEC", 5.0))
+
+    # Causal adjustment
+    causal_weights_path: str = field(default_factory=lambda: str(os.environ.get("CAUSAL_WEIGHTS_PATH", "")).strip())
+    causal_weight: float = field(default_factory=lambda: get_env_float("CAUSAL_WEIGHT", 0.05))
+    causal_reload_sec: float = field(default_factory=lambda: get_env_float("CAUSAL_RELOAD_SEC", 60.0))
+    garch_param_path: str = field(default_factory=lambda: str(os.environ.get("GARCH_PARAM_PATH", "")).strip())
+    garch_param_reload_sec: float = field(default_factory=lambda: get_env_float("GARCH_PARAM_RELOAD_SEC", 86400.0))
+    garch_daily_fit_enabled: bool = field(default_factory=lambda: get_env_bool("GARCH_DAILY_FIT_ENABLED", False))
+    garch_fit_interval_sec: float = field(default_factory=lambda: get_env_float("GARCH_FIT_INTERVAL_SEC", 86400.0))
+    garch_fit_data_glob: str = field(default_factory=lambda: str(os.environ.get("GARCH_FIT_DATA_GLOB", "data/*.csv")).strip())
+    garch_fit_lookback: int = field(default_factory=lambda: get_env_int("GARCH_FIT_LOOKBACK", 4000))
+    garch_fit_min_obs: int = field(default_factory=lambda: get_env_int("GARCH_FIT_MIN_OBS", 300))
+    garch_fit_timeout_sec: float = field(default_factory=lambda: get_env_float("GARCH_FIT_TIMEOUT_SEC", 120.0))
+    garch_fit_allow_fallback: bool = field(default_factory=lambda: get_env_bool("GARCH_FIT_ALLOW_FALLBACK", True))
     
     # --- Execution Costs & Spread ---
     slippage_mult: float = field(default_factory=lambda: get_env_float("SLIPPAGE_MULT", 0.3))
@@ -98,6 +210,13 @@ class MCConfig:
     policy_w_ev_beta: float = field(default_factory=lambda: get_env_float("POLICY_W_EV_BETA", 200.0))
     exit_early_delta_sec: float = field(default_factory=lambda: get_env_float("EXIT_EARLY_DELTA_SEC", 60.0))
     exit_early_penalty_k: float = field(default_factory=lambda: get_env_float("EXIT_EARLY_PENALTY_K", 0.5))
+    exit_policy_dynamic_enabled: bool = field(default_factory=lambda: get_env_bool("EXIT_POLICY_DYNAMIC_ENABLED", True))
+    exit_policy_mu_align_scale: float = field(default_factory=lambda: get_env_float("EXIT_POLICY_MU_ALIGN_SCALE", 1.5))
+    exit_policy_shock_enabled: bool = field(default_factory=lambda: get_env_bool("EXIT_POLICY_SHOCK_ENABLED", True))
+    exit_policy_shock_breakout_score: float = field(default_factory=lambda: get_env_float("EXIT_POLICY_SHOCK_BREAKOUT_SCORE", 0.0008))
+    exit_policy_shock_trend_z: float = field(default_factory=lambda: get_env_float("EXIT_POLICY_SHOCK_TREND_Z", 2.0))
+    exit_policy_noise_trend_z: float = field(default_factory=lambda: get_env_float("EXIT_POLICY_NOISE_TREND_Z", 1.0))
+    exit_policy_noise_vpin_cap: float = field(default_factory=lambda: get_env_float("EXIT_POLICY_NOISE_VPIN_CAP", 0.80))
     policy_objective_mode: str = field(default_factory=lambda: os.environ.get("POLICY_OBJECTIVE_MODE", "ratio_time_var").strip().lower())
     policy_lambda_var: float = field(default_factory=lambda: get_env_float("POLICY_LAMBDA_VAR", 2.0))
     policy_cvar_eps: float = field(default_factory=lambda: get_env_float("POLICY_CVAR_EPS", 1e-6))
@@ -110,6 +229,11 @@ class MCConfig:
     # Unified Psi score parameters
     unified_risk_lambda: float = field(default_factory=lambda: get_env_float("UNIFIED_RISK_LAMBDA", 1.0))
     unified_rho: float = field(default_factory=lambda: get_env_float("UNIFIED_RHO", 0.0))
+    # Small-gap policy: default to WAIT, optionally allow entry on high confidence
+    policy_small_gap_allow_high_conf: bool = field(default_factory=lambda: get_env_bool("POLICY_SMALL_GAP_ALLOW_HIGH_CONF", True))
+    policy_small_gap_confidence: float = field(default_factory=lambda: get_env_float("POLICY_SMALL_GAP_CONFIDENCE", 0.60))
+    policy_small_gap_dir_confidence: float = field(default_factory=lambda: get_env_float("POLICY_SMALL_GAP_DIR_CONFIDENCE", 0.58))
+    policy_small_gap_dir_edge: float = field(default_factory=lambda: get_env_float("POLICY_SMALL_GAP_DIR_EDGE", 0.08))
 
     # --- Neighbor / Consensus Logic ---
     policy_neighbor_bonus_w: float = field(default_factory=lambda: get_env_float("POLICY_NEIGHBOR_BONUS_W", 0.25))
@@ -139,6 +263,11 @@ class MCConfig:
     
     score_entry_min_size: float = field(default_factory=lambda: get_env_float("SCORE_ENTRY_MIN_SIZE", 0.01))
     k_lev: float = field(default_factory=lambda: get_env_float("K_LEV", 2000.0))
+    leverage_conf_gain: float = field(default_factory=lambda: get_env_float("LEVERAGE_CONF_GAIN", 0.8))
+    leverage_score_ref: float = field(default_factory=lambda: get_env_float("LEVERAGE_SCORE_REF", 0.003))
+    leverage_hmm_gain: float = field(default_factory=lambda: get_env_float("LEVERAGE_HMM_GAIN", 0.5))
+    leverage_sync_step: float = field(default_factory=lambda: get_env_float("LEVERAGE_SYNC_STEP", 1.0))
+    leverage_sync_fallback_on_fail: bool = field(default_factory=lambda: get_env_bool("LEVERAGE_SYNC_FALLBACK_ON_FAIL", True))
     score_only_mode: bool = field(default_factory=lambda: get_env_bool("SCORE_ONLY_MODE", False))
     use_gpu_leverage: bool = field(default_factory=lambda: get_env_bool("USE_GPU_LEVERAGE", True))
     funnel_use_winrate_filter: bool = field(default_factory=lambda: get_env_bool("FUNNEL_USE_WINRATE_FILTER", False))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import logging
+import os
 import config as base_config
 import time
 from typing import Any, Dict, Optional, Sequence
@@ -207,6 +208,217 @@ class MonteCarloEntryEvaluationMixin:
         ofi_score = _s(ctx.get("ofi_score"), 0.0)
         mu_alpha_parts = self._signal_alpha_mu_annual_parts(closes or [], bar_seconds, ofi_score, regime_ctx)
         mu_alpha_raw = float(mu_alpha_parts.get("mu_alpha") or 0.0)
+
+        # -----------------------------
+        # Advanced alpha components (optional)
+        # -----------------------------
+        try:
+            use_mlofi = bool(getattr(config, "alpha_use_mlofi", False))
+            use_vpin = bool(getattr(config, "alpha_use_vpin", False))
+            use_kf = bool(getattr(config, "alpha_use_kf", False))
+            use_hurst = bool(getattr(config, "alpha_use_hurst", False))
+            use_garch = bool(getattr(config, "alpha_use_garch", False))
+            use_bayes = bool(getattr(config, "alpha_use_bayes", False))
+            use_arima = bool(getattr(config, "alpha_use_arima", False))
+            use_ml = bool(getattr(config, "alpha_use_ml", False))
+            use_hawkes = bool(getattr(config, "alpha_use_hawkes", False))
+            use_pf = bool(getattr(config, "alpha_use_pf", False))
+            use_causal = bool(getattr(config, "alpha_use_causal", False))
+            use_hmm = bool(getattr(config, "alpha_use_hmm", False))
+        except Exception:
+            use_mlofi = use_vpin = use_kf = use_hurst = False
+            use_garch = use_bayes = use_arima = use_ml = False
+            use_hawkes = use_pf = use_causal = False
+            use_hmm = False
+
+        comp_sum_w = 0.0
+        comp_sum = 0.0
+
+        def _add_comp(name: str, val: float, w: float) -> None:
+            nonlocal comp_sum_w, comp_sum
+            if w is None:
+                return
+            w = float(w)
+            if w <= 0:
+                return
+            comp_sum_w += w
+            comp_sum += w * float(val)
+            mu_alpha_parts[name] = float(val)
+            mu_alpha_parts[f"{name}_w"] = float(w)
+
+        if use_mlofi:
+            mlofi = _s(ctx.get("mlofi"), 0.0)
+            mlofi_scale = float(getattr(config, "mlofi_scale", 8.0))
+            mu_mlofi = float(mlofi) * mlofi_scale
+            _add_comp("mu_mlofi", mu_mlofi, float(getattr(config, "mlofi_weight", 0.20)))
+
+        if use_kf:
+            mu_kf = _s(ctx.get("mu_kf"), 0.0)
+            _add_comp("mu_kf", mu_kf, float(getattr(config, "kf_weight", 0.20)))
+
+        if use_bayes:
+            mu_bayes = _s(ctx.get("mu_bayes"), 0.0)
+            _add_comp("mu_bayes", mu_bayes, float(getattr(config, "bayes_weight", 0.10)))
+            mu_alpha_parts["mu_bayes_var"] = _s(ctx.get("mu_bayes_var"), 0.0)
+
+        if use_arima:
+            mu_ar = _s(ctx.get("mu_ar"), 0.0)
+            _add_comp("mu_ar", mu_ar, float(getattr(config, "arima_weight", 0.10)))
+
+        if use_pf:
+            mu_pf = _s(ctx.get("mu_pf"), 0.0)
+            _add_comp("mu_pf", mu_pf, float(getattr(config, "pf_weight", 0.10)))
+
+        if use_ml:
+            mu_ml = _s(ctx.get("mu_ml"), 0.0)
+            _add_comp("mu_ml", mu_ml, float(getattr(config, "ml_weight", 0.15)))
+
+        if use_causal:
+            mu_causal = _s(ctx.get("mu_causal"), 0.0)
+            _add_comp("mu_causal", mu_causal, float(getattr(config, "causal_weight", 0.05)))
+
+        # Combine with base mu_alpha
+        if comp_sum_w > 1.0:
+            scale = 1.0 / comp_sum_w
+            comp_sum *= scale
+            comp_sum_w = 1.0
+        base_w = max(0.0, 1.0 - comp_sum_w)
+        mu_alpha_raw = float(base_w * mu_alpha_raw + comp_sum)
+        mu_alpha_parts["mu_alpha_mix_base_w"] = float(base_w)
+        mu_alpha_parts["mu_alpha_mix_sum_w"] = float(comp_sum_w)
+        mu_alpha_parts["mu_alpha_after_mix"] = float(mu_alpha_raw)
+
+        # Hurst-driven regime switch / OU blend
+        if use_hurst:
+            hurst = ctx.get("hurst")
+            if hurst is not None:
+                hurst = float(hurst)
+                mu_alpha_parts["hurst"] = float(hurst)
+                low = float(getattr(config, "hurst_low", 0.45))
+                high = float(getattr(config, "hurst_high", 0.55))
+                if hurst < low:
+                    mu_ou = _s(ctx.get("mu_ou"), 0.0)
+                    ou_w = float(getattr(config, "ou_weight", 0.7))
+                    mu_alpha_raw = float((1.0 - ou_w) * mu_alpha_raw + ou_w * mu_ou)
+                    mu_alpha_parts["hurst_regime"] = "mean_revert"
+                elif hurst > high:
+                    boost = float(getattr(config, "hurst_trend_boost", 1.15))
+                    mu_alpha_raw = float(mu_alpha_raw * boost)
+                    mu_alpha_parts["hurst_regime"] = "trend"
+                else:
+                    damp = float(getattr(config, "hurst_random_dampen", 0.25))
+                    mu_alpha_raw = float(mu_alpha_raw * damp)
+                    mu_alpha_parts["hurst_regime"] = "random"
+
+        # Optional HMM regime correction (online Gaussian HMM from runtime alpha state)
+        if use_hmm:
+            hmm_state = str(ctx.get("hmm_state") or "")
+            hmm_sign = _s(ctx.get("hmm_regime_sign"), 0.0)
+            hmm_conf = float(max(0.0, min(1.0, _s(ctx.get("hmm_conf"), 0.0))))
+            hmm_w = float(getattr(config, "hmm_weight", 0.10))
+            hmm_min_conf = float(getattr(config, "hmm_min_confidence", 0.55))
+            hmm_trend_boost = float(getattr(config, "hmm_trend_boost", 1.10))
+            hmm_chop_dampen = float(getattr(config, "hmm_chop_dampen", 0.85))
+            hmm_blend = 0.0
+            if abs(hmm_sign) > 0.0 and hmm_conf >= hmm_min_conf and hmm_w > 0.0:
+                # Blend toward HMM direction while preserving current magnitude scale.
+                base_mag = max(abs(float(mu_alpha_raw)), abs(_s(ctx.get("mu_kf"), 0.0)), 1e-6)
+                hmm_target = math.copysign(base_mag, float(hmm_sign))
+                hmm_blend = float(min(1.0, max(0.0, hmm_w * hmm_conf)))
+                mu_alpha_raw = float((1.0 - hmm_blend) * float(mu_alpha_raw) + hmm_blend * float(hmm_target))
+                sign_mu = 1.0 if mu_alpha_raw > 0 else (-1.0 if mu_alpha_raw < 0 else 0.0)
+                sign_hmm = 1.0 if hmm_sign > 0 else (-1.0 if hmm_sign < 0 else 0.0)
+                if sign_mu != 0.0 and sign_mu == sign_hmm:
+                    boost = 1.0 + max(0.0, float(hmm_trend_boost) - 1.0) * hmm_conf
+                    mu_alpha_raw = float(mu_alpha_raw * boost)
+            elif hmm_state == "chop":
+                damp = float(np.clip(hmm_chop_dampen + (1.0 - hmm_conf) * (1.0 - hmm_chop_dampen), 0.30, 1.00))
+                mu_alpha_raw = float(mu_alpha_raw * damp)
+            mu_alpha_parts["hmm_state"] = hmm_state
+            mu_alpha_parts["hmm_sign"] = float(hmm_sign)
+            mu_alpha_parts["hmm_conf"] = float(hmm_conf)
+            mu_alpha_parts["hmm_blend"] = float(hmm_blend)
+
+        # VPIN risk adjustment (drift damping + sigma expansion)
+        if use_vpin:
+            vpin = ctx.get("vpin")
+            if vpin is not None:
+                vpin = max(0.0, min(1.0, float(vpin)))
+                gamma = float(getattr(config, "vpin_gamma", 0.6))
+                damp_floor = float(getattr(config, "vpin_damp_floor", 0.10))
+                damp = max(float(damp_floor), 1.0 - gamma * vpin)
+                vpin_ext = float(getattr(config, "vpin_extreme_threshold", 0.90))
+                vpin_ou_w = float(getattr(config, "vpin_extreme_ou_weight", 0.85))
+                sigma_cap_mult = float(getattr(config, "vpin_sigma_cap_mult", 2.5))
+                h_low = float(getattr(config, "hurst_low", 0.45))
+                hurst_now = _s(ctx.get("hurst"), 0.5)
+                mu_ou_now = _s(ctx.get("mu_ou"), 0.0)
+                in_extreme = bool(vpin >= vpin_ext)
+                if in_extreme and hurst_now <= h_low and abs(mu_ou_now) > 0.0:
+                    # Extreme toxicity + mean-reversion regime: blend toward OU instead of only dampening.
+                    mu_alpha_raw = float((1.0 - vpin_ou_w) * float(mu_alpha_raw) + vpin_ou_w * float(mu_ou_now))
+                    contra_boost = float(getattr(config, "vpin_extreme_contra_boost", 1.10))
+                    mu_alpha_raw = float(mu_alpha_raw * max(0.5, contra_boost))
+                    mu_alpha_parts["vpin_extreme_mode"] = "ou_contrarian"
+                    mu_alpha_parts["vpin_extreme_ou_weight"] = float(vpin_ou_w)
+                    mu_alpha_parts["vpin_extreme_contra_boost"] = float(contra_boost)
+                mu_alpha_raw = float(mu_alpha_raw * damp)
+                mu_alpha_parts["vpin"] = float(vpin)
+                mu_alpha_parts["vpin_damp"] = float(damp)
+                # sigma boost for toxicity
+                vpin_sigma_k = float(getattr(config, "vpin_sigma_k", 0.8))
+                sigma_mult = float(1.0 + vpin_sigma_k * vpin)
+                if in_extreme and hurst_now <= h_low:
+                    sigma_relax = float(getattr(config, "vpin_extreme_sigma_relax", 0.30))
+                    sigma_mult = float(1.0 + vpin_sigma_k * vpin * max(0.0, 1.0 - sigma_relax))
+                sigma_mult = float(min(max(1.0, sigma_mult), max(1.0, sigma_cap_mult)))
+                sigma = float(sigma) * sigma_mult
+                mu_alpha_parts["vpin_sigma_mult"] = float(sigma_mult)
+
+        # Hawkes boost
+        if use_hawkes:
+            hawkes_boost = _s(ctx.get("hawkes_boost"), 0.0)
+            hawkes_k = float(getattr(config, "hawkes_boost_k", 0.3))
+            mu_alpha_raw = float(mu_alpha_raw + hawkes_k * hawkes_boost)
+            mu_alpha_parts["hawkes_boost"] = float(hawkes_boost)
+            mu_alpha_parts["hawkes_k"] = float(hawkes_k)
+
+        # GARCH sigma blending (optional)
+        if use_garch:
+            sigma_garch = ctx.get("sigma_garch")
+            if sigma_garch is not None and float(sigma_garch) > 0:
+                w_g = float(getattr(config, "garch_sigma_weight", 0.5))
+                sigma = float((1.0 - w_g) * float(sigma) + w_g * float(sigma_garch))
+                mu_alpha_parts["sigma_garch"] = float(sigma_garch)
+                mu_alpha_parts["sigma_garch_w"] = float(w_g)
+
+        # Optional: directional correction layer from lightweight classifier (logistic baseline).
+        # This adjusts the sign of mu_alpha when direction confidence is high.
+        try:
+            use_dir_corr = bool(getattr(config, "alpha_direction_use", False))
+        except Exception:
+            use_dir_corr = False
+        if use_dir_corr:
+            dir_edge = _s(ctx.get("mu_dir_edge"), 0.0)
+            dir_conf = _s(ctx.get("mu_dir_conf"), abs(dir_edge))
+            dir_prob_long = _s(ctx.get("mu_dir_prob_long"), 0.5)
+            dir_strength = float(getattr(config, "alpha_direction_strength", 0.6))
+            dir_conf_th = float(getattr(config, "alpha_direction_min_confidence", 0.55))
+            dir_conf_floor = float(getattr(config, "alpha_direction_confidence_floor", 0.45))
+            dir_conf_th = float(max(dir_conf_th, dir_conf_floor))
+            dir_conf = float(max(0.0, min(1.0, dir_conf)))
+            dir_blend = 0.0
+            if abs(dir_edge) > 0.0 and dir_conf >= dir_conf_th and dir_strength > 0.0:
+                # Blend current mu toward classifier-indicated direction, but keep magnitude anchored.
+                dir_target = math.copysign(abs(mu_alpha_raw), float(dir_edge))
+                dir_blend = float(min(1.0, max(0.0, dir_strength * dir_conf)))
+                mu_alpha_raw = float((1.0 - dir_blend) * float(mu_alpha_raw) + dir_blend * float(dir_target))
+            mu_alpha_parts["mu_dir_prob_long"] = float(dir_prob_long)
+            mu_alpha_parts["mu_dir_edge"] = float(dir_edge)
+            mu_alpha_parts["mu_dir_conf"] = float(dir_conf)
+            mu_alpha_parts["mu_dir_conf_min_required"] = float(dir_conf_th)
+            mu_alpha_parts["mu_dir_blend"] = float(dir_blend)
+        mu_alpha_parts["mu_alpha_raw"] = float(mu_alpha_raw)
         
         # ✅ [FIX 2] PMaker fill 결과를 mu_alpha에 반영하여 개선
         # fill rate가 높으면 alpha 신뢰도 증가 → mu_alpha 증가
@@ -2115,12 +2327,12 @@ class MonteCarloEntryEvaluationMixin:
             logger.info(
                 f"[EV_DEBUG] {symbol} | best_obj_long={best_obj_long:.6f}@{best_h_long}s best_obj_short={best_obj_short:.6f}@{best_h_short}s | "
                 f"score_long={score_long:.6f} score_short={score_short:.6f} | "
-                f"score_gap={ev_gap:.6f} min_gap={min_gap:.6f} mode={obj_mode}"
+                f"score_gap={ev_gap:.6f} min_gap_eff={min_gap_eff:.6f} mode={obj_mode}"
             )
             print(
                 f"[EV_DEBUG] {symbol} | best_obj_long={best_obj_long:.6f}@{best_h_long}s best_obj_short={best_obj_short:.6f}@{best_h_short}s | "
                 f"score_long={score_long:.6f} score_short={score_short:.6f} | "
-                f"score_gap={ev_gap:.6f} min_gap={min_gap:.6f} mode={obj_mode}"
+                f"score_gap={ev_gap:.6f} min_gap_eff={min_gap_eff:.6f} mode={obj_mode}"
             )
 
         # ✅ SCORE-BASED DIRECTION: 롱과 숏을 독립적으로 판단 (차등 임계점 적용)
@@ -2188,14 +2400,95 @@ class MonteCarloEntryEvaluationMixin:
             direction_policy = 0
             policy_direction_reason = f"both_scores_invalid (scoreL={score_long:.6f}, scoreS={score_short:.6f}, threshold={score_threshold_eff:.6f}, h={best_h_chosen})"
         elif score_long_valid and score_short_valid:
-            # 둘 다 양수 → gap이 충분히 크면 큰 쪽 선택, 아니면 WAIT
-            if abs(ev_gap) >= min_gap:
+            # 둘 다 양수 → gap이 충분히 크면 큰 쪽 선택
+            if abs(ev_gap) >= min_gap_eff:
                 direction_policy = 1 if ev_gap > 0 else -1
-                policy_direction_reason = f"both_positive_gap_ok (scoreL={score_long:.6f}, scoreS={score_short:.6f}, gap={ev_gap:.6f})"
+                policy_direction_reason = (
+                    f"both_positive_gap_ok (scoreL={score_long:.6f}, scoreS={score_short:.6f}, "
+                    f"gap={ev_gap:.6f}, min_gap_eff={min_gap_eff:.6f})"
+                )
             else:
-                # ✅ Force entry to the better side even if gap is small (to ensure 1000% utilization)
-                direction_policy = 1 if ev_gap > 0 else -1
-                policy_direction_reason = f"both_positive_small_gap_force (scoreL={score_long:.6f}, scoreS={score_short:.6f}, gap={ev_gap:.6f})"
+                # small-gap 구간은 기본 WAIT. 단, 고신뢰(p_pos)가 충분할 때만 예외 진입.
+                side_candidate = 1 if ev_gap > 0 else -1
+                side_conf = float(best_p_pos_long) if side_candidate == 1 else float(best_p_pos_short)
+                reg_key = "CHOP"
+                if reg == "trend":
+                    reg_key = "TREND"
+                elif reg == "volatile":
+                    reg_key = "VOLATILE"
+
+                def _sg_env_float(key: str, fallback: float) -> float:
+                    try:
+                        v = os.environ.get(f"{key}_{reg_key}")
+                        if v is None or str(v).strip() == "":
+                            v = os.environ.get(key)
+                        if v is None or str(v).strip() == "":
+                            return float(fallback)
+                        return float(v)
+                    except Exception:
+                        return float(fallback)
+
+                def _sg_env_bool(key: str, fallback: bool) -> bool:
+                    try:
+                        v = os.environ.get(f"{key}_{reg_key}")
+                        if v is None or str(v).strip() == "":
+                            v = os.environ.get(key)
+                        if v is None:
+                            return bool(fallback)
+                        txt = str(v).strip().lower()
+                        if txt in ("1", "true", "yes", "on", "y"):
+                            return True
+                        if txt in ("0", "false", "no", "off", "n"):
+                            return False
+                    except Exception:
+                        pass
+                    return bool(fallback)
+
+                allow_high_conf = _sg_env_bool(
+                    "POLICY_SMALL_GAP_ALLOW_HIGH_CONF",
+                    bool(getattr(config, "policy_small_gap_allow_high_conf", True)),
+                )
+                conf_th = _sg_env_float(
+                    "POLICY_SMALL_GAP_CONFIDENCE",
+                    float(getattr(config, "policy_small_gap_confidence", 0.60)),
+                )
+                dir_conf = float(mu_alpha_parts.get("mu_dir_conf") or 0.0) if isinstance(mu_alpha_parts, dict) else 0.0
+                dir_edge = abs(float(mu_alpha_parts.get("mu_dir_edge") or 0.0)) if isinstance(mu_alpha_parts, dict) else 0.0
+                dir_prob_long = float(mu_alpha_parts.get("mu_dir_prob_long") or 0.5) if isinstance(mu_alpha_parts, dict) else 0.5
+                side_prob = float(dir_prob_long) if side_candidate == 1 else float(1.0 - dir_prob_long)
+                dir_conf_th = _sg_env_float(
+                    "POLICY_SMALL_GAP_DIR_CONFIDENCE",
+                    float(getattr(config, "policy_small_gap_dir_confidence", 0.58)),
+                )
+                dir_edge_th = _sg_env_float(
+                    "POLICY_SMALL_GAP_DIR_EDGE",
+                    float(getattr(config, "policy_small_gap_dir_edge", 0.08)),
+                )
+                side_prob_th = _sg_env_float(
+                    "POLICY_SMALL_GAP_SIDE_PROB",
+                    float(getattr(config, "policy_small_gap_side_prob", 0.56)),
+                )
+                if (
+                    allow_high_conf
+                    and side_conf >= conf_th
+                    and dir_conf >= dir_conf_th
+                    and dir_edge >= dir_edge_th
+                    and side_prob >= side_prob_th
+                ):
+                    direction_policy = side_candidate
+                    policy_direction_reason = (
+                        f"both_positive_small_gap_high_conf (scoreL={score_long:.6f}, scoreS={score_short:.6f}, "
+                        f"gap={ev_gap:.6f}, min_gap_eff={min_gap_eff:.6f}, p_pos={side_conf:.4f}, conf_th={conf_th:.4f}, "
+                        f"dir_conf={dir_conf:.4f}, dir_edge={dir_edge:.4f}, side_prob={side_prob:.4f}/{side_prob_th:.4f})"
+                    )
+                else:
+                    direction_policy = 0
+                    policy_direction_reason = (
+                        f"both_positive_small_gap_wait (scoreL={score_long:.6f}, scoreS={score_short:.6f}, "
+                        f"gap={ev_gap:.6f}, min_gap_eff={min_gap_eff:.6f}, p_pos={side_conf:.4f}, conf_th={conf_th:.4f}, "
+                        f"dir_conf={dir_conf:.4f}/{dir_conf_th:.4f}, dir_edge={dir_edge:.4f}/{dir_edge_th:.4f}, "
+                        f"side_prob={side_prob:.4f}/{side_prob_th:.4f})"
+                    )
         elif score_long_valid:
             # 롱만 임계값 통과 → LONG
             direction_policy = 1
@@ -2329,7 +2622,7 @@ class MonteCarloEntryEvaluationMixin:
         meta["policy_profit_cost_by_h_short"] = profit_cost_short_h.tolist()
         meta["policy_direction"] = direction_policy
         meta["policy_direction_reason"] = str(policy_direction_reason) if policy_direction_reason else None
-        meta["policy_min_ev_gap"] = min_gap
+        meta["policy_min_ev_gap"] = min_gap_eff
         meta["policy_best_ev_gap"] = float(best_ev_gap)
         meta["policy_ev_gap"] = float(ev_gap)
         meta["policy_p_pos_gap"] = float(p_pos_gap)
@@ -3175,6 +3468,9 @@ class MonteCarloEntryEvaluationMixin:
             "mu_alpha_pmaker_boost": float(mu_alpha_parts.get("mu_alpha_pmaker_boost") or 0.0)
             if isinstance(mu_alpha_parts, dict)
             else None,
+            "mu_dir_edge": float(mu_alpha_parts.get("mu_dir_edge") or 0.0) if isinstance(mu_alpha_parts, dict) else None,
+            "mu_dir_conf": float(mu_alpha_parts.get("mu_dir_conf") or 0.0) if isinstance(mu_alpha_parts, dict) else None,
+            "mu_dir_prob_long": float(mu_alpha_parts.get("mu_dir_prob_long") or 0.5) if isinstance(mu_alpha_parts, dict) else None,
             "execution_cost": float(execution_cost),
             "fee_roundtrip_total": float(execution_cost),
             "slippage_dyn": float(slippage_dyn),

@@ -94,7 +94,12 @@ class HybridPlanner:
             if prev_score is not None and (score_beam - prev_score) < self.cfg.switch_hysteresis:
                 final_action = int(self.prev_action)
             elif self.prev_state_sig is not None and curr_sig is not None:
-                dist = torch.norm(curr_sig - self.prev_state_sig).item()
+                # Signature length can change when feature schema changes during runtime.
+                # In that case skip lock-distance check for this step instead of crashing.
+                if curr_sig.numel() != self.prev_state_sig.numel():
+                    dist = float("inf")
+                else:
+                    dist = torch.norm(curr_sig - self.prev_state_sig).item()
                 if dist < self.cfg.sig_lock_dist and (score_beam - prev_score) < self.cfg.sig_lock_improve:
                     final_action = int(self.prev_action)
 

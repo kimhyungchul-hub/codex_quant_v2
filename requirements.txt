@@ -1,3 +1,5 @@
 # Core RL/MC training deps
 torch>=2.0.0
 torchvision>=0.15.0
+# Optional but recommended for daily GARCH(1,1) fitting pipeline
+arch>=6.2.0

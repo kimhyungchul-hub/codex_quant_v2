@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import time
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -286,6 +287,7 @@ class OnlineAlphaTrainer:
         # Gradient accumulation
         self._grad_accum_counter = 0
         self._last_replay_save_n = 0
+        self._train_lock = threading.Lock()
         
         # Load checkpoint if exists
         self._load_checkpoint()
@@ -297,6 +299,71 @@ class OnlineAlphaTrainer:
             f"n_features={cfg.n_features} buffer_max={cfg.max_buffer} "
             f"label_smoothing={cfg.label_smoothing} feature_normalize={cfg.feature_normalize}"
         )
+
+    def _coerce_horizon_vec(self, arr: Any) -> np.ndarray:
+        """Normalize a label vector to current horizon length."""
+        n_h = int(len(self.cfg.horizons_sec))
+        try:
+            out = np.asarray(arr, dtype=np.float32).reshape(-1)
+        except Exception:
+            out = np.zeros(n_h, dtype=np.float32)
+        if out.size < n_h:
+            pad = np.zeros(n_h - out.size, dtype=np.float32)
+            out = np.concatenate([out, pad], axis=0)
+        elif out.size > n_h:
+            out = out[:n_h]
+        return out.astype(np.float32, copy=False)
+
+    def _coerce_feature_vec(self, x: Any) -> np.ndarray:
+        """Normalize a feature vector to configured input dimension."""
+        n_f = int(self.cfg.n_features)
+        try:
+            out = np.asarray(x, dtype=np.float32).reshape(-1)
+        except Exception:
+            out = np.zeros(n_f, dtype=np.float32)
+        if out.size < n_f:
+            pad = np.zeros(n_f - out.size, dtype=np.float32)
+            out = np.concatenate([out, pad], axis=0)
+        elif out.size > n_f:
+            out = out[:n_f]
+        return out.astype(np.float32, copy=False)
+
+    def _is_mps_runtime_error(self, err_msg: str) -> bool:
+        """Detect unstable MPS autograd/runtime failures and trigger CPU fallback."""
+        e = str(err_msg or "").lower()
+        mps_markers = (
+            "mps",
+            "inplace operation",
+            "version",
+            "autograd",
+            "not implemented for 'mps'",
+        )
+        return any(m in e for m in mps_markers)
+
+    def _switch_device(self, device: str) -> bool:
+        """Move model to a safer device and reset optimizer/normalizer state."""
+        if not _TORCH_OK or self.model is None:
+            return False
+        try:
+            new_device = torch.device(device)
+            if self.device is not None and self.device.type == new_device.type:
+                return True
+            self.device = new_device
+            self.cfg.device = str(device)
+            self.model.to(self.device)
+            # Re-create optimizer on new device for stable continued training.
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self._get_lr(),
+                weight_decay=self.cfg.weight_decay,
+            )
+            if self.cfg.feature_normalize:
+                self.normalizer = RunningNormalizer(self.cfg.n_features, device=str(device))
+            logger.warning(f"[ALPHA_TRAINER] Switched training device to {device} due to runtime instability")
+            return True
+        except Exception as e:
+            logger.warning(f"[ALPHA_TRAINER] Failed to switch device to {device}: {e}")
+            return False
     
     def _get_lr(self) -> float:
         """Get current learning rate with warmup and decay"""
@@ -385,16 +452,12 @@ class OnlineAlphaTrainer:
             symbol: Trading pair symbol
         """
         try:
-            x_arr = np.asarray(x, dtype=np.float32).flatten()
+            x_arr = self._coerce_feature_vec(x)
             
             # Validate y
             y_clean = {}
             for key in ["tp_long", "sl_long", "tp_short", "sl_short"]:
-                arr = y.get(key)
-                if arr is not None:
-                    y_clean[key] = np.asarray(arr, dtype=np.float32)
-                else:
-                    y_clean[key] = np.zeros(len(self.cfg.horizons_sec), dtype=np.float32)
+                y_clean[key] = self._coerce_horizon_vec(y.get(key))
             
             self._buffer_x.append(x_arr)
             self._buffer_y.append(y_clean)
@@ -441,7 +504,7 @@ class OnlineAlphaTrainer:
         self._last_replay_save_n = n
         self._save_replay()
     
-    def train_tick(self) -> Dict[str, float]:
+    def train_tick(self, _retry_on_device_fail: bool = True) -> Dict[str, float]:
         """
         Perform training step(s).
         
@@ -454,6 +517,10 @@ class OnlineAlphaTrainer:
         n = len(self._buffer_x)
         if n < self.cfg.min_buffer:
             return {"loss": 0.0, "n_samples": n, "skipped": True, "reason": "insufficient_samples"}
+
+        # Guard against concurrent optimizer updates from async engine loops.
+        if not self._train_lock.acquire(blocking=False):
+            return {"loss": self._last_loss, "n_samples": n, "skipped": True, "reason": "trainer_busy"}
         
         try:
             self.model.train()
@@ -564,8 +631,23 @@ class OnlineAlphaTrainer:
             }
             
         except Exception as e:
-            logger.warning(f"[ALPHA_TRAINER] Training failed: {e}")
-            return {"loss": 0.0, "n_samples": n, "skipped": True, "error": str(e)}
+            err = str(e)
+            if (
+                _retry_on_device_fail
+                and self.device is not None
+                and self.device.type == "mps"
+                and self._is_mps_runtime_error(err)
+                and self._switch_device("cpu")
+            ):
+                logger.warning("[ALPHA_TRAINER] CPU fallback armed; training will resume on next tick")
+                return {"loss": self._last_loss, "n_samples": n, "skipped": True, "reason": "device_fallback_switched"}
+            logger.warning(f"[ALPHA_TRAINER] Training failed: {err}")
+            return {"loss": 0.0, "n_samples": n, "skipped": True, "error": err}
+        finally:
+            try:
+                self._train_lock.release()
+            except RuntimeError:
+                pass
     
     def _sample_indices_with_decay(self, batch_size: int) -> List[int]:
         """Sample indices with exponential recency weighting"""
@@ -690,15 +772,15 @@ class OnlineAlphaTrainer:
             if any(v is None for v in (y_tp_long, y_sl_long, y_tp_short, y_sl_short, ts, sym)):
                 return
 
-            self._buffer_x = [np.asarray(v, dtype=np.float32) for v in x]
+            self._buffer_x = [self._coerce_feature_vec(v) for v in x]
             self._buffer_y = []
             for i in range(len(self._buffer_x)):
                 self._buffer_y.append(
                     {
-                        "tp_long": np.asarray(y_tp_long[i], dtype=np.float32),
-                        "sl_long": np.asarray(y_sl_long[i], dtype=np.float32),
-                        "tp_short": np.asarray(y_tp_short[i], dtype=np.float32),
-                        "sl_short": np.asarray(y_sl_short[i], dtype=np.float32),
+                        "tp_long": self._coerce_horizon_vec(y_tp_long[i]),
+                        "sl_long": self._coerce_horizon_vec(y_sl_long[i]),
+                        "tp_short": self._coerce_horizon_vec(y_tp_short[i]),
+                        "sl_short": self._coerce_horizon_vec(y_sl_short[i]),
                     }
                 )
             self._buffer_ts = [int(v) for v in ts.tolist()]

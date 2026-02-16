@@ -162,8 +162,12 @@ class MonteCarloDecisionMixin:
             return self._decide_hybrid_only(ctx, params, seed, symbol, price, regime_ctx, boost_val)
 
         # ✅ 최적 레버리지 자동 산출
-        leverage_val = ctx.get("leverage")
-        optimal_leverage = float(leverage_val if leverage_val is not None else 5.0)
+        try:
+            lev_floor_env = float(os.environ.get("LEVERAGE_MIN", 1.0) or 1.0)
+        except Exception:
+            lev_floor_env = 1.0
+        lev_floor_env = float(max(1.0, lev_floor_env))
+        optimal_leverage = float(lev_floor_env)
         optimal_size = 0.0
         best_net_ev = None
         
@@ -268,6 +272,9 @@ class MonteCarloDecisionMixin:
                             else:
                                 optimal_leverage = float(max(1.0, min(max_leverage, sig_strength * k_lev)))
                             best_net_ev = None
+                        else:
+                            # No positive edge from Kelly scan -> keep leverage at floor (avoid sticky default 5x).
+                            optimal_leverage = float(max(1.0, min(max_leverage, lev_floor_env)))
         except Exception as e:
             logger.error(f"[LEVERAGE_ERROR] {symbol} | {e}")
             import traceback
@@ -1729,6 +1736,14 @@ class MonteCarloDecisionMixin:
         tstar = None
         tstar_src = None
         tstar_n_paths = None
+        obs_mu_alpha = None
+        obs_mu_alpha_raw = None
+        obs_mu_dir_conf = None
+        obs_mu_dir_edge = None
+        obs_mu_dir_prob_long = None
+        obs_policy_score_threshold = None
+        obs_policy_event_exit_min_score = None
+        obs_policy_unrealized_dd_floor = None
         try:
             tstar_on = str(os.environ.get("HYBRID_TSTAR_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
@@ -1758,6 +1773,32 @@ class MonteCarloDecisionMixin:
                 if isinstance(metrics_t, dict):
                     tstar = metrics_t.get("unified_t_star") or metrics_t.get("best_h")
                     meta_t = metrics_t.get("meta") if isinstance(metrics_t.get("meta"), dict) else {}
+
+                    def _pick_obs(*keys: str):
+                        for kk in keys:
+                            try:
+                                vv = metrics_t.get(kk)
+                                if vv is not None:
+                                    return vv
+                            except Exception:
+                                pass
+                            try:
+                                vv = meta_t.get(kk)
+                                if vv is not None:
+                                    return vv
+                            except Exception:
+                                pass
+                        return None
+
+                    obs_mu_alpha = _pick_obs("mu_alpha", "event_exit_dynamic_mu_alpha")
+                    obs_mu_alpha_raw = _pick_obs("mu_alpha_raw")
+                    obs_mu_dir_conf = _pick_obs("mu_dir_conf")
+                    obs_mu_dir_edge = _pick_obs("mu_dir_edge")
+                    obs_mu_dir_prob_long = _pick_obs("mu_dir_prob_long")
+                    obs_policy_score_threshold = _pick_obs("policy_score_threshold_eff", "policy_score_threshold", "score_threshold")
+                    obs_policy_event_exit_min_score = _pick_obs("event_exit_min_score")
+                    obs_policy_unrealized_dd_floor = _pick_obs("unrealized_dd_floor_dyn")
+
                     if tstar is None:
                         tstar = meta_t.get("unified_t_star") or meta_t.get("policy_horizon_eff_sec") or meta_t.get("best_h")
                     try:
@@ -1771,6 +1812,34 @@ class MonteCarloDecisionMixin:
                         tstar_src = "entry_eval"
             except Exception as e:
                 logger.warning(f"[HYBRID_TSTAR] {symbol} | compute failed: {e}")
+
+        def _opt_float(v):
+            try:
+                if v is None:
+                    return None
+                fv = float(v)
+                if not math.isfinite(fv):
+                    return None
+                return fv
+            except Exception:
+                return None
+
+        mu_alpha_meta = _opt_float(obs_mu_alpha)
+        if mu_alpha_meta is None:
+            mu_alpha_meta = _opt_float(ctx.get("mu_alpha"))
+        mu_alpha_raw_meta = _opt_float(obs_mu_alpha_raw)
+        if mu_alpha_raw_meta is None:
+            mu_alpha_raw_meta = _opt_float(ctx.get("mu_alpha_raw"))
+        mu_dir_conf_meta = _opt_float(obs_mu_dir_conf)
+        if mu_dir_conf_meta is None:
+            mu_dir_conf_meta = _opt_float(ctx.get("mu_dir_conf"))
+        mu_dir_edge_meta = _opt_float(obs_mu_dir_edge)
+        if mu_dir_edge_meta is None:
+            mu_dir_edge_meta = _opt_float(ctx.get("mu_dir_edge"))
+        mu_dir_prob_long_meta = _opt_float(obs_mu_dir_prob_long)
+        if mu_dir_prob_long_meta is None:
+            mu_dir_prob_long_meta = _opt_float(ctx.get("mu_dir_prob_long"))
+
         meta = {
             "hybrid_action": hybrid_decision,
             "hybrid_action_idx": action_idx,
@@ -1831,6 +1900,17 @@ class MonteCarloDecisionMixin:
             "opt_hold_sec": float(tstar) if tstar is not None else None,
             "opt_hold_src": tstar_src,
             "opt_hold_n_paths": int(tstar_n_paths) if (tstar is not None and tstar_n_paths) else None,
+            # Keep alpha observability populated even in HYBRID_ONLY mode.
+            "mu_alpha": mu_alpha_meta,
+            "mu_alpha_raw": mu_alpha_raw_meta,
+            "mu_dir_conf": mu_dir_conf_meta,
+            "mu_dir_edge": mu_dir_edge_meta,
+            "mu_dir_prob_long": mu_dir_prob_long_meta,
+            "vpin": _opt_float(ctx.get("vpin")),
+            "hurst": _opt_float(ctx.get("hurst")),
+            "policy_score_threshold_eff": _opt_float(obs_policy_score_threshold),
+            "event_exit_min_score": _opt_float(obs_policy_event_exit_min_score),
+            "unrealized_dd_floor_dyn": _opt_float(obs_policy_unrealized_dd_floor),
         }
         if lev_sweep_meta is not None:
             meta["lev_sweep"] = lev_sweep_meta
@@ -1861,6 +1941,11 @@ class MonteCarloDecisionMixin:
             "unified_score_long": score_long,
             "unified_score_short": score_short,
             "unified_score_hold": score_hold,
+            "mu_alpha": mu_alpha_meta,
+            "mu_alpha_raw": mu_alpha_raw_meta,
+            "mu_dir_conf": mu_dir_conf_meta,
+            "mu_dir_edge": mu_dir_edge_meta,
+            "mu_dir_prob_long": mu_dir_prob_long_meta,
             "details": [
                 {
                     "_engine": "mc_barrier",

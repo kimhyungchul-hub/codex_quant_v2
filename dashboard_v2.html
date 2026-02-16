@@ -67,6 +67,15 @@
       font-size: 13px
     }
 
+    .chip.toggle {
+      cursor: pointer;
+      transition: border-color 0.15s ease;
+    }
+
+    .chip.toggle:hover {
+      border-color: var(--accent);
+    }
+
     .chip b {
       font-size: 12px;
       color: var(--muted);
@@ -83,6 +92,15 @@
 
     .chip .off {
       color: var(--good)
+    }
+
+    .alpha-sub {
+      display: block;
+      font-size: 10px;
+      line-height: 1.1;
+      color: var(--muted);
+      margin-top: 2px;
+      white-space: nowrap;
     }
 
     .spacer {
@@ -253,10 +271,12 @@
       font-size: 11px;
       color: var(--warn);
       margin-bottom: 4px;
-      max-width: 240px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      max-width: 520px;
+      white-space: normal;
+      overflow: visible;
+      text-overflow: clip;
+      word-break: break-word;
+      line-height: 1.25;
     }
 
     .wait-reason.muted {
@@ -419,26 +439,38 @@
 <body>
   <div class="wrap">
     <div class="topbar">
-      <div class="chip"><b>KillSwitch</b><span id="ks" class="v off">OFF</span></div>
-      <div class="chip"><b>Equity</b><span id="eq" class="v">-</span></div>
-      <div class="chip"><b>WS</b><span id="ws" class="v">-</span></div>
-      <div class="chip"><b>Feed</b><span id="feed" class="v">-</span></div>
-      <div class="chip" title="Last MC decide_batch latency"><b>MC</b><span id="mcTime" class="v">-</span></div>
-      <div class="chip" title="MC backend/device"><b>MC Dev</b><span id="mcDev" class="v">-</span></div>
-      <div class="chip"><b>Util</b><span id="util" class="v">-</span></div>
-      <div class="chip"><b>Brier</b><span id="brier" class="v">-</span></div>
-      <div class="chip"><b>Hit%</b><span id="hit" class="v">-</span></div>
-      <div class="chip" title="Alpha Hit ML 활성화 상태"><b>αML</b><span id="alphaHit" class="v">-</span></div>
-      <div class="chip" title="Alpha Signal Boost 상태 (mu_alpha 3x 증폭)"><b>αBoost</b><span id="alphaBst"
+      <div class="chip" title="리스크 킬스위치 상태입니다. ON이면 신규 진입이 제한됩니다."><b>KillSwitch</b><span id="ks" class="v off">OFF</span></div>
+      <div class="chip" title="현재 평가자산(Equity)입니다. 모델 기준 또는 라이브 기준이 표시됩니다."><b>Equity</b><span id="eq" class="v">-</span></div>
+      <div class="chip" title="현재 연결된 대시보드 WebSocket 클라이언트 수입니다."><b>WS</b><span id="ws" class="v">-</span></div>
+      <div class="chip" title="거래소 시세 피드 수신 상태입니다."><b>Feed</b><span id="feed" class="v">-</span></div>
+      <div class="chip" title="최근 MC decide_batch 처리 시간입니다."><b>MC</b><span id="mcTime" class="v">-</span></div>
+      <div class="chip" title="MC 연산 백엔드/디바이스 정보입니다."><b>MC Dev</b><span id="mcDev" class="v">-</span></div>
+      <div class="chip" title="총 노출도(사용 중 노셔널 / 노출 한도) 비율입니다."><b>Util</b><span id="util" class="v">-</span></div>
+      <div class="chip" title="예측 확률의 보정 품질 지표(Brier Score)입니다. 낮을수록 좋습니다."><b>Brier</b><span id="brier" class="v">-</span></div>
+      <div class="chip" title="최근 구간 방향 적중률입니다."><b>Hit%</b><span id="hit" class="v">-</span></div>
+      <div class="chip" title="Alpha Hit ML 모듈 활성화 상태입니다."><b>αML</b><span id="alphaHit" class="v">-</span></div>
+      <div class="chip" title="Signal Boost 활성화 상태입니다. mu_alpha가 추가 증폭됩니다."><b>αBoost</b><span id="alphaBst"
           class="v">-</span></div>
-      <div class="chip" title="AlphaHit replay buffer (samples/min_buffer)"><b>αBuf</b><span id="alphaBuf"
+      <div class="chip" title="AlphaHit 학습 버퍼 샘플 수(현재/최소)입니다."><b>αBuf</b><span id="alphaBuf"
           class="v">-</span></div>
-      <div class="chip" title="AlphaHit training loss / EMA"><b>αLoss</b><span id="alphaLoss"
+      <div class="chip" title="AlphaHit 학습 손실값과 EMA입니다."><b>αLoss</b><span id="alphaLoss"
           class="v">-</span></div>
-      <div class="chip" title="AlphaHit replay file status"><b>αReplay</b><span id="alphaReplay"
+      <div class="chip" title="AlphaHit replay 파일 저장/로드 상태입니다."><b>αReplay</b><span id="alphaReplay"
           class="v">-</span></div>
-      <div class="chip" title="Loaded env profile/file"><b>ENV</b><span id="envSrc" class="v">-</span></div>
-      <div class="chip"><b>Selected</b><span id="selSym" class="v">-</span></div>
+      <div class="chip toggle" title="ALPHA 컬럼 상세 표시 토글입니다. OFF여도 매매 로직에는 영향이 없습니다."><b>αDetail</b><span id="alphaDetail" class="v">-</span></div>
+      <div class="chip" title="MLOFI/CAUSAL 가중치 수집/학습 파이프라인 상태입니다."><b>αWgt</b><span id="alphaWgt" class="v">-</span></div>
+      <div class="chip" title="MLOFI 가중치 파일 생성/학습 진행 상태입니다."><b>MLOFI</b><span id="alphaMlofi" class="v">-</span></div>
+      <div class="chip" title="CAUSAL 가중치 파일 생성/학습 진행 상태입니다."><b>CAUSAL</b><span id="alphaCausal" class="v">-</span></div>
+      <div class="chip" title="누적 신규 청산 건수입니다. NewExit anchor 기준으로 리셋 없이 계속 누적됩니다."><b>NewExitCum</b><span id="newClosedCum" class="v">-</span></div>
+      <div class="chip" title="현재 배치 신규 청산 진행률입니다. 엔진의 REVAL_TARGET_MIN_NEW_CLOSED 기준(예: 21/200)이며, 목표 달성 후 baseline 롤링으로 0부터 다시 시작됩니다."><b>NewExitBatch</b><span id="newClosedBatch" class="v">-</span></div>
+      <div class="chip" title="자동 재평가 리포트 진행률입니다. auto_reval_db_report.json(target_new) 기준으로 3개 리포트(관측성/진단/카운터팩추얼) 준비 상태를 보여줍니다."><b>RevalRpt</b><span id="autoReval" class="v">-</span></div>
+      <div class="chip" title="최근 완료된 자동 재평가 배치의 방향 적중률과 직전 배치 대비 변화입니다."><b>DirHitΔ</b><span id="kpiDirHit" class="v">-</span></div>
+      <div class="chip" title="최근 완료된 자동 재평가 배치의 진입 이슈 비율과 직전 배치 대비 변화입니다. 낮을수록 좋습니다."><b>EntryIssueΔ</b><span id="kpiEntryIssue" class="v">-</span></div>
+      <div class="chip" title="최근 완료된 자동 재평가 배치의 평균 청산 후회값과 직전 배치 대비 변화입니다. 낮을수록 좋습니다."><b>ExitRegretΔ</b><span id="kpiExitRegret" class="v">-</span></div>
+      <div class="chip" title="RevalRpt 기반 자동 튜닝 상태입니다. 배치별 적용 액션/재학습 성공 여부를 표시합니다."><b>AutoTune</b><span id="autoTune" class="v">-</span></div>
+      <div class="chip" title="진입 precheck(event_exit_ok)와 실제 event_mc_exit 청산의 최근 일치율입니다. Strict Consistency 모드에서 높을수록 정합성이 높습니다."><b>EvAlign</b><span id="eventAlign" class="v">-</span></div>
+      <div class="chip" title="현재 로드된 환경파일/프로파일입니다."><b>ENV</b><span id="envSrc" class="v">-</span></div>
+      <div class="chip" title="현재 선택된 심볼입니다."><b>Selected</b><span id="selSym" class="v">-</span></div>
       <div class="spacer"></div>
       <div class="controls">
         <input id="search" class="input" placeholder="심볼/상태/레짐 검색 (예: BTC, LONG, chop)" />
@@ -459,7 +491,7 @@
         <table id="mktTable">
           <thead>
             <tr>
-              <th data-k="rank">RANK</th>
+              <th data-k="rank" title="TOP 필터 기준 순위(없으면 점수 순위)">RANK</th>
               <th data-k="symbol">SYM</th>
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
@@ -476,6 +508,7 @@
               <th data-k="delta_ev">ΔH</th>
               <th data-k="exec_cost">COST</th>
               <th data-k="wgt">WGT</th>
+              <th data-k="alpha">ALPHA</th>
             </tr>
           </thead>
           <tbody id="mktBody"></tbody>
@@ -506,9 +539,9 @@
           <span id="eqRangeLabel" class="mono muted">-</span>
         </div>
         <div class="kpi">
-          <span class="pill">Balance <span class="mono" id="balKpi">-</span></span>
-          <span class="pill">Equity <span class="mono" id="eqKpi">-</span></span>
-          <span class="pill">DD <span class="mono" id="ddKpi">-</span></span>
+          <span class="pill" title="기준 잔고(현금성 자산)입니다.">Balance <span class="mono" id="balKpi">-</span></span>
+          <span class="pill" title="미실현 손익 포함 평가자산입니다.">Equity <span class="mono" id="eqKpi">-</span></span>
+          <span class="pill" title="최근 고점 대비 현재 손실률(Drawdown)입니다.">DD <span class="mono" id="ddKpi">-</span></span>
         </div>
       </div>
     </div>
@@ -518,11 +551,11 @@
       <div class="body">
         <canvas id="liveEquityChart"></canvas>
         <div class="kpi">
-          <span class="pill">Wallet <span class="mono" id="liveWalletKpi">-</span></span>
-          <span class="pill">Equity <span class="mono" id="liveEqKpi">-</span></span>
-          <span class="pill">Free <span class="mono" id="liveFreeKpi">-</span></span>
-          <span class="pill">IM/MM <span class="mono" id="liveMarginKpi">-</span></span>
-          <span class="pill">Sync <span class="mono" id="liveSyncKpi">-</span></span>
+          <span class="pill" title="거래소 지갑 잔고입니다.">Wallet <span class="mono" id="liveWalletKpi">-</span></span>
+          <span class="pill" title="거래소 기준 실시간 평가자산입니다.">Equity <span class="mono" id="liveEqKpi">-</span></span>
+          <span class="pill" title="사용 가능한 여유 증거금/잔고입니다.">Free <span class="mono" id="liveFreeKpi">-</span></span>
+          <span class="pill" title="초기/유지 증거금(IM/MM)입니다.">IM/MM <span class="mono" id="liveMarginKpi">-</span></span>
+          <span class="pill" title="거래소 라이브 잔고 동기화 지연 시간입니다.">Sync <span class="mono" id="liveSyncKpi">-</span></span>
         </div>
       </div>
     </div>
@@ -621,6 +654,16 @@
     const mcTimeEl = $('mcTime'), mcDevEl = $('mcDev');
     const alphaHitEl = $('alphaHit'), alphaBstEl = $('alphaBst');
     const alphaBufEl = $('alphaBuf'), alphaLossEl = $('alphaLoss'), alphaReplayEl = $('alphaReplay');
+    const alphaDetailEl = $('alphaDetail');
+    const alphaWgtEl = $('alphaWgt'), alphaMlofiEl = $('alphaMlofi'), alphaCausalEl = $('alphaCausal');
+    const newClosedCumEl = $('newClosedCum');
+    const newClosedBatchEl = $('newClosedBatch');
+    const autoRevalEl = $('autoReval');
+    const kpiDirHitEl = $('kpiDirHit');
+    const kpiEntryIssueEl = $('kpiEntryIssue');
+    const kpiExitRegretEl = $('kpiExitRegret');
+    const autoTuneEl = $('autoTune');
+    const eventAlignEl = $('eventAlign');
     const envSrcEl = $('envSrc');
     const selSymEl = $('selSym'), searchEl = $('search');
     const outsideWarnEl = $('outsideWarn');
@@ -754,8 +797,30 @@
 
     // ---------- state ----------
     let selectedSym = null;
-    let sortKey = 'symbol';
+    // Default view: show symbols by rank (1 = best).
+    let sortKey = 'rank';
     let sortAsc = true;
+    let alphaDetailMode = (localStorage.getItem('alphaDetailMode') || 'off') === 'on';
+
+    function setAlphaDetailMode(on) {
+      alphaDetailMode = !!on;
+      if (alphaDetailEl) {
+        alphaDetailEl.textContent = alphaDetailMode ? 'ON' : 'OFF';
+        alphaDetailEl.className = `v ${alphaDetailMode ? 'up' : 'muted'}`;
+        alphaDetailEl.title = alphaDetailMode ? 'ALPHA 컴포넌트 상세 표시 (매매 로직 영향 없음)' : 'ALPHA 요약 표시 (매매 로직 영향 없음)';
+      }
+      localStorage.setItem('alphaDetailMode', alphaDetailMode ? 'on' : 'off');
+    }
+
+    if (alphaDetailEl) {
+      alphaDetailEl.onclick = () => {
+        setAlphaDetailMode(!alphaDetailMode);
+        if (latestPayload && latestPayload.market) {
+          renderMarketTable(latestPayload.market);
+        }
+      };
+      setAlphaDetailMode(alphaDetailMode);
+    }
 
     // history for charts
     const maxPoints = 20000;
@@ -852,6 +917,18 @@
     const fmtNum = (v, digits = 6) => (isNum(v) ? Number(v).toFixed(digits) : 'n/a');
     const fmtPct = (v, digits = 4) => (isNum(v) ? (Number(v) * 100).toFixed(digits) + '%' : 'n/a');
     const fmtUsd = (v) => (isNum(v) ? f2(v) : 'n/a');
+    const fmtDeltaPp = (v, digits = 2) => {
+      if (!isNum(v)) return '-';
+      const n = Number(v) * 100;
+      const sign = n > 0 ? '+' : '';
+      return `${sign}${n.toFixed(digits)}%p`;
+    };
+    const fmtDeltaAbs = (v, digits = 4) => {
+      if (!isNum(v)) return '-';
+      const n = Number(v);
+      const sign = n > 0 ? '+' : '';
+      return `${sign}${n.toFixed(digits)}`;
+    };
     function fmtHMSPrime(sec, maxSec = 3600) {
       if (!isNum(sec)) return '-';
       let s = Math.max(0, Math.round(Number(sec)));
@@ -1048,6 +1125,11 @@
       return `${sec}초`;
     }
 
+    function fmtTs(ms) {
+      if (!isNum(ms) || ms <= 0) return '-';
+      return new Date(Number(ms)).toLocaleTimeString();
+    }
+
     function normalizeHist(hist) {
       if (!Array.isArray(hist) || !hist.length) return;
       hist.sort((a, b) => (a.t || 0) - (b.t || 0));
@@ -1212,6 +1294,9 @@
           decision_leverage: x.decision_leverage ?? (x.meta && x.meta.lev) ?? null,
           dyn_leverage: x.dyn_leverage ?? null,
           lev_source: x.lev_source ?? (x.meta && x.meta.lev_source) ?? null,
+          top_n_active: (x.top_n_active ?? (x.meta && x.meta.top_n_active) ?? null),
+          top_n_rank: (x.top_n_rank ?? (x.meta && x.meta.top_n_rank) ?? null),
+          top_n_limit: (x.top_n_limit ?? (x.meta && x.meta.top_n_limit) ?? null),
         };
       }).filter(r => {
         if (!q) return true;
@@ -1219,8 +1304,18 @@
         return hay.includes(q);
       });
 
-      // compute ranking by hybrid score
+      // compute score rank (fallback rank)
       data.forEach((d) => { d._score_for_rank = isNum(d.hybrid_score) ? d.hybrid_score : 0; });
+      const byScore = data.slice().sort((a, b) => b._score_for_rank - a._score_for_rank);
+      const scoreRankMap = new Map();
+      byScore.forEach((d, i) => scoreRankMap.set(d.symbol, i + 1));
+      data.forEach((d) => {
+        const scoreRank = scoreRankMap.get(d.symbol) || null;
+        d.score_rank = scoreRank;
+        // Keep rank consistent with engine top_n gate when available.
+        if (d.top_n_active === true && isNum(d.top_n_rank)) d.rank = Number(d.top_n_rank);
+        else d.rank = scoreRank;
+      });
 
       data.sort((a, b) => {
         const va = a[sortKey], vb = b[sortKey];
@@ -1231,14 +1326,6 @@
         return 0;
       });
 
-      // If user is sorting by default (symbol), inject a computed rank by score
-      if (sortKey === 'symbol') {
-        const byScore = data.slice().sort((a, b) => b._score_for_rank - a._score_for_rank);
-        const rankMap = new Map();
-        byScore.forEach((d, i) => rankMap.set(d.symbol, i + 1));
-        data.forEach(d => d.rank = rankMap.get(d.symbol) || null);
-      }
-
       // ✅ smooth: reuse <tr> nodes, reorder with fragment
       const frag = document.createDocumentFragment();
 
@@ -1247,7 +1334,7 @@
         if (!cached) {
           const tr = document.createElement('tr');
           const cells = [];
-          for (let i = 0; i < 17; i++) {  // 확장: 17열 (REASON, LS_SCORE 추가)
+          for (let i = 0; i < 18; i++) {  // 확장: 18열 (ALPHA 추가)
             const td = document.createElement('td');
             cells.push(td);
             tr.appendChild(td);
@@ -1300,6 +1387,8 @@
           SPR: 'SPR: spread gap must be below cap',
           CV: 'CV: event CVaR risk must be below limit',
           EMC: 'EMC: event MC exit metrics within limits',
+          NX: 'NX: net expectancy (EV-fee/slippage) must exceed dynamic floor',
+          SQ: 'SQ: symbol quality (recent expectancy/hit/reject) must meet threshold',
           LIQ: 'LIQ: liquidity score must meet minimum',
           MIN: 'MIN: estimated notional must meet minimum',
           MEX: 'MEX: exposure notional must meet minimum',
@@ -1319,7 +1408,7 @@
           ? `${help.CV} | event_cvar_r=${fmtNum(m.event_cvar_r, 4)} | floor=${fmtNum(m.cvar_floor, 4)}`
           : `${help.CV} | disabled`;
         const evtExitTip = (isNum(m.event_exit_score) || isNum(m.event_p_sl) || isNum(m.event_cvar_pct))
-          ? `${help.EMC} | score=${fmtPct(m.event_exit_score, 4)} | EV%=${fmtPct(m.event_ev_pct, 4)} | CVaR%=${fmtPct(m.event_cvar_pct, 4)} | P_SL=${fmtPct(m.event_p_sl, 2)} | min_score=${fmtPct(m.event_exit_min_score, 4)} | max_cvar=${fmtPct(m.event_exit_max_cvar, 4)} | max_p_sl=${fmtPct(m.event_exit_max_p_sl, 2)}`
+          ? `${help.EMC} | score=${fmtPct(m.event_exit_score, 4)} | EV%=${fmtPct(m.event_ev_pct, 4)} | CVaR%=${fmtPct(m.event_cvar_pct, 4)} | P_SL=${fmtPct(m.event_p_sl, 2)} | P_TP=${fmtPct(m.event_p_tp, 2)} | min_score=${fmtPct(m.event_exit_min_score, 4)} | max_cvar=${fmtPct(m.event_exit_max_cvar, 4)} | max_p_sl=${fmtPct(m.event_exit_max_p_sl, 2)} | min_p_tp=${fmtPct(m.event_exit_min_p_tp, 2)} | src=${(m.event_exit_eval_source ?? m.event_eval_source ?? 'n/a')} | pre_allow_now=${(m.event_precheck_allow_exit_now === undefined || m.event_precheck_allow_exit_now === null) ? 'n/a' : (m.event_precheck_allow_exit_now ? 'yes' : 'no')} | pre_guard=${(m.event_precheck_guard_reason ?? m.event_exit_guard ?? 'n/a')} | pre_confirm=${(m.event_precheck_confirm_mode ?? 'n/a')}:${(m.event_precheck_confirm_required ?? 'n/a')}/${(m.event_precheck_confirm_count ?? 'n/a')} | pre_t*= ${fmtNum(m.event_precheck_guard_remaining_sec ?? m.event_hold_remaining_sec, 1)}s`
           : `${help.EMC} | disabled`;
         const liqTip = (isNum(m.min_liq_score))
           ? `${help.LIQ} | liq_score=${fmtNum(m.liq_score, 2)} | min=${fmtNum(m.min_liq_score, 2)}`
@@ -1336,6 +1425,12 @@
         const feeTip = (isNum(m.fee_filter_cost) || isNum(m.fee_filter_ev))
           ? `${help.FEE} | ev=${fmtPct(m.fee_filter_ev, 4)} | ev_eff=${fmtPct(m.fee_filter_ev_eff, 4)} | lev=${fmtNum(m.fee_filter_lev, 2)} | cost=${fmtPct(m.fee_filter_cost, 4)} | base=${fmtPct(m.fee_filter_base, 4)} | mult=${fmtNum(m.fee_filter_mult, 2)}`
           : `${help.FEE} | disabled`;
+        const netTip = (isNum(m.net_expectancy_effective) || isNum(m.net_expectancy_min))
+          ? `${help.NX} | net=${fmtPct(m.net_expectancy_effective, 4)} | floor=${fmtPct(m.net_expectancy_min, 4)} | raw=${fmtPct(m.net_expectancy_raw, 4)} | fee=${fmtPct(m.net_expectancy_fee_cost, 4)} | vpin=${fmtNum(m.net_expectancy_vpin, 3)} | dir_conf=${fmtNum(m.net_expectancy_dir_conf, 3)}`
+          : `${help.NX} | disabled`;
+        const sqTip = (isNum(m.symbol_quality_score) || isNum(m.symbol_quality_min_score))
+          ? `${help.SQ} | score=${fmtNum(m.symbol_quality_score, 3)} | min=${fmtNum(m.symbol_quality_min_score, 3)} | n=${(m.symbol_quality_sample_n ?? 'n/a')} | exp=${fmtPct(m.symbol_quality_expectancy, 4)} | hit=${fmtPct(m.symbol_quality_hit_rate, 2)} | reject=${fmtPct(m.symbol_quality_reject_ratio, 2)} | min_n=${(m.symbol_quality_min_exits ?? 'n/a')}`
+          : `${help.SQ} | warming up`;
         const posTxt = (m.max_positions === null || m.max_positions === undefined)
           ? `${(m.positions_count ?? 'n/a')}/∞`
           : `${(m.positions_count ?? 'n/a')}/${m.max_positions}`;
@@ -1344,8 +1439,8 @@
           : `cap off | open=${fmtUsd(m.total_open_notional)}`;
         const capTip = `${help.CAP} | safety=${m.safety_mode ? 'on' : 'off'} | positions=${posTxt} | exposure=${expTxt}`;
         const topTip = (!m.top_n_active)
-          ? `${help.TOP} | inactive`
-          : `${help.TOP} | rank=${(m.top_n_rank ?? 'n/a')} | limit=${(m.top_n_limit ?? 'n/a')}`;
+          ? `${help.TOP} | inactive | score_rank=${(r.score_rank ?? 'n/a')}`
+          : `${help.TOP} | rank=${(m.top_n_rank ?? 'n/a')} | limit=${(m.top_n_limit ?? 'n/a')} | score_rank=${(r.score_rank ?? 'n/a')}`;
         let pmcTip = '';
         if (!m.pre_mc_active) {
           pmcTip = `${help.PMC} | disabled`;
@@ -1375,6 +1470,8 @@
           spread: ['SPR', sprTip],
           event_cvar: ['CV', cvTip],
           event_mc_exit: ['EMC', evtExitTip],
+          net_expectancy: ['NX', netTip],
+          symbol_quality: ['SQ', sqTip],
           liquidity: ['LIQ', liqTip],
           min_notional: ['MIN', minTip],
           min_exposure: ['MEX', minExpTip],
@@ -1395,6 +1492,8 @@
           if (fs.spread === false) addBlocked('SPR', sprTip);
           if (fs.event_cvar === false) addBlocked('CV', cvTip);
           if (fs.event_exit === false) addBlocked('EMC', evtExitTip);
+          if (fs.net_expectancy === false) addBlocked('NX', netTip);
+          if (fs.symbol_quality === false) addBlocked('SQ', sqTip);
           if (fs.liq === false) addBlocked('LIQ', liqTip);
           if (fs.min_notional === false) addBlocked('MIN', minTip);
           if (fs.min_exposure === false) addBlocked('MEX', minExpTip);
@@ -1411,14 +1510,15 @@
         let waitReasonHtml = '';
         if (r.status === 'WAIT') {
           if (blocked.length) {
-            const tip = escAttr(blockedTips.join(' | '));
-            const txt = escAttr(`BLOCKED: ${blocked.join(', ')}`);
+            const blockedRaw = (entryBlocks && entryBlocks.length) ? entryBlocks.join(', ') : blocked.join(', ');
+            const tip = escAttr(`${blockedTips.join(' | ')}${blockedTips.length ? ' | ' : ''}raw=${blockedRaw}`);
+            const txt = escAttr(`filter_block: ${blockedRaw}`);
             waitReasonHtml = `<div class="wait-reason" title="${tip}">${txt}</div>`;
           } else {
             const altReason = r.raw.direction_reason || r.raw.mc || r.raw.reason;
             if (altReason && String(altReason).trim() && altReason !== '-') {
               const tip = escAttr(String(altReason));
-              const txt = escAttr(`WAIT: ${shortTxt(altReason, 64)}`);
+              const txt = escAttr(`WAIT: ${String(altReason)}`);
               waitReasonHtml = `<div class="wait-reason muted" title="${tip}">${txt}</div>`;
             }
           }
@@ -1427,6 +1527,8 @@
         if ('spread' in fs) badges.push(badge('SPR', fs.spread, sprTip));
         if ('event_cvar' in fs) badges.push(badge('CV', fs.event_cvar, cvTip));
         if ('event_exit' in fs) badges.push(badge('EMC', fs.event_exit, evtExitTip));
+        if ('net_expectancy' in fs) badges.push(badge('NX', fs.net_expectancy, netTip));
+        if ('symbol_quality' in fs) badges.push(badge('SQ', fs.symbol_quality, sqTip));
         if ('liq' in fs) badges.push(badge('LIQ', fs.liq, liqTip));
         if ('min_notional' in fs) badges.push(badge('MIN', fs.min_notional, minTip));
         if ('min_exposure' in fs) badges.push(badge('MEX', fs.min_exposure, minExpTip));
@@ -1496,10 +1598,14 @@
 
         // REASON (Direction Policy Reason)
         c[12].className = 'muted';
-        c[12].style.maxWidth = '120px';
-        c[12].style.overflow = 'hidden';
-        c[12].style.textOverflow = 'ellipsis';
-        const reason = r.raw.direction_reason || '-';
+        c[12].style.maxWidth = '440px';
+        c[12].style.whiteSpace = 'normal';
+        c[12].style.overflow = 'visible';
+        c[12].style.textOverflow = 'clip';
+        c[12].style.lineHeight = '1.25';
+        const reason = (r.raw.reason && String(r.raw.reason).trim() && r.raw.reason !== '-')
+          ? r.raw.reason
+          : (r.raw.direction_reason || '-');
         c[12].title = reason; // Tooltip for full reason
         c[12].textContent = reason;
 
@@ -1529,6 +1635,21 @@
         // Joint weight (fraction of leverage allocated)
         c[16].className = 'mono';
         c[16].textContent = (r.rebalance_weight === null || r.rebalance_weight === undefined) ? '-' : (isNum(r.rebalance_weight) ? (Number(r.rebalance_weight)).toFixed(4) : r.rebalance_weight);
+
+        // Alpha components (mu_alpha + key signals)
+        const muA = isNum(r.mu_alpha) ? Number(r.mu_alpha) : null;
+        c[17].className = `mono ${muA === null ? 'muted' : (muA >= 0 ? 'up' : 'down')}`;
+        const alphaText = (muA === null ? '-' : muA.toFixed(3));
+        if (alphaDetailMode && muA !== null) {
+          const kf = fmtNum(r.alpha_mu_kf, 3);
+          const mlf = fmtNum(r.alpha_mlofi, 3);
+          const ml = fmtNum(r.alpha_mu_ml, 3);
+          const vp = fmtNum(r.alpha_vpin, 3);
+          c[17].innerHTML = `<div>${alphaText}</div><div class="alpha-sub">KF ${kf} · MLF ${mlf} · ML ${ml} · VP ${vp}</div>`;
+        } else {
+          c[17].textContent = alphaText;
+        }
+        c[17].title = `mu_alpha=${fmtNum(r.mu_alpha, 4)} | raw=${fmtNum(r.mu_alpha_raw, 4)} | mlofi=${fmtNum(r.alpha_mlofi, 4)} | vpin=${fmtNum(r.alpha_vpin, 4)} | kf=${fmtNum(r.alpha_mu_kf, 4)} | hurst=${fmtNum(r.alpha_hurst, 3)} | ml=${fmtNum(r.alpha_mu_ml, 4)} | bayes=${fmtNum(r.alpha_mu_bayes, 4)} | ar=${fmtNum(r.alpha_mu_ar, 4)} | pf=${fmtNum(r.alpha_mu_pf, 4)} | ou=${fmtNum(r.alpha_mu_ou, 4)} | hawkes=${fmtNum(r.alpha_hawkes_boost, 4)} | sigma_garch=${fmtNum(r.alpha_sigma_garch, 4)}`;
 
         frag.appendChild(tr);
       });
@@ -1567,7 +1688,24 @@
         const pnlPct = (roeLev === null) ? null : (roeLev * 100);
         const pnlPctUnlev = (roeUnlev === null) ? null : (roeUnlev * 100);
         const cap = p.cap_frac !== undefined && p.cap_frac !== null ? Number(p.cap_frac) * 100 : null;
-        const age = p.age_sec ?? (p.time ? Math.max(0, (Date.now() - p.time) / 1000) : null);
+        const normalizeTsMs = (v) => {
+          if (!isNum(v)) return null;
+          let t = Number(v);
+          if (!isFinite(t) || t <= 0) return null;
+          if (t < 1e12) t = t * 1000;          // sec -> ms
+          else if (t > 1e14) t = Math.floor(t / 1000); // us -> ms
+          return t;
+        };
+        let age = isNum(p.age_sec) ? Number(p.age_sec) : null;
+        if (age !== null && (!isFinite(age) || age < 0 || age > 86400 * 365 * 3)) {
+          age = null;
+        }
+        if (age === null) {
+          const entryMs = normalizeTsMs(p.entry_time ?? p.time ?? null);
+          if (entryMs !== null) {
+            age = Math.max(0, (Date.now() - entryMs) / 1000);
+          }
+        }
         const tEntry = (p.opt_hold_entry_sec !== undefined && p.opt_hold_entry_sec !== null)
           ? Number(p.opt_hold_entry_sec)
           : ((p.opt_hold_sec !== undefined && p.opt_hold_sec !== null) ? Number(p.opt_hold_sec) : null);
@@ -1946,6 +2084,285 @@
         }
       }
 
+      // Alpha weight training status (MLOFI/CAUSAL)
+      const aw = d.alpha_weights || {};
+      if (alphaWgtEl) {
+        const collectOn = aw.collect_enabled === true;
+        const trainOn = aw.train_enabled === true;
+        const trig = Number(aw.trigger_new_exits ?? NaN);
+        const prog = Number(aw.new_exits_since_last_train ?? NaN);
+        const readyForce = aw.force_train_ready === true;
+        const progTxt = (isNum(prog) && isNum(trig) && trig > 0) ? `${Math.round(prog)}/${Math.round(trig)}` : '-';
+        alphaWgtEl.textContent = (collectOn || trainOn) ? `${collectOn ? 'C' : '-'}${trainOn ? 'T' : '-'} ${progTxt}` : 'OFF';
+        alphaWgtEl.className = `v ${(collectOn || trainOn) ? (readyForce ? 'wait' : 'up') : 'muted'}`;
+        alphaWgtEl.title = `collect=${collectOn} train=${trainOn} | min_samples=${aw.min_samples || '-'} | ridge=${aw.ridge_lambda || '-'} | save=${fmtTs(aw.last_save_ms)} | train=${fmtTs(aw.last_train_ms)} | exit_trigger=${progTxt} | force_ready=${readyForce} | last_reason=${aw.last_train_reason || '-'}`;
+      }
+      if (alphaMlofiEl) {
+        const minS = Number(aw.min_samples ?? 0);
+        const samples = Number(aw.mlofi_samples ?? 0);
+        const exists = aw.mlofi_weight_exists === true;
+        const display = minS > 0 ? `${samples}/${minS}` : `${samples}`;
+        alphaMlofiEl.textContent = exists ? `ok ${display}` : display;
+        const state = exists ? 'up' : (minS > 0 && samples >= minS ? 'wait' : 'muted');
+        alphaMlofiEl.className = `v ${state}`;
+        alphaMlofiEl.title = `weights=${exists ? 'ok' : 'missing'} | last_train=${fmtTs(aw.last_train_ms)} | path=${aw.mlofi_weight_path || '-'}`;
+      }
+      if (alphaCausalEl) {
+        const minS = Number(aw.min_samples ?? 0);
+        const samples = Number(aw.causal_samples ?? 0);
+        const exists = aw.causal_weight_exists === true;
+        const display = minS > 0 ? `${samples}/${minS}` : `${samples}`;
+        alphaCausalEl.textContent = exists ? `ok ${display}` : display;
+        const state = exists ? 'up' : (minS > 0 && samples >= minS ? 'wait' : 'muted');
+        alphaCausalEl.className = `v ${state}`;
+        alphaCausalEl.title = `weights=${exists ? 'ok' : 'missing'} | last_train=${fmtTs(aw.last_train_ms)} | path=${aw.causal_weight_path || '-'}`;
+      }
+      if (newClosedCumEl || newClosedBatchEl) {
+        const rv = d.reval || {};
+        const newClosedBatch = Number(rv.new_closed_total_batch ?? rv.new_closed_total ?? NaN);
+        const newClosedCum = Number(rv.new_closed_total_cum ?? NaN);
+        const targetMin = Number(rv.target_min ?? NaN);
+        const targetMax = Number(rv.target_max ?? NaN);
+        const baseline = Number(rv.baseline_closed ?? NaN);
+        const anchor = Number(rv.anchor_closed ?? NaN);
+        const closedTotal = Number(rv.closed_total ?? NaN);
+        const remaining = Number(rv.remaining_to_min ?? NaN);
+        const ready = rv.ready === true;
+        const hasCum = isNum(newClosedCum);
+        const hasBatch = isNum(newClosedBatch) && isNum(targetMin) && targetMin > 0;
+        const targetTxt = isNum(targetMax) ? `${Math.round(targetMin)}~${Math.round(targetMax)}` : `${Math.round(targetMin)}`;
+        const remTxt = isNum(remaining) ? Math.max(0, Math.round(remaining)) : '-';
+        const baseTxt = isNum(baseline) ? Math.round(baseline) : '-';
+        const ancTxt = isNum(anchor) ? Math.round(anchor) : '-';
+        const curTxt = isNum(closedTotal) ? Math.round(closedTotal) : '-';
+
+        if (newClosedCumEl) {
+          if (hasCum) {
+            const cumTxt = `${Math.round(newClosedCum)}`;
+            newClosedCumEl.textContent = cumTxt;
+            if (Math.round(newClosedCum) > 0) newClosedCumEl.className = 'v wait';
+            else newClosedCumEl.className = 'v muted';
+            newClosedCumEl.title = `누적 신규 청산 건수(리셋 없음)\n현재 누적=${cumTxt}\nanchor=${ancTxt}, baseline=${baseTxt}, current=${curTxt}`;
+          } else {
+            newClosedCumEl.textContent = '-';
+            newClosedCumEl.className = 'v muted';
+            newClosedCumEl.title = '누적 신규 청산 카운트 정보 없음';
+          }
+        }
+        if (newClosedBatchEl) {
+          if (hasBatch) {
+            const batchTxt = `${Math.round(newClosedBatch)}`;
+            newClosedBatchEl.textContent = `${batchTxt}/${Math.round(targetMin)}`;
+            if (ready) newClosedBatchEl.className = 'v up';
+            else if (Math.round(newClosedBatch) > 0) newClosedBatchEl.className = 'v wait';
+            else newClosedBatchEl.className = 'v muted';
+            newClosedBatchEl.title = `현재 배치 신규 청산 진행률(REVAL_TARGET_MIN_NEW_CLOSED 기준)\n진행=${batchTxt}/${Math.round(targetMin)}\n목표범위=${targetTxt}, 남은수=${remTxt}`;
+          } else {
+            newClosedBatchEl.textContent = '-';
+            newClosedBatchEl.className = 'v muted';
+            newClosedBatchEl.title = '배치 신규 청산 진행률 정보 없음';
+          }
+        }
+      }
+      if (autoRevalEl) {
+        const ar = d.auto_reval || {};
+        const rptReady = Number(ar.reports_ready ?? NaN);
+        const rptTotal = Number(ar.reports_total ?? NaN);
+        const ready = ar.ready === true;
+        const exists = ar.exists === true;
+        const newClosed = Number(ar.new_closed_total ?? NaN);
+        const newClosedCum = Number(ar.new_closed_total_cum ?? NaN);
+        const targetNew = Number(ar.target_new ?? NaN);
+        const remain = Number(ar.remaining_to_target ?? NaN);
+        const doneBatch = Number(ar.completed_batches ?? NaN);
+        const doneReports = Number(ar.completed_reports_total ?? NaN);
+        const staleSec = Number(ar.stale_sec ?? NaN);
+        if (isNum(rptReady) && isNum(rptTotal) && rptTotal > 0) {
+          const batchTxt = isNum(doneBatch) ? ` B${Math.max(0, Math.round(doneBatch))}` : '';
+          autoRevalEl.textContent = `${Math.round(rptReady)}/${Math.round(rptTotal)}${batchTxt}`;
+          if (ready && rptReady >= rptTotal) autoRevalEl.className = 'v up';
+          else if (exists) autoRevalEl.className = 'v wait';
+          else autoRevalEl.className = 'v muted';
+          const freshTxt = isNum(staleSec) ? `${staleSec.toFixed(0)}초 전` : '-';
+          const newTxt = isNum(newClosed) ? `${Math.round(newClosed)}` : '-';
+          const newCumTxt = isNum(newClosedCum) ? `${Math.round(newClosedCum)}` : '-';
+          const tgtTxt = isNum(targetNew) ? `${Math.round(targetNew)}` : '-';
+          const remTxt = isNum(remain) ? `${Math.max(0, Math.round(remain))}` : '-';
+          const doneRptTxt = isNum(doneReports) ? `${Math.max(0, Math.round(doneReports))}` : '-';
+          const doneBatchTxt = isNum(doneBatch) ? `${Math.max(0, Math.round(doneBatch))}` : '-';
+          autoRevalEl.title = `자동 재평가 파일 진행률: ${Math.round(rptReady)}/${Math.round(rptTotal)}\n현재 배치 신규청산=${newTxt}/${tgtTxt}, 남은수=${remTxt}\n누적 신규청산(리셋없음)=${newCumTxt}\n완료 배치수=${doneBatchTxt}, 누적 리포트 실행수=${doneRptTxt}\n참고: 배치 목표 달성 시 baseline 롤링으로 현재 배치 카운트는 0부터 재시작합니다.\n갱신시각=${freshTxt}`;
+        } else {
+          const batchTxt = isNum(doneBatch) ? ` B${Math.max(0, Math.round(doneBatch))}` : '';
+          autoRevalEl.textContent = exists ? `0/3${batchTxt}` : '-';
+          autoRevalEl.className = exists ? 'v wait' : 'v muted';
+          autoRevalEl.title = exists ? '자동 재평가 대기 중: 목표 신규청산 도달 후 리포트가 채워집니다. 배치 카운트는 목표 달성 시 0부터 재시작되는 것이 정상입니다.' : 'auto_reval_db_report.json 파일이 아직 생성되지 않았습니다.';
+        }
+      }
+      if (kpiDirHitEl || kpiEntryIssueEl || kpiExitRegretEl) {
+        const ar = d.auto_reval || {};
+        const at = d.auto_tune || {};
+        const dirHit = Number(ar.direction_hit ?? at.direction_hit ?? NaN);
+        const entryIssue = Number(ar.entry_issue_ratio ?? at.entry_issue_ratio ?? at.entry_issue_rate ?? NaN);
+        const exitRegret = Number(ar.avg_exit_regret ?? at.avg_exit_regret ?? NaN);
+        const cachedDirRaw = localStorage.getItem('kpi_delta_direction_hit');
+        const cachedEntryRaw = localStorage.getItem('kpi_delta_entry_issue_ratio');
+        const cachedRegretRaw = localStorage.getItem('kpi_delta_avg_exit_regret');
+        const cachedDir = cachedDirRaw === null ? NaN : Number(cachedDirRaw);
+        const cachedEntry = cachedEntryRaw === null ? NaN : Number(cachedEntryRaw);
+        const cachedRegret = cachedRegretRaw === null ? NaN : Number(cachedRegretRaw);
+        let dirHitDelta = Number(ar.direction_hit_delta ?? at.direction_hit_delta ?? NaN);
+        let entryIssueDelta = Number(ar.entry_issue_ratio_delta ?? at.entry_issue_ratio_delta ?? NaN);
+        let exitRegretDelta = Number(ar.avg_exit_regret_delta ?? at.avg_exit_regret_delta ?? NaN);
+        if (!isNum(dirHitDelta) && isNum(cachedDir)) dirHitDelta = cachedDir;
+        if (!isNum(entryIssueDelta) && isNum(cachedEntry)) entryIssueDelta = cachedEntry;
+        if (!isNum(exitRegretDelta) && isNum(cachedRegret)) exitRegretDelta = cachedRegret;
+        if (isNum(dirHitDelta)) localStorage.setItem('kpi_delta_direction_hit', String(dirHitDelta));
+        if (isNum(entryIssueDelta)) localStorage.setItem('kpi_delta_entry_issue_ratio', String(entryIssueDelta));
+        if (isNum(exitRegretDelta)) localStorage.setItem('kpi_delta_avg_exit_regret', String(exitRegretDelta));
+        const stale = Number(ar.stale_sec ?? at.stale_sec ?? NaN);
+        const staleTxt = isNum(stale) ? `${stale.toFixed(0)}초 전` : '-';
+
+        if (kpiDirHitEl) {
+          if (isNum(dirHit)) {
+            const baseTxt = `${(dirHit * 100).toFixed(1)}%`;
+            const deltaTxt = isNum(dirHitDelta) ? ` ${fmtDeltaPp(dirHitDelta, 2)}` : '';
+            kpiDirHitEl.textContent = `${baseTxt}${deltaTxt}`;
+            if (isNum(dirHitDelta) && dirHitDelta > 0) kpiDirHitEl.className = 'v up';
+            else if (isNum(dirHitDelta) && dirHitDelta < 0) kpiDirHitEl.className = 'v dn';
+            else kpiDirHitEl.className = 'v wait';
+            kpiDirHitEl.title = `방향 적중률(direction_hit)\n현재=${baseTxt}\n직전배치 대비=${fmtDeltaPp(dirHitDelta, 2)}\n갱신시각=${staleTxt}`;
+          } else {
+            kpiDirHitEl.textContent = '-';
+            kpiDirHitEl.className = 'v muted';
+            kpiDirHitEl.title = 'direction_hit 데이터 대기 중';
+          }
+        }
+        if (kpiEntryIssueEl) {
+          if (isNum(entryIssue)) {
+            const baseTxt = `${(entryIssue * 100).toFixed(1)}%`;
+            const deltaTxt = isNum(entryIssueDelta) ? ` ${fmtDeltaPp(entryIssueDelta, 2)}` : '';
+            kpiEntryIssueEl.textContent = `${baseTxt}${deltaTxt}`;
+            if (isNum(entryIssueDelta) && entryIssueDelta < 0) kpiEntryIssueEl.className = 'v up';
+            else if (isNum(entryIssueDelta) && entryIssueDelta > 0) kpiEntryIssueEl.className = 'v dn';
+            else kpiEntryIssueEl.className = 'v wait';
+            kpiEntryIssueEl.title = `진입 이슈 비율(entry_issue_ratio, 낮을수록 좋음)\n현재=${baseTxt}\n직전배치 대비=${fmtDeltaPp(entryIssueDelta, 2)}\n갱신시각=${staleTxt}`;
+          } else {
+            kpiEntryIssueEl.textContent = '-';
+            kpiEntryIssueEl.className = 'v muted';
+            kpiEntryIssueEl.title = 'entry_issue_ratio 데이터 대기 중';
+          }
+        }
+        if (kpiExitRegretEl) {
+          if (isNum(exitRegret)) {
+            const baseTxt = exitRegret.toFixed(4);
+            const deltaTxt = isNum(exitRegretDelta) ? ` ${fmtDeltaAbs(exitRegretDelta, 4)}` : '';
+            kpiExitRegretEl.textContent = `${baseTxt}${deltaTxt}`;
+            if (isNum(exitRegretDelta) && exitRegretDelta < 0) kpiExitRegretEl.className = 'v up';
+            else if (isNum(exitRegretDelta) && exitRegretDelta > 0) kpiExitRegretEl.className = 'v dn';
+            else kpiExitRegretEl.className = 'v wait';
+            kpiExitRegretEl.title = `평균 청산 후회(avg_exit_regret, 낮을수록 좋음)\n현재=${baseTxt}\n직전배치 대비=${fmtDeltaAbs(exitRegretDelta, 4)}\n갱신시각=${staleTxt}`;
+          } else {
+            kpiExitRegretEl.textContent = '-';
+            kpiExitRegretEl.className = 'v muted';
+            kpiExitRegretEl.title = 'avg_exit_regret 데이터 대기 중';
+          }
+        }
+      }
+      if (autoTuneEl) {
+        const at = d.auto_tune || {};
+        const aw2 = d.alpha_weights || {};
+        const enabled = at.enabled !== false;
+        const exists = at.exists === true;
+        const batch = Number(at.last_batch_id ?? NaN);
+        const overrideCount = Number(at.override_count ?? NaN);
+        const retrainRan = at.retrain_ran === true;
+        const retrainRc = Number(at.retrain_rc ?? NaN);
+        const directionHit = Number(at.direction_hit ?? NaN);
+        const entryIssue = Number(at.entry_issue_ratio ?? at.entry_issue_rate ?? NaN);
+        const exitRegret = Number(at.avg_exit_regret ?? NaN);
+        const trig = Number(aw2.trigger_new_exits ?? NaN);
+        const prog = Number(aw2.new_exits_since_last_train ?? NaN);
+        const progTxt = (isNum(prog) && isNum(trig) && trig > 0) ? `${Math.round(prog)}/${Math.round(trig)}` : '-';
+        const batchTxt = isNum(batch) ? `B${Math.max(0, Math.round(batch))}` : 'B-';
+        const ovTxt = isNum(overrideCount) ? `O${Math.max(0, Math.round(overrideCount))}` : 'O-';
+        let rtTxt = 'R-';
+        if (retrainRan) rtTxt = (!isNaN(retrainRc) && retrainRc === 0) ? 'Rok' : `R${retrainRc}`;
+        autoTuneEl.textContent = enabled ? `${batchTxt} ${ovTxt} ${rtTxt}` : 'OFF';
+        if (!enabled) autoTuneEl.className = 'v muted';
+        else if (retrainRan && !isNaN(retrainRc) && retrainRc !== 0) autoTuneEl.className = 'v dn';
+        else if (exists) autoTuneEl.className = 'v up';
+        else autoTuneEl.className = 'v wait';
+        const stale = Number(at.stale_sec ?? NaN);
+        const staleTxt = isNum(stale) ? `${stale.toFixed(0)}초 전` : '-';
+        const actions = Array.isArray(at.actions) ? at.actions.join(', ') : '-';
+        const directionHitTxt = isNum(directionHit) ? `${(directionHit * 100).toFixed(2)}%` : '-';
+        const entryIssueTxt = isNum(entryIssue) ? entryIssue.toFixed(3) : '-';
+        const exitRegretTxt = isNum(exitRegret) ? exitRegret.toFixed(4) : '-';
+        autoTuneEl.title = `RevalRpt 조건 기반 자동 튜닝 상태\nbatch=${batchTxt}, overrides=${ovTxt}, retrain=${rtTxt}\ndirection_hit=${directionHitTxt}, entry_issue_ratio=${entryIssueTxt}, avg_exit_regret=${exitRegretTxt}\nalpha retrain trigger progress=${progTxt}\nactions=${actions}\n갱신시각=${staleTxt}`;
+      }
+      if (eventAlignEl) {
+        const ea = d.event_alignment || {};
+        const eaNew = (ea && typeof ea.since_anchor === 'object') ? ea.since_anchor : {};
+        const enabled = ea.enabled === true;
+        const nAll = Number(ea.samples ?? NaN);
+        const nKnown = Number(ea.known_samples ?? NaN);
+        const nAligned = Number(ea.aligned ?? NaN);
+        const align = Number(ea.alignment_rate ?? NaN);
+        const blocked = Number(ea.blocked_samples ?? NaN);
+        const blockedRate = Number(ea.blocked_to_event_exit_rate ?? NaN);
+        const safe = Number(ea.safe_samples ?? NaN);
+        const safeRate = Number(ea.safe_to_non_event_exit_rate ?? NaN);
+        const win = Number(ea.window ?? NaN);
+        const strictN = Number(ea.strict_mode_samples ?? NaN);
+        const nKnownNew = Number(eaNew.known_samples ?? NaN);
+        const nAlignedNew = Number(eaNew.aligned ?? NaN);
+        const alignNew = Number(eaNew.alignment_rate ?? NaN);
+        const blockedNew = Number(eaNew.blocked_samples ?? NaN);
+        const blockedRateNew = Number(eaNew.blocked_to_event_exit_rate ?? NaN);
+        const safeNew = Number(eaNew.safe_samples ?? NaN);
+        const safeRateNew = Number(eaNew.safe_to_non_event_exit_rate ?? NaN);
+        const anchorTs = Number(ea.anchor_ts_ms ?? NaN);
+        const anchorId = Number(ea.anchor_trade_id ?? NaN);
+        if (enabled && isNum(align) && isNum(nKnown) && nKnown > 0) {
+          let txt = `${(align * 100).toFixed(1)}% ${Math.round(nAligned)}/${Math.round(nKnown)}`;
+          if (isNum(alignNew) && isNum(nKnownNew) && nKnownNew > 0) {
+            txt += ` | NEW ${(alignNew * 100).toFixed(1)}%`;
+          }
+          eventAlignEl.textContent = txt;
+          if (align >= 0.70) eventAlignEl.className = 'v up';
+          else if (align >= 0.50) eventAlignEl.className = 'v wait';
+          else eventAlignEl.className = 'v dn';
+          const bTxt = (isNum(blockedRate) && isNum(blocked)) ? `${(blockedRate * 100).toFixed(1)}% (${Math.round(blocked)})` : '-';
+          const sTxt = (isNum(safeRate) && isNum(safe)) ? `${(safeRate * 100).toFixed(1)}% (${Math.round(safe)})` : '-';
+          const bTxtNew = (isNum(blockedRateNew) && isNum(blockedNew)) ? `${(blockedRateNew * 100).toFixed(1)}% (${Math.round(blockedNew)})` : '-';
+          const sTxtNew = (isNum(safeRateNew) && isNum(safeNew)) ? `${(safeRateNew * 100).toFixed(1)}% (${Math.round(safeNew)})` : '-';
+          const winTxt = isNum(win) ? `${Math.round(win)}` : '-';
+          const nAllTxt = isNum(nAll) ? `${Math.round(nAll)}` : '-';
+          const strictTxt = isNum(strictN) ? `${Math.round(strictN)}` : '-';
+          const newTxt = (isNum(alignNew) && isNum(nKnownNew) && nKnownNew > 0)
+            ? `신규(패치 이후) 일치율=${(alignNew * 100).toFixed(2)}% (${Math.round(nAlignedNew)}/${Math.round(nKnownNew)})\n신규 blocked→event_exit=${bTxtNew}\n신규 safe→non_event_exit=${sTxtNew}`
+            : `신규(패치 이후) 샘플 대기 중`;
+          const anchorTxt = (isNum(anchorTs) || isNum(anchorId))
+            ? `anchor_ts=${isNum(anchorTs) ? fmtTs(anchorTs) : '-'}, anchor_trade_id=${isNum(anchorId) ? Math.round(anchorId) : '-'}`
+            : '';
+          eventAlignEl.title = `Event precheck↔실청산 정합성\n일치율=${(align * 100).toFixed(2)}% (${Math.round(nAligned)}/${Math.round(nKnown)})\nblocked→event_exit=${bTxt}\nsafe→non_event_exit=${sTxt}\nwindow=${winTxt}, samples=${nAllTxt}, strict_samples=${strictTxt}\n${newTxt}${anchorTxt ? `\n${anchorTxt}` : ''}`;
+        } else if (!enabled) {
+          eventAlignEl.textContent = 'OFF';
+          eventAlignEl.className = 'v muted';
+          eventAlignEl.title = 'Strict Consistency 모드가 꺼져 있습니다 (EVENT_EXIT_STRICT_CONSISTENCY_MODE=0).';
+        } else {
+          if (isNum(alignNew) && isNum(nKnownNew) && nKnownNew > 0) {
+            eventAlignEl.textContent = `NEW ${(alignNew * 100).toFixed(1)}% ${Math.round(nAlignedNew)}/${Math.round(nKnownNew)}`;
+            eventAlignEl.className = alignNew >= 0.70 ? 'v up' : (alignNew >= 0.50 ? 'v wait' : 'v dn');
+            eventAlignEl.title = `신규(패치 이후) 정합성\n일치율=${(alignNew * 100).toFixed(2)}% (${Math.round(nAlignedNew)}/${Math.round(nKnownNew)})`;
+          } else {
+            eventAlignEl.textContent = '-';
+            eventAlignEl.className = 'v muted';
+            eventAlignEl.title = '정합성 샘플 대기 중';
+          }
+        }
+      }
+
       if (envSrcEl) {
         const active = eng.env_active;
         const profile = eng.env_profile;
@@ -2119,17 +2536,48 @@
       renderAlerts(d.alerts || []);
     }
 
+    let lastUiErrorMsg = '';
+    let lastUiErrorTs = 0;
+    function safeApplyUpdate(d) {
+      try {
+        applyUpdate(d);
+      } catch (err) {
+        const msg = (err && err.message) ? err.message : String(err);
+        const now = Date.now();
+        if (msg !== lastUiErrorMsg || (now - lastUiErrorTs) > 5000) {
+          lastUiErrorMsg = msg;
+          lastUiErrorTs = now;
+          console.error('[dashboard] applyUpdate failed:', err);
+          if (feedEl) {
+            feedEl.textContent = 'ERR';
+            feedEl.title = msg;
+          }
+          if (logsEl) {
+            const div = document.createElement('div');
+            div.className = 'muted';
+            div.textContent = `[UI_ERR] ${new Date(now).toLocaleTimeString()} ${msg}`;
+            logsEl.prepend(div);
+          }
+        }
+      }
+    }
+
     ws.onmessage = (e) => {
       try {
         latestPayload = JSON.parse(e.data);
-      } catch (_) {
+      } catch (err) {
+        console.error('[dashboard] ws parse error:', err);
+        if (feedEl) {
+          feedEl.textContent = 'PARSE_ERR';
+          feedEl.title = String(err);
+        }
         return;
       }
       if (!rafScheduled) {
         rafScheduled = true;
         requestAnimationFrame(() => {
           rafScheduled = false;
-          applyUpdate(latestPayload);
+          safeApplyUpdate(latestPayload);
         });
       }
     };

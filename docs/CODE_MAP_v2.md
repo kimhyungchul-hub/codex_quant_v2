@@ -5,6 +5,34 @@
 > **목적**: 리팩터링, 문서화, 테스트 작성 시 "무엇이 어디에 있는가"를 빠르게 확인하기 위한 참조 자료
 > **주의**: 자동 스캔 + 수동 검토 기반. 코드가 바뀌면 이 문서도 갱신하세요.
 
+### 2026-02-10 추가 맵 (mu_alpha/청산/레버리지)
+
+- `main_engine_mc_v2_final.py:_maybe_persist_alpha_samples`
+  - causal 학습 샘플에 `symbols/timestamps`를 포함 저장하고 라벨 파생값 `y_net`, `y_fee_adj`, `y_hstar`, `y_hstar_net`, `hstar_bars`를 생성/영속화
+  - 목적: 방향모델 학습 라벨을 `h*`/순수익 기준으로 확장(기존 단일 `y` fallback 유지)
+- `main_engine_mc_v2_final.py:_load_alpha_training_samples`
+  - 저장된 `symbols/timestamps`를 로드해 메모리 deque 복원 시 샘플 메타정보를 유지
+- `scripts/train_alpha_weights.py:_prepare_direction_targets`
+  - 라벨 후보별 활성비율 검사(`ALPHA_DIRECTION_LABEL_MIN_ACTIVE_RATIO`)를 추가해 희소 라벨 소스 자동 제외
+  - 보고 항목에 `candidate_active_ratios`, `selected_active_ratio`를 추가
+- `scripts/auto_reval_policy_tuner.py:main`
+  - `counterfactual_replay`의 `top_regret_reasons`를 집계해 `event_mc_exit/unified_flip/ev_drop_exit/unrealized_dd` 비중 기반 2차 튜닝 수행
+  - 신규 자동 튜닝 대상: `EVENT_EXIT_CONFIRM_*`, `UNREALIZED_DD_CONFIRM_*`, `EVENT_MC_TSTAR_*`, `EXIT_SCORE_DROP`, `ALPHA_DIRECTION_LABEL_*`
+
+- `main_engine_mc_v2_final.py:_dynamic_leverage_risk`
+  - 신규 계산값: `entry_quality_score`, `one_way_move_score`, `leverage_signal_score`
+  - 신규 환경변수: `LEVERAGE_SIGNAL_*`, `LEVERAGE_ENTRY_QUALITY_*`, `LEVERAGE_ONEWAY_*`
+  - 동작: EV/risk 기반 레버리지 + 신호기반 레버리지 혼합
+- `main_engine_mc_v2_final.py:_maybe_exit_position`
+  - 신규 가드: `EXIT_RESPECT_ENTRY_*` (고품질 진입의 조기청산 억제)
+  - 적용 대상: `unified_flip`, `unified_cash`, `unrealized_dd_*` (shock/심각 DD 예외)
+- `main_engine_mc_v2_final.py:_capture_position_observability` / `_record_trade`
+  - 포지션/체결에 `entry_quality_score`, `one_way_move_score`, `leverage_signal_score` 저장
+- `core/database_manager.py:trades`
+  - 신규 컬럼: `entry_quality_score`, `one_way_move_score`, `leverage_signal_score`
+- `scripts/auto_reval_policy_tuner.py`
+  - Reval KPI 기반 자동 튜닝 대상에 `LEVERAGE_SIGNAL_*`, `EXIT_RESPECT_ENTRY_*`, `UNREALIZED_DD_SEVERE_MULT` 포함
+
 ---
 
 ## 목차
@@ -138,6 +166,25 @@ DD_STOP_ROE = -0.02  # -2% 미실현 손실 시 강제 청산
 - **권장하지 않음** — 프로덕션 환경에서는 false 사용
 
 **Change Log (selected):**
+- 2026-02-11: `unified_flip` exit 완화 + 방향게이트 적응화 — `_maybe_exit_position`의 `unified_flip` 경로를 모드별 확인틱(`UNIFIED_FLIP_CONFIRM_*`)과 역신호 강도(`UNIFIED_FLIP_MIN_*`) 및 `t*` 진행률 가드(`UNIFIED_FLIP_TSTAR_GUARD_ENABLED`, `UNIFIED_FLIP_MIN_PROGRESS_*`)로 재구성. 동시에 진입 `dir_gate`에 자동튜너 KPI 연동 적응 임계값(`ALPHA_DIRECTION_ADAPTIVE_*`)을 추가해 성능 저하 시 보수화/회복 시 완화를 자동 적용. 관측성에는 `pred_mu_dir_prob_long` 영속화를 추가 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-10: 레버리지 1x 고착 실원인 복구 — `_dynamic_leverage_risk` 강제 패스가 `MAINT_MARGIN_RATE` NameError로 실패하며 `LEVERAGE_TARGET_MIN`(1x) fallback으로 고정되던 경로를 수정. 동시에 `lev_*` 진단 필드를 trade raw_data에 영속화하고, 디레버리지 완화 규칙(`LEVERAGE_SIGMA_STRESS_CLIP`, `LEVERAGE_BALANCE_REJECT_*`) + Auto-tune 최소 바닥(`LEVERAGE_AUTOTUNE_MIN_*`)을 추가해 과도한 레버리지 축소 재발을 방지 (`main_engine_mc_v2_final.py`, `scripts/auto_reval_policy_tuner.py`, `scripts/diagnose_leverage_floor.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-10: Reval 기반 자동 튜닝 운영화 — 배치 리포트(`RevalRpt`) 완료 시 `scripts/auto_reval_policy_tuner.py`가 진단/카운터팩추얼 지표로 방향/청산/레버리지 파라미터 오버라이드를 생성(`state/auto_tune_overrides.json`)하고 필요 시 방향모델 재학습을 자동 실행. 엔진은 오버라이드를 런타임 hot-reload하고 대시보드에 `AutoTune` 진행 상태 및 `αWgt`의 `new_exits/trigger`를 표시 (`scripts/auto_reval_policy_tuner.py`, `scripts/run_auto_reval_singleton.py`, `main_engine_mc_v2_final.py`, `dashboard_v2.html`).
+- 2026-02-10: Auto Reval 누적 진행 상태 추가 — `auto_reval_db_reports.py`에 배치 누적 진행(`progress.completed_batches`, `progress.completed_reports_total`, `new_closed_total_cum`)을 영속화하는 `--progress-file` 경로를 도입하고, 엔진/대시보드에서 해당 필드를 표시해 `new_closed_total` 배치 리셋(100→0)과 누적 진행을 분리 가시화 (`scripts/auto_reval_db_reports.py`, `scripts/run_auto_reval_singleton.py`, `main_engine_mc_v2_final.py`, `dashboard_v2.html`).
+- 2026-02-10: 레버리지 바닥 고착 완화 + 50x 조건부 개방 — `_dynamic_leverage_risk`에 레짐별 상한(`LEVERAGE_REGIME_MAX_*`)과 고신뢰 구간 확장 게이트(`LEVERAGE_AGGRESSIVE_*`)를 추가하고, `110007` 거절 이력 기반 자동 디레버리지(`LEVERAGE_BALANCE_REJECT_*`), 바닥 고착 진입 차단(`lev_floor_lock`, `LEVERAGE_FLOOR_LOCK_*`), 다회 축소 재시도(`LIVE_ORDER_RETRY_MAX_ATTEMPTS`)를 적용 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-09: 2/3/4단계 후속 운영 보강 — `+200 EXIT` 누적 시 방향모델 재튜닝 강제 트리거(`ALPHA_TRAIN_TRIGGER_NEW_EXITS`)와 학습 상태 영속화(`state/alpha_train_state.json`)를 추가하고, `event_mc_exit`/`unrealized_dd`를 `shock/normal/noise` 모드별 임계값·사유(`event_mc_exit_<mode>`, `unrealized_dd_<mode>`)로 세분화. 잔존 고레버리지(기본 5x+) 포지션은 비동기 단계 하향(`LEGACY_5X_DELEVERAGE_*`)으로 강제 디레버리지 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-09: `NewExit` 카운터 분리 — rolling baseline(`reval_baseline`)과 독립된 누적 anchor(`state/new_exit_anchor.json`)를 도입해 `new_closed_total_cum`(리셋 없음) + `new_closed_total_batch`(배치 진행) 동시 제공, 대시보드 표기를 `누적 | 배치`로 변경 (`main_engine_mc_v2_final.py`, `dashboard_v2.html`).
+- 2026-02-09: 방향 게이트 2차 강화 — small-gap `dir_gate`에 side-probability(`mu_dir_prob_long`) 조건을 추가해 확률 정합이 낮은 LONG/SHORT 진입을 차단하고, 운영 임계값(`ALPHA_DIRECTION_GATE_MIN_*`)을 상향 튜닝 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-09: Alpha hot-reload 확장 + 청산 확인틱 보강 — `mlofi_weight_path` 파일 변경을 런타임에서 자동 리로드(`[ALPHA_MLOFI]` 로그)하도록 추가하고, `_maybe_exit_position`의 `hybrid_exit` 경로에 Shock/Noise 연동 confirmation gate(`HYBRID_EXIT_CONFIRM_*`)를 적용. row payload에 `vpin/hurst/mu_dir_*` alias를 추가해 대시보드/리포트 호환성 강화 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-09: 누적 정체 복구 + 자동 리포트 고도화 — `ENV_PROFILE=bybit` 고정, `hybrid_planner` 시그니처 길이 mismatch 방어, `LIVE_LIQUIDATION_TRIGGER_SAFETY`/`ENTRY_BLOCK_EVENT_MC_EXIT` 토글 추가, `hold_eval_loop` eval-only 고정(스레드 주문 오류 방지), `auto_reval_db_reports.py` Stage-4 baseline/compare 자동 생성, `counterfactual_replay.py --since-id` 추가 (`main_engine_mc_v2_final.py`, `engines/mc/hybrid_planner.py`, `scripts/auto_reval_db_reports.py`, `scripts/counterfactual_replay.py`, `trainers/online_alpha_trainer.py`, `state/bybit.env`).
+- 2026-02-09: 4단계(레버리지/노출 동적화) 적용 — `_dynamic_leverage_risk`에 VPIN/신뢰도/변동성 디레버리징 및 `LEVERAGE_MIN_LIQ_DISTANCE` 기반 레버리지 상한 캡을 추가하고, `_calc_position_size`에 독성/신뢰도 기반 노출 스케일링(`EXPOSURE_DYNAMIC_*`)을 도입 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-09: 청산 3단계(충격 대응 vs 일반 변동 분리) 1차 구현 — `event_mc_exit`, `hold_vs_exit`, `unified_cash` 경로에 상태형 확인 tick 게이트를 도입해 단발성 약화 신호의 조기 청산을 억제하고, `shock_score/noise_mode`에 따라 확인 횟수를 동적으로 분기. 진단 필드(`*_confirm_mode/required/count/confirmed`)를 `decision.meta`/position에 기록 (`main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-09: Stage-1/2 고도화 반영 — `entry_id` 영속화(ENTRY↔EXIT 매칭 alias), `auto_reval` 대시보드 상태칩(`RevalRpt`) 추가, 방향모델 `by_regime` 추론/학습 지원, small-gap 저신뢰 진입 차단(`dir_gate`) 도입 (`core/database_manager.py`, `main_engine_mc_v2_final.py`, `dashboard_v2.html`, `utils/alpha_models.py`, `scripts/train_alpha_weights.py`).
+- 2026-02-09: 신규 청산 200~300건 재평가 파이프라인 추가 — 재시작 기준 baseline 이후 청산 건수 누적을 감시하고 목표 구간 도달 시 별도 성과 리포트를 생성 (`scripts/wait_new_exits_and_report.py`, `state/reval_baseline.json`, `state/alpha_pipeline_report_new_exits.json`).
+- 2026-02-09: 방향모델 튜닝 확장 — `scripts/train_alpha_weights.py`에 로지스틱 하이퍼파라미터 탐색 + LightGBM 벤치마크를 추가하고, `utils/alpha_models.py`에서 `ALPHA_DIRECTION_USE_LGBM=1`일 때 LightGBM 추론 우선/로지스틱 fallback을 지원.
+- 2026-02-09: HMM 방향 보정 + 청산 Shock/Noise 분기 + 보유시간 진단 연결 — `entry_evaluation_new.py`의 `mu_alpha` 결합에 HMM 보정(`hmm_sign/conf/state`) 추가, `main_engine_mc_v2_final.py`의 동적 Exit/DD 컷에 `shock_score/noise_mode/hmm` 연동, trade tape에 `pred_mu_alpha/pred_hmm/opt_hold_*` 및 `hold_duration_sec` 기록을 확장해 진입 vs 청산 원인분석 품질 개선 (`engines/mc/entry_evaluation_new.py`, `main_engine_mc_v2_final.py`, `scripts/evaluate_alpha_pipeline.py`, `tests/test_alpha_models.py`).
+- 2026-02-09: 레버리지 동기화 실패 자동 완화 — Bybit `110013` 에러에서 `maxLeverage`를 파싱해 자동 cap 재시도, sync 실패 시 suggested leverage fallback으로 주문 차단/고정 레버리지 체감 완화 (`main_engine_mc_v2_final.py`).
+- 2026-02-08: 동적 청산 정책 일원화 + DD 컷 통합 — ExitPolicy 임계값을 VPIN/Hurst/mu_alignment 기반으로 동적 계산하고, `_maybe_exit_position`의 `UNREALIZED_DD_EXIT_ROE`도 동일 신호 체계로 동적화하여 청산 경로 일관성 강화 (`main_engine_mc_v2_final.py`, `engines/mc/config.py`, `state/bybit.env`, `.env.example`).
+- 2026-02-08: GARCH 자동 주입 파이프라인 완성 — `arch` 기반 일배치 피팅 스크립트(`scripts/fit_garch_params.py`) 추가, JSON 포맷(global+symbol override+var0) 도입, 런타임 비차단 재피팅/리로드 및 심볼별 파라미터 반영 (`main_engine_mc_v2_final.py`, `scripts/fit_garch_params.py`, `docs/garch_param_pipeline.md`, `requirements.txt`).
 - 2026-02-06: Entry 필터/Pre-MC 게이트 통합 + 대시보드 툴팁 강화 — pre-MC 포트폴리오 시뮬레이션 결과를 진입 필터에 반영(사이즈 스케일/차단), TOP-N/유동성/최소 노티오널/캡 상태를 필터 영역에 노출하고 툴팁으로 상세 사유 표시 (`main_engine_mc_v2_final.py`, `dashboard_v2.html`).
 - 2026-02-06: 문서 업데이트 — Hybrid Planner(LSM+Beam) 기반 UnifiedScore 대체 경로 및 Hybrid-only 런타임 플래그 정리 (`docs/CODE_MAP_v2.md`).
 - 2026-01-31: AlphaHit EV 블렌딩 + 온라인 학습 파이프라인 연결 — MC 확률과 AlphaHit 확률을 신뢰도/베타로 혼합해 EV 재계산, 진입/청산에서 AlphaHit feature/라벨을 수집해 온라인 학습으로 전달, Replay 버퍼 저장/로드 및 CSV OHLCV 백필 스크립트 추가 (`engines/mc/entry_evaluation.py`, `core/orchestrator.py`, `trainers/online_alpha_trainer.py`, `engines/mc/alpha_hit.py`, `scripts/backfill_alpha_hit_from_csv.py`, `.env`).
@@ -1102,6 +1149,7 @@ MC 리스크 헬퍼.
 | `scripts/cleanup_root_files.sh` | 루트 정리 | 파일 이동/정리 |
 | `scripts/archive_non_sensitive_logs.sh` | 로그 정리 | 비민감 로그 보관 |
 | `scripts/consolidate_venvs.sh` | venv 정리 | 가상환경 정리 |
+| `scripts/fit_garch_params.py` | GARCH(1,1) 피팅 | CSV→`state/garch_params.json` |
 
 ### 테스트/실험
 | 파일 | 역할 | 한글 |
@@ -1114,6 +1162,32 @@ MC 리스크 헬퍼.
 ## 변경 로그
 | 날짜 | 내용 | 파일 |
 |------|------|------|
+| 2026-02-11 | 대시보드 연결 재발 방지: `nohup` 백그라운드 소멸 패턴을 운영 이슈로 고정하고 `screen` 기반 표준 엔진 런처(`scripts/engine_screen.sh`)를 도입. `start/stop/restart/status/logs`와 `:9999` health-check 절차를 문서화한 runbook 추가. 방향 신뢰도 게이트 운영값을 `0.58`로 상향 고정 | `scripts/engine_screen.sh`, `docs/ENGINE_DASHBOARD_RUNBOOK.md`, `state/bybit.env`, `docs/CHANGELOG.md` |
+| 2026-02-11 | Reval 자동튜너 고도화: 배치 KPI 델타 악화(`direction_hit_delta`, `entry_issue_ratio_delta`, `avg_exit_regret_delta`) 기반 공격적 재튜닝 트리거 추가, 레짐별 `ENTRY_NET_EXPECTANCY_*`/`EVENT_EXIT_SCORE_OFFSET_*` 보정 강화, ORDER_REJECT(110007/precision) 레짐 통계로 `SYMBOL_QUALITY_*`/`LEVERAGE_BALANCE_REJECT_*`/`LIVE_MIN_QTY_MAX_UPSIZE*` 자동 튜닝 연결 | `scripts/auto_reval_policy_tuner.py` |
+| 2026-02-11 | 엔트리 `net_expectancy` 필터 레짐 확장: `ENTRY_NET_EXPECTANCY_*` 키를 `_TREND/_CHOP/_VOLATILE` suffix까지 우선 해석하고, 적용된 레짐/threshold를 decision meta에 기록 | `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example` |
+| 2026-02-10 | Live balance 안정화/진입정체 완화: Bybit timestamp drift(`10002`) 자동 time-diff sync+retry, stale 구간 캐시잔고 fallback(`LIVE_BALANCE_CACHE_MAX_AGE_SEC`), `_consensus_action`의 `spread_pct=None` 예외 제거, Bybit `recvWindow`/`adjustForTimeDifference` 옵션 반영 | `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example` |
+| 2026-02-10 | `live_exit_quality_monitor`에 `new_exits>=20` 자동 요약 추가: 이전 스냅샷 대비 + 배치 시작 대비 델타를 주기적으로 계산/기록 | `scripts/live_exit_quality_monitor.py` |
+| 2026-02-10 | 방향/청산/레버리지 2차 튜닝: direction 학습 점수 Expectancy 우선화, `ENTRY_EVENT_EXIT_BYPASS` 추가, `UNREALIZED_DD` h* 진행률 가드, 저신뢰/고독성 1~3x 캡 + 고품질 고레버리지 조건 분기, 심볼 품질 시간대 버킷 결합 | `scripts/train_alpha_weights.py`, `main_engine_mc_v2_final.py`, `scripts/auto_reval_policy_tuner.py`, `state/bybit.env` |
+| 2026-02-10 | Entry 필터 확장(`net_expectancy`, `symbol_quality`) + 청산 확인틱 보강(`EXIT_FAST_ONLY_SHOCK`, non-shock min confirm). 대시보드 filter badge/tooltip 및 blocked reason 매핑 추가 | `main_engine_mc_v2_final.py`, `dashboard_v2.html`, `docs/CHANGELOG.md` |
+| 2026-02-10 | Reval KPI 델타 보존 개선: 배치 대기(`ready=false`) 중 status overwrite로 `batch_kpi_delta`가 유실되던 경로를 보강. `auto_reval_progress`에 `last_batch_kpi`를 영속화하고 auto tuner는 `state_file.last_metrics`를 fallback으로 사용. 대시보드는 마지막 유효 델타를 localStorage 캐시로 유지 | `scripts/auto_reval_db_reports.py`, `scripts/auto_reval_policy_tuner.py`, `dashboard_v2.html` |
+| 2026-02-10 | Online AlphaTrainer MPS 불안정성 완화: 학습 중 MPS autograd/in-place 런타임 오류 감지 시 CPU 자동 폴백 후 동일 tick 재학습 재시도. 실시간 학습 실패 루프와 불필요한 지연을 줄이도록 보강 | `trainers/online_alpha_trainer.py` |
+| 2026-02-10 | Reval 200배치 운영 정합성 + KPI 변화 가시화: `auto_reval_db_report`에 `direction_hit/entry_issue_ratio/avg_exit_regret` 및 배치 델타 저장, 엔진 WS 노출, 대시보드 상단 `DirHitΔ/EntryIssueΔ/ExitRegretΔ` 칩 추가. 자동튜너를 레짐 인식형으로 확장해 `POLICY_SMALL_GAP_*_<REGIME>`, `EVENT_EXIT_SCORE_OFFSET_<REGIME>`, `UNREALIZED_DD_REGIME_MULT_<REGIME>` 2차 미세조정 연결 및 reval singleton 기본 `target_new=200` 상향 | `scripts/auto_reval_db_reports.py`, `scripts/auto_reval_policy_tuner.py`, `scripts/run_auto_reval_singleton.py`, `main_engine_mc_v2_final.py`, `dashboard_v2.html`, `engines/mc/entry_evaluation_new.py`, `engines/mc/entry_evaluation.py`, `.env.example`, `docs/CHANGELOG.md` |
+| 2026-02-10 | 2/3/6/7단계 보강: 방향모델 학습을 순수익(expectancy) 중심으로 전환(라벨 소스 자동선택/오염필터/레짐별 LGBM 저장), small-gap 예외를 `side_prob`까지 포함한 4중 게이트로 강화, `event_mc_exit/unrealized_dd/hold_vs_exit/hybrid/unified_cash`를 공통 `exit_mode(state)` + 확인틱 규칙으로 통합, 의사결정 루프에 컨텍스트 레이턴시 버짓(`DECISION_CTX_LATENCY_BUDGET_MS`)과 alpha-cache 경량 폴백 도입 | `scripts/train_alpha_weights.py`, `engines/mc/entry_evaluation_new.py`, `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`, `docs/CHANGELOG.md` |
+| 2026-02-10 | 방향/청산 품질 2차 보강: `mu_alpha` direction 하한(`ALPHA_DIRECTION_CONFIDENCE_FLOOR`) + weak-edge `dir_gate` 확장, small-gap 예외를 `mu_dir_conf+mu_dir_edge` 동시 조건으로 강화. `event_mc_exit` t* hold-target fallback(`EVENT_MC_TSTAR_MIN_HOLD_FALLBACK_SEC`)과 `UNREALIZED_DD_CONFIRM_*` 확인 tick을 추가해 조기 DD 청산 노이즈를 완화 | `engines/mc/config.py`, `engines/mc/entry_evaluation_new.py`, `engines/mc/entry_evaluation.py`, `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example` |
+| 2026-02-09 | `HYBRID_ONLY` 경로에서도 alpha 관측값 유지: `mu_alpha/mu_dir_conf/vpin/hurst/policy_*`를 `meta`/top-level로 주입해 ENTRY/EXIT 스냅샷 공백(0.0 고정) 방지 | `engines/mc/decision.py`, `main_engine_mc_v2_final.py` |
+| 2026-02-09 | 관측성 캡처 경로 보강: `decision.meta` 비어도 `details[].meta`/top-level fallback으로 `pred_mu_alpha`, `pred_mu_dir_conf`, 임계값 필드 영속화 | `main_engine_mc_v2_final.py` |
+| 2026-02-09 | 단건 평가 반환 계약 통일(`evaluate_entry_metrics -> meta`), 운영 프로파일에서 `MC_HYBRID_ONLY=0` 전환 및 방향 게이트 임계값 스케일 재조정 | `engines/mc/entry_evaluation.py`, `state/bybit.env`, `.env.example` |
+| 2026-02-09 | 5·6단계 운영화 마감: GARCH 자동피팅 UTC 윈도우(`GARCH_FIT_HOURS_UTC`, `GARCH_FIT_WINDOW_MIN`, `GARCH_FIT_INTERVAL_SEC=43200`), Alpha 재학습 증분/시간창 게이트(`ALPHA_WEIGHT_TRAIN_MIN_NEW_SAMPLES`, `ALPHA_WEIGHT_TRAIN_HOURS_UTC`, `ALPHA_WEIGHT_TRAIN_WINDOW_MIN`), 무거운 피처 쓰로틀(`ALPHA_*_UPDATE_SEC`) 및 리로드 체크(`ALPHA_RELOAD_CHECK_SEC`) 운영값 반영 | `state/bybit.env`, `.env.example`, `main_engine_mc_v2_final.py` |
+| 2026-02-09 | 거래소 사이드 종료 분류 강화: `exchange_close_external_sync`/`exchange_close_manual_cleanup`/`exchange_close_risk_forced` 원인 분기 및 EXIT raw_data/position_history 로깅 확장 | `main_engine_mc_v2_final.py` |
+| 2026-02-09 | 최소수량 업사이즈 레짐 분리(`LIVE_MIN_QTY_MAX_UPSIZE_TREND/CHOP/VOLATILE/MEAN_REVERT`)로 데이터 수집 vs 과도 강제진입 균형 튜닝 | `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example` |
+| 2026-02-09 | 신규 EXIT +100 자동 재평가 단일 인스턴스 워처(파일락 기반) 추가 | `scripts/run_auto_reval_singleton.py` |
+| 2026-02-09 | 주문 최소수량/정밀도 보정(precision-aware sizing) 추가: `_enter_position`/`_execute_order`/`110007 retry` 공통 수량 정규화, 거래소 min qty/step/min cost 기반 사전 스킵/보정 로그(`ENTRY_SKIP_MIN_QTY`, `ENTRY_QTY_NORM`) 도입 | `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example` |
+| 2026-02-09 | 포지션 이벤트 DB 기록 버그 수정: `position_history` INSERT placeholder 개수 불일치(14 vs 15) 정정 | `core/database_manager.py` |
+| 2026-02-08 | DD 하드컷(`UNREALIZED_DD_EXIT_ROE`)을 mu_alignment/VPIN/Hurst 연동 동적 임계값으로 통합 | `main_engine_mc_v2_final.py` |
+| 2026-02-08 | GARCH 일배치 자동주입 파이프라인 구축 + 심볼 매핑 튜닝(`BTCUSDT.csv -> BTC/USDT:USDT`) | `scripts/fit_garch_params.py`, `main_engine_mc_v2_final.py`, `engines/mc/config.py`, `docs/garch_param_pipeline.md`, `requirements.txt`, `state/bybit.env`, `.env.example` |
+| 2026-02-08 | 대시보드 데이터 미표시 대응: WS payload 경량화(history/trade_tape tail, details 제외 옵션) + 프론트 render/parse 예외 내성 강화 | `main_engine_mc_v2_final.py`, `dashboard_v2.html`, `config.py`, `docs/CHANGELOG.md` |
+| 2026-02-08 | 대시보드 상단 수치 한글 툴팁 추가 + 라이브 노출 한도 변수(`LIVE_MAX_NOTIONAL_EXPOSURE`) 도입(최소 1000%) | `dashboard_v2.html`, `config.py`, `main_engine_mc_v2_final.py`, `state/bybit.env`, `.env.example`, `docs/CHANGELOG.md` |
+| 2026-02-08 | 포지션 AGE 과대표시 보정(초/밀리초 정규화, 최신 exchange timestamp 우선) + Bybit `110007` 완화(가용잔고 수량가드/축소 재시도/진단로그) | `main_engine_mc_v2_final.py`, `dashboard_v2.html`, `docs/CHANGELOG.md` |
 | 2026-02-06 | 사전 포트폴리오 MC에 리밸런스/부분청산/제로청산 시뮬레이션 추가 + 포트폴리오 프리MC 결과 요약 전송 | `engines/mc/portfolio_joint_sim.py`, `engines/mc/config.py`, `main_engine_mc_v2_final.py` |
 | 2026-02-06 | 진입 필터 강화(최소 노출/유동성/스프레드 상한) 및 대시보드 필터 배지 확장 | `main_engine_mc_v2_final.py`, `config.py`, `dashboard_v2.html`, `.env.midterm` |
 | 2026-02-06 | 테스트용 DD 완화 지원: `MAX_DRAWDOWN_LIMIT` 환경변수화 | `main_engine_mc_v2_final.py`, `.env.midterm` |

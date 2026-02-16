@@ -237,6 +237,11 @@ def _build_payload(orch, rows, include_history, include_trade_tape, *, include_l
         "eval_metrics": eval_metrics,
         "trade_tape": trade_tape,
     }
+    try:
+        if hasattr(orch, "_event_alignment_status"):
+            payload["event_alignment"] = orch._event_alignment_status()
+    except Exception:
+        payload["event_alignment"] = {}
     logs_data = list(orch.logs)[-100:] if include_logs and hasattr(orch, 'logs') else []
     payload["logs"] = logs_data
     payload["alerts"] = list(getattr(orch, "anomalies", [])) if hasattr(orch, "anomalies") else []

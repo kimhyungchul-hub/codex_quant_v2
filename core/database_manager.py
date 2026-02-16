@@ -187,11 +187,28 @@ class DatabaseManager:
                     realized_pnl REAL,
                     roe REAL,
                     hold_duration_sec REAL,
+
+                    -- 링크/관측성 (entry↔exit 추적 및 분석용)
+                    trade_uid TEXT,           -- 각 체결 레코드 고유 UID
+                    entry_id TEXT,            -- entry_link_id alias (분석/호환성)
+                    entry_link_id TEXT,       -- 동일 포지션 생명주기(ENTRY~EXIT) 연결키
+                    regime TEXT,
+                    alpha_vpin REAL,
+                    alpha_hurst REAL,
+                    pred_mu_alpha REAL,
+                    pred_mu_dir_conf REAL,
+                    policy_score_threshold REAL,
+                    policy_event_exit_min_score REAL,
+                    policy_unrealized_dd_floor REAL,
+                    entry_quality_score REAL,
+                    one_way_move_score REAL,
+                    leverage_signal_score REAL,
                     
                     -- 원본 데이터 (디버깅용)
                     raw_data TEXT
                 )
             """)
+            self._ensure_trade_schema_columns(cursor)
             
             # ─────────────────────────────────────────────────────────────────
             # 2. 자산 가치 기록 (Equity History)
@@ -393,6 +410,9 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp_ms);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode ON trades(trading_mode);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_link ON trades(entry_link_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_id ON trades(entry_id);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_uid ON trades(trade_uid);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_history(timestamp_ms);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_equity_mode ON equity_history(trading_mode);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_pos_hist_symbol ON position_history(symbol);")
@@ -406,6 +426,33 @@ class DatabaseManager:
             
             conn.commit()
             logger.info("Database tables initialized successfully")
+
+    def _ensure_trade_schema_columns(self, cursor: sqlite3.Cursor) -> None:
+        """
+        기존 DB가 과거 스키마로 생성된 경우, 관측성 컬럼을 안전하게 추가한다.
+        """
+        cursor.execute("PRAGMA table_info(trades)")
+        existing = {str(row[1]) for row in cursor.fetchall()}
+        add_columns = [
+            ("trade_uid", "TEXT"),
+            ("entry_id", "TEXT"),
+            ("entry_link_id", "TEXT"),
+            ("regime", "TEXT"),
+            ("alpha_vpin", "REAL"),
+            ("alpha_hurst", "REAL"),
+            ("pred_mu_alpha", "REAL"),
+            ("pred_mu_dir_conf", "REAL"),
+            ("policy_score_threshold", "REAL"),
+            ("policy_event_exit_min_score", "REAL"),
+            ("policy_unrealized_dd_floor", "REAL"),
+            ("entry_quality_score", "REAL"),
+            ("one_way_move_score", "REAL"),
+            ("leverage_signal_score", "REAL"),
+        ]
+        for col, col_type in add_columns:
+            if col in existing:
+                continue
+            cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
 
     # 내부적으로 동기/비동기 공용으로 사용할 파라미터 빌더
     def _prepare_trade_params(self, trade_data: Dict[str, Any], mode: TradingMode) -> Tuple:
@@ -464,6 +511,20 @@ class DatabaseManager:
             _fn(trade_data.get("realized_pnl")),
             _fn(trade_data.get("roe")),
             _fn(trade_data.get("hold_duration_sec")),
+            trade_data.get("trade_uid"),
+            trade_data.get("entry_id") or trade_data.get("entry_link_id"),
+            trade_data.get("entry_link_id"),
+            trade_data.get("regime"),
+            _fn(trade_data.get("alpha_vpin")),
+            _fn(trade_data.get("alpha_hurst")),
+            _fn(trade_data.get("pred_mu_alpha")),
+            _fn(trade_data.get("pred_mu_dir_conf")),
+            _fn(trade_data.get("policy_score_threshold")),
+            _fn(trade_data.get("policy_event_exit_min_score")),
+            _fn(trade_data.get("policy_unrealized_dd_floor")),
+            _fn(trade_data.get("entry_quality_score")),
+            _fn(trade_data.get("one_way_move_score")),
+            _fn(trade_data.get("leverage_signal_score")),
             json.dumps(trade_data),
         )
 
@@ -539,8 +600,13 @@ class DatabaseManager:
                     slippage_bps, slippage_est_bps, fee, fee_rate,
                     trading_mode, pos_source, exec_type, order_id, timestamp_ms,
                     entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
-                    realized_pnl, roe, hold_duration_sec, raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    realized_pnl, roe, hold_duration_sec,
+                    trade_uid, entry_id, entry_link_id, regime, alpha_vpin, alpha_hurst,
+                    pred_mu_alpha, pred_mu_dir_conf,
+                    policy_score_threshold, policy_event_exit_min_score, policy_unrealized_dd_floor,
+                    entry_quality_score, one_way_move_score, leverage_signal_score,
+                    raw_data
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, params)
             conn.commit()
 
@@ -553,8 +619,13 @@ class DatabaseManager:
                 slippage_bps, slippage_est_bps, fee, fee_rate,
                 trading_mode, pos_source, exec_type, order_id, timestamp_ms,
                 entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
-                realized_pnl, roe, hold_duration_sec, raw_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                realized_pnl, roe, hold_duration_sec,
+                trade_uid, entry_id, entry_link_id, regime, alpha_vpin, alpha_hurst,
+                pred_mu_alpha, pred_mu_dir_conf,
+                policy_score_threshold, policy_event_exit_min_score, policy_unrealized_dd_floor,
+                entry_quality_score, one_way_move_score, leverage_signal_score,
+                raw_data
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )
@@ -584,6 +655,25 @@ class DatabaseManager:
             cursor.execute(query, params)
             rows = cursor.fetchall()
             return [dict(row) for row in rows][::-1]
+
+    def count_closed_trades(self, mode: Optional[TradingMode] = None) -> int:
+        """종료성 거래(EXIT 계열) 건수를 반환합니다."""
+        with self.lock, self._get_connection() as conn:
+            query = (
+                "SELECT COUNT(*) AS n FROM trades "
+                "WHERE action IN ('EXIT', 'REBAL_EXIT', 'KILL', 'MANUAL', 'EXTERNAL')"
+            )
+            params: list[Any] = []
+            if mode:
+                query += " AND trading_mode = ?"
+                params.append(mode.value)
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            try:
+                return int((row[0] if row is not None else 0) or 0)
+            except Exception:
+                return 0
 
     # ═══════════════════════════════════════════════════════════════════════
     # 자산 기록 메서드 (Equity History)
@@ -733,7 +823,7 @@ class DatabaseManager:
                     symbol, trading_mode, pos_source, event_type, timestamp_ms,
                     side, size, entry_price, exit_price, leverage,
                     realized_pnl, unrealized_pnl, roe, reason, snapshot_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 symbol,
                 mode.value,

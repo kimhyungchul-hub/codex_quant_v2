@@ -185,8 +185,10 @@ class CleanEntryEvaluator:
             gross_long = gross_ret * leverage
             gross_short = -gross_ret * leverage
             
-            net_long = gross_long - fee_roundtrip * leverage
-            net_short = gross_short - fee_roundtrip * leverage
+            # `fee_roundtrip` passed from caller is already ROE-space cost
+            # (typically cost_exit_roe), so do not multiply leverage again.
+            net_long = gross_long - fee_roundtrip
+            net_short = gross_short - fee_roundtrip
             
             # TP/SL 체크
             tp_hit_long = net_long >= tp_target
