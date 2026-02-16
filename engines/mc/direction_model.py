@@ -253,15 +253,10 @@ class DirectionModel:
         # 1. Consensus 강도 [0, 1]
         consensus_strength = min(1.0, abs(consensus_score))
         
-        # 2. mu_alpha 크기 → 확신도 (sigmoid 변환)
-        # |mu_alpha| = 0 → 0.5, |mu_alpha| = 5 → 0.92, |mu_alpha| = 10 → 0.99
+        # 2. mu_alpha 크기 → 확신도 (cap-free log transform)
         mu_abs = abs(mu_alpha)
-        try:
-            mu_cap = float(os.environ.get("MU_ALPHA_CAP", "10.0") or "10.0")
-        except Exception:
-            mu_cap = 10.0
-        mu_norm = min(1.0, mu_abs / max(mu_cap, 1.0))
-        mu_confidence = 2.0 / (1.0 + math.exp(-4.0 * mu_norm)) - 1.0  # sigmoid [0, 1)
+        mu_strength = math.log1p(max(0.0, float(mu_abs)))
+        mu_confidence = 1.0 - math.exp(-0.85 * mu_strength)
 
         # 3. Signal diversity: 3개 이상 동의 시 보너스
         diversity_bonus = min(1.0, max(0.0, (signal_count - 1) / 5.0))

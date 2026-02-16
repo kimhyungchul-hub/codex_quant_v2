@@ -17,7 +17,7 @@ closes + ofi_score
     ├── divergence → dominant × 0.3
     ├── combined_raw = w_mom × mu_mom + w_ofi × mu_ofi
     ├── KAMA ER < 0.3 → regime_factor 감쇠 (min 0.3)
-    └── cap(±5.0) → mu_alpha_raw
+    └── hard cap 없음 (raw 유지) → mu_alpha_raw
             │ 전형적 범위: ±(0.5 ~ 3.0) annualized
             ▼
 [STAGE 2] entry_evaluation.py — Advanced Alpha 블렌딩
@@ -32,7 +32,7 @@ closes + ofi_score
     ├── 3.3 Hawkes: +0.3×hawkes_boost
     ├── 3.4 Direction: dir_blend strength=0.6
     ├── 3.5 PMaker: fill_rate bias boost
-    ├── 3.6 Cap(±5) + EMA smoothing
+    ├── 3.6 EMA smoothing (hard cap 없음)
     └── mu_alpha_final
             │ 전형적 감쇠율: 30~40% 잔존 (chop에서)
             ▼

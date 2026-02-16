@@ -101,15 +101,7 @@ def _calculate_refined_mu_alpha_with_debug(
     alpha_scaling = float(base_params.get("alpha_scaling_factor", 1.0))
     final_mu = float(final_mu * alpha_scaling)
 
-    cap = float(base_params.get("mu_cap", 15.0))
-    floor = float(base_params.get("mu_floor", -15.0))
     mu_clipped = False
-    if final_mu > cap:
-        final_mu = cap
-        mu_clipped = True
-    elif final_mu < floor:
-        final_mu = floor
-        mu_clipped = True
 
     debug = {
         "avg_velocity": float(avg_velocity),
@@ -124,8 +116,8 @@ def _calculate_refined_mu_alpha_with_debug(
         "vol_ratio": float(current_vol / (long_term_vol + 1e-9)),
         "regime_factor": float(regime_factor),
         "alpha_scaling_factor": float(alpha_scaling),
-        "mu_alpha_cap": float(cap),
-        "mu_alpha_floor": float(floor),
+        "mu_alpha_cap": None,
+        "mu_alpha_floor": None,
         "mu_alpha_clipped": bool(mu_clipped),
     }
     return final_mu, debug
@@ -214,7 +206,7 @@ class MonteCarloSignalFeaturesMixin:
                 "mu_ofi": 0.0,
                 "mu_mom": 0.0,
                 "mu_alpha_raw": 0.0,
-                "mu_alpha_cap": 40.0,
+                "mu_alpha_cap": None,
                 "mu_alpha": 0.0,
                 "reason": "insufficient_closes",
             }
@@ -273,8 +265,6 @@ class MonteCarloSignalFeaturesMixin:
         base_params = {
             "mu_mom_scale": float(os.environ.get("MU_MOM_SCALE", 10.0) or 10.0),
             "mu_ofi_scale": float(getattr(config, "mu_ofi_scale", 10.0) or 10.0),
-            "mu_cap": float(config.mu_alpha_cap),
-            "mu_floor": float(config.mu_alpha_floor),
             "boost_enabled": bool(config.alpha_signal_boost),
             "alpha_scaling_factor": float(config.alpha_scaling_factor),
             "chop_threshold": 0.3,
@@ -301,7 +291,7 @@ class MonteCarloSignalFeaturesMixin:
             "mu_mom": float(dbg.get("mu_mom", 0.0)),
             "mu_ofi": float(dbg.get("mu_ofi", 0.0)),
             "mu_alpha_raw": float(dbg.get("combined_raw", 0.0)),
-            "mu_alpha_cap": float(dbg.get("mu_alpha_cap", config.mu_alpha_cap)),
+            "mu_alpha_cap": None,
             "mu_alpha_clipped": bool(dbg.get("mu_alpha_clipped", False)),
             "mu_alpha": float(mu_alpha),
             "mu_alpha_accel_dampen": bool(dbg.get("accel_dampen", False)),

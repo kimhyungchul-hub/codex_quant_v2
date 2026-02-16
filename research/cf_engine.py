@@ -235,6 +235,7 @@ class StageSimulator:
     """Base class for pipeline-stage counterfactual simulation."""
     stage_name: str = "base"
     description: str = ""
+    max_combos_hint: int = 120
 
     def get_param_grid(self) -> dict[str, list]:
         """Return {param_name: [candidate_values]} to sweep."""
@@ -735,6 +736,340 @@ class UnifiedEntryFloorSimulator(StageSimulator):
         return [t for t in trades if t.entry_ev >= min_ev]
 
 
+class TopNSimulator(StageSimulator):
+    """TOP-N ranking gate CF."""
+    stage_name = "top_n"
+    description = "TOP_N 심볼 수 제한: TOP_N_SYMBOLS"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "top_n_symbols": [4, 8, 12, 20, 30, 50],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        top_n = int(params.get("top_n_symbols", 30))
+        # Proxy: keep highest entry_ev trades in rolling time windows
+        sorted_trades = sorted(trades, key=lambda t: t.timestamp_ms)
+        if not sorted_trades:
+            return []
+        window_ms = 10 * 60 * 1000
+        result: list[Trade] = []
+        i = 0
+        n = len(sorted_trades)
+        while i < n:
+            t0 = sorted_trades[i].timestamp_ms
+            j = i
+            bucket: list[Trade] = []
+            while j < n and sorted_trades[j].timestamp_ms <= t0 + window_ms:
+                bucket.append(sorted_trades[j])
+                j += 1
+            bucket_sorted = sorted(bucket, key=lambda t: (t.entry_ev, t.dir_conf), reverse=True)
+            result.extend(bucket_sorted[:top_n])
+            i = j
+        return result
+
+
+class DirectionGateSimulator(StageSimulator):
+    """Direction gate CF (confidence/edge)."""
+    stage_name = "direction_gate"
+    description = "방향 게이트: ALPHA_DIRECTION_GATE_MIN_CONF/EDGE"
+    max_combos_hint = 100
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "dir_gate_min_conf": [0.52, 0.55, 0.58, 0.60, 0.65, 0.70],
+            "dir_gate_min_edge": [0.00, 0.02, 0.04, 0.06, 0.08, 0.10],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        min_conf = float(params.get("dir_gate_min_conf", 0.58))
+        min_edge = float(params.get("dir_gate_min_edge", 0.06))
+        result = []
+        for t in trades:
+            # edge proxy: abs(mu_alpha)
+            edge = abs(float(t.mu_alpha or 0.0))
+            if float(t.dir_conf or 0.0) >= min_conf and edge >= min_edge:
+                result.append(t)
+        return result
+
+
+class PreMCSimulator(StageSimulator):
+    """Pre-MC portfolio gate CF."""
+    stage_name = "pre_mc_gate"
+    description = "PRE_MC 게이트: min expected pnl / max liq prob"
+    max_combos_hint = 100
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "pre_mc_min_expected_pnl": [0.0, 0.0002, 0.0005, 0.001, 0.002],
+            "pre_mc_max_liq_prob": [0.02, 0.05, 0.08, 0.10, 0.15],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        min_exp = float(params.get("pre_mc_min_expected_pnl", 0.0))
+        max_liq = float(params.get("pre_mc_max_liq_prob", 0.05))
+        result = []
+        for t in trades:
+            exp_proxy = float(t.entry_ev or 0.0)
+            liq_proxy = min(0.99, max(0.0, float(t.sigma or 0.0) * 0.5))
+            if exp_proxy >= min_exp and liq_proxy <= max_liq:
+                result.append(t)
+        return result
+
+
+class EventExitPolicySimulator(StageSimulator):
+    """Event-based exit threshold CF."""
+    stage_name = "event_exit_policy"
+    description = "이벤트 청산 문턱: EVENT_EXIT_MAX_P_SL / EVENT_EXIT_MAX_ABS_CVAR"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "event_exit_max_p_sl": [0.85, 0.90, 0.93, 0.95, 0.97, 0.99],
+            "event_exit_max_abs_cvar": [0.03, 0.05, 0.075, 0.10, 0.15],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        max_psl = float(params.get("event_exit_max_p_sl", 0.97))
+        max_cvar = float(params.get("event_exit_max_abs_cvar", 0.075))
+        result = []
+        for t in trades:
+            t2 = copy.copy(t)
+            is_event_exit = "event" in (t.exit_reason or "").lower()
+            if is_event_exit:
+                psl_proxy = min(0.99, max(0.0, float(t.vpin or 0.0)))
+                cvar_proxy = min(0.50, max(0.0, abs(float(t.sigma or 0.0)) * 0.2))
+                if psl_proxy > max_psl or cvar_proxy > max_cvar:
+                    # Stricter event-exit threshold would have exited earlier
+                    t2.realized_pnl = t.realized_pnl * (0.7 if t.realized_pnl > 0 else 0.8)
+            result.append(t2)
+        return result
+
+
+class MinNotionalSimulator(StageSimulator):
+    """Minimum notional floor CF."""
+    stage_name = "min_notional"
+    description = "최소 진입 금액: MIN_ENTRY_NOTIONAL"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "min_entry_notional": [1, 3, 5, 10, 20, 30, 50],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        floor = float(params.get("min_entry_notional", 5))
+        return [t for t in trades if float(t.notional or 0.0) >= floor]
+
+
+class TodFilterSimulator(StageSimulator):
+    """Time-of-day entry filter CF."""
+    stage_name = "tod_filter"
+    description = "시간대 필터: TOD_FILTER_ENABLED, TRADING_BAD_HOURS_UTC"
+    max_combos_hint = 60
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "trading_bad_hours_utc": [
+                "6,7",
+                "6,7,13",
+                "6,7,19",
+                "6,7,13,19",
+                "",
+            ],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        bad_raw = str(params.get("trading_bad_hours_utc", "6,7") or "")
+        bad_hours = set()
+        for tok in bad_raw.split(","):
+            tok = tok.strip()
+            if tok.isdigit():
+                bad_hours.add(int(tok) % 24)
+        if not bad_hours:
+            return list(trades)
+        result = []
+        for t in trades:
+            try:
+                h = int((int(t.timestamp_ms) // 1000) % 86400 // 3600)
+            except Exception:
+                h = 0
+            if h in bad_hours:
+                continue
+            result.append(t)
+        return result
+
+
+class RegimeSideBlockSimulator(StageSimulator):
+    """Regime-side blocklist CF."""
+    stage_name = "regime_side_block"
+    description = "레짐-방향 차단: REGIME_SIDE_BLOCK_LIST"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "regime_side_block_list": [
+                "",
+                "bear_long,bull_short",
+                "bear_long,chop_long",
+                "bear_long,bull_short,chop_long",
+                "volatile_long,bear_long",
+            ],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        block_raw = str(params.get("regime_side_block_list", "") or "").strip().lower()
+        blocks = {tok.strip() for tok in block_raw.split(",") if tok.strip()}
+        if not blocks:
+            return list(trades)
+        out = []
+        for t in trades:
+            side = str(t.side or "").lower()
+            regime = str(t.regime or "unknown").lower()
+            key = f"{regime}_{side}"
+            if key in blocks:
+                continue
+            out.append(t)
+        return out
+
+
+class LeverageFloorLockSimulator(StageSimulator):
+    """Leverage floor lock gate CF."""
+    stage_name = "leverage_floor_lock"
+    description = "레버리지 바닥 고착 차단: LEVERAGE_FLOOR_LOCK_*"
+    max_combos_hint = 120
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "lev_floor_lock_min_sticky": [2, 3, 4, 5],
+            "lev_floor_lock_max_ev_gap": [0.0004, 0.0008, 0.0012, 0.0016],
+            "lev_floor_lock_max_conf": [0.55, 0.60, 0.65, 0.70],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        min_sticky = int(params.get("lev_floor_lock_min_sticky", 3))
+        max_gap = float(params.get("lev_floor_lock_max_ev_gap", 0.0008))
+        max_conf = float(params.get("lev_floor_lock_max_conf", 0.60))
+        out: list[Trade] = []
+        for t in trades:
+            t2 = copy.copy(t)
+            lev_near_floor = float(t.leverage or 1.0) <= (1.0 + 0.02 * min_sticky)
+            low_edge = abs(float(t.entry_ev or 0.0)) <= max_gap
+            low_conf = float(t.entry_confidence or 0.0) <= max_conf
+            if lev_near_floor and low_edge and low_conf:
+                continue
+            out.append(t2)
+        return out
+
+
+class PreMCScaledSizeSimulator(StageSimulator):
+    """PRE-MC scaled-size gate CF."""
+    stage_name = "pre_mc_scaled_size"
+    description = "PRE_MC_SIZE_SCALE, PRE_MC_MAX_LIQ_PROB 기반 스케일"
+    max_combos_hint = 100
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "pre_mc_size_scale": [0.25, 0.40, 0.50, 0.65, 0.80, 1.00],
+            "pre_mc_max_liq_prob": [0.03, 0.05, 0.08, 0.10, 0.15],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        size_scale = float(params.get("pre_mc_size_scale", 0.50))
+        max_liq = float(params.get("pre_mc_max_liq_prob", 0.05))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            liq_proxy = min(0.99, max(0.0, float(t.sigma or 0.0) * 0.5))
+            if liq_proxy > max_liq:
+                t2.realized_pnl = float(t2.realized_pnl) * float(size_scale)
+                t2.notional = float(t2.notional) * float(size_scale)
+            out.append(t2)
+        return out
+
+
+class PreMCBlockModeSimulator(StageSimulator):
+    """PRE-MC fail handling mode CF."""
+    stage_name = "pre_mc_block_mode"
+    description = "PRE_MC_BLOCK_ON_FAIL, PRE_MC_MIN_CVAR"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "pre_mc_block_on_fail": [0, 1],
+            "pre_mc_min_cvar": [-0.20, -0.12, -0.08, -0.05, -0.03],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        block_on_fail = int(params.get("pre_mc_block_on_fail", 1))
+        min_cvar = float(params.get("pre_mc_min_cvar", -0.05))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            cvar_proxy = -abs(float(t.sigma or 0.0)) * 0.15
+            if cvar_proxy < min_cvar:
+                if block_on_fail:
+                    continue
+                t2.realized_pnl = float(t2.realized_pnl) * 0.6
+            out.append(t2)
+        return out
+
+
+class DirectionConfirmSimulator(StageSimulator):
+    """Direction confirmation ticks CF."""
+    stage_name = "direction_confirm"
+    description = "방향 확인틱: ALPHA_DIRECTION_GATE_CONFIRM_TICKS*"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "dir_gate_confirm_ticks": [1, 2, 3, 4],
+            "dir_gate_confirm_ticks_chop": [1, 2, 3, 4],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        base_ticks = int(params.get("dir_gate_confirm_ticks", 1))
+        chop_ticks = int(params.get("dir_gate_confirm_ticks_chop", base_ticks))
+        out = []
+        for t in trades:
+            ticks_need = chop_ticks if str(t.regime or "").lower() == "chop" else base_ticks
+            conf_penalty = max(0.0, min(0.25, (ticks_need - 1) * 0.04))
+            if float(t.dir_conf or 0.0) >= (0.50 + conf_penalty):
+                out.append(t)
+        return out
+
+
+class SymbolQualityTimeSimulator(StageSimulator):
+    """Symbol-quality time filter CF."""
+    stage_name = "symbol_quality_time"
+    description = "심볼 품질 시간가중: SYMBOL_QUALITY_TIME_WINDOW_HOURS/WEIGHT"
+    max_combos_hint = 100
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "sq_time_window_hours": [1, 2, 3, 4, 6],
+            "sq_time_weight": [0.10, 0.20, 0.35, 0.50],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        window_h = int(params.get("sq_time_window_hours", 2))
+        weight = float(params.get("sq_time_weight", 0.35))
+        # proxy: penalize off-hour entries (UTC 0~5) as quality-time mismatch
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            try:
+                h = int((int(t.timestamp_ms) // 1000) % 86400 // 3600)
+            except Exception:
+                h = 0
+            dist = min(abs(h - 12), 24 - abs(h - 12))
+            if dist > max(1, window_h):
+                t2.realized_pnl = float(t2.realized_pnl) * float(max(0.2, 1.0 - weight))
+            out.append(t2)
+        return out
+
+
 # ─────────────────────────────────────────────────────────────────
 # Counterfactual Engine
 # ─────────────────────────────────────────────────────────────────
@@ -759,6 +1094,18 @@ ALL_SIMULATORS = [
     ChopGuardSimulator(),
     MuSignFlipSimulator(),
     UnifiedEntryFloorSimulator(),
+    TopNSimulator(),
+    DirectionGateSimulator(),
+    PreMCSimulator(),
+    EventExitPolicySimulator(),
+    MinNotionalSimulator(),
+    TodFilterSimulator(),
+    RegimeSideBlockSimulator(),
+    LeverageFloorLockSimulator(),
+    PreMCScaledSizeSimulator(),
+    PreMCBlockModeSimulator(),
+    DirectionConfirmSimulator(),
+    SymbolQualityTimeSimulator(),
 ]
 
 
@@ -800,13 +1147,18 @@ class CFEngine:
         grid = sim.get_param_grid()
         param_names = list(grid.keys())
         param_values = list(grid.values())
+        try:
+            stage_max_combos = int(getattr(sim, "max_combos_hint", max_combos) or max_combos)
+        except Exception:
+            stage_max_combos = int(max_combos)
+        stage_max_combos = int(max(1, min(int(max_combos), stage_max_combos)))
 
         # Generate all combinations (capped)
         combos = list(itertools.product(*param_values))
-        if len(combos) > max_combos:
+        if len(combos) > stage_max_combos:
             # Random sample
             rng = np.random.default_rng(42)
-            indices = rng.choice(len(combos), size=max_combos, replace=False)
+            indices = rng.choice(len(combos), size=stage_max_combos, replace=False)
             combos = [combos[i] for i in indices]
 
         stage_findings: list[Finding] = []

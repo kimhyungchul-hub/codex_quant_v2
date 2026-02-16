@@ -354,24 +354,16 @@ class MonteCarloEntryEvaluationMixin:
         comp_sum_w = 0.0
         comp_sum = 0.0
 
-        # ── [FIX 2026-02-15] Clamp each component to MU_ALPHA_CAP BEFORE mixing ──
-        # Parity with batch path (L3750). Individual components can reach ±630,000
-        # after annualization, dominating comp_sum.
-        try:
-            _comp_cap = float(config.mu_alpha_cap)
-        except Exception:
-            _comp_cap = 5.0
-        try:
-            _comp_floor = float(config.mu_alpha_floor)
-        except Exception:
-            _comp_floor = -_comp_cap
-
-        def _clamp_comp_val(v):
+        # Hard cap 제거: 정보 손실 없이 극단치를 안정화하기 위해 log-compression 사용
+        # (예: 10과 50은 둘 다 포화되지 않고 순서가 유지됨)
+        def _compress_comp_val(v):
             try:
                 v = float(v or 0.0)
             except Exception:
                 return 0.0
-            return float(max(_comp_floor, min(_comp_cap, v)))
+            if not math.isfinite(v):
+                return 0.0
+            return float(math.copysign(math.log1p(abs(v)), v))
 
         def _add_comp(name: str, val: float, w: float) -> None:
             nonlocal comp_sum_w, comp_sum
@@ -380,7 +372,7 @@ class MonteCarloEntryEvaluationMixin:
             w = float(w)
             if w <= 0:
                 return
-            val = _clamp_comp_val(val)
+            val = _compress_comp_val(val)
             comp_sum_w += w
             comp_sum += w * float(val)
             mu_alpha_parts[name] = float(val)
@@ -569,20 +561,7 @@ class MonteCarloEntryEvaluationMixin:
                 mu_alpha_parts["mu_alpha_pmaker_fill_rate"] = None
                 mu_alpha_parts["mu_alpha_pmaker_boost"] = 0.0
         
-        # mu_alpha cap 적용 (pmaker 조정 후)
-        try:
-            mu_cap = config.mu_alpha_cap
-        except Exception:
-            mu_cap = 5.0
-        try:
-            mu_floor = config.mu_alpha_floor
-        except Exception:
-            mu_floor = -5.0
         mu_alpha_final = float(mu_alpha_pmaker_adjusted)
-        if mu_alpha_final > mu_cap:
-            mu_alpha_final = mu_cap
-        elif mu_alpha_final < mu_floor:
-            mu_alpha_final = mu_floor
 
         # Optional: EMA smoothing (residual alpha / inertia) to reduce signal flicker.
         # - Enabled when MU_ALPHA_EMA_ALPHA in (0, 1].
@@ -604,12 +583,6 @@ class MonteCarloEntryEvaluationMixin:
                     mu_alpha_final = float(mu_alpha_pre_ema)
                 else:
                     mu_alpha_final = float((1.0 - float(mu_alpha_ema_alpha)) * float(prev) + float(mu_alpha_ema_alpha) * float(mu_alpha_pre_ema))
-                # safety clamp
-                if mu_alpha_final > mu_cap:
-                    mu_alpha_final = mu_cap
-                elif mu_alpha_final < mu_floor:
-                    mu_alpha_final = mu_floor
-
                 mu_alpha_parts["mu_alpha_before_ema"] = float(mu_alpha_pre_ema)
                 mu_alpha_parts["mu_alpha_ema_alpha"] = float(mu_alpha_ema_alpha)
                 mu_alpha_parts["mu_alpha"] = float(mu_alpha_final)
@@ -3750,38 +3723,30 @@ class MonteCarloEntryEvaluationMixin:
                 comp_w += w
                 comp_sum += w * v
 
-            # ── [FIX 2026-02-13] Clamp each component to MU_ALPHA_CAP BEFORE mixing ──
-            # Individual components (mu_kf, mu_bayes, etc.) can reach ±630,000 after
-            # annualization, dominating the comp_sum.  Clamp to ±mu_cap first.
-            try:
-                _comp_cap = float(config.mu_alpha_cap)
-            except Exception:
-                _comp_cap = 5.0
-            try:
-                _comp_floor = float(config.mu_alpha_floor)
-            except Exception:
-                _comp_floor = -_comp_cap
-            def _clamp_comp(v):
+            # Hard cap 제거: batch 경로도 동일하게 log-compression 적용
+            def _compress_comp(v):
                 try:
                     v = float(v or 0.0)
                 except Exception:
                     return 0.0
-                return float(max(_comp_floor, min(_comp_cap, v)))
+                if not math.isfinite(v):
+                    return 0.0
+                return float(math.copysign(math.log1p(abs(v)), v))
 
             if use_mlofi:
-                _add_comp(_clamp_comp(float(ctx.get("mlofi", 0.0) or 0.0) * float(getattr(config, "mlofi_scale", 8.0))), float(getattr(config, "mlofi_weight", 0.20)))
+                _add_comp(_compress_comp(float(ctx.get("mlofi", 0.0) or 0.0) * float(getattr(config, "mlofi_scale", 8.0))), float(getattr(config, "mlofi_weight", 0.20)))
             if use_kf:
-                _add_comp(_clamp_comp(ctx.get("mu_kf", 0.0)), float(getattr(config, "kf_weight", 0.20)))
+                _add_comp(_compress_comp(ctx.get("mu_kf", 0.0)), float(getattr(config, "kf_weight", 0.20)))
             if use_bayes:
-                _add_comp(_clamp_comp(ctx.get("mu_bayes", 0.0)), float(getattr(config, "bayes_weight", 0.10)))
+                _add_comp(_compress_comp(ctx.get("mu_bayes", 0.0)), float(getattr(config, "bayes_weight", 0.10)))
             if use_arima:
-                _add_comp(_clamp_comp(ctx.get("mu_ar", 0.0)), float(getattr(config, "arima_weight", 0.10)))
+                _add_comp(_compress_comp(ctx.get("mu_ar", 0.0)), float(getattr(config, "arima_weight", 0.10)))
             if use_pf:
-                _add_comp(_clamp_comp(ctx.get("mu_pf", 0.0)), float(getattr(config, "pf_weight", 0.10)))
+                _add_comp(_compress_comp(ctx.get("mu_pf", 0.0)), float(getattr(config, "pf_weight", 0.10)))
             if use_ml:
-                _add_comp(_clamp_comp(ctx.get("mu_ml", 0.0)), float(getattr(config, "ml_weight", 0.15)))
+                _add_comp(_compress_comp(ctx.get("mu_ml", 0.0)), float(getattr(config, "ml_weight", 0.15)))
             if use_causal:
-                _add_comp(_clamp_comp(ctx.get("mu_causal", 0.0)), float(getattr(config, "causal_weight", 0.05)))
+                _add_comp(_compress_comp(ctx.get("mu_causal", 0.0)), float(getattr(config, "causal_weight", 0.05)))
 
             if comp_w > 1.0:
                 comp_sum = comp_sum / comp_w
@@ -3875,9 +3840,8 @@ class MonteCarloEntryEvaluationMixin:
                     dir_blend = float(min(1.0, max(0.0, dir_strength * dir_conf)))
                     mu_alpha = float((1.0 - dir_blend) * float(mu_alpha) + dir_blend * float(dir_target))
 
-            # ── [FIX 2026-02-13] Apply MU_ALPHA_CAP in batch path (parity with single-symbol) ──
-            mu_alpha = float(max(_comp_floor, min(_comp_cap, mu_alpha)))
-            mu_alpha_raw = float(max(_comp_floor, min(_comp_cap, mu_alpha_raw)))
+            mu_alpha = float(mu_alpha)
+            mu_alpha_raw = float(mu_alpha_raw)
 
             # Warm-up fallback: 재시작 직후 mu_alpha≈0인 경우 base drift 일부를 사용해 방향 신호 소실 방지
             try:
@@ -3895,7 +3859,7 @@ class MonteCarloEntryEvaluationMixin:
                     fallback_mult = 0.35
                 mu_fb = float(ctx.get("mu_base", 0.0) or 0.0) * float(fallback_mult)
                 if abs(mu_fb) > 0.0:
-                    mu_alpha = float(max(_comp_floor, min(_comp_cap, mu_fb)))
+                    mu_alpha = float(mu_fb)
                     mu_alpha_raw = float(mu_alpha)
                     try:
                         ctx["mu_alpha_warmup_fallback"] = True

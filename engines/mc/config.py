@@ -47,8 +47,8 @@ class MCConfig:
     # --- Alpha / Signal Features ---
     # ALPHA_SIGNAL_BOOST: 신호 강화 모드 (true면 공격적 설정 적용)
     alpha_signal_boost: bool = field(default_factory=lambda: get_env_bool("ALPHA_SIGNAL_BOOST", False))
-    # mu_alpha_cap: 연율 기대수익 상한
-    # [FIX 2026-02-09] 15→5: ±15 포화(97.6% pegging) 방지. 방향 gradient 유지
+    # mu_alpha_cap: 레거시 관측/호환용 스케일 (hard clamp에는 사용하지 않음)
+    # 하드 캡 제거 이후에도 기존 env 호환을 위해 유지
     mu_alpha_cap: float = field(default_factory=lambda: get_env_float("MU_ALPHA_CAP", 5.0))
     # alpha_scaling_factor: 신호 배율
     # [FIX 2026-02-09] BOOST 모드 1.5→1.2: cap 축소에 맞춰 과도한 스케일링 방지
@@ -57,8 +57,7 @@ class MCConfig:
     mu_mom_tau_floor_sec: float = field(default_factory=lambda: get_env_float("MU_MOM_TAU_FLOOR_SEC", 900.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 1800.0))
     # mu_mom_ann_cap: 연율 모멘텀 상한 (신호 강화 시 10.0)
     mu_mom_ann_cap: float = field(default_factory=lambda: get_env_float("MU_MOM_ANN_CAP", 10.0 if get_env_bool("ALPHA_SIGNAL_BOOST", False) else 3.0))
-    # mu_alpha_floor: mu_alpha 하한
-    # [FIX 2026-02-09] -10→-5: cap과 대칭 유지
+    # mu_alpha_floor: 레거시 관측/호환용 하한 스케일 (hard clamp 비사용)
     mu_alpha_floor: float = field(default_factory=lambda: get_env_float("MU_ALPHA_FLOOR", -5.0))
     # mu_ofi_scale: OFI의 연율 알파 변환 계수
     # [FIX 2026-02-09] 15→8: OFI 0.3만으로도 mu_ofi=4.5→cap 미도달. Gradient 보존

@@ -525,16 +525,7 @@ class MonteCarloEntryEvaluationMixin:
                 mu_alpha_parts["mu_alpha_pmaker_fill_rate"] = None
                 mu_alpha_parts["mu_alpha_pmaker_boost"] = 0.0
         
-        # mu_alpha cap 적용 (pmaker 조정 후)
-        try:
-            mu_cap = config.mu_alpha_cap
-        except Exception:
-            mu_cap = 40.0
         mu_alpha_final = float(mu_alpha_pmaker_adjusted)
-        if mu_alpha_final > mu_cap:
-            mu_alpha_final = mu_cap
-        elif mu_alpha_final < -mu_cap:
-            mu_alpha_final = -mu_cap
 
         # Optional: EMA smoothing (residual alpha / inertia) to reduce signal flicker.
         # - Enabled when MU_ALPHA_EMA_ALPHA in (0, 1].
@@ -556,12 +547,6 @@ class MonteCarloEntryEvaluationMixin:
                     mu_alpha_final = float(mu_alpha_pre_ema)
                 else:
                     mu_alpha_final = float((1.0 - float(mu_alpha_ema_alpha)) * float(prev) + float(mu_alpha_ema_alpha) * float(mu_alpha_pre_ema))
-                # safety clamp
-                if mu_alpha_final > mu_cap:
-                    mu_alpha_final = mu_cap
-                elif mu_alpha_final < -mu_cap:
-                    mu_alpha_final = -mu_cap
-
                 mu_alpha_parts["mu_alpha_before_ema"] = float(mu_alpha_pre_ema)
                 mu_alpha_parts["mu_alpha_ema_alpha"] = float(mu_alpha_ema_alpha)
                 mu_alpha_parts["mu_alpha"] = float(mu_alpha_final)

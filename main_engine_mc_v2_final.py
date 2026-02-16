@@ -1573,31 +1573,21 @@ class LiveOrchestrator:
             mu_mean = float(_np.mean(mu_arr))
             mu_abs_mean = float(_np.mean(_np.abs(mu_arr)))
             mu_max = float(_np.max(_np.abs(mu_arr)))
-            try:
-                mu_cap = float(os.environ.get("MU_ALPHA_CAP", 5.0) or 5.0)
-            except Exception:
-                mu_cap = 5.0
-
-            # Check 1a: mu_alpha 초과 (cap이 안 먹힌 경우)
-            if mu_max > mu_cap * 1.1:
-                msg = f"mu_alpha cap 초과: max={mu_max:.2f} > cap={mu_cap} — batch path capping 미적용 가능성"
-                checks.append({"name": "mu_alpha_cap", "status": "CRITICAL", "msg": msg})
-                self._register_anomaly("MC_MU_CAP", "CRITICAL", msg)
-                all_ok = False
-            # Check 1b: 모든 mu_alpha가 0 (warm-up 미완)
-            elif mu_abs_mean < 0.001 and len(mu_vals) > 10:
+            # Check 1a: 모든 mu_alpha가 0 (warm-up 미완)
+            if mu_abs_mean < 0.001 and len(mu_vals) > 10:
                 msg = f"mu_alpha 거의 0: |mean|={mu_abs_mean:.6f} — alpha 모델 warm-up 미완 또는 신호 사라짐"
                 checks.append({"name": "mu_alpha_zero", "status": "WARN", "msg": msg})
                 all_ok = False
-            # Check 1c: 대부분 pegged (방향 다양성 없음)
+            # Check 1b: 극단치 과다 여부 (상위 분위수 기반)
             elif mu_max > 0:
-                pegged = float(_np.sum(_np.abs(mu_arr) >= (mu_cap - 0.01))) / len(mu_arr)
-                if pegged > 0.8:
-                    msg = f"mu_alpha {pegged*100:.0f}% pegged at cap={mu_cap} — 과도한 신호 또는 dampening 부족"
-                    checks.append({"name": "mu_alpha_pegged", "status": "WARN", "msg": msg})
+                q95 = float(_np.quantile(_np.abs(mu_arr), 0.95)) if len(mu_arr) >= 5 else mu_max
+                heavy_tail_ratio = (mu_max / max(1e-8, q95)) if q95 > 0 else 1.0
+                if heavy_tail_ratio >= 4.0 and mu_max >= 20.0:
+                    msg = f"mu_alpha heavy-tail: max={mu_max:.2f}, q95={q95:.2f}, ratio={heavy_tail_ratio:.2f}"
+                    checks.append({"name": "mu_alpha_heavy_tail", "status": "WARN", "msg": msg})
                     all_ok = False
                 else:
-                    checks.append({"name": "mu_alpha_range", "status": "OK", "msg": f"|mean|={mu_abs_mean:.4f}, max={mu_max:.4f}"})
+                    checks.append({"name": "mu_alpha_range", "status": "OK", "msg": f"|mean|={mu_abs_mean:.4f}, max={mu_max:.4f}, q95={q95:.4f}"})
             else:
                 checks.append({"name": "mu_alpha_range", "status": "OK", "msg": f"|mean|={mu_abs_mean:.4f}"})
 
@@ -3710,9 +3700,32 @@ class LiveOrchestrator:
         score_short = _opt_float(mc_meta_final.get("hybrid_score_short") or mc_meta_final.get("policy_ev_score_short"))
         score_threshold = _opt_float(mc_meta_final.get("policy_score_threshold_eff"))
 
+        status_signal = None
+        try:
+            policy_dir = mc_meta_final.get("policy_direction")
+            if policy_dir is None:
+                policy_dir = meta.get("policy_direction") if isinstance(meta, dict) else None
+            if policy_dir in (1, "1", "LONG", "long"):
+                status_signal = "LONG"
+            elif policy_dir in (-1, "-1", "SHORT", "short"):
+                status_signal = "SHORT"
+            if score_long is not None or score_short is not None:
+                sl = float(score_long or 0.0)
+                ss = float(score_short or 0.0)
+                if status_signal is None and sl > ss:
+                    status_signal = "LONG"
+                elif status_signal is None and ss > sl:
+                    status_signal = "SHORT"
+            if status_signal is None and mu_alpha_row is not None:
+                status_signal = "LONG" if float(mu_alpha_row) >= 0 else "SHORT"
+        except Exception:
+            status_signal = None
+
         row = {
             "symbol": sym,
             "price": price,
+            "raw_status": status,
+            "status_signal": status_signal,
             "status": status,
             "ai": ai,
             "mc": mc,
@@ -8629,13 +8642,8 @@ class LiveOrchestrator:
             meta.get("event_exit_dynamic_mu_alpha"),
             pos.get("pred_mu_alpha"),
         )
-        try:
-            mu_cap_obs = float(os.environ.get("MU_ALPHA_CAP", 15.0) or 15.0)
-        except Exception:
-            mu_cap_obs = 15.0
-        mu_cap_obs = float(max(0.1, abs(mu_cap_obs)))
         if mu_alpha is not None:
-            mu_alpha = float(max(-mu_cap_obs, min(mu_cap_obs, float(mu_alpha))))
+            mu_alpha = float(mu_alpha)
         mu_alpha_raw = _pick_float(
             meta.get("mu_alpha_raw"),
             (decision or {}).get("mu_alpha_raw") if isinstance(decision, dict) else None,
@@ -12175,14 +12183,9 @@ class LiveOrchestrator:
             )
         opt_hold_entry_sec = int(round(opt_hold_sec)) if opt_hold_sec is not None else None
         entry_link_id = self._new_trade_uid()
-        try:
-            mu_cap_obs = float(os.environ.get("MU_ALPHA_CAP", 15.0) or 15.0)
-        except Exception:
-            mu_cap_obs = 15.0
-        mu_cap_obs = float(max(0.1, abs(mu_cap_obs)))
         mu_alpha_entry = self._safe_float(_dget("mu_alpha"), None)
         if mu_alpha_entry is not None:
-            mu_alpha_entry = float(max(-mu_cap_obs, min(mu_cap_obs, float(mu_alpha_entry))))
+            mu_alpha_entry = float(mu_alpha_entry)
         pos = {
             "symbol": sym,
             "side": side,
@@ -15307,9 +15310,8 @@ class LiveOrchestrator:
                     except Exception:
                         lev_cap_mult = 1.60
 
-                    mu_cap = float(getattr(config, "mu_alpha_cap", 5.0) or 5.0)
                     mu_alpha_now = self._safe_float(decision_meta.get("mu_alpha"), 0.0) or 0.0
-                    mu_strength = float(max(0.0, min(1.0, abs(float(mu_alpha_now)) / max(1e-6, abs(mu_cap)))))
+                    mu_strength = float(1.0 - math.exp(-0.7 * math.log1p(abs(float(mu_alpha_now)))))
                     side_now = str(decision.get("action") or "").upper()
                     ev_side = self._decision_metric_float(
                         decision,
@@ -16473,12 +16475,7 @@ class LiveOrchestrator:
         )
         if mu_alpha is None:
             return False
-        try:
-            mu_cap_obs = float(os.environ.get("MU_ALPHA_CAP", 15.0) or 15.0)
-        except Exception:
-            mu_cap_obs = 15.0
-        mu_cap_obs = float(max(0.1, abs(mu_cap_obs)))
-        mu_alpha = float(max(-mu_cap_obs, min(mu_cap_obs, float(mu_alpha))))
+        mu_alpha = float(mu_alpha)
 
         side = str(pos.get("side") or "").upper()
         if side not in ("LONG", "SHORT"):
@@ -20726,29 +20723,21 @@ class LiveOrchestrator:
                                     mu_alpha_vals.append(float(ma))
                             if mu_alpha_vals:
                                 ma_arr = np.asarray(mu_alpha_vals)
-                                try:
-                                    ma_cap = float(os.environ.get("MU_ALPHA_CAP", 5.0) or 5.0)
-                                except Exception:
-                                    ma_cap = 5.0
-                                # pegged = cap 이상이거나 cap에 ±0.01 이내
-                                pegged_count = int(np.sum(
-                                    (np.abs(ma_arr) >= (ma_cap - 0.01))
-                                ))
-                                peg_ratio = pegged_count / len(ma_arr)
-                                # 총 dampening 모니터 (1 - |mu_alpha|/cap에서 유추)
+                                q95 = float(np.quantile(np.abs(ma_arr), 0.95)) if len(ma_arr) >= 5 else float(np.max(np.abs(ma_arr)))
+                                q99 = float(np.quantile(np.abs(ma_arr), 0.99)) if len(ma_arr) >= 5 else float(np.max(np.abs(ma_arr)))
+                                tail_ratio = q99 / max(1e-8, q95) if q95 > 0 else 1.0
                                 mean_abs = float(np.mean(np.abs(ma_arr)))
                                 self._log(
                                     f"[MU_ALPHA_HEALTH] n={len(ma_arr)} | "
                                     f"mean={float(np.mean(ma_arr)):.4f} | "
                                     f"|mean|={mean_abs:.4f} | "
                                     f"std={float(np.std(ma_arr)):.4f} | "
-                                    f"pegged={pegged_count}/{len(ma_arr)} ({peg_ratio*100:.1f}%)"
+                                    f"q95={q95:.4f} | q99={q99:.4f} | tail_ratio={tail_ratio:.2f}"
                                 )
-                                if peg_ratio >= 0.60:
+                                if tail_ratio >= 2.5 and q99 >= 20.0:
                                     self._log(
-                                        f"[MU_ALPHA_ALERT] ⚠ {peg_ratio*100:.0f}% pegged at cap! "
-                                        f"Possible compound dampening issue. "
-                                        f"Check: MU_ALPHA_CAP={ma_cap}, HURST_RANDOM_DAMPEN, KAMA_ER dampening"
+                                        f"[MU_ALPHA_ALERT] ⚠ heavy tail detected (q99/q95={tail_ratio:.2f}, q99={q99:.2f}). "
+                                        f"Check: HURST_RANDOM_DAMPEN, KAMA_ER dampening, component outliers"
                                     )
                                 if mean_abs < 0.05:
                                     self._log(

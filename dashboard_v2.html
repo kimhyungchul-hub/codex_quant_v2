@@ -224,6 +224,17 @@
       max-height: none
     }
 
+    #mktWrap {
+      overflow-x: auto;
+      overflow-y: visible;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    #mktTable {
+      min-width: 2000px;
+      width: max-content;
+    }
+
     table {
       width: 100%;
       border-collapse: separate;
@@ -528,18 +539,17 @@
               <th data-k="price">PRICE</th>
               <th data-k="status">STATUS</th>
               <th data-k="filters">FILTER</th>
-              <th data-k="hybrid_score">HYBRID</th>
-              <th data-k="hybrid_score_hold">HYB_HOLD</th>
-              <th data-k="hybrid_score_logw">LOGW</th>
+              <th data-k="hybrid_score">UNIFIED%</th>
+              <th data-k="ls_scores">LS%</th>
+              <th data-k="net_expectancy">NET%</th>
               <th data-k="kelly">KELLY</th>
               <th data-k="pos_roe">ROE%</th>
               <th data-k="pos_leverage">LEV</th>
-              <th data-k="rebalance">REBAL</th>
+              <th data-k="entry_quality">E_Q</th>
+              <th data-k="leverage_signal">LEV_SIG</th>
+              <th data-k="event_exit">EVENT</th>
+              <th data-k="regime">REGIME</th>
               <th data-k="direction_reason">REASON</th>
-              <th data-k="ls_scores">HYB_LS</th>
-              <th data-k="delta_ev">ΔH</th>
-              <th data-k="exec_cost">COST</th>
-              <th data-k="wgt">WGT</th>
               <th data-k="alpha">ALPHA</th>
             </tr>
           </thead>
@@ -1394,7 +1404,26 @@
           raw: x,
           symbol: sym,
           price: x.price ?? null,
-          status: x.status || 'WAIT',
+          raw_status: (x.raw_status || x.status || 'WAIT'),
+          status_signal: (x.status_signal || (x.meta && x.meta.status_signal) || null),
+          status: (function () {
+            const rawStatus = (x.raw_status || x.status || 'WAIT');
+            const m = x.meta || {};
+            if (rawStatus !== 'WAIT') return rawStatus;
+            const sig = (x.status_signal || m.status_signal || '').toUpperCase();
+            if (sig === 'LONG' || sig === 'SHORT') return sig;
+            const blockedFromReason = String(x.reason || x.direction_reason || '').includes('filter_block:');
+            const blockedFromMeta = Boolean(m.entry_blocked_filters && m.entry_blocked_filters.length);
+            const blockedFromField = Boolean(x.filter_block || m.filter_block);
+            if (!(blockedFromReason || blockedFromMeta || blockedFromField)) return rawStatus;
+            const sL = Number((x.hybrid_score_long ?? m.hybrid_score_long ?? m.policy_ev_score_long) ?? NaN);
+            const sS = Number((x.hybrid_score_short ?? m.hybrid_score_short ?? m.policy_ev_score_short) ?? NaN);
+            if (Number.isFinite(sL) && Number.isFinite(sS) && sL !== sS) return sL > sS ? 'LONG' : 'SHORT';
+            const mu = Number((x.mu_alpha ?? m.mu_alpha ?? x.pred_mu_alpha ?? m.pred_mu_alpha) ?? NaN);
+            if (Number.isFinite(mu)) return mu >= 0 ? 'LONG' : 'SHORT';
+            return rawStatus;
+          })(),
+          wait_decision: ((x.raw_status || x.status || 'WAIT') === 'WAIT'),
           regime: x.regime || '-',
           action_type: action_type || '-',
           filter_states: x.filter_states || (x.meta && x.meta.filter_states) || null,
@@ -1412,6 +1441,26 @@
           top_n_active: (x.top_n_active ?? (x.meta && x.meta.top_n_active) ?? null),
           top_n_rank: (x.top_n_rank ?? (x.meta && x.meta.top_n_rank) ?? null),
           top_n_limit: (x.top_n_limit ?? (x.meta && x.meta.top_n_limit) ?? null),
+          net_expectancy_effective: (x.net_expectancy_effective ?? (x.meta && x.meta.net_expectancy_effective) ?? null),
+          net_expectancy_raw: (x.net_expectancy_raw ?? (x.meta && x.meta.net_expectancy_raw) ?? null),
+          entry_quality_score: (x.entry_quality_score ?? (x.meta && x.meta.entry_quality_score) ?? null),
+          leverage_signal_score: (x.leverage_signal_score ?? (x.meta && x.meta.leverage_signal_score) ?? null),
+          event_exit_score: (x.event_exit_score ?? (x.meta && x.meta.event_exit_score) ?? null),
+          event_cvar_r: (x.event_cvar_r ?? (x.meta && x.meta.event_cvar_r) ?? null),
+          event_p_sl: (x.event_p_sl ?? (x.meta && x.meta.event_p_sl) ?? null),
+          mu_alpha: (x.mu_alpha ?? (x.meta && x.meta.mu_alpha) ?? null),
+          mu_alpha_raw: (x.mu_alpha_raw ?? (x.meta && x.meta.mu_alpha_raw) ?? null),
+          alpha_mlofi: (x.alpha_mlofi ?? (x.meta && x.meta.alpha_mlofi) ?? null),
+          alpha_vpin: (x.alpha_vpin ?? (x.meta && x.meta.alpha_vpin) ?? null),
+          alpha_mu_kf: (x.alpha_mu_kf ?? (x.meta && x.meta.alpha_mu_kf) ?? null),
+          alpha_hurst: (x.alpha_hurst ?? (x.meta && x.meta.alpha_hurst) ?? null),
+          alpha_mu_ml: (x.alpha_mu_ml ?? (x.meta && x.meta.alpha_mu_ml) ?? null),
+          alpha_mu_bayes: (x.alpha_mu_bayes ?? (x.meta && x.meta.alpha_mu_bayes) ?? null),
+          alpha_mu_ar: (x.alpha_mu_ar ?? (x.meta && x.meta.alpha_mu_ar) ?? null),
+          alpha_mu_pf: (x.alpha_mu_pf ?? (x.meta && x.meta.alpha_mu_pf) ?? null),
+          alpha_mu_ou: (x.alpha_mu_ou ?? (x.meta && x.meta.alpha_mu_ou) ?? null),
+          alpha_hawkes_boost: (x.alpha_hawkes_boost ?? (x.meta && x.meta.alpha_hawkes_boost) ?? null),
+          alpha_sigma_garch: (x.alpha_sigma_garch ?? (x.meta && x.meta.alpha_sigma_garch) ?? null),
         };
       }).filter(r => {
         if (!q) return true;
@@ -1449,7 +1498,7 @@
         if (!cached) {
           const tr = document.createElement('tr');
           const cells = [];
-          for (let i = 0; i < 18; i++) {  // 확장: 18열 (ALPHA 추가)
+          for (let i = 0; i < 17; i++) {  // 17열
             const td = document.createElement('td');
             cells.push(td);
             tr.appendChild(td);
@@ -1623,7 +1672,7 @@
         }
 
         let waitReasonHtml = '';
-        if (r.status === 'WAIT') {
+        if (r.wait_decision) {
           if (blocked.length) {
             const blockedRaw = (entryBlocks && entryBlocks.length) ? entryBlocks.join(', ') : blocked.join(', ');
             const tip = escAttr(`${blockedTips.join(' | ')}${blockedTips.length ? ' | ' : ''}raw=${blockedRaw}`);
@@ -1662,10 +1711,17 @@
         c[5].textContent = (isNum(r.hybrid_score) ? (Number(r.hybrid_score) * 100).toFixed(4) : '-');
 
         c[6].className = 'mono';
-        c[6].textContent = (isNum(r.hybrid_score_hold) ? (Number(r.hybrid_score_hold) * 100).toFixed(4) : '-');
+        if (isNum(r.raw.hybrid_score_long) || isNum(r.raw.hybrid_score_short) || isNum(r.raw.score_long) || isNum(r.raw.score_short)) {
+          const sl = isNum(r.raw.hybrid_score_long) ? Number(r.raw.hybrid_score_long) : (isNum(r.raw.score_long) ? Number(r.raw.score_long) : null);
+          const ss = isNum(r.raw.hybrid_score_short) ? Number(r.raw.hybrid_score_short) : (isNum(r.raw.score_short) ? Number(r.raw.score_short) : null);
+          c[6].innerHTML = `${sl === null ? '-' : (sl * 100).toFixed(3)} / ${ss === null ? '-' : (ss * 100).toFixed(3)}`;
+        } else {
+          c[6].textContent = '-';
+        }
 
         c[7].className = 'mono';
-        c[7].textContent = (isNum(r.hybrid_score_logw) ? Number(r.hybrid_score_logw).toFixed(4) : '-');
+        c[7].textContent = (isNum(r.net_expectancy_effective) ? (Number(r.net_expectancy_effective) * 100).toFixed(4) : '-');
+        c[7].title = `raw=${fmtPct(r.net_expectancy_raw, 4)} | effective=${fmtPct(r.net_expectancy_effective, 4)}`;
 
         c[8].className = 'mono';
         c[8].textContent = (r.kelly === null ? '-' : (isNum(r.kelly) ? f2(r.kelly) : r.kelly));
@@ -1703,68 +1759,49 @@
         }
         if (levTips.length) c[10].title = levTips.join(' | ');
 
-        // Rebalance decision badge
-        c[11].className = '';
-        const reb = r.rebalance_decision || null;
-        if (reb === null) { c[11].innerHTML = '<span class="pill muted">-</span>'; }
-        else if (reb === 'HOLD') { c[11].innerHTML = '<span class="pill wait">HOLD</span>'; }
-        else if (reb === 'SWITCH') { c[11].innerHTML = '<span class="pill">SWITCH</span>'; }
-        else { c[11].innerHTML = `<span class="pill muted">${reb}</span>`; }
+        c[11].className = 'mono';
+        c[11].textContent = isNum(r.entry_quality_score) ? Number(r.entry_quality_score).toFixed(3) : '-';
+
+        c[12].className = 'mono';
+        c[12].textContent = isNum(r.leverage_signal_score) ? Number(r.leverage_signal_score).toFixed(3) : '-';
+
+        c[13].className = 'mono';
+        const evScore = isNum(r.event_exit_score) ? (Number(r.event_exit_score) * 100).toFixed(3) : '-';
+        const evCvar = isNum(r.event_cvar_r) ? (Number(r.event_cvar_r) * 100).toFixed(2) : '-';
+        const evPsl = isNum(r.event_p_sl) ? (Number(r.event_p_sl) * 100).toFixed(1) : '-';
+        c[13].innerHTML = `${evScore} / ${evCvar} / ${evPsl}`;
+        c[13].title = 'event_exit_score% / event_cvar_r% / event_p_sl%';
+
+        c[14].className = '';
+        c[14].textContent = r.regime || '-';
 
         // REASON (Direction Policy Reason)
-        c[12].className = 'muted';
-        c[12].style.maxWidth = '440px';
-        c[12].style.whiteSpace = 'normal';
-        c[12].style.overflow = 'visible';
-        c[12].style.textOverflow = 'clip';
-        c[12].style.lineHeight = '1.25';
+        c[15].className = 'muted';
+        c[15].style.maxWidth = '520px';
+        c[15].style.whiteSpace = 'normal';
+        c[15].style.overflow = 'visible';
+        c[15].style.textOverflow = 'clip';
+        c[15].style.lineHeight = '1.25';
         const reason = (r.raw.reason && String(r.raw.reason).trim() && r.raw.reason !== '-')
           ? r.raw.reason
           : (r.raw.direction_reason || '-');
-        c[12].title = reason; // Tooltip for full reason
-        c[12].textContent = reason;
-
-        // LS_SCORE (Long / Short / Threshold)
-        c[13].className = 'mono';
-        const sL = (r.raw.hybrid_score_long !== undefined && r.raw.hybrid_score_long !== null) ? r.raw.hybrid_score_long : r.raw.score_long;
-        const sS = (r.raw.hybrid_score_short !== undefined && r.raw.hybrid_score_short !== null) ? r.raw.hybrid_score_short : r.raw.score_short;
-        const sT = (r.raw.hybrid_entry_floor !== undefined && r.raw.hybrid_entry_floor !== null)
-          ? r.raw.hybrid_entry_floor
-          : (r.raw.meta && r.raw.meta.hybrid_entry_floor !== undefined ? r.raw.meta.hybrid_entry_floor : r.raw.score_threshold);
-        if (isNum(sL) && isNum(sS) && isNum(sT)) {
-          c[13].innerHTML = `<span class="${sL > sT ? 'up' : ''}" title="Hybrid Long Score">${(sL * 100).toFixed(4)}</span> / ` +
-            `<span class="${sS > sT ? 'down' : ''}" title="Hybrid Short Score">${(sS * 100).toFixed(4)}</span> ` +
-            `<small class="muted" title="Threshold">(>${(sT * 100).toFixed(4)})</small>`;
-        } else {
-          c[13].textContent = '-';
-        }
-
-        // ΔH (show as percentage if number)
-        c[14].className = 'mono';
-        c[14].textContent = (r.rebalance_delta_ev === null || r.rebalance_delta_ev === undefined) ? '-' : (isNum(r.rebalance_delta_ev) ? (Number(r.rebalance_delta_ev) * 100).toFixed(2) : r.rebalance_delta_ev);
-
-        // Exec cost (bps) display
-        c[15].className = 'mono';
-        c[15].textContent = (r.rebalance_exec_cost === null || r.rebalance_exec_cost === undefined) ? '-' : (isNum(r.rebalance_exec_cost) ? f2(r.rebalance_exec_cost * 100) : r.rebalance_exec_cost);
-
-        // Joint weight (fraction of leverage allocated)
-        c[16].className = 'mono';
-        c[16].textContent = (r.rebalance_weight === null || r.rebalance_weight === undefined) ? '-' : (isNum(r.rebalance_weight) ? (Number(r.rebalance_weight)).toFixed(4) : r.rebalance_weight);
+        c[15].title = reason;
+        c[15].textContent = reason;
 
         // Alpha components (mu_alpha + key signals)
         const muA = isNum(r.mu_alpha) ? Number(r.mu_alpha) : null;
-        c[17].className = `mono ${muA === null ? 'muted' : (muA >= 0 ? 'up' : 'down')}`;
+        c[16].className = `mono ${muA === null ? 'muted' : (muA >= 0 ? 'up' : 'down')}`;
         const alphaText = (muA === null ? '-' : muA.toFixed(3));
         if (alphaDetailMode && muA !== null) {
           const kf = fmtNum(r.alpha_mu_kf, 3);
           const mlf = fmtNum(r.alpha_mlofi, 3);
           const ml = fmtNum(r.alpha_mu_ml, 3);
           const vp = fmtNum(r.alpha_vpin, 3);
-          c[17].innerHTML = `<div>${alphaText}</div><div class="alpha-sub">KF ${kf} · MLF ${mlf} · ML ${ml} · VP ${vp}</div>`;
+          c[16].innerHTML = `<div>${alphaText}</div><div class="alpha-sub">KF ${kf} · MLF ${mlf} · ML ${ml} · VP ${vp}</div>`;
         } else {
-          c[17].textContent = alphaText;
+          c[16].textContent = alphaText;
         }
-        c[17].title = `mu_alpha=${fmtNum(r.mu_alpha, 4)} | raw=${fmtNum(r.mu_alpha_raw, 4)} | mlofi=${fmtNum(r.alpha_mlofi, 4)} | vpin=${fmtNum(r.alpha_vpin, 4)} | kf=${fmtNum(r.alpha_mu_kf, 4)} | hurst=${fmtNum(r.alpha_hurst, 3)} | ml=${fmtNum(r.alpha_mu_ml, 4)} | bayes=${fmtNum(r.alpha_mu_bayes, 4)} | ar=${fmtNum(r.alpha_mu_ar, 4)} | pf=${fmtNum(r.alpha_mu_pf, 4)} | ou=${fmtNum(r.alpha_mu_ou, 4)} | hawkes=${fmtNum(r.alpha_hawkes_boost, 4)} | sigma_garch=${fmtNum(r.alpha_sigma_garch, 4)}`;
+        c[16].title = `mu_alpha=${fmtNum(r.mu_alpha, 4)} | raw=${fmtNum(r.mu_alpha_raw, 4)} | mlofi=${fmtNum(r.alpha_mlofi, 4)} | vpin=${fmtNum(r.alpha_vpin, 4)} | kf=${fmtNum(r.alpha_mu_kf, 4)} | hurst=${fmtNum(r.alpha_hurst, 3)} | ml=${fmtNum(r.alpha_mu_ml, 4)} | bayes=${fmtNum(r.alpha_mu_bayes, 4)} | ar=${fmtNum(r.alpha_mu_ar, 4)} | pf=${fmtNum(r.alpha_mu_pf, 4)} | ou=${fmtNum(r.alpha_mu_ou, 4)} | hawkes=${fmtNum(r.alpha_hawkes_boost, 4)} | sigma_garch=${fmtNum(r.alpha_sigma_garch, 4)}`;
 
         frag.appendChild(tr);
       });
@@ -3085,7 +3122,19 @@
           hybrid_score: hybrid,
           scorep: scorep,
           price: x.price ?? null,
-          status: x.status || 'WAIT',
+          status: (function () {
+            const rawStatus = (x.raw_status || x.status || 'WAIT');
+            if (rawStatus !== 'WAIT') return rawStatus;
+            const m = x.meta || {};
+            const sig = String(x.status_signal || m.status_signal || '').toUpperCase();
+            if (sig === 'LONG' || sig === 'SHORT') return sig;
+            const blocked = Boolean(x.filter_block || m.filter_block || String(x.reason || '').includes('filter_block:'));
+            if (!blocked) return rawStatus;
+            const sL = Number((x.hybrid_score_long ?? m.hybrid_score_long ?? m.policy_ev_score_long) ?? NaN);
+            const sS = Number((x.hybrid_score_short ?? m.hybrid_score_short ?? m.policy_ev_score_short) ?? NaN);
+            if (Number.isFinite(sL) && Number.isFinite(sS) && sL !== sS) return sL > sS ? 'LONG' : 'SHORT';
+            return rawStatus;
+          })(),
           regime: x.regime || '-',
         };
       });

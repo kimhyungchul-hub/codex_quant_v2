@@ -44,7 +44,7 @@ logger = logging.getLogger("research.runner")
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "state", "bot_data_live.db")
 CF_INTERVAL_SEC = 300          # 5분마다 CF 분석
 GEMINI_INTERVAL_SEC = 3600     # 1시간마다 Gemini 리뷰
-MAX_COMBOS_PER_STAGE = 300
+MAX_COMBOS_PER_STAGE = 220
 DASHBOARD_PORT = 9998
 FINDINGS_OUTPUT = os.path.join(PROJECT_ROOT, "docs", "RESEARCH_FINDINGS.md")
 FINDINGS_JSON = os.path.join(PROJECT_ROOT, "state", "research_findings.json")
@@ -244,7 +244,7 @@ def main():
     logger.info(f"  DB: {args.db}")
     logger.info(f"  Stage: {args.stage or 'ALL ({} simulators)'.format(len(ALL_SIMULATORS))}")
     logger.info(f"  CF interval: {args.interval}s ({args.interval//60}min)")
-    logger.info(f"  Auto-apply: {'ON (conservative: 1 param/cycle, 30min monitor, rollback on -$10)' if not args.no_auto_apply else 'OFF'}")
+    logger.info(f"  Auto-apply: {'ON (qualifying findings all apply, 30min monitor each, rollback on -$10)' if not args.no_auto_apply else 'OFF'}")
     logger.info(f"  Gemini review: {'ON' if not args.no_gemini else 'OFF'} (every {args.gemini_interval//60}min)")
     logger.info(f"  Dashboard: {'OFF' if args.no_dashboard else f'http://0.0.0.0:{args.port}'}")
     logger.info("=" * 60)
@@ -258,7 +258,7 @@ def main():
 
     try:
         while True:
-            # ── Phase 1: CF Analysis (18 stage simulators) ──
+            # ── Phase 1: CF Analysis (expanded stage simulators) ──
             result = run_cf_cycle(
                 db_path=args.db,
                 stage_filter=args.stage,

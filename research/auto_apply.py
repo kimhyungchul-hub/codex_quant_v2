@@ -37,8 +37,8 @@ MIN_CONFIDENCE = 0.80          # 최소 신뢰도 80%
 MIN_PNL_IMPROVEMENT = 100.0    # 최소 PnL 개선 $100
 MONITOR_DURATION_SEC = 1800    # 30분 모니터링
 ROLLBACK_LOSS_USD = 10.0       # $10 이상 손실 시 롤백
-MAX_CHANGES_PER_CYCLE = 1      # 사이클당 최대 1개 변경
-COOLDOWN_BETWEEN_APPLY_SEC = 1800  # 30분 쿨다운
+MAX_CHANGES_PER_CYCLE = 9999   # 제한 없음(사실상 무제한)
+COOLDOWN_BETWEEN_APPLY_SEC = 0  # 쿨다운 비활성
 
 # ─────────────────────────────────────────────────────────────────
 # CF Parameter → bybit.env Variable Mapping
@@ -87,6 +87,27 @@ PARAM_TO_ENV: dict[str, list[str]] = {
     # Chop
     "chop_entry_floor_add": ["CHOP_ENTRY_FLOOR_ADD"],
     "chop_entry_min_dir_conf": ["CHOP_ENTRY_MIN_DIR_CONF"],
+    # Expanded research params
+    "top_n_symbols": ["TOP_N_SYMBOLS"],
+    "dir_gate_min_conf": ["ALPHA_DIRECTION_GATE_MIN_CONF"],
+    "dir_gate_min_edge": ["ALPHA_DIRECTION_GATE_MIN_EDGE"],
+    "pre_mc_min_expected_pnl": ["PRE_MC_MIN_EXPECTED_PNL"],
+    "pre_mc_max_liq_prob": ["PRE_MC_MAX_LIQ_PROB"],
+    "event_exit_max_p_sl": ["EVENT_EXIT_MAX_P_SL"],
+    "event_exit_max_abs_cvar": ["EVENT_EXIT_MAX_ABS_CVAR"],
+    "min_entry_notional": ["MIN_ENTRY_NOTIONAL"],
+    "trading_bad_hours_utc": ["TRADING_BAD_HOURS_UTC"],
+    "regime_side_block_list": ["REGIME_SIDE_BLOCK_LIST"],
+    "lev_floor_lock_min_sticky": ["LEVERAGE_FLOOR_LOCK_MIN_STICKY"],
+    "lev_floor_lock_max_ev_gap": ["LEVERAGE_FLOOR_LOCK_MAX_EV_GAP"],
+    "lev_floor_lock_max_conf": ["LEVERAGE_FLOOR_LOCK_MAX_CONF"],
+    "pre_mc_size_scale": ["PRE_MC_SIZE_SCALE"],
+    "pre_mc_block_on_fail": ["PRE_MC_BLOCK_ON_FAIL"],
+    "pre_mc_min_cvar": ["PRE_MC_MIN_CVAR"],
+    "dir_gate_confirm_ticks": ["ALPHA_DIRECTION_GATE_CONFIRM_TICKS"],
+    "dir_gate_confirm_ticks_chop": ["ALPHA_DIRECTION_GATE_CONFIRM_TICKS_CHOP"],
+    "sq_time_window_hours": ["SYMBOL_QUALITY_TIME_WINDOW_HOURS"],
+    "sq_time_weight": ["SYMBOL_QUALITY_TIME_WEIGHT"],
 }
 
 # 값 범위 제한 (안전 가드)
@@ -117,6 +138,24 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "HURST_RANDOM_DAMPEN": (0.20, 1.00),
     "CHOP_ENTRY_FLOOR_ADD": (0.0, 0.01),
     "CHOP_ENTRY_MIN_DIR_CONF": (0.50, 0.90),
+    "TOP_N_SYMBOLS": (2, 100),
+    "ALPHA_DIRECTION_GATE_MIN_CONF": (0.45, 0.90),
+    "ALPHA_DIRECTION_GATE_MIN_EDGE": (0.0, 0.20),
+    "PRE_MC_MIN_EXPECTED_PNL": (-0.001, 0.01),
+    "PRE_MC_MAX_LIQ_PROB": (0.01, 0.50),
+    "EVENT_EXIT_MAX_P_SL": (0.50, 0.999),
+    "EVENT_EXIT_MAX_ABS_CVAR": (0.005, 0.50),
+    "MIN_ENTRY_NOTIONAL": (0.1, 200.0),
+    "LEVERAGE_FLOOR_LOCK_MIN_STICKY": (1, 12),
+    "LEVERAGE_FLOOR_LOCK_MAX_EV_GAP": (0.0001, 0.01),
+    "LEVERAGE_FLOOR_LOCK_MAX_CONF": (0.40, 0.90),
+    "PRE_MC_SIZE_SCALE": (0.10, 1.00),
+    "PRE_MC_BLOCK_ON_FAIL": (0, 1),
+    "PRE_MC_MIN_CVAR": (-0.30, -0.005),
+    "ALPHA_DIRECTION_GATE_CONFIRM_TICKS": (1, 8),
+    "ALPHA_DIRECTION_GATE_CONFIRM_TICKS_CHOP": (1, 8),
+    "SYMBOL_QUALITY_TIME_WINDOW_HOURS": (1, 12),
+    "SYMBOL_QUALITY_TIME_WEIGHT": (0.0, 1.0),
 }
 
 
@@ -314,7 +353,10 @@ def _format_env_value(value, env_key: str) -> str:
                      "LEVERAGE_REGIME_MAX_CHOP", "LEVERAGE_REGIME_MAX_VOLATILE",
                      "POLICY_MAX_HOLD_SEC", "EXIT_MIN_HOLD_SEC", "MAX_CONCURRENT_POSITIONS",
                      "MU_SIGN_FLIP_MIN_AGE_SEC", "MU_SIGN_FLIP_CONFIRM_TICKS",
-                     "EXIT_MIN_HOLD_SEC_BULL", "EXIT_MIN_HOLD_SEC_CHOP", "EXIT_MIN_HOLD_SEC_BEAR"}
+                     "EXIT_MIN_HOLD_SEC_BULL", "EXIT_MIN_HOLD_SEC_CHOP", "EXIT_MIN_HOLD_SEC_BEAR",
+                     "TOP_N_SYMBOLS", "LEVERAGE_FLOOR_LOCK_MIN_STICKY",
+                     "ALPHA_DIRECTION_GATE_CONFIRM_TICKS", "ALPHA_DIRECTION_GATE_CONFIRM_TICKS_CHOP",
+                     "SYMBOL_QUALITY_TIME_WINDOW_HOURS", "PRE_MC_BLOCK_ON_FAIL"}
         if env_key in int_keys:
             return str(int(value))
     if isinstance(value, float):
@@ -332,39 +374,26 @@ def should_apply(finding: dict) -> bool:
     """Check if a finding meets auto-apply criteria."""
     conf = finding.get("confidence", 0)
     pnl = finding.get("improvement_pct", 0)  # This is actually delta PnL in $
-    if conf < MIN_CONFIDENCE:
-        logger.debug(f"Skip {finding.get('finding_id')}: conf={conf:.2f} < {MIN_CONFIDENCE}")
-        return False
-    if pnl < MIN_PNL_IMPROVEMENT:
-        logger.debug(f"Skip {finding.get('finding_id')}: pnl=${pnl:.2f} < ${MIN_PNL_IMPROVEMENT}")
+    if conf < MIN_CONFIDENCE and pnl < MIN_PNL_IMPROVEMENT:
+        logger.debug(
+            f"Skip {finding.get('finding_id')}: conf={conf:.2f} < {MIN_CONFIDENCE} "
+            f"and pnl=${pnl:.2f} < ${MIN_PNL_IMPROVEMENT}"
+        )
         return False
     if finding.get("applied"):
         return False
     return True
 
 
-def apply_finding(finding: dict) -> Optional[ApplyRecord]:
-    """
-    Apply a single CF finding to bybit.env.
-    Returns ApplyRecord on success, None on failure.
-    """
-    if _is_in_cooldown():
-        logger.info("Auto-apply skipped: in cooldown period")
-        return None
-
+def _build_env_changes_for_finding(finding: dict) -> dict[str, dict]:
+    """Build env var changes for one finding without applying them."""
     param_changes = finding.get("param_changes", {})
-    if not param_changes:
-        return None
-
-    # Map CF params to env vars
     env_changes: dict[str, dict] = {}
     for cf_param, cf_value in param_changes.items():
         env_keys = PARAM_TO_ENV.get(cf_param, [])
         if not env_keys:
-            logger.debug(f"No env mapping for CF param: {cf_param}")
             continue
         for env_key in env_keys:
-            # Clamp value
             if isinstance(cf_value, (int, float)):
                 clamped = _clamp_value(env_key, float(cf_value))
             else:
@@ -372,18 +401,25 @@ def apply_finding(finding: dict) -> Optional[ApplyRecord]:
             old = _read_env_value(env_key)
             new_str = _format_env_value(clamped, env_key)
             if old is not None and old == new_str:
-                continue  # No change needed
+                continue
             env_changes[env_key] = {"old": old, "new": new_str}
+    return env_changes
+
+
+def apply_finding(finding: dict, *, restart_after_apply: bool = True) -> Optional[ApplyRecord]:
+    """
+    Apply a single CF finding to bybit.env.
+    Returns ApplyRecord on success, None on failure.
+    """
+    param_changes = finding.get("param_changes", {})
+    if not param_changes:
+        return None
+
+    env_changes = _build_env_changes_for_finding(finding)
 
     if not env_changes:
         logger.info(f"No effective env changes for finding {finding.get('finding_id')}")
         return None
-
-    # Limit to MAX_CHANGES_PER_CYCLE
-    if len(env_changes) > MAX_CHANGES_PER_CYCLE:
-        # Pick the most impactful (first one)
-        first_key = list(env_changes.keys())[0]
-        env_changes = {first_key: env_changes[first_key]}
 
     # Backup
     backup_path = backup_env()
@@ -413,70 +449,78 @@ def apply_finding(finding: dict) -> Optional[ApplyRecord]:
     records.append(asdict(record))
     _save_apply_log(records)
 
-    # Restart engine
-    if not restart_engine():
-        logger.error("Engine restart failed — rolling back")
-        rollback_env(backup_path)
-        restart_engine()
-        record.status = "rolled_back"
-        record.rollback_reason = "engine_restart_failed"
-        record.rolled_back = True
-        records[-1] = asdict(record)
-        _save_apply_log(records)
-        return None
+    # Restart engine (optional in batch mode)
+    if restart_after_apply:
+        if not restart_engine():
+            logger.error("Engine restart failed — rolling back")
+            rollback_env(backup_path)
+            restart_engine()
+            record.status = "rolled_back"
+            record.rollback_reason = "engine_restart_failed"
+            record.rolled_back = True
+            records[-1] = asdict(record)
+            _save_apply_log(records)
+            return None
 
     return record
 
 
-def check_and_rollback() -> Optional[str]:
+def check_and_rollback_all() -> dict:
     """
     Check if a pending monitoring period has elapsed.
     If performance degraded, rollback.
-    Returns status string or None.
+    Returns summary dict.
     """
     records = _load_apply_log()
     if not records:
-        return None
+        return {"processed": 0, "applied": 0, "rolled_back": 0, "monitoring": 0, "messages": []}
 
-    last = records[-1]
-    if last.get("status") != "monitoring":
-        return None
-
-    elapsed = time.time() - last.get("timestamp", 0)
-    if elapsed < MONITOR_DURATION_SEC:
-        remaining = MONITOR_DURATION_SEC - elapsed
-        logger.debug(f"Monitoring: {remaining:.0f}s remaining")
-        return f"monitoring ({remaining:.0f}s left)"
-
-    # Monitor period elapsed — check performance
+    now = time.time()
     equity_now = _get_current_equity()
-    equity_at_apply = last.get("equity_at_apply", 0)
-    delta = equity_now - equity_at_apply
+    processed = applied = rolled_back = monitoring = 0
+    messages: list[str] = []
+    need_engine_restart = False
 
-    if delta < -ROLLBACK_LOSS_USD:
-        # Rollback!
-        logger.warning(
-            f"[AUTO_ROLLBACK] Equity dropped ${abs(delta):.2f} (threshold: ${ROLLBACK_LOSS_USD}). "
-            f"Rolling back to {last.get('backup_path')}"
-        )
-        rollback_env(last["backup_path"])
+    for rec in records:
+        if rec.get("status") != "monitoring":
+            continue
+        elapsed = now - float(rec.get("timestamp", 0) or 0)
+        if elapsed < MONITOR_DURATION_SEC:
+            monitoring += 1
+            continue
+
+        processed += 1
+        delta = float(equity_now) - float(rec.get("equity_at_apply", 0) or 0)
+        rec["equity_after_monitor"] = float(equity_now)
+        if delta < -ROLLBACK_LOSS_USD:
+            logger.warning(
+                f"[AUTO_ROLLBACK] {rec.get('finding_id')} Δ${delta:.2f} < -${ROLLBACK_LOSS_USD:.2f}; "
+                f"backup={rec.get('backup_path')}"
+            )
+            rollback_env(rec["backup_path"])
+            rec["status"] = "rolled_back"
+            rec["rolled_back"] = True
+            rec["rollback_reason"] = f"equity_drop_{delta:.2f}"
+            rolled_back += 1
+            need_engine_restart = True
+            messages.append(f"rolled_back {rec.get('finding_id')} (Δ${delta:.2f})")
+        else:
+            rec["status"] = "applied"
+            applied += 1
+            messages.append(f"applied {rec.get('finding_id')} (Δ${delta:+.2f})")
+
+    if processed > 0:
+        _save_apply_log(records)
+    if need_engine_restart:
         restart_engine()
-        last["status"] = "rolled_back"
-        last["rolled_back"] = True
-        last["rollback_reason"] = f"equity_drop_{delta:.2f}"
-        last["equity_after_monitor"] = equity_now
-        _save_apply_log(records)
-        return f"rolled_back (Δ${delta:.2f})"
-    else:
-        # Keep the change
-        logger.info(
-            f"[AUTO_APPLY_OK] Change kept. Equity Δ${delta:+.2f} "
-            f"({last.get('env_changes', {})})"
-        )
-        last["status"] = "applied"
-        last["equity_after_monitor"] = equity_now
-        _save_apply_log(records)
-        return f"applied (Δ${delta:+.2f})"
+
+    return {
+        "processed": processed,
+        "applied": applied,
+        "rolled_back": rolled_back,
+        "monitoring": monitoring,
+        "messages": messages,
+    }
 
 
 def git_commit_and_push(message: str = "auto: CF parameter update") -> bool:
@@ -518,50 +562,99 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
     status = {
         "auto_apply_enabled": True,
         "last_check_ts": time.time(),
-        "cooldown": _is_in_cooldown(),
+        "cooldown": False,
         "applied_count": 0,
         "rollback_count": 0,
         "last_action": None,
+        "monitoring_count": 0,
     }
 
-    # Phase 1: Check pending rollbacks
-    rb_status = check_and_rollback()
-    if rb_status:
-        status["last_action"] = rb_status
-        if "rolled_back" in rb_status:
-            status["rollback_count"] = 1
+    # Phase 1: Check all pending monitors
+    mon = check_and_rollback_all()
+    status["rollback_count"] = int(mon.get("rolled_back", 0))
+    status["monitoring_count"] = int(mon.get("monitoring", 0))
+    if mon.get("processed", 0) > 0:
+        status["last_action"] = "; ".join(mon.get("messages", [])[:4])
+        if mon.get("rolled_back", 0) > 0:
             git_commit_and_push("auto: rollback — performance degradation")
-        elif "applied" in rb_status:
-            git_commit_and_push("auto: CF change confirmed — performance maintained")
-        return status
+        elif mon.get("applied", 0) > 0:
+            git_commit_and_push("auto: CF changes confirmed — performance maintained")
 
-    # Phase 2: Find applicable findings
-    if _is_in_cooldown():
-        status["last_action"] = "cooldown"
-        return status
-
+    # Phase 2: Find applicable findings (OR condition)
     applicable = [f for f in findings if should_apply(f)]
     if not applicable:
-        status["last_action"] = "no_qualifying_findings"
+        if not status.get("last_action"):
+            status["last_action"] = "no_qualifying_findings"
         return status
 
-    # Pick the best one (highest PnL improvement)
-    best = max(applicable, key=lambda f: f.get("improvement_pct", 0))
-    logger.info(
-        f"[AUTO_APPLY] Candidate: {best.get('finding_id')} "
-        f"stage={best.get('stage')} PnL=+${best.get('improvement_pct', 0):.2f} "
-        f"conf={best.get('confidence', 0):.0%}"
-    )
+    # Phase 3: Apply ALL qualifying findings (resolve env-key conflicts by higher ΔPnL)
+    sorted_applicable = sorted(applicable, key=lambda f: float(f.get("improvement_pct", 0) or 0), reverse=True)
+    planned: list[dict] = []
+    used_env_keys: set[str] = set()
+    for f in sorted_applicable:
+        env_changes = _build_env_changes_for_finding(f)
+        if not env_changes:
+            continue
+        filtered_changes = {k: v for k, v in env_changes.items() if k not in used_env_keys}
+        if not filtered_changes:
+            continue
+        planned.append({"finding": f, "env_changes": filtered_changes})
+        used_env_keys.update(filtered_changes.keys())
 
-    # Phase 3: Apply
-    record = apply_finding(best)
-    if record:
-        status["applied_count"] = 1
-        status["last_action"] = f"applied {record.finding_id} → monitoring 30min"
-        git_commit_and_push(
-            f"auto: apply CF {record.finding_id} ({record.stage}) — "
-            f"expected +${best.get('improvement_pct', 0):.0f}"
+    if not planned:
+        if not status.get("last_action"):
+            status["last_action"] = "qualifying_findings_but_no_effective_env_changes"
+        return status
+
+    backup_path = backup_env()
+    equity_now = _get_current_equity()
+    records = _load_apply_log()
+    new_records = []
+
+    for item in planned:
+        f = item["finding"]
+        env_changes = item["env_changes"]
+        for env_key, change in env_changes.items():
+            _update_env_value(env_key, change["new"])
+            logger.info(
+                f"[AUTO_APPLY] {env_key}: {change['old']} → {change['new']} "
+                f"(finding={f.get('finding_id')}, stage={f.get('stage')})"
+            )
+        record = ApplyRecord(
+            timestamp=time.time(),
+            finding_id=f.get("finding_id", ""),
+            stage=f.get("stage", ""),
+            param_changes=f.get("param_changes", {}),
+            env_changes=env_changes,
+            backup_path=backup_path,
+            equity_at_apply=equity_now,
+            status="monitoring",
         )
+        records.append(asdict(record))
+        new_records.append(record)
+
+    _save_apply_log(records)
+
+    if not restart_engine():
+        logger.error("Batch restart failed — rolling back")
+        rollback_env(backup_path)
+        restart_engine()
+        for rec in records:
+            if rec.get("backup_path") == backup_path and rec.get("status") == "monitoring":
+                rec["status"] = "rolled_back"
+                rec["rolled_back"] = True
+                rec["rollback_reason"] = "engine_restart_failed"
+        _save_apply_log(records)
+        status["last_action"] = "batch_apply_failed_rollback"
+        return status
+
+    status["applied_count"] = len(new_records)
+    status["monitoring_count"] = status.get("monitoring_count", 0) + len(new_records)
+    applied_ids = [r.finding_id for r in new_records]
+    status["last_action"] = f"applied {len(new_records)} findings → monitoring 30min each"
+    git_commit_and_push(
+        f"auto: apply {len(new_records)} CF findings ({', '.join(applied_ids[:6])})"
+    )
 
     return status
 
