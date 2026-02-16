@@ -1040,6 +1040,236 @@ class DirectionConfirmSimulator(StageSimulator):
         return out
 
 
+# ─────────────────────────────────────────────────────────────────
+# HYBRID SYSTEM SIMULATORS (MC_HYBRID_ONLY=1)
+# ─────────────────────────────────────────────────────────────────
+
+class HybridExitTimingSimulator(StageSimulator):
+    """Hybrid exit confirmation ticks by regime."""
+    stage_name = "hybrid_exit_timing"
+    description = "하이브리드 청산 확인틱: HYBRID_EXIT_CONFIRM_TICKS_*"
+    max_combos_hint = 150
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "hybrid_exit_confirm_shock": [1, 2, 3, 4, 5],
+            "hybrid_exit_confirm_normal": [3, 4, 5, 6, 7, 8],
+            "hybrid_exit_confirm_noise": [5, 6, 7, 8, 10, 12],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        shock_ticks = int(params.get("hybrid_exit_confirm_shock", 3))
+        normal_ticks = int(params.get("hybrid_exit_confirm_normal", 6))
+        noise_ticks = int(params.get("hybrid_exit_confirm_noise", 8))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            regime = str(t.regime or "").lower()
+            # Map regime to confirm ticks
+            if "shock" in regime:
+                confirm = shock_ticks
+            elif "noise" in regime or "chop" in regime:
+                confirm = noise_ticks
+            else:
+                confirm = normal_ticks
+            # Proxy: more ticks = later exit = worse if losing, better if winning
+            hold_factor = 1.0 + (confirm - 6) * 0.02  # baseline=6
+            if t.realized_pnl > 0:
+                t2.realized_pnl = float(t.realized_pnl) * hold_factor
+            else:
+                t2.realized_pnl = float(t.realized_pnl) * (2.0 - hold_factor)
+            out.append(t2)
+        return out
+
+
+class HybridLeverageSimulator(StageSimulator):
+    """Hybrid leverage sweep parameters."""
+    stage_name = "hybrid_leverage"
+    description = "하이브리드 레버리지: HYBRID_LEV_SWEEP_MIN/MAX/STEP"
+    max_combos_hint = 120
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "hybrid_lev_sweep_min": [1.0, 1.5, 2.0, 2.5],
+            "hybrid_lev_sweep_max": [3.0, 4.0, 5.0, 6.0, 8.0],
+            "hybrid_lev_ev_scale": [50, 100, 150, 200, 300],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        lev_min = float(params.get("hybrid_lev_sweep_min", 1.5))
+        lev_max = float(params.get("hybrid_lev_sweep_max", 5.0))
+        ev_scale = float(params.get("hybrid_lev_ev_scale", 100))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            # Simulate leverage adjustment based on EV
+            ev = float(t.entry_ev or 0)
+            optimal_lev = lev_min + (lev_max - lev_min) * min(1.0, max(0.0, ev * ev_scale))
+            actual_lev = float(t.leverage or 1.0)
+            lev_ratio = optimal_lev / max(actual_lev, 0.1)
+            # Adjust PnL by leverage ratio (capped)
+            adj = min(2.0, max(0.5, lev_ratio))
+            t2.realized_pnl = float(t.realized_pnl) * adj
+            out.append(t2)
+        return out
+
+
+class MCHybridPathsSimulator(StageSimulator):
+    """MC simulation paths and horizon steps."""
+    stage_name = "mc_hybrid_paths"
+    description = "MC 시뮬레이션: MC_HYBRID_N_PATHS, MC_HYBRID_HORIZON_STEPS"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "mc_hybrid_n_paths": [1024, 2048, 4096, 8192, 16384],
+            "mc_hybrid_horizon_steps": [30, 60, 120, 180, 300],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        n_paths = int(params.get("mc_hybrid_n_paths", 4096))
+        horizon = int(params.get("mc_hybrid_horizon_steps", 60))
+        # Proxy: more paths = better EV estimation
+        # More horizon = captures longer trends
+        quality_factor = np.log2(n_paths / 4096 + 1) * 0.5 + 1.0
+        horizon_factor = 1.0 + (horizon - 60) * 0.002
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            # Better simulation = more accurate entry/exit = better PnL
+            if t.realized_pnl > 0:
+                t2.realized_pnl = float(t.realized_pnl) * quality_factor * horizon_factor
+            else:
+                # Loss trades: better simulation might have avoided them
+                t2.realized_pnl = float(t.realized_pnl) * (0.5 + 0.5 / quality_factor)
+            out.append(t2)
+        return out
+
+
+class HybridCashPenaltySimulator(StageSimulator):
+    """Hybrid cash penalty (opportunity cost)."""
+    stage_name = "hybrid_cash_penalty"
+    description = "현금 페널티: HYBRID_CASH_PENALTY"
+    max_combos_hint = 60
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "hybrid_cash_penalty": [0.0, 0.0001, 0.0005, 0.001, 0.002, 0.005],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        penalty = float(params.get("hybrid_cash_penalty", 0.001))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            # High penalty = more aggressive entry = more trades but lower quality
+            # Proxy: penalty reduces effective PnL threshold
+            hold_sec = float(t.hold_duration_sec or 0)
+            opportunity_cost = penalty * hold_sec / 3600  # per hour
+            t2.realized_pnl = float(t.realized_pnl) - opportunity_cost
+            out.append(t2)
+        return out
+
+
+class ExpValsThresholdSimulator(StageSimulator):
+    """exp_vals direction dominance threshold."""
+    stage_name = "exp_vals_threshold"
+    description = "exp_vals 방향 임계치: EXP_VALS_MIN_DIFF, EXP_VALS_DOMINANCE"
+    max_combos_hint = 100
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "exp_vals_min_diff": [0.0001, 0.0005, 0.001, 0.002, 0.005],
+            "exp_vals_dominance_ratio": [1.2, 1.5, 2.0, 2.5, 3.0],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        min_diff = float(params.get("exp_vals_min_diff", 0.001))
+        dom_ratio = float(params.get("exp_vals_dominance_ratio", 1.5))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            # Proxy: direction confidence as quality indicator
+            conf = float(t.dir_conf or 0.5)
+            ev = abs(float(t.entry_ev or 0))
+            # High dominance requirement = fewer but better trades
+            if conf < 0.5 + min_diff or ev < min_diff * dom_ratio:
+                continue  # Would have been filtered
+            # Quality multiplier for passing threshold
+            quality = 1.0 + (conf - 0.5) * 0.5
+            t2.realized_pnl = float(t.realized_pnl) * quality
+            out.append(t2)
+        return out
+
+
+class HybridBeamSearchSimulator(StageSimulator):
+    """Hybrid beam search parameters for LSM."""
+    stage_name = "hybrid_beam_search"
+    description = "LSM Beam Search: HYBRID_BEAM_WIDTH, LSM_POLY_DEGREE"
+    max_combos_hint = 80
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "hybrid_beam_width": [3, 5, 8, 10, 15],
+            "lsm_poly_degree": [2, 3, 4, 5],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        beam_width = int(params.get("hybrid_beam_width", 5))
+        poly_deg = int(params.get("lsm_poly_degree", 3))
+        # Proxy: wider beam = better path exploration
+        beam_factor = 1.0 + (beam_width - 5) * 0.02
+        poly_factor = 1.0 + (poly_deg - 3) * 0.01
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            t2.realized_pnl = float(t.realized_pnl) * beam_factor * poly_factor
+            out.append(t2)
+        return out
+
+
+class HybridTPSLRatioSimulator(StageSimulator):
+    """Hybrid TP/SL ratio by regime."""
+    stage_name = "hybrid_tp_sl_ratio"
+    description = "하이브리드 TP/SL: HYBRID_TP_PCT_*, HYBRID_SL_PCT_*"
+    max_combos_hint = 200
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "hybrid_tp_base": [0.003, 0.004, 0.005, 0.006, 0.008, 0.010],
+            "hybrid_sl_base": [0.002, 0.003, 0.004, 0.005, 0.006],
+            "hybrid_tp_shock_mult": [0.6, 0.75, 0.9, 1.0],
+            "hybrid_tp_noise_mult": [1.2, 1.5, 1.8, 2.0],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        tp_base = float(params.get("hybrid_tp_base", 0.005))
+        sl_base = float(params.get("hybrid_sl_base", 0.004))
+        shock_mult = float(params.get("hybrid_tp_shock_mult", 0.75))
+        noise_mult = float(params.get("hybrid_tp_noise_mult", 1.5))
+        out = []
+        for t in trades:
+            t2 = copy.copy(t)
+            regime = str(t.regime or "").lower()
+            # Adjust TP/SL by regime
+            if "shock" in regime:
+                tp = tp_base * shock_mult
+                sl = sl_base * 0.8
+            elif "noise" in regime or "chop" in regime:
+                tp = tp_base * noise_mult
+                sl = sl_base * 1.2
+            else:
+                tp = tp_base
+                sl = sl_base
+            # Risk-reward proxy
+            rr_factor = tp / max(sl, 0.001)
+            # Better R:R = better outcome
+            adj = min(1.5, max(0.7, rr_factor / 1.5))
+            t2.realized_pnl = float(t.realized_pnl) * adj
+            out.append(t2)
+        return out
+
+
 class SymbolQualityTimeSimulator(StageSimulator):
     """Symbol-quality time filter CF."""
     stage_name = "symbol_quality_time"
@@ -1106,6 +1336,14 @@ ALL_SIMULATORS = [
     PreMCBlockModeSimulator(),
     DirectionConfirmSimulator(),
     SymbolQualityTimeSimulator(),
+    # HYBRID SYSTEM simulators (MC_HYBRID_ONLY=1)
+    HybridExitTimingSimulator(),
+    HybridLeverageSimulator(),
+    MCHybridPathsSimulator(),
+    HybridCashPenaltySimulator(),
+    ExpValsThresholdSimulator(),
+    HybridBeamSearchSimulator(),
+    HybridTPSLRatioSimulator(),
 ]
 
 

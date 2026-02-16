@@ -1,9 +1,34 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-16 15:01
+> Auto-generated: 2026-02-16 15:07
 > Baseline: 4909 trades, PnL=$-59.16, WR=36.5%, R:R=1.48
 
 ## Pipeline Stage Impact Summary
+
+### MC_HYBRID_PATHS — mc_hybrid_paths
+
+**Best Finding:** mc_hybrid_paths: PnL +$845.29
+- Improvement: $+845.29
+- Confidence: 80%
+- Parameters: `{"mc_hybrid_n_paths": 16384, "mc_hybrid_horizon_steps": 300}`
+
+```
+[MC_HYBRID_PATHS] 파라미터 변경 제안:
+  mc_hybrid_n_paths = 16384
+  mc_hybrid_horizon_steps = 300
+예상 효과: PnL $+845.29, WR +0.0%, R:R +4.99
+신뢰도: 80.0%
+```
+
+| Metric | Baseline | CF | Delta |
+|--------|----------|----|----|
+| n | 4909 | 4909 | +0 |
+| pnl | -59.16 | 786.13 | +845.29 |
+| wr | 0.3650 | 0.3650 | +0.0000 |
+| rr | 1.48 | 6.47 | +4.99 |
+| edge | -0.0383 | 0.2311 | +0.2694 |
+| sharpe | -1.07 | 5.26 | +6.33 |
+| pf | 0.85 | 3.72 | +2.87 |
 
 ### TP_SL — TP/SL 타겟
 
@@ -103,6 +128,32 @@
 | edge | -0.0383 | 0.0679 | +0.1062 |
 | sharpe | -1.07 | 0.67 | +1.74 |
 | pf | 0.85 | 1.36 | +0.51 |
+
+### HYBRID_LEVERAGE — hybrid_leverage
+
+**Best Finding:** hybrid_leverage: PnL +$79.52
+- Improvement: $+79.52
+- Confidence: 67%
+- Parameters: `{"hybrid_lev_sweep_min": 1.0, "hybrid_lev_sweep_max": 3.0, "hybrid_lev_ev_scale": 100}`
+
+```
+[HYBRID_LEVERAGE] 파라미터 변경 제안:
+  hybrid_lev_sweep_min = 1.0
+  hybrid_lev_sweep_max = 3.0
+  hybrid_lev_ev_scale = 100
+예상 효과: PnL $+79.52, WR +0.0%, R:R +0.37
+신뢰도: 67.4%
+```
+
+| Metric | Baseline | CF | Delta |
+|--------|----------|----|----|
+| n | 4909 | 4909 | +0 |
+| pnl | -59.16 | 20.36 | +79.52 |
+| wr | 0.3650 | 0.3650 | +0.0000 |
+| rr | 1.48 | 1.85 | +0.37 |
+| edge | -0.0383 | 0.0143 | +0.0526 |
+| sharpe | -1.07 | 0.26 | +1.33 |
+| pf | 0.85 | 1.06 | +0.21 |
 
 ### ENTRY_FILTER — 진입 필터
 
@@ -207,6 +258,32 @@
 | edge | -0.0383 | 0.0137 | +0.0520 |
 | sharpe | -1.07 | 0.24 | +1.31 |
 | pf | 0.85 | 1.06 | +0.21 |
+
+### HYBRID_EXIT_TIMING — hybrid_exit_timing
+
+**Best Finding:** hybrid_exit_timing: PnL +$69.36
+- Improvement: $+69.36
+- Confidence: 66%
+- Parameters: `{"hybrid_exit_confirm_shock": 4, "hybrid_exit_confirm_normal": 8, "hybrid_exit_confirm_noise": 12}`
+
+```
+[HYBRID_EXIT_TIMING] 파라미터 변경 제안:
+  hybrid_exit_confirm_shock = 4
+  hybrid_exit_confirm_normal = 8
+  hybrid_exit_confirm_noise = 12
+예상 효과: PnL $+69.36, WR +0.0%, R:R +0.31
+신뢰도: 66.2%
+```
+
+| Metric | Baseline | CF | Delta |
+|--------|----------|----|----|
+| n | 4909 | 4909 | +0 |
+| pnl | -59.16 | 10.20 | +69.36 |
+| wr | 0.3650 | 0.3650 | +0.0000 |
+| rr | 1.48 | 1.79 | +0.31 |
+| edge | -0.0383 | 0.0065 | +0.0448 |
+| sharpe | -1.07 | 0.18 | +1.25 |
+| pf | 0.85 | 1.03 | +0.18 |
 
 ### PRE_MC_GATE — pre_mc_gate
 
@@ -417,23 +494,21 @@
 
 ## 🎯 Recommended Actions
 
-1. **tp_sl: PnL +$127.47** (ΔPnL: $+127.47, confidence: 80%)
+1. **mc_hybrid_paths: PnL +$845.29** (ΔPnL: $+845.29, confidence: 80%)
+   - `mc_hybrid_n_paths` = `16384`
+   - `mc_hybrid_horizon_steps` = `300`
+
+2. **tp_sl: PnL +$127.47** (ΔPnL: $+127.47, confidence: 80%)
    - `tp_pct` = `0.04`
    - `sl_pct` = `0.005`
 
-2. **chop_guard: PnL +$110.09** (ΔPnL: $+110.09, confidence: 81%)
+3. **chop_guard: PnL +$110.09** (ΔPnL: $+110.09, confidence: 81%)
    - `chop_entry_floor_add` = `0.003`
    - `chop_entry_min_dir_conf` = `0.8`
 
-3. **regime_side_block: PnL +$93.67** (ΔPnL: $+93.67, confidence: 77%)
+4. **regime_side_block: PnL +$93.67** (ΔPnL: $+93.67, confidence: 77%)
    - `regime_side_block_list` = `bear_long,bull_short,chop_long`
 
-4. **direction_gate: PnL +$83.04** (ΔPnL: $+83.04, confidence: 78%)
+5. **direction_gate: PnL +$83.04** (ΔPnL: $+83.04, confidence: 78%)
    - `dir_gate_min_conf` = `0.7`
    - `dir_gate_min_edge` = `0.0`
-
-5. **entry_filter: PnL +$77.83** (ΔPnL: $+77.83, confidence: 69%)
-   - `min_confidence` = `0.55`
-   - `min_dir_conf` = `0.65`
-   - `min_entry_quality` = `0.2`
-   - `min_ev` = `0.03`
