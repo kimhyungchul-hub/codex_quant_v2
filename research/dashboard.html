@@ -66,10 +66,19 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
 
 <div class="tabs">
   <div class="tab active" onclick="switchTab('overview')">Overview</div>
+  <div class="tab" onclick="switchTab('trace')">Research Trace</div>
   <div class="tab" onclick="switchTab('findings')">Findings</div>
   <div class="tab" onclick="switchTab('sweep')">Sweep Progress</div>
   <div class="tab" onclick="switchTab('regime')">Regime Analysis</div>
   <div class="tab" onclick="switchTab('log')">Log</div>
+</div>
+
+<!-- TRACE TAB -->
+<div class="tab-content" id="tab-trace">
+  <div class="card">
+    <h2>🧭 Research Progress & Applied Effects</h2>
+    <div id="researchTrace"></div>
+  </div>
 </div>
 
 <!-- OVERVIEW TAB -->
@@ -162,7 +171,10 @@ function connect() {
 function render(data) {
   // Cycle info
   const ci = document.getElementById('cycleInfo');
-  ci.textContent = `cycle ${data.cycle_count||0} | ${data.running?'⚡ Running':'⏸ Idle'} | ${new Date((data.last_update_ts||0)*1000).toLocaleTimeString()}`;
+  const done = Number(data.completed_cycles_total ?? data.cycle_count ?? 0);
+  const current = Number(data.current_cycle_index ?? (data.running ? done + 1 : done));
+  const stageNow = data.stage_current || '-';
+  ci.textContent = `done ${done} | current #${current} ${data.running ? `⚡ ${stageNow}` : '⏸ idle'} | ${new Date((data.last_update_ts||0)*1000).toLocaleTimeString()}`;
 
   // Baseline
   const bl = data.baseline || {};
@@ -281,6 +293,60 @@ function render(data) {
   }
   rtHtml += '</table>';
   rt.innerHTML = rtHtml;
+
+  // Research trace (cycle-level proposal/apply/effect)
+  const traceEl = document.getElementById('researchTrace');
+  const cycles = Array.isArray(data.research_cycles) ? data.research_cycles.slice().reverse() : [];
+  if (!cycles.length) {
+    traceEl.innerHTML = '<span style="color:var(--text2)">No research cycle history yet...</span>';
+  } else {
+    const rows = cycles.map(c => {
+      const sugg = Array.isArray(c.suggestions) ? c.suggestions : [];
+      const suggRows = sugg.slice(0, 12).map(s => {
+        const finalDelta = Number(s.effect_delta_equity_final);
+        const liveDelta = Number(s.effect_delta_equity_live);
+        let effTxt = '-';
+        let effColor = 'var(--text2)';
+        if (Number.isFinite(finalDelta)) {
+          effTxt = `${finalDelta >= 0 ? '+' : ''}$${finalDelta.toFixed(2)} (final)`;
+          effColor = finalDelta >= 0 ? 'var(--green)' : 'var(--red)';
+        } else if (Number.isFinite(liveDelta)) {
+          effTxt = `${liveDelta >= 0 ? '+' : ''}$${liveDelta.toFixed(2)} (live)`;
+          effColor = liveDelta >= 0 ? 'var(--green)' : 'var(--red)';
+        }
+        return `<tr>
+          <td>${esc(String(s.finding_id||'-'))}</td>
+          <td>${esc(String(s.stage||'-'))}</td>
+          <td>${esc(String(s.title||'-'))}</td>
+          <td>${(Number(s.improvement_pct)||0).toFixed(2)}</td>
+          <td>${(Number(s.confidence||0)*100).toFixed(0)}%</td>
+          <td>${s.applied ? 'Y' : 'N'} (${esc(String(s.apply_state||'not_applied'))})</td>
+          <td style="color:${effColor}">${effTxt}</td>
+        </tr>`;
+      }).join('');
+      const avgEff = Number(c.avg_effect_delta_equity);
+      const avgTxt = Number.isFinite(avgEff) ? `${avgEff >= 0 ? '+' : ''}$${avgEff.toFixed(2)}` : '-';
+      const avgCls = Number.isFinite(avgEff) ? (avgEff >= 0 ? 'good' : 'bad') : 'info';
+      return `
+        <div class="finding" style="margin-bottom:10px">
+          <div class="title">#${Number(c.cycle_index)||0} | status=${esc(String(c.status||'-'))} | elapsed=${Number(c.elapsed_sec||0).toFixed(1)}s</div>
+          <div style="margin-bottom:6px">
+            <span class="metric info">findings=${Number(c.n_findings||0)}</span>
+            <span class="metric good">applied=${Number(c.applied_n||0)}</span>
+            <span class="metric neutral">monitoring=${Number(c.monitoring_n||0)}</span>
+            <span class="metric bad">rolled_back=${Number(c.rolled_back_n||0)}</span>
+            <span class="metric ${avgCls}">avg ΔEq=${avgTxt}</span>
+            <span class="metric info">started=${new Date((Number(c.started_ts)||0)*1000).toLocaleString()}</span>
+          </div>
+          <table>
+            <tr><th>FindingID</th><th>Stage</th><th>Title</th><th>ΔPnL</th><th>Conf</th><th>Applied</th><th>Observed Effect</th></tr>
+            ${suggRows || '<tr><td colspan="7" style="color:var(--text2)">No suggestions</td></tr>'}
+          </table>
+        </div>
+      `;
+    }).join('');
+    traceEl.innerHTML = rows;
+  }
 }
 
 function metricChips(m) {

@@ -1386,6 +1386,16 @@
           }
           return 0;
         })();
+        const unified_score = (function () {
+          if (x.unified_score !== undefined && x.unified_score !== null) return Number(x.unified_score);
+          if (x.meta && x.meta.unified_score !== undefined && x.meta.unified_score !== null) return Number(x.meta.unified_score);
+          if (Array.isArray(x.details)) {
+            for (const d of x.details) {
+              if (d && d.meta && d.meta.unified_score !== undefined) return Number(d.meta.unified_score);
+            }
+          }
+          return Number(hybrid_score || 0);
+        })();
         const scorep = hybrid_score * 100;
         const confp = (x.conf || 0) * 100;
         const mc_win = (x.mc_win_rate || 0) * 100;
@@ -1428,6 +1438,7 @@
           action_type: action_type || '-',
           filter_states: x.filter_states || (x.meta && x.meta.filter_states) || null,
           hybrid_score,
+          unified_score,
           hybrid_score_hold,
           hybrid_score_logw,
           scorep,
@@ -1469,7 +1480,11 @@
       });
 
       // compute score rank (fallback rank)
-      data.forEach((d) => { d._score_for_rank = isNum(d.hybrid_score) ? d.hybrid_score : 0; });
+      data.forEach((d) => {
+        d._score_for_rank = isNum(d.unified_score)
+          ? d.unified_score
+          : (isNum(d.hybrid_score) ? d.hybrid_score : 0);
+      });
       const byScore = data.slice().sort((a, b) => b._score_for_rank - a._score_for_rank);
       const scoreRankMap = new Map();
       byScore.forEach((d, i) => scoreRankMap.set(d.symbol, i + 1));

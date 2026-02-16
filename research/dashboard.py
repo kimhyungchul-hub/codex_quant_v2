@@ -28,6 +28,10 @@ _state: dict = {
     "last_update_ts": 0,
     "running": False,
     "cycle_count": 0,
+    "current_cycle_index": 0,
+    "completed_cycles_total": 0,
+    "stage_current": None,
+    "research_cycles": [],
 }
 _ws_clients: list = []
 _dashboard_html: str = ""
