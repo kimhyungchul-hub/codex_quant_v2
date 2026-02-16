@@ -29,6 +29,9 @@ Notes:
 - Many keys are module-specific and currently read directly via `os.environ.get(...)` or `_env_*()` in their modules. Centralization (having modules import values from `config.py`) is a recommended next step to make runtime configuration auditable and testable.
 - This list includes some environment variables from system packages discovered during the scan (e.g., `PYTEST_*`, `NUMPY_*`). Focus on keys prefixed with project-specific names such as `MC_`, `PAPER_`, `PMAKER_`, `EVPH_`, `POLICY_`, `KELLY_`, `PAPER_`, `NAPV_`, etc.
 
+Research runner toggles:
+- `ALWAYS_RUN_CF` (default: `0`): `1/true/on`이면 새 거래가 없어도 `research/runner.py`가 CF 37개 스테이지를 매 사이클 강제 실행합니다.
+
 ---
 
 Generated list (unique keys found):

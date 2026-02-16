@@ -55,6 +55,16 @@ MAX_CYCLE_HISTORY = 80
 MIN_NEW_TRADES_FOR_REANALYSIS = 3  # 최소 3개의 새 거래가 있어야 재분석
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        v = os.environ.get(name)
+        if v is None:
+            return bool(default)
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return bool(default)
+
+
 def _load_cycle_history() -> list[dict]:
     p = Path(RESEARCH_CYCLES_JSON)
     if not p.exists():
@@ -238,6 +248,7 @@ def run_cf_cycle(
         }
 
     # ── Check for new trades to avoid repeated analysis ──
+    always_run_cf = _env_bool("ALWAYS_RUN_CF", False)
     last_analyzed = _load_last_analyzed()
     current_hash = _compute_trades_hash(trades)
     current_count = len(trades)
@@ -246,7 +257,7 @@ def run_cf_cycle(
     new_trade_count = current_count - int(last_analyzed.get("last_trade_count", 0))
     hash_changed = current_hash != last_analyzed.get("last_pnl_hash", "")
     
-    if not hash_changed and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
+    if (not always_run_cf) and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
         logger.info(f"[SKIP] No significant new trades (new={new_trade_count}, min={MIN_NEW_TRADES_FOR_REANALYSIS}). Skipping CF cycle.")
         run_cf_cycle._cycle = cycle_index
         _update_dashboard({
@@ -262,7 +273,14 @@ def run_cf_cycle(
             "running": False,
             "new_trade_count": new_trade_count,
             "min_required": MIN_NEW_TRADES_FOR_REANALYSIS,
+            "always_run_cf": always_run_cf,
         }
+
+    if always_run_cf and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
+        logger.info(
+            f"[CF_FORCE] ALWAYS_RUN_CF=1 -> running CF with unchanged trades "
+            f"(new={new_trade_count}, min={MIN_NEW_TRADES_FOR_REANALYSIS})"
+        )
 
     # Update last analyzed info
     _save_last_analyzed({
@@ -312,6 +330,7 @@ def run_cf_cycle(
         "status": "ok",
         "elapsed_sec": round(elapsed, 1),
         "running": False,
+        "always_run_cf": always_run_cf,
         "baseline": engine.baseline,
         "baseline_by_regime": engine.baseline_by_regime,
         "n_trades": len(trades),
