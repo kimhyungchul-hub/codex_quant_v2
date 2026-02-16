@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -48,6 +49,124 @@ MAX_COMBOS_PER_STAGE = 220
 DASHBOARD_PORT = 9998
 FINDINGS_OUTPUT = os.path.join(PROJECT_ROOT, "docs", "RESEARCH_FINDINGS.md")
 FINDINGS_JSON = os.path.join(PROJECT_ROOT, "state", "research_findings.json")
+RESEARCH_CYCLES_JSON = os.path.join(PROJECT_ROOT, "state", "research_cycles.json")
+MAX_CYCLE_HISTORY = 80
+
+
+def _load_cycle_history() -> list[dict]:
+    p = Path(RESEARCH_CYCLES_JSON)
+    if not p.exists():
+        return []
+    try:
+        rows = json.loads(p.read_text(encoding="utf-8"))
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def _save_cycle_history(rows: list[dict]) -> None:
+    p = Path(RESEARCH_CYCLES_JSON)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(rows[-MAX_CYCLE_HISTORY:], ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _get_latest_equity() -> float | None:
+    try:
+        conn = sqlite3.connect(DEFAULT_DB)
+        row = conn.execute("SELECT total_equity FROM equity_history ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return float(row[0])
+    except Exception:
+        return None
+    return None
+
+
+def _latest_apply_lookup(apply_history: list[dict]) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    for rec in (apply_history or []):
+        if not isinstance(rec, dict):
+            continue
+        fid = str(rec.get("finding_id") or "").strip()
+        if not fid:
+            continue
+        prev = out.get(fid)
+        if (prev is None) or (float(rec.get("timestamp") or 0.0) >= float(prev.get("timestamp") or 0.0)):
+            out[fid] = rec
+    return out
+
+
+def _build_cycle_report(
+    *,
+    cycle_index: int,
+    cycle_started_ts: float,
+    result: dict,
+    findings: list[dict],
+    apply_history: list[dict],
+    apply_status: dict | None,
+    stage_filter: str | None,
+) -> dict:
+    apply_lookup = _latest_apply_lookup(apply_history)
+    latest_equity = _get_latest_equity()
+    suggestion_rows: list[dict] = []
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("finding_id") or "")
+        rec = apply_lookup.get(fid)
+        applied = rec is not None
+        apply_state = str((rec or {}).get("status") or "not_applied")
+        eq_at_apply = (rec or {}).get("equity_at_apply")
+        eq_after = (rec or {}).get("equity_after_monitor")
+        effect_delta_final = None
+        effect_delta_live = None
+        try:
+            if eq_at_apply is not None and eq_after is not None:
+                effect_delta_final = float(eq_after) - float(eq_at_apply)
+        except Exception:
+            effect_delta_final = None
+        try:
+            if apply_state == "monitoring" and eq_at_apply is not None and latest_equity is not None:
+                effect_delta_live = float(latest_equity) - float(eq_at_apply)
+        except Exception:
+            effect_delta_live = None
+
+        suggestion_rows.append({
+            "finding_id": fid,
+            "stage": f.get("stage"),
+            "title": f.get("title"),
+            "confidence": float(f.get("confidence") or 0.0),
+            "improvement_pct": float(f.get("improvement_pct") or 0.0),
+            "recommendation": f.get("recommendation"),
+            "param_changes": f.get("param_changes") or {},
+            "applied": bool(applied),
+            "apply_state": apply_state,
+            "effect_delta_equity_final": effect_delta_final,
+            "effect_delta_equity_live": effect_delta_live,
+        })
+
+    applied_n = sum(1 for s in suggestion_rows if s.get("applied"))
+    monitoring_n = sum(1 for s in suggestion_rows if s.get("apply_state") == "monitoring")
+    rolled_n = sum(1 for s in suggestion_rows if s.get("apply_state") == "rolled_back")
+    finalized = [s.get("effect_delta_equity_final") for s in suggestion_rows if s.get("effect_delta_equity_final") is not None]
+    avg_effect = (sum(finalized) / len(finalized)) if finalized else None
+
+    return {
+        "cycle_index": int(cycle_index),
+        "started_ts": float(cycle_started_ts),
+        "completed_ts": float(result.get("last_update_ts") or time.time()),
+        "status": str(result.get("status") or "unknown"),
+        "stage_filter": stage_filter,
+        "elapsed_sec": float(result.get("elapsed_sec") or 0.0),
+        "n_trades": int(result.get("n_trades") or 0),
+        "n_findings": int(result.get("n_findings") or 0),
+        "applied_n": int(applied_n),
+        "monitoring_n": int(monitoring_n),
+        "rolled_back_n": int(rolled_n),
+        "avg_effect_delta_equity": avg_effect,
+        "auto_apply": apply_status or {},
+        "suggestions": suggestion_rows,
+    }
 
 
 def setup_logging():
@@ -65,12 +184,29 @@ def run_cf_cycle(
 ) -> dict:
     """Run one complete CF analysis cycle and return results."""
     t0 = time.perf_counter()
+    cycle_index = int(getattr(run_cf_cycle, "_cycle", 0)) + 1
+    cycle_started_ts = time.time()
+
+    _update_dashboard({
+        "running": True,
+        "current_cycle_index": cycle_index,
+        "completed_cycles_total": max(0, cycle_index - 1),
+        "stage_current": "init",
+        "cycle_started_ts": cycle_started_ts,
+    })
 
     loader = TradeLoader(db_path)
     trades = loader.load_trades()
     if not trades:
         logger.warning("No trades found. Skipping CF cycle.")
-        return {"status": "no_trades"}
+        run_cf_cycle._cycle = cycle_index
+        return {
+            "status": "no_trades",
+            "cycle_count": cycle_index,
+            "cycle_started_ts": cycle_started_ts,
+            "last_update_ts": time.time(),
+            "running": False,
+        }
 
     simulators = ALL_SIMULATORS
     if stage_filter:
@@ -89,6 +225,9 @@ def run_cf_cycle(
                 "sweep_progress": sweep_progress,
                 "running": True,
                 "stage_current": sim.stage_name,
+                "current_cycle_index": cycle_index,
+                "completed_cycles_total": max(0, cycle_index - 1),
+                "cycle_started_ts": cycle_started_ts,
             })
             engine._run_stage(sim, max_combos)
             sweep_progress[sim.stage_name] = {"done": 1, "total": 1, "status": "done"}
@@ -118,10 +257,14 @@ def run_cf_cycle(
         "top_10": [asdict(f) for f in findings[:10]],
         "sweep_progress": sweep_progress,
         "apply_history": apply_history_snapshot,
-        "cycle_count": getattr(run_cf_cycle, "_cycle", 0),
+        "cycle_count": cycle_index,
+        "current_cycle_index": cycle_index,
+        "completed_cycles_total": cycle_index,
+        "cycle_started_ts": cycle_started_ts,
+        "stage_current": "done",
         "last_update_ts": time.time(),
     }
-    run_cf_cycle._cycle = getattr(run_cf_cycle, "_cycle", 0) + 1
+    run_cf_cycle._cycle = cycle_index
 
     try:
         save_findings_json([asdict(f) for f in findings], FINDINGS_JSON)
@@ -259,6 +402,17 @@ def main():
     if not args.no_dashboard:
         start_dashboard_thread(args.port)
         time.sleep(1)
+        try:
+            hist = _load_cycle_history()
+            completed = int(hist[-1].get("cycle_index") or len(hist)) if hist else 0
+            _update_dashboard({
+                "research_cycles": hist[-30:],
+                "completed_cycles_total": completed,
+                "current_cycle_index": completed + 1,
+                "stage_current": "idle",
+            })
+        except Exception:
+            pass
 
     last_gemini_ts = 0
     last_findings: list[dict] = []
@@ -275,6 +429,8 @@ def main():
             findings = result.get("findings", [])
             if findings:
                 last_findings = findings
+
+            apply_status = None
 
             if findings:
                 print("\n" + "─" * 60)
@@ -294,6 +450,35 @@ def main():
                 action = apply_status.get("last_action")
                 if action and action not in ("no_qualifying_findings", "cooldown"):
                     logger.info(f"[AUTO_APPLY] {action}")
+
+            try:
+                from research.auto_apply import get_apply_history
+                apply_history_snapshot = get_apply_history()
+            except Exception:
+                apply_history_snapshot = []
+
+            cycle_report = _build_cycle_report(
+                cycle_index=int(result.get("cycle_count") or getattr(run_cf_cycle, "_cycle", 0) or 0),
+                cycle_started_ts=float(result.get("cycle_started_ts") or time.time()),
+                result=result,
+                findings=([f for f in findings if isinstance(f, dict)] if isinstance(findings, list) else []),
+                apply_history=apply_history_snapshot,
+                apply_status=apply_status,
+                stage_filter=args.stage,
+            )
+            cycle_history = _load_cycle_history()
+            cycle_history.append(cycle_report)
+            _save_cycle_history(cycle_history)
+            _update_dashboard({
+                "research_cycles": cycle_history[-30:],
+                "current_cycle_index": int(result.get("cycle_count") or 0) + 1,
+                "completed_cycles_total": int(result.get("cycle_count") or 0),
+                "stage_current": "idle",
+                "running": False,
+                "apply_history": apply_history_snapshot,
+                "auto_apply": apply_status or {},
+                "last_cycle_report": cycle_report,
+            })
 
             # ── Phase 3: Gemini Review (hourly) ──
             if not args.no_gemini and (time.time() - last_gemini_ts) >= args.gemini_interval:
