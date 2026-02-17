@@ -1,6 +1,6 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-17 23:37
+> Auto-generated: 2026-02-18 00:09
 > Baseline: 4638 trades, PnL=$-73.36, WR=36.5%, R:R=1.43
 
 ## Pipeline Stage Impact Summary
@@ -57,33 +57,33 @@
 
 ### VOLATILITY_GATE — volatility_gate
 
-**Best Finding:** volatility_gate: PnL +$131.92
-- Improvement: $+131.92
-- Confidence: 82%
-- Parameters: `{"scope": "chop_only", "chop_min_sigma": 0.1, "chop_max_sigma": 2.5, "chop_max_vpin": 0.65, "chop_min_dir_conf": 0.64, "chop_min_abs_mu_alpha": 20.0, "chop_max_hold_sec": 180}`
+**Best Finding:** volatility_gate: PnL +$132.94
+- Improvement: $+132.94
+- Confidence: 83%
+- Parameters: `{"scope": "chop_only", "chop_min_sigma": 0.1, "chop_max_sigma": 4.0, "chop_max_vpin": 0.65, "chop_min_dir_conf": 0.68, "chop_min_abs_mu_alpha": 40.0, "chop_max_hold_sec": 900}`
 
 ```
 [VOLATILITY_GATE] 파라미터 변경 제안:
   scope = chop_only
   chop_min_sigma = 0.1
-  chop_max_sigma = 2.5
+  chop_max_sigma = 4.0
   chop_max_vpin = 0.65
-  chop_min_dir_conf = 0.64
-  chop_min_abs_mu_alpha = 20.0
-  chop_max_hold_sec = 180
-예상 효과: PnL $+131.92, WR +7.7%, R:R +0.34
-신뢰도: 82.3%
+  chop_min_dir_conf = 0.68
+  chop_min_abs_mu_alpha = 40.0
+  chop_max_hold_sec = 900
+예상 효과: PnL $+132.94, WR +8.3%, R:R +0.33
+신뢰도: 83.2%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4638 | 1283 | -3355 |
-| pnl | -73.36 | 58.55 | +131.92 |
-| wr | 0.3650 | 0.4419 | +0.0769 |
-| rr | 1.43 | 1.77 | +0.34 |
-| edge | -0.0468 | 0.0812 | +0.1280 |
-| sharpe | -1.31 | 1.27 | +2.59 |
-| pf | 0.82 | 1.40 | +0.58 |
+| n | 4638 | 1224 | -3414 |
+| pnl | -73.36 | 59.58 | +132.94 |
+| wr | 0.3650 | 0.4477 | +0.0827 |
+| rr | 1.43 | 1.76 | +0.33 |
+| edge | -0.0468 | 0.0855 | +0.1323 |
+| sharpe | -1.31 | 1.28 | +2.59 |
+| pf | 0.82 | 1.43 | +0.61 |
 
 ### CHOP_GUARD — chop_guard
 
@@ -139,12 +139,13 @@
 **Best Finding:** direction_gate: PnL +$94.44
 - Improvement: $+94.44
 - Confidence: 78%
-- Parameters: `{"dir_gate_min_conf": 0.7, "dir_gate_min_edge": 0.0}`
+- Parameters: `{"dir_gate_min_conf": 0.7, "dir_gate_min_edge": 0.06, "dir_gate_min_side_prob": 0.6}`
 
 ```
 [DIRECTION_GATE] 파라미터 변경 제안:
   dir_gate_min_conf = 0.7
-  dir_gate_min_edge = 0.0
+  dir_gate_min_edge = 0.06
+  dir_gate_min_side_prob = 0.6
 예상 효과: PnL $+94.44, WR -0.4%, R:R +0.89
 신뢰도: 77.8%
 ```
@@ -164,13 +165,13 @@
 **Best Finding:** entry_filter: PnL +$91.70
 - Improvement: $+91.70
 - Confidence: 69%
-- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.3, "min_ev": 0.02}`
+- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.4, "min_ev": 0.02}`
 
 ```
 [ENTRY_FILTER] 파라미터 변경 제안:
   min_confidence = 0.55
   min_dir_conf = 0.65
-  min_entry_quality = 0.3
+  min_entry_quality = 0.4
   min_ev = 0.02
 예상 효과: PnL $+91.70, WR +9.2%, R:R +0.29
 신뢰도: 68.5%
@@ -434,14 +435,14 @@
    - `tp_pct` = `0.04`
    - `sl_pct` = `0.005`
 
-3. **volatility_gate: PnL +$131.92** (ΔPnL: $+131.92, confidence: 82%)
+3. **volatility_gate: PnL +$132.94** (ΔPnL: $+132.94, confidence: 83%)
    - `scope` = `chop_only`
    - `chop_min_sigma` = `0.1`
-   - `chop_max_sigma` = `2.5`
+   - `chop_max_sigma` = `4.0`
    - `chop_max_vpin` = `0.65`
-   - `chop_min_dir_conf` = `0.64`
-   - `chop_min_abs_mu_alpha` = `20.0`
-   - `chop_max_hold_sec` = `180`
+   - `chop_min_dir_conf` = `0.68`
+   - `chop_min_abs_mu_alpha` = `40.0`
+   - `chop_max_hold_sec` = `900`
 
 4. **chop_guard: PnL +$129.50** (ΔPnL: $+129.50, confidence: 84%)
    - `chop_entry_floor_add` = `0.003`

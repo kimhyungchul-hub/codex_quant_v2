@@ -122,6 +122,10 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
 
 <!-- MTF IMAGEH TAB -->
 <div class="tab-content" id="tab-mtf_imageh">
+  <div class="card" style="margin-bottom:12px">
+    <h2>📘 MTF 엔진 설명</h2>
+    <div id="mtfGuide"></div>
+  </div>
   <div class="grid">
     <div class="card">
       <h2>🧠 Stage / Runtime 상태</h2>
@@ -134,6 +138,16 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
   </div>
   <div class="grid">
     <div class="card">
+      <h2>🗂 입력 / 데이터 범위</h2>
+      <div id="mtfInput"></div>
+    </div>
+    <div class="card">
+      <h2>📊 점수 분포 / 게이트 통과율</h2>
+      <div id="mtfScoreStats"></div>
+    </div>
+  </div>
+  <div class="grid">
+    <div class="card">
       <h2>🎯 Training / Validation</h2>
       <div id="mtfTraining"></div>
     </div>
@@ -141,6 +155,10 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
       <h2>📈 CF Best Gate</h2>
       <div id="mtfBest"></div>
     </div>
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <h2>🧮 Threshold Sweep 요약</h2>
+    <div id="mtfSweep"></div>
   </div>
   <div class="card" style="margin-bottom:12px">
     <h2>🧪 MTF Findings</h2>
@@ -312,6 +330,23 @@ function render(data) {
   // MTF ImageH
   const mtf = data.mtf_imageh || {};
   const mtfStage = mtf.stage_progress || {};
+  const mtfInputCfg = mtf.input || {};
+  const mtfArtifactsCfg = mtf.artifacts || {};
+  const mtfScore = mtf.score_stats || {};
+  const mtfDataWindow = mtf.data_window || {};
+  const mtfSweep = mtf.sweep || {};
+  const sideThr = Number(mtf.runtime_env?.MTF_DL_ENTRY_MIN_SIDE_PROB || 0);
+  const winThr = Number(mtf.runtime_env?.MTF_DL_ENTRY_MIN_WIN_PROB || 0);
+
+  const mtfGuide = document.getElementById('mtfGuide');
+  mtfGuide.innerHTML = `
+    <div style="font-size:0.82em;line-height:1.55;color:var(--text2)">
+      <div>MTF 엔진은 <b>종가 기반 체결 이력(trades)</b>에서 EXIT 페어를 모아 학습하고, 각 트레이드의 진입시점 1분봉을 멀티 타임프레임 이미지(예: 1/3/5/15분)로 변환해 확률 점수를 만듭니다.</div>
+      <div style="margin-top:6px">연구 스테이지는 5분 CF 사이클마다 실행되며, 현재 사이클에서 생성된 점수/모델/리포트를 아래에 표시합니다.</div>
+      <div style="margin-top:6px">게이트 해석: <code>mtf_dl_prob</code>가 현재 임계치(side=${sideThr.toFixed(3)}, win=${winThr.toFixed(3)})를 얼마나 통과하는지 비율로 확인하세요.</div>
+    </div>
+  `;
+
   const mtfSummary = document.getElementById('mtfSummary');
   mtfSummary.innerHTML = `
     <span class="metric info">stage=${esc(String(mtf.stage_name || 'mtf_image_dl_gate'))}</span>
@@ -321,6 +356,9 @@ function render(data) {
     <span class="metric ${mtf.runtime_env?.MTF_DL_RUNTIME_ENABLED ? 'good':'bad'}">Runtime=${mtf.runtime_env?.MTF_DL_RUNTIME_ENABLED ? 'ON':'OFF'}</span>
     <span class="metric ${mtf.runtime_env?.MTF_DL_ENTRY_GATE_ENABLED ? 'good':'neutral'}">EntryGate=${mtf.runtime_env?.MTF_DL_ENTRY_GATE_ENABLED ? 'ON':'OFF'}</span>
     <span class="metric ${mtf.runtime_env?.MTF_DL_EXIT_HEAD_ENABLED ? 'good':'neutral'}">ExitHead=${mtf.runtime_env?.MTF_DL_EXIT_HEAD_ENABLED ? 'ON':'OFF'}</span>
+    <span class="metric info">side_thr=${sideThr.toFixed(3)}</span>
+    <span class="metric info">win_thr=${winThr.toFixed(3)}</span>
+    <span class="metric ${Number(mtfScore.ratio_ge_side_threshold||0)>=0.2?'good':Number(mtfScore.ratio_ge_side_threshold||0)>=0.05?'neutral':'bad'}">pass_side=${(Number(mtfScore.ratio_ge_side_threshold||0)*100).toFixed(1)}%</span>
     <div style="margin-top:8px;color:var(--text2);font-size:0.78em">
       cycle=${Number(mtf.cycle_count||0)} | updated=${fmtTime((data.last_update_ts||0)*1000)}
     </div>
@@ -336,7 +374,39 @@ function render(data) {
       <tr><td>report</td><td>${esc(String(report.path||'-'))}</td><td>${fmtTime((Number(report.mtime)||0)*1000)}</td><td>-</td></tr>
       <tr><td>model</td><td>${esc(String(model.path||'-'))}</td><td>${fmtTime((Number(model.mtime)||0)*1000)}</td><td>${fmtSize(model.size_bytes)}</td></tr>
       <tr><td>scores</td><td>${esc(String(scores.path||'-'))}</td><td>${fmtTime((Number(scores.mtime)||0)*1000)}</td><td>${fmtSize(scores.size_bytes)}</td></tr>
+      <tr><td>model(out)</td><td>${esc(String(mtfArtifactsCfg.model_out||'-'))}</td><td>-</td><td>-</td></tr>
+      <tr><td>scores(out)</td><td>${esc(String(mtfArtifactsCfg.scores_out||'-'))}</td><td>-</td><td>-</td></tr>
     </table>
+  `;
+
+  const mtfInput = document.getElementById('mtfInput');
+  mtfInput.innerHTML = `
+    <table>
+      <tr><th>항목</th><th>값</th></tr>
+      <tr><td>db</td><td>${esc(String(mtfInputCfg.db||'-'))}</td></tr>
+      <tr><td>max_symbols</td><td>${Number(mtfInputCfg.max_symbols||0)}</td></tr>
+      <tr><td>max_trades</td><td>${Number(mtfInputCfg.max_trades||0)}</td></tr>
+      <tr><td>min_hold_sec</td><td>${Number(mtfInputCfg.min_hold_sec||0)}</td></tr>
+      <tr><td>timeframes</td><td>${esc(JSON.stringify(mtfInputCfg.timeframes||[]))}</td></tr>
+      <tr><td>lookback_bars</td><td>${Number(mtfInputCfg.lookback_bars||0)}</td></tr>
+      <tr><td>train_ratio</td><td>${Number(mtfInputCfg.train_ratio||0).toFixed(2)}</td></tr>
+      <tr><td>epochs / batch</td><td>${Number(mtfInputCfg.epochs||0)} / ${Number(mtfInputCfg.batch_size||0)}</td></tr>
+      <tr><td>excluded_symbols</td><td>${esc((mtfInputCfg.excluded_symbols||[]).join(', ') || '-')}</td></tr>
+      <tr><td>entry_window_start</td><td>${fmtTime(Number(mtfDataWindow.entry_ts_min_ms||0))}</td></tr>
+      <tr><td>entry_window_end</td><td>${fmtTime(Number(mtfDataWindow.entry_ts_max_ms||0))}</td></tr>
+      <tr><td>entry_span_hours</td><td>${Number(mtfDataWindow.entry_span_hours||0).toFixed(1)}h</td></tr>
+      <tr><td>cf_eval_start</td><td>${fmtTime(Number(mtfDataWindow.cf_eval_start_ts_ms||0))}</td></tr>
+    </table>
+  `;
+
+  const mtfScoreStats = document.getElementById('mtfScoreStats');
+  mtfScoreStats.innerHTML = `
+    <span class="metric info">n_scores=${Number(mtfScore.n_scores||0)}</span>
+    <span class="metric info">prob_min=${Number(mtfScore.prob_min||0).toFixed(4)}</span>
+    <span class="metric info">prob_max=${Number(mtfScore.prob_max||0).toFixed(4)}</span>
+    <span class="metric info">prob_mean=${Number(mtfScore.prob_mean||0).toFixed(4)}</span>
+    <span class="metric ${Number(mtfScore.ratio_ge_side_threshold||0)>=0.2?'good':Number(mtfScore.ratio_ge_side_threshold||0)>=0.05?'neutral':'bad'}">>=side_thr ${Number(mtfScore.n_ge_side_threshold||0)} (${(Number(mtfScore.ratio_ge_side_threshold||0)*100).toFixed(1)}%)</span>
+    <span class="metric ${Number(mtfScore.ratio_ge_win_threshold||0)>=0.2?'good':Number(mtfScore.ratio_ge_win_threshold||0)>=0.05?'neutral':'bad'}">>=win_thr ${Number(mtfScore.n_ge_win_threshold||0)} (${(Number(mtfScore.ratio_ge_win_threshold||0)*100).toFixed(1)}%)</span>
   `;
 
   const mtfTraining = document.getElementById('mtfTraining');
@@ -351,21 +421,45 @@ function render(data) {
     <span class="metric neutral">val_hold_mae=${Number(trn.val_hold_mae_last||0).toFixed(1)}s</span>
     <span class="metric neutral">val_exit_acc=${Number(trn.val_exit_acc_last||0).toFixed(3)}</span>
     <div style="margin-top:8px;color:var(--text2);font-size:0.78em">
-      eval_side_auc=${Number(trn.eval_side_auc||0).toFixed(4)} | eval_win_auc=${Number(trn.eval_win_auc||0).toFixed(4)}
+      eval_side_auc=${Number(trn.eval_side_auc||0).toFixed(4)} | eval_win_auc=${Number(trn.eval_win_auc||0).toFixed(4)} | trades_loaded=${Number(ds.n_trades_loaded||0)} | skipped=${Number(ds.n_skipped||0)}
+    </div>
+    <div style="margin-top:6px;color:var(--text2);font-size:0.78em">
+      symbols=${esc((ds.symbols_used||[]).join(', ') || '-')}
     </div>
   `;
 
   const mtfBest = document.getElementById('mtfBest');
   const best = mtf.best || {};
+  const baseM = (mtf.baseline||{}).all || {};
   const bg = best.global_gate || {};
   const bgq = best.global_gate_quantile || {};
   const bcq = best.chop_only_gate_quantile || {};
   mtfBest.innerHTML = `
+    <div style="margin-bottom:8px;color:var(--text2);font-size:0.78em">
+      baseline(all): n=${Number(baseM.n||0)} pnl=${Number(baseM.pnl||0).toFixed(2)} wr=${(Number(baseM.wr||0)*100).toFixed(1)}%
+    </div>
     <table>
       <tr><th>Mode</th><th>Thr/Q</th><th>N</th><th>PnL</th><th>WR</th></tr>
       <tr><td>global</td><td>${Number(bg.threshold||0).toFixed(2)}</td><td>${Number(bg.n||0)}</td><td style="color:${Number(bg.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(bg.pnl||0).toFixed(2)}</td><td>${(Number(bg.wr||0)*100).toFixed(1)}%</td></tr>
       <tr><td>global_q</td><td>q=${Number(bgq.quantile||0).toFixed(2)} / ${Number(bgq.threshold||0).toFixed(2)}</td><td>${Number(bgq.n||0)}</td><td style="color:${Number(bgq.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(bgq.pnl||0).toFixed(2)}</td><td>${(Number(bgq.wr||0)*100).toFixed(1)}%</td></tr>
       <tr><td>chop_q</td><td>q=${Number(bcq.quantile||0).toFixed(2)} / ${Number(bcq.threshold||0).toFixed(2)}</td><td>${Number(bcq.n||0)}</td><td style="color:${Number(bcq.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(bcq.pnl||0).toFixed(2)}</td><td>${(Number(bcq.wr||0)*100).toFixed(1)}%</td></tr>
+    </table>
+  `;
+
+  const mtfSweepEl = document.getElementById('mtfSweep');
+  const rowsG = Array.isArray(mtfSweep.global_gate) ? mtfSweep.global_gate : [];
+  const rowsGQ = Array.isArray(mtfSweep.global_gate_quantile) ? mtfSweep.global_gate_quantile : [];
+  const rowsCQ = Array.isArray(mtfSweep.chop_only_gate_quantile) ? mtfSweep.chop_only_gate_quantile : [];
+  const topByPnl = (rows) => rows.slice().sort((a,b)=>Number(b.pnl||0)-Number(a.pnl||0)).slice(0,3);
+  const gTop = topByPnl(rowsG);
+  const gqTop = topByPnl(rowsGQ);
+  const cqTop = topByPnl(rowsCQ);
+  mtfSweepEl.innerHTML = `
+    <table>
+      <tr><th>bucket</th><th>rank</th><th>thr/q</th><th>n</th><th>pnl</th><th>wr</th><th>pf</th></tr>
+      ${gTop.map((r,i)=>`<tr><td>global</td><td>#${i+1}</td><td>${Number(r.threshold||0).toFixed(3)}</td><td>${Number(r.n||0)}</td><td style="color:${Number(r.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(r.pnl||0).toFixed(2)}</td><td>${(Number(r.wr||0)*100).toFixed(1)}%</td><td>${Number(r.pf||0).toFixed(2)}</td></tr>`).join('')}
+      ${gqTop.map((r,i)=>`<tr><td>global_q</td><td>#${i+1}</td><td>q=${Number(r.quantile||0).toFixed(2)} / ${Number(r.threshold||0).toFixed(3)}</td><td>${Number(r.n||0)}</td><td style="color:${Number(r.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(r.pnl||0).toFixed(2)}</td><td>${(Number(r.wr||0)*100).toFixed(1)}%</td><td>${Number(r.pf||0).toFixed(2)}</td></tr>`).join('')}
+      ${cqTop.map((r,i)=>`<tr><td>chop_q</td><td>#${i+1}</td><td>q=${Number(r.quantile||0).toFixed(2)} / ${Number(r.threshold||0).toFixed(3)}</td><td>${Number(r.n||0)}</td><td style="color:${Number(r.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(r.pnl||0).toFixed(2)}</td><td>${(Number(r.wr||0)*100).toFixed(1)}%</td><td>${Number(r.pf||0).toFixed(2)}</td></tr>`).join('')}
     </table>
   `;
 

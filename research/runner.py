@@ -218,6 +218,79 @@ def _read_json(path: Path) -> dict | list | None:
         return None
 
 
+def _collect_mtf_score_stats(
+    scores_path: Path,
+    *,
+    side_threshold: float,
+    win_threshold: float,
+) -> dict:
+    out = {
+        "n_scores": 0,
+        "prob_min": None,
+        "prob_max": None,
+        "prob_mean": None,
+        "n_ge_side_threshold": 0,
+        "n_ge_win_threshold": 0,
+        "ratio_ge_side_threshold": 0.0,
+        "ratio_ge_win_threshold": 0.0,
+        "entry_ts_min_ms": None,
+        "entry_ts_max_ms": None,
+        "entry_span_hours": None,
+    }
+    rows = _read_json(scores_path)
+    if not isinstance(rows, list):
+        return out
+    probs: list[float] = []
+    entry_ts_vals: list[int] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        try:
+            p = float(r.get("mtf_dl_prob"))
+            if p == p:  # NaN-safe
+                probs.append(p)
+        except Exception:
+            pass
+        try:
+            ts = int(float(r.get("entry_ts_ms") or 0))
+            if ts > 0:
+                entry_ts_vals.append(ts)
+        except Exception:
+            pass
+    n = len(probs)
+    if n <= 0:
+        return out
+    p_min = min(probs)
+    p_max = max(probs)
+    p_mean = sum(probs) / float(max(1, n))
+    n_ge_side = sum(1 for p in probs if p >= float(side_threshold))
+    n_ge_win = sum(1 for p in probs if p >= float(win_threshold))
+    out.update(
+        {
+            "n_scores": int(n),
+            "prob_min": float(p_min),
+            "prob_max": float(p_max),
+            "prob_mean": float(p_mean),
+            "n_ge_side_threshold": int(n_ge_side),
+            "n_ge_win_threshold": int(n_ge_win),
+            "ratio_ge_side_threshold": float(n_ge_side / float(max(1, n))),
+            "ratio_ge_win_threshold": float(n_ge_win / float(max(1, n))),
+        }
+    )
+    if entry_ts_vals:
+        ts_min = int(min(entry_ts_vals))
+        ts_max = int(max(entry_ts_vals))
+        span_h = float(max(0.0, (ts_max - ts_min) / 3_600_000.0))
+        out.update(
+            {
+                "entry_ts_min_ms": ts_min,
+                "entry_ts_max_ms": ts_max,
+                "entry_span_hours": span_h,
+            }
+        )
+    return out
+
+
 def _collect_mtf_imageh_state(
     *,
     result: dict,
@@ -235,6 +308,8 @@ def _collect_mtf_imageh_state(
     best = report.get("best") if isinstance(report.get("best"), dict) else {}
     baseline = report.get("baseline") if isinstance(report.get("baseline"), dict) else {}
     sweep = report.get("threshold_sweep") if isinstance(report.get("threshold_sweep"), dict) else {}
+    input_cfg = report.get("input") if isinstance(report.get("input"), dict) else {}
+    artifacts = report.get("artifacts") if isinstance(report.get("artifacts"), dict) else {}
 
     stage_prog = {}
     try:
@@ -284,6 +359,18 @@ def _collect_mtf_imageh_state(
         "MTF_DL_EXIT_MIN_CONF": _file_env_float("MTF_DL_EXIT_MIN_CONF", 0.62),
         "MTF_DL_EXIT_MIN_PROGRESS": _file_env_float("MTF_DL_EXIT_MIN_PROGRESS", 0.95),
     }
+    score_stats = _collect_mtf_score_stats(
+        scores_path,
+        side_threshold=float(runtime_env.get("MTF_DL_ENTRY_MIN_SIDE_PROB") or 0.58),
+        win_threshold=float(runtime_env.get("MTF_DL_ENTRY_MIN_WIN_PROB") or 0.52),
+    )
+
+    data_window = {
+        "entry_ts_min_ms": score_stats.get("entry_ts_min_ms"),
+        "entry_ts_max_ms": score_stats.get("entry_ts_max_ms"),
+        "entry_span_hours": score_stats.get("entry_span_hours"),
+        "cf_eval_start_ts_ms": int(dataset.get("cf_eval_start_ts_ms") or 0) if dataset else 0,
+    }
 
     return {
         "stage_name": MTF_STAGE_NAME,
@@ -306,6 +393,10 @@ def _collect_mtf_imageh_state(
             "size_bytes": _path_size(model_path),
         },
         "dataset": dataset,
+        "input": input_cfg,
+        "artifacts": artifacts,
+        "data_window": data_window,
+        "score_stats": score_stats,
         "training": training,
         "baseline": baseline,
         "best": best,

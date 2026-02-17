@@ -68,6 +68,189 @@ def _env_float(name: str, default: float) -> float:
     except Exception:
         return float(default)
 
+
+_ENV_FILE_CACHE: dict[str, str] | None = None
+
+
+def _env_file_values() -> dict[str, str]:
+    global _ENV_FILE_CACHE
+    if _ENV_FILE_CACHE is not None:
+        return _ENV_FILE_CACHE
+    out: dict[str, str] = {}
+    env_path = PROJECT_ROOT / "state" / "bybit.env"
+    try:
+        if env_path.exists():
+            for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                s = str(raw or "").strip()
+                if (not s) or s.startswith("#") or ("=" not in s):
+                    continue
+                k, v = s.split("=", 1)
+                out[str(k).strip()] = str(v).strip()
+    except Exception:
+        out = {}
+    _ENV_FILE_CACHE = out
+    return out
+
+
+def _env_runtime_raw(key: str) -> str | None:
+    raw = os.environ.get(str(key))
+    if raw is not None:
+        return str(raw).strip()
+    return _env_file_values().get(str(key))
+
+
+def _norm_csv_tokens(v: Any) -> str:
+    toks = [str(x).strip().lower() for x in str(v or "").replace(";", ",").split(",") if str(x).strip()]
+    if not toks:
+        return ""
+    # preserve set semantics for blocklist/hourlist style params
+    return ",".join(sorted(set(toks)))
+
+
+# CF param -> runtime env key candidates (priority order).
+# Used to anchor each stage baseline to current bybit.env values.
+CF_PARAM_ENV_KEYS: dict[str, list[str]] = {
+    "max_leverage": ["MAX_LEVERAGE"],
+    "regime_max_bull": ["LEVERAGE_REGIME_MAX_BULL"],
+    "regime_max_bear": ["LEVERAGE_REGIME_MAX_BEAR"],
+    "regime_max_chop": ["LEVERAGE_REGIME_MAX_CHOP"],
+    "regime_max_volatile": ["LEVERAGE_REGIME_MAX_VOLATILE"],
+    "tp_pct": ["MC_TP_BASE_ROE", "DEFAULT_TP_PCT"],
+    "sl_pct": ["MC_SL_BASE_ROE", "DEFAULT_SL_PCT"],
+    "max_hold_sec": ["POLICY_MAX_HOLD_SEC"],
+    "min_hold_sec": ["EXIT_MIN_HOLD_SEC"],
+    "min_hold_sec_bull": ["EXIT_MIN_HOLD_SEC_BULL"],
+    "min_hold_sec_chop": ["EXIT_MIN_HOLD_SEC_CHOP"],
+    "min_hold_sec_bear": ["EXIT_MIN_HOLD_SEC_BEAR"],
+    "min_confidence": ["UNI_MIN_CONFIDENCE"],
+    "min_dir_conf": ["ALPHA_DIRECTION_MIN_CONFIDENCE"],
+    "min_ev": ["UNIFIED_ENTRY_FLOOR"],
+    "min_dir_conf_for_entry": ["ALPHA_DIRECTION_MIN_CONFIDENCE"],
+    "max_vpin": ["UNI_MAX_VPIN_HARD"],
+    "scope": ["VOLATILITY_GATE_SCOPE"],
+    "chop_min_sigma": ["CHOP_VOL_GATE_MIN_SIGMA"],
+    "chop_max_sigma": ["CHOP_VOL_GATE_MAX_SIGMA"],
+    "chop_max_vpin": ["CHOP_VPIN_MAX"],
+    "chop_min_dir_conf": ["CHOP_ENTRY_MIN_DIR_CONF"],
+    "chop_min_abs_mu_alpha": ["CHOP_ENTRY_MIN_MU_ALPHA"],
+    "chop_max_hold_sec": ["TARGET_HOLD_SEC_MAX_CHOP"],
+    "notional_hard_cap": ["NOTIONAL_HARD_CAP_USD"],
+    "max_pos_frac": ["UNI_MAX_POS_FRAC"],
+    "spread_pct_max": ["SPREAD_PCT_MAX"],
+    "net_expectancy_min": ["ENTRY_NET_EXPECTANCY_MIN"],
+    "both_ev_neg_net_floor": ["ENTRY_BOTH_EV_NEG_NET_FLOOR"],
+    "gross_ev_min": ["ENTRY_GROSS_EV_MIN"],
+    "max_exposure": ["MAX_NOTIONAL_EXPOSURE", "LIVE_MAX_NOTIONAL_EXPOSURE"],
+    "max_concurrent": ["MAX_CONCURRENT_POSITIONS"],
+    "hurst_dampen": ["HURST_RANDOM_DAMPEN"],
+    "fee_filter_mult": ["FEE_FILTER_MULT"],
+    "chop_entry_floor_add": ["CHOP_ENTRY_FLOOR_ADD"],
+    "chop_entry_min_dir_conf": ["CHOP_ENTRY_MIN_DIR_CONF"],
+    "block_mu_sign_flip_before_sec": ["MU_SIGN_FLIP_MIN_AGE_SEC"],
+    "mu_sign_flip_min_magnitude": ["MU_SIGN_FLIP_MIN_MAGNITUDE"],
+    "mu_sign_flip_confirm_ticks": ["MU_SIGN_FLIP_CONFIRM_TICKS"],
+    "top_n_symbols": ["TOP_N_SYMBOLS"],
+    "dir_gate_min_conf": ["ALPHA_DIRECTION_GATE_MIN_CONF"],
+    "dir_gate_min_edge": ["ALPHA_DIRECTION_GATE_MIN_EDGE"],
+    "dir_gate_min_side_prob": ["ALPHA_DIRECTION_GATE_MIN_SIDE_PROB"],
+    "dir_gate_confirm_ticks": ["ALPHA_DIRECTION_GATE_CONFIRM_TICKS"],
+    "dir_gate_confirm_ticks_chop": ["ALPHA_DIRECTION_GATE_CONFIRM_TICKS_CHOP"],
+    "pre_mc_min_expected_pnl": ["PRE_MC_MIN_EXPECTED_PNL"],
+    "pre_mc_max_liq_prob": ["PRE_MC_MAX_LIQ_PROB"],
+    "event_exit_max_p_sl": ["EVENT_EXIT_MAX_P_SL"],
+    "event_exit_max_abs_cvar": ["EVENT_EXIT_MAX_ABS_CVAR"],
+    "min_entry_notional": ["MIN_ENTRY_NOTIONAL"],
+    "trading_bad_hours_utc": ["TRADING_BAD_HOURS_UTC"],
+    "regime_side_block_list": ["REGIME_SIDE_BLOCK_LIST"],
+    "lev_floor_lock_min_sticky": ["LEVERAGE_FLOOR_LOCK_MIN_STICKY"],
+    "lev_floor_lock_max_ev_gap": ["LEVERAGE_FLOOR_LOCK_MAX_EV_GAP"],
+    "lev_floor_lock_max_conf": ["LEVERAGE_FLOOR_LOCK_MAX_CONF"],
+    "pre_mc_size_scale": ["PRE_MC_SIZE_SCALE"],
+    "pre_mc_block_on_fail": ["PRE_MC_BLOCK_ON_FAIL"],
+    "pre_mc_min_cvar": ["PRE_MC_MIN_CVAR"],
+    "sq_time_window_hours": ["SYMBOL_QUALITY_TIME_WINDOW_HOURS"],
+    "sq_time_weight": ["SYMBOL_QUALITY_TIME_WEIGHT"],
+    "hybrid_exit_confirm_shock": ["HYBRID_EXIT_CONFIRM_TICKS_SHOCK"],
+    "hybrid_exit_confirm_normal": ["HYBRID_EXIT_CONFIRM_TICKS_NORMAL"],
+    "hybrid_exit_confirm_noise": ["HYBRID_EXIT_CONFIRM_TICKS_NOISE"],
+    "hybrid_lev_sweep_min": ["HYBRID_LEV_MIN"],
+    "hybrid_lev_sweep_max": ["HYBRID_LEV_MAX"],
+    "mc_hybrid_n_paths": ["MC_HYBRID_N_PATHS"],
+    "mc_hybrid_horizon_steps": ["MC_HYBRID_HORIZON_STEPS"],
+    "hybrid_cash_penalty": ["HYBRID_CASH_PENALTY"],
+    "exp_vals_min_diff": ["EXP_VALS_MIN_DIFF"],
+    "exp_vals_dominance_ratio": ["EXP_VALS_DOMINANCE"],
+    "hybrid_beam_width": ["HYBRID_BEAM_WIDTH"],
+    "lsm_poly_degree": ["LSM_POLY_DEGREE"],
+    "hybrid_tp_base": ["HYBRID_TP_PCT_BASE", "HYBRID_TP_PCT_BULL"],
+    "hybrid_sl_base": ["HYBRID_SL_PCT_BASE", "HYBRID_SL_PCT_BULL"],
+    "hybrid_tp_shock_mult": ["HYBRID_TP_MULT_SHOCK"],
+    "hybrid_tp_noise_mult": ["HYBRID_TP_MULT_NOISE"],
+    "mtf_dl_entry_min_side_prob": ["MTF_DL_ENTRY_MIN_SIDE_PROB"],
+    "mtf_dl_entry_min_win_prob": ["MTF_DL_ENTRY_MIN_WIN_PROB"],
+}
+
+
+def _baseline_candidate_from_env(param_name: str, candidates: list[Any]) -> Any:
+    vals = list(candidates or [])
+    if not vals:
+        return None
+
+    env_keys = CF_PARAM_ENV_KEYS.get(str(param_name), [])
+    raw: str | None = None
+    for k in env_keys:
+        raw = _env_runtime_raw(k)
+        if raw not in (None, ""):
+            break
+    if raw in (None, ""):
+        return vals[0]
+
+    first = vals[0]
+    # bool
+    if isinstance(first, bool):
+        rv = str(raw).strip().lower() in ("1", "true", "yes", "on")
+        for c in vals:
+            if bool(c) == rv:
+                return c
+        return vals[0]
+
+    # numeric
+    if isinstance(first, (int, float)) and not isinstance(first, bool):
+        try:
+            rv = float(str(raw).strip())
+        except Exception:
+            return vals[0]
+        best = vals[0]
+        best_gap = float("inf")
+        for c in vals:
+            try:
+                gap = abs(float(c) - rv)
+            except Exception:
+                continue
+            if gap < best_gap:
+                best_gap = gap
+                best = c
+        return best
+
+    # string-like / csv-like
+    raw_s = str(raw).strip()
+    for c in vals:
+        if str(c).strip() == raw_s:
+            return c
+    raw_norm = _norm_csv_tokens(raw_s)
+    if raw_norm:
+        for c in vals:
+            if _norm_csv_tokens(c) == raw_norm:
+                return c
+    return vals[0]
+
+
+def _baseline_combo_from_env(param_names: list[str], param_values: list[list[Any]]) -> tuple[Any, ...]:
+    combo: list[Any] = []
+    for p, vals in zip(param_names, param_values):
+        combo.append(_baseline_candidate_from_env(str(p), list(vals or [])))
+    return tuple(combo)
+
 # ─────────────────────────────────────────────────────────────────
 # Data Structures
 # ─────────────────────────────────────────────────────────────────
@@ -880,7 +1063,7 @@ class NetExpectancySimulator(StageSimulator):
 
     def get_param_grid(self) -> dict[str, list]:
         return {
-            "net_expectancy_min": [-0.002, -0.001, -0.0005, -0.0002, 0.0, 0.0005, 0.001, 0.002],
+            "net_expectancy_min": [-0.0030, -0.0020, -0.0015, -0.0010, -0.0007, -0.0005, -0.0003, -0.0002, -0.0001, 0.0, 0.0002, 0.0005, 0.0008, 0.0012, 0.0018, 0.0025],
         }
 
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
@@ -891,6 +1074,104 @@ class NetExpectancySimulator(StageSimulator):
             if t.entry_ev >= ne_min:
                 result.append(t)
         return result
+
+
+class EVSanityGateSimulator(StageSimulator):
+    """
+    Entry EV sanity gate for both-ev-negative + gross-ev floors.
+    Proxy-based stage because per-side EV vectors are not persisted in trades table.
+    """
+
+    stage_name = "ev_sanity_gate"
+    description = "EV 건전성 게이트: ENTRY_BOTH_EV_NEG_NET_FLOOR / ENTRY_GROSS_EV_MIN"
+    max_combos_hint = 120
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "both_ev_neg_net_floor": [-0.0010, -0.0007, -0.0005, -0.0003, -0.0001, 0.0],
+            "gross_ev_min": [0.0, 0.0002, 0.0005, 0.0008, 0.0012, 0.0016],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        both_floor = float(params.get("both_ev_neg_net_floor", -0.0003))
+        gross_floor = float(params.get("gross_ev_min", 0.0005))
+        out: list[Trade] = []
+        for t in trades:
+            # net edge proxy
+            net_edge = float(t.entry_ev or 0.0)
+            # gross edge proxy: add back round-trip fee proxy from raw payload
+            fee_rate = 0.0006
+            try:
+                fee_rate = float((t.raw or {}).get("fee_rate") or fee_rate)
+            except Exception:
+                fee_rate = 0.0006
+            fee_rate = max(0.0, min(0.01, float(fee_rate)))
+            gross_edge = float(net_edge + fee_rate * 2.0)
+            if net_edge <= both_floor:
+                continue
+            if gross_edge < gross_floor:
+                continue
+            out.append(t)
+        return out
+
+
+class MTFEntryGateSimulator(StageSimulator):
+    """Sweep runtime MTF entry thresholds against scored historical trades."""
+
+    stage_name = "mtf_entry_gate"
+    description = "MTF 진입 게이트 임계치: MTF_DL_ENTRY_MIN_SIDE_PROB / MIN_WIN_PROB"
+    max_combos_hint = 120
+
+    def __init__(self):
+        self.scores_path = Path(os.environ.get("CF_MTF_DL_SCORES_PATH", str(DEFAULT_DL_SCORES)))
+        self._score_map: dict[str, float] = {}
+
+    def _load_score_map(self) -> None:
+        self._score_map = {}
+        if not self.scores_path.exists():
+            return
+        try:
+            rows = json.loads(self.scores_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            uid = str(r.get("trade_uid") or "").strip()
+            if not uid:
+                continue
+            try:
+                p = float(r.get("mtf_dl_prob"))
+            except Exception:
+                continue
+            if not math.isfinite(p):
+                continue
+            self._score_map[uid] = p
+
+    def get_param_grid(self) -> dict[str, list]:
+        self._load_score_map()
+        return {
+            "mtf_dl_entry_min_side_prob": [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62],
+            "mtf_dl_entry_min_win_prob": [0.50, 0.52, 0.54, 0.56, 0.58, 0.60],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        if not self._score_map:
+            return list(trades)
+        min_side = float(params.get("mtf_dl_entry_min_side_prob", 0.58))
+        min_win = float(params.get("mtf_dl_entry_min_win_prob", 0.52))
+        out: list[Trade] = []
+        for t in trades:
+            p = self._score_map.get(str(t.trade_uid or "").strip())
+            # keep unknown-score trades to avoid coverage-bias over-blocking
+            if p is None:
+                out.append(t)
+                continue
+            if float(p) >= min_side and float(p) >= min_win:
+                out.append(t)
+        return out
 
 
 class MinHoldRegimeSimulator(StageSimulator):
@@ -1079,7 +1360,7 @@ class TopNSimulator(StageSimulator):
 
     def get_param_grid(self) -> dict[str, list]:
         return {
-            "top_n_symbols": [4, 8, 12, 20, 30, 50],
+            "top_n_symbols": [4, 6, 8, 10, 12, 16, 20, 24, 30, 40, 50, 60],
         }
 
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
@@ -1113,18 +1394,21 @@ class DirectionGateSimulator(StageSimulator):
 
     def get_param_grid(self) -> dict[str, list]:
         return {
-            "dir_gate_min_conf": [0.52, 0.55, 0.58, 0.60, 0.65, 0.70],
-            "dir_gate_min_edge": [0.00, 0.02, 0.04, 0.06, 0.08, 0.10],
+            "dir_gate_min_conf": [0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70],
+            "dir_gate_min_edge": [0.00, 0.01, 0.02, 0.04, 0.06, 0.08, 0.10],
+            "dir_gate_min_side_prob": [0.50, 0.53, 0.56, 0.58, 0.60, 0.62, 0.65, 0.70],
         }
 
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
         min_conf = float(params.get("dir_gate_min_conf", 0.58))
         min_edge = float(params.get("dir_gate_min_edge", 0.06))
+        min_side_prob = float(params.get("dir_gate_min_side_prob", 0.58))
         result = []
         for t in trades:
             # edge proxy: abs(mu_alpha)
             edge = abs(float(t.mu_alpha or 0.0))
-            if float(t.dir_conf or 0.0) >= min_conf and edge >= min_edge:
+            side_prob = max(0.50, min(1.0, float(t.dir_conf or 0.0)))
+            if float(t.dir_conf or 0.0) >= min_conf and edge >= min_edge and side_prob >= min_side_prob:
                 result.append(t)
         return result
 
@@ -1648,12 +1932,14 @@ ALL_SIMULATORS = [
     VPINFilterSimulator(),
     VolatilityGateSimulator(),
     MTFImageDLGateSimulator(),
+    MTFEntryGateSimulator(),
     ExitReasonSimulator(),
     CapitalAllocationSimulator(),
     RegimeMultiplierSimulator(),
     # New expanded simulators
     SpreadFilterSimulator(),
     NetExpectancySimulator(),
+    EVSanityGateSimulator(),
     MinHoldRegimeSimulator(),
     ExposureSimulator(),
     HurstDampenSimulator(),
@@ -1746,6 +2032,7 @@ class CFEngine:
         sim: StageSimulator,
         param_values: list[list[Any]],
         stage_max_combos: int,
+        baseline_combo: tuple[Any, ...] | None = None,
     ) -> tuple[list[tuple[Any, ...]], str, int]:
         combos_all = list(itertools.product(*param_values))
         total = len(combos_all)
@@ -1768,7 +2055,7 @@ class CFEngine:
             seen.add(combo)
             selected.append(combo)
 
-        baseline = tuple(vals[0] for vals in param_values)
+        baseline = tuple(baseline_combo) if baseline_combo else tuple(vals[0] for vals in param_values)
         _add(baseline)
         _add(tuple(vals[len(vals) // 2] for vals in param_values))
         _add(tuple(vals[-1] for vals in param_values))
@@ -1823,6 +2110,7 @@ class CFEngine:
         grid = sim.get_param_grid()
         param_names = list(grid.keys())
         param_values = list(grid.values())
+        baseline_combo = _baseline_combo_from_env(param_names, param_values)
         try:
             stage_max_combos = int(getattr(sim, "max_combos_hint", max_combos) or max_combos)
         except Exception:
@@ -1832,6 +2120,7 @@ class CFEngine:
             sim=sim,
             param_values=param_values,
             stage_max_combos=stage_max_combos,
+            baseline_combo=baseline_combo,
         )
         logger.info(
             f"[CF_STAGE] {sim.stage_name} search={combo_mode} "

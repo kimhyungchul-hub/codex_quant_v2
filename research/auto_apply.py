@@ -90,6 +90,8 @@ PARAM_TO_ENV: dict[str, list[str]] = {
     "fee_filter_mult": ["FEE_FILTER_MULT"],
     # Net Expectancy
     "net_expectancy_min": ["ENTRY_NET_EXPECTANCY_MIN"],
+    "both_ev_neg_net_floor": ["ENTRY_BOTH_EV_NEG_NET_FLOOR"],
+    "gross_ev_min": ["ENTRY_GROSS_EV_MIN"],
     # Exposure
     "max_exposure": ["MAX_NOTIONAL_EXPOSURE", "LIVE_MAX_NOTIONAL_EXPOSURE"],
     # Hurst
@@ -101,6 +103,7 @@ PARAM_TO_ENV: dict[str, list[str]] = {
     "top_n_symbols": ["TOP_N_SYMBOLS"],
     "dir_gate_min_conf": ["ALPHA_DIRECTION_GATE_MIN_CONF"],
     "dir_gate_min_edge": ["ALPHA_DIRECTION_GATE_MIN_EDGE"],
+    "dir_gate_min_side_prob": ["ALPHA_DIRECTION_GATE_MIN_SIDE_PROB"],
     "pre_mc_min_expected_pnl": ["PRE_MC_MIN_EXPECTED_PNL"],
     "pre_mc_max_liq_prob": ["PRE_MC_MAX_LIQ_PROB"],
     "event_exit_max_p_sl": ["EVENT_EXIT_MAX_P_SL"],
@@ -127,6 +130,9 @@ PARAM_TO_ENV: dict[str, list[str]] = {
     "mc_hybrid_n_paths": ["MC_HYBRID_N_PATHS"],
     "mc_hybrid_horizon_steps": ["MC_HYBRID_HORIZON_STEPS"],
     "hybrid_cash_penalty": ["HYBRID_CASH_PENALTY"],
+    # MTF entry gate thresholds
+    "mtf_dl_entry_min_side_prob": ["MTF_DL_ENTRY_MIN_SIDE_PROB"],
+    "mtf_dl_entry_min_win_prob": ["MTF_DL_ENTRY_MIN_WIN_PROB"],
 }
 
 # 값 범위 제한 (안전 가드)
@@ -158,6 +164,8 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "SPREAD_PCT_MAX": (0.0001, 0.005),
     "FEE_FILTER_MULT": (0.50, 1.50),
     "ENTRY_NET_EXPECTANCY_MIN": (-0.005, 0.01),
+    "ENTRY_BOTH_EV_NEG_NET_FLOOR": (-0.01, 0.01),
+    "ENTRY_GROSS_EV_MIN": (0.0, 0.02),
     "MAX_NOTIONAL_EXPOSURE": (1.0, 10.0),
     "HURST_RANDOM_DAMPEN": (0.20, 1.00),
     "CHOP_ENTRY_FLOOR_ADD": (0.0, 0.01),
@@ -165,6 +173,7 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "TOP_N_SYMBOLS": (2, 100),
     "ALPHA_DIRECTION_GATE_MIN_CONF": (0.45, 0.90),
     "ALPHA_DIRECTION_GATE_MIN_EDGE": (0.0, 0.20),
+    "ALPHA_DIRECTION_GATE_MIN_SIDE_PROB": (0.45, 0.95),
     "PRE_MC_MIN_EXPECTED_PNL": (-0.001, 0.01),
     "PRE_MC_MAX_LIQ_PROB": (0.01, 0.50),
     "EVENT_EXIT_MAX_P_SL": (0.50, 0.999),
@@ -188,6 +197,8 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "MC_HYBRID_N_PATHS": (512, 32768),
     "MC_HYBRID_HORIZON_STEPS": (15, 1200),
     "HYBRID_CASH_PENALTY": (0.0, 0.02),
+    "MTF_DL_ENTRY_MIN_SIDE_PROB": (0.45, 0.90),
+    "MTF_DL_ENTRY_MIN_WIN_PROB": (0.45, 0.90),
 }
 
 
