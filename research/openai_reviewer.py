@@ -357,16 +357,24 @@ def git_push_all(message: str = "auto: pre-OpenAI review snapshot") -> bool:
         return False
 
 
-def _apply_env_suggestions(suggestions: list[dict], *, min_confidence: float = 0.7) -> list[dict]:
+def _apply_env_suggestions(
+    suggestions: list[dict],
+    *,
+    min_confidence: float = 0.7,
+    source: str = "openai_review",
+    reason: str = "",
+) -> list[dict]:
     """Apply env variable changes from OpenAI suggestions (safe keys only)."""
     from research.auto_apply import (
+        _apply_runtime_updates,
         _clamp_value,
+        _format_env_value,
         _read_env_value,
-        _update_env_value,
         PARAM_BOUNDS,
     )
 
-    applied = []
+    updates: dict[str, str] = {}
+    source_map: dict[str, str] = {}
     for s in suggestions:
         if float(s.get("confidence", 0) or 0.0) < float(min_confidence):
             continue
@@ -381,13 +389,37 @@ def _apply_env_suggestions(suggestions: list[dict], *, min_confidence: float = 0
                 fval = float(val)
                 clamped = _clamp_value(key, fval)
                 old = _read_env_value(key)
-                if old is not None and abs(float(old) - clamped) < 1e-8:
+                new_str = _format_env_value(clamped, key)
+                if old is not None and str(old).strip() == str(new_str).strip():
                     continue
-                logger.info(f"[OPENAI_APPLY] {key}: {old} -> {clamped}")
-                _update_env_value(key, str(clamped))
-                applied.append({"key": key, "old": old, "new": str(clamped), "source": s.get("title")})
+                updates[str(key)] = str(new_str)
+                source_map[str(key)] = str(s.get("title") or source)
             except (ValueError, TypeError):
                 continue
+    if not updates:
+        return []
+
+    changed = _apply_runtime_updates(
+        updates,
+        source=str(source or "openai_review"),
+        reason=str(reason or "openai_suggestions"),
+        batch_id=f"openai-{int(time.time())}",
+    )
+    applied: list[dict] = []
+    for key, payload in (changed or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        old = payload.get("old")
+        new = payload.get("new")
+        logger.info(f"[OPENAI_APPLY] {key}: {old} -> {new}")
+        applied.append(
+            {
+                "key": str(key),
+                "old": old,
+                "new": new,
+                "source": source_map.get(str(key), str(source)),
+            }
+        )
     return applied
 
 
@@ -485,7 +517,12 @@ def apply_latest_review_suggestions(
 
     backup_env()
     min_conf = -1.0 if allow_low_confidence else 0.7
-    applied = _apply_env_suggestions(selected, min_confidence=min_conf)
+    applied = _apply_env_suggestions(
+        selected,
+        min_confidence=min_conf,
+        source="openai_manual_apply",
+        reason=f"manual_selection:{selection}",
+    )
     if applied:
         keys = ", ".join(sorted({str(a.get("key") or "") for a in applied if a.get("key")}))
         git_push_all(f"auto: OpenAI manual apply ({len(applied)} params) [{keys}]")
@@ -560,7 +597,12 @@ def run_openai_review(
         from research.auto_apply import backup_env
 
         backup_env()
-        applied = _apply_env_suggestions(review["suggestions"], min_confidence=0.7)
+        applied = _apply_env_suggestions(
+            review["suggestions"],
+            min_confidence=0.7,
+            source="openai_auto_apply",
+            reason="run_openai_review:auto_apply_env",
+        )
         status["applied_env_changes"] = applied
         if applied:
             git_push_all(
