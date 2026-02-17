@@ -1,6 +1,6 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-18 00:14
+> Auto-generated: 2026-02-18 00:52
 > Baseline: 4638 trades, PnL=$-73.36, WR=36.5%, R:R=1.43
 
 ## Pipeline Stage Impact Summary
@@ -165,13 +165,13 @@
 **Best Finding:** entry_filter: PnL +$91.70
 - Improvement: $+91.70
 - Confidence: 69%
-- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.2, "min_ev": 0.02}`
+- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.3, "min_ev": 0.02}`
 
 ```
 [ENTRY_FILTER] 파라미터 변경 제안:
   min_confidence = 0.55
   min_dir_conf = 0.65
-  min_entry_quality = 0.2
+  min_entry_quality = 0.3
   min_ev = 0.02
 예상 효과: PnL $+91.70, WR +9.2%, R:R +0.29
 신뢰도: 68.5%

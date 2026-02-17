@@ -113,6 +113,36 @@ def _file_env_float(name: str, default: float = 0.0) -> float:
     return float(default)
 
 
+def _file_env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(round(float(_file_env_float(name, float(default)))))
+    except Exception:
+        return int(default)
+
+
+def _runtime_interval_sec(default_sec: int, *, deep_mode: bool = False) -> int:
+    """
+    Resolve cycle interval from env (hot-reload friendly).
+
+    Priority:
+    - RESEARCH_CF_INTERVAL_SEC_DEEP (when deep_mode)
+    - RESEARCH_CF_INTERVAL_SEC
+    - CF_INTERVAL_SEC
+    - CLI/default
+    """
+    try:
+        if deep_mode:
+            v = _file_env_int("RESEARCH_CF_INTERVAL_SEC_DEEP", 0)
+            if v > 0:
+                return int(max(60, min(v, 24 * 3600)))
+        v = _file_env_int("RESEARCH_CF_INTERVAL_SEC", 0)
+        if v <= 0:
+            v = _file_env_int("CF_INTERVAL_SEC", int(default_sec))
+        return int(max(60, min(int(v), 24 * 3600)))
+    except Exception:
+        return int(max(60, int(default_sec)))
+
+
 def _load_cycle_history() -> list[dict]:
     p = Path(RESEARCH_CYCLES_JSON)
     if not p.exists():
@@ -468,6 +498,9 @@ def _build_cycle_report(
         "completed_ts": float(result.get("last_update_ts") or time.time()),
         "status": str(result.get("status") or "unknown"),
         "stage_filter": stage_filter,
+        "research_mode": str(result.get("research_mode") or "normal"),
+        "ensemble_runs": int(result.get("ensemble_runs") or 1),
+        "cycle_max_combos": int(result.get("cycle_max_combos") or 0),
         "elapsed_sec": float(result.get("elapsed_sec") or 0.0),
         "n_trades": int(result.get("n_trades") or 0),
         "n_findings": int(result.get("n_findings") or 0),
@@ -526,7 +559,8 @@ def run_cf_cycle(
         }
 
     # ── Check for new trades to avoid repeated analysis ──
-    always_run_cf = _env_bool("ALWAYS_RUN_CF", _file_env_bool("ALWAYS_RUN_CF", False))
+    # Prefer bybit.env for live tuning (file-first), then process env fallback.
+    always_run_cf = _file_env_bool("ALWAYS_RUN_CF", _env_bool("ALWAYS_RUN_CF", False))
     try:
         idle_force_sec = float(
             os.environ.get(
@@ -607,28 +641,74 @@ def run_cf_cycle(
             return {"status": "unknown_stage"}
 
     sample_seed = (int(cycle_started_ts * 1000) ^ (int(cycle_index) * 7919)) & 0xFFFFFFFF
-    engine = CFEngine(trades, simulators, sample_seed=sample_seed)
-    sweep_progress = {}
+    deep_enabled = _file_env_bool("CF_DEEP_SWEEP_ENABLED", _env_bool("CF_DEEP_SWEEP_ENABLED", True))
+    deep_every = max(1, _file_env_int("CF_DEEP_SWEEP_EVERY_CYCLES", 6))
+    deep_new_trades = max(MIN_NEW_TRADES_FOR_REANALYSIS, _file_env_int("CF_DEEP_MIN_NEW_TRADES", MIN_NEW_TRADES_FOR_REANALYSIS * 2))
+    deep_mode = bool(
+        deep_enabled and (
+            (cycle_index % deep_every == 0)
+            or bool(hash_changed)
+            or int(new_trade_count) >= int(deep_new_trades)
+        )
+    )
+    deep_max_combos = max(int(max_combos), _file_env_int("CF_DEEP_MAX_COMBOS", int(max_combos * 2)))
+    cycle_max_combos = int(deep_max_combos if deep_mode else int(max_combos))
+    normal_runs = max(1, _file_env_int("CF_ENSEMBLE_RUNS", 1))
+    deep_runs = max(normal_runs, _file_env_int("CF_DEEP_ENSEMBLE_RUNS", 2))
+    ensemble_runs = int(max(1, min(4, (deep_runs if deep_mode else normal_runs))))
 
-    for sim in simulators:
-        sweep_progress[sim.stage_name] = {"done": 0, "total": 1, "status": "running"}
-        try:
-            _update_dashboard({
-                "sweep_progress": sweep_progress,
-                "running": True,
-                "stage_current": sim.stage_name,
-                "current_cycle_index": cycle_index,
-                "completed_cycles_total": max(0, cycle_index - 1),
-                "cycle_started_ts": cycle_started_ts,
-            })
-            engine._run_stage(sim, max_combos)
-            sweep_progress[sim.stage_name] = {"done": 1, "total": 1, "status": "done"}
-        except Exception as e:
-            logger.error(f"Stage {sim.stage_name} failed: {e}")
-            sweep_progress[sim.stage_name] = {"done": 0, "total": 1, "status": "error"}
+    sweep_progress = {
+        sim.stage_name: {"done": 0, "total": ensemble_runs, "status": "pending"}
+        for sim in simulators
+    }
+    engines: list[CFEngine] = []
+    for run_idx in range(ensemble_runs):
+        run_seed = int((int(sample_seed) + (run_idx + 1) * 104729) % (2**32 - 1))
+        if run_seed <= 0:
+            run_seed = int(sample_seed or 1)
+        engine_i = CFEngine(trades, simulators, sample_seed=run_seed)
+        for sim in simulators:
+            try:
+                sweep_progress[sim.stage_name]["status"] = "running"
+                _update_dashboard({
+                    "sweep_progress": sweep_progress,
+                    "running": True,
+                    "stage_current": f"{sim.stage_name} [run {run_idx + 1}/{ensemble_runs}]",
+                    "current_cycle_index": cycle_index,
+                    "completed_cycles_total": max(0, cycle_index - 1),
+                    "cycle_started_ts": cycle_started_ts,
+                    "research_mode": ("deep" if deep_mode else "normal"),
+                    "ensemble_runs": ensemble_runs,
+                    "cycle_max_combos": cycle_max_combos,
+                })
+                engine_i._run_stage(sim, cycle_max_combos)
+                sweep_progress[sim.stage_name]["done"] = int(sweep_progress[sim.stage_name].get("done", 0)) + 1
+                if int(sweep_progress[sim.stage_name].get("done", 0)) >= ensemble_runs:
+                    sweep_progress[sim.stage_name]["status"] = "done"
+            except Exception as e:
+                logger.error(f"Stage {sim.stage_name} failed: {e}")
+                sweep_progress[sim.stage_name]["status"] = "error"
+        engines.append(engine_i)
 
     elapsed = time.perf_counter() - t0
-    findings = engine.get_top_findings(20)
+    primary_engine = engines[0] if engines else CFEngine(trades, simulators, sample_seed=sample_seed)
+
+    merged_findings: dict[tuple[str, str], Any] = {}
+    total_results = 0
+    for eng in engines:
+        total_results += int(len(getattr(eng, "results", [])))
+        for f in eng.findings:
+            try:
+                key = (
+                    str(f.stage or ""),
+                    json.dumps(f.param_changes or {}, sort_keys=True, ensure_ascii=False),
+                )
+            except Exception:
+                key = (str(f.stage or ""), str(f.finding_id or ""))
+            prev = merged_findings.get(key)
+            if (prev is None) or (float(f.improvement_pct or 0.0) > float(prev.improvement_pct or 0.0)):
+                merged_findings[key] = f
+    findings = sorted(merged_findings.values(), key=lambda x: float(x.improvement_pct or 0.0), reverse=True)[:20]
     apply_history_snapshot = []
     try:
         from research.auto_apply import get_apply_history
@@ -649,15 +729,19 @@ def run_cf_cycle(
         "status": "ok",
         "elapsed_sec": round(elapsed, 1),
         "running": False,
+        "research_mode": ("deep" if deep_mode else "normal"),
+        "deep_mode": bool(deep_mode),
+        "cycle_max_combos": int(cycle_max_combos),
+        "ensemble_runs": int(ensemble_runs),
         "always_run_cf": always_run_cf,
         "forced_by_idle": forced_by_idle,
         "idle_elapsed_sec": float(idle_elapsed_sec),
         "idle_force_sec": float(idle_force_sec),
         "sample_seed": int(sample_seed),
-        "baseline": engine.baseline,
-        "baseline_by_regime": engine.baseline_by_regime,
+        "baseline": primary_engine.baseline,
+        "baseline_by_regime": primary_engine.baseline_by_regime,
         "n_trades": len(trades),
-        "n_results": len(engine.results),
+        "n_results": int(total_results),
         "n_findings": len(findings),
         "findings": [asdict(f) for f in findings],
         "top_10": [asdict(f) for f in findings[:10]],
@@ -681,8 +765,8 @@ def run_cf_cycle(
     try:
         generate_findings_markdown(
             [asdict(f) for f in findings],
-            engine.baseline,
-            engine.baseline_by_regime,
+            primary_engine.baseline,
+            primary_engine.baseline_by_regime,
             FINDINGS_OUTPUT,
         )
     except Exception as e:
@@ -699,7 +783,8 @@ def run_cf_cycle(
 
     logger.info(
         f"CF cycle complete: {len(findings)} findings in {elapsed:.1f}s "
-        f"(trades={len(trades)}, results={len(engine.results)})"
+        f"(mode={'deep' if deep_mode else 'normal'}, runs={ensemble_runs}, "
+        f"trades={len(trades)}, results={total_results})"
     )
 
     return result
@@ -800,7 +885,8 @@ def main():
     logger.info("  Codex Quant Research Engine v2 — Auto-Optimize")
     logger.info(f"  DB: {args.db}")
     logger.info(f"  Stage: {args.stage or 'ALL ({} simulators)'.format(len(ALL_SIMULATORS))}")
-    logger.info(f"  CF interval: {args.interval}s ({args.interval//60}min)")
+    boot_interval = _runtime_interval_sec(args.interval, deep_mode=False)
+    logger.info(f"  CF interval: {boot_interval}s ({boot_interval//60}min)")
     logger.info(f"  Auto-apply: {'ON (qualifying findings all apply, 30min monitor each, rollback on -$10)' if not args.no_auto_apply else 'OFF'}")
     logger.info(f"  Gemini review: {'ON' if not args.no_gemini else 'OFF'} (every {args.gemini_interval//60}min)")
     logger.info(f"  Dashboard: {'OFF' if args.no_dashboard else f'http://0.0.0.0:{args.port}'}")
@@ -903,8 +989,12 @@ def main():
             if args.once:
                 break
 
-            logger.info(f"Next CF cycle in {args.interval}s...")
-            time.sleep(args.interval)
+            next_interval = _runtime_interval_sec(args.interval, deep_mode=bool(result.get("deep_mode")))
+            logger.info(
+                f"Next CF cycle in {next_interval}s... "
+                f"(mode={result.get('research_mode', 'normal')}, combos={result.get('cycle_max_combos')}, runs={result.get('ensemble_runs')})"
+            )
+            time.sleep(next_interval)
 
     except KeyboardInterrupt:
         logger.info("Research engine stopped by user")

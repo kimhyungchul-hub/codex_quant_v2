@@ -225,7 +225,10 @@ function render(data) {
   const done = Number(data.completed_cycles_total ?? data.cycle_count ?? 0);
   const current = Number(data.current_cycle_index ?? (data.running ? done + 1 : done));
   const stageNow = data.stage_current || '-';
-  ci.textContent = `done ${done} | current #${current} ${data.running ? `⚡ ${stageNow}` : '⏸ idle'} | ${new Date((data.last_update_ts||0)*1000).toLocaleTimeString()}`;
+  const modeNow = String(data.research_mode || 'normal');
+  const runsNow = Number(data.ensemble_runs || 1);
+  const combosNow = Number(data.cycle_max_combos || 0);
+  ci.textContent = `done ${done} | current #${current} ${data.running ? `⚡ ${stageNow}` : '⏸ idle'} | mode=${modeNow} runs=${runsNow} combos=${combosNow} | ${new Date((data.last_update_ts||0)*1000).toLocaleTimeString()}`;
 
   // Baseline
   const bl = data.baseline || {};
@@ -547,12 +550,14 @@ function render(data) {
       const avgCls = Number.isFinite(avgEff) ? (avgEff >= 0 ? 'good' : 'bad') : 'info';
       return `
         <div class="finding" style="margin-bottom:10px">
-          <div class="title">#${Number(c.cycle_index)||0} | status=${esc(String(c.status||'-'))} | elapsed=${Number(c.elapsed_sec||0).toFixed(1)}s</div>
+          <div class="title">#${Number(c.cycle_index)||0} | status=${esc(String(c.status||'-'))} | mode=${esc(String(c.research_mode||'normal'))} | elapsed=${Number(c.elapsed_sec||0).toFixed(1)}s</div>
           <div style="margin-bottom:6px">
             <span class="metric info">findings=${Number(c.n_findings||0)}</span>
             <span class="metric good">applied=${Number(c.applied_n||0)}</span>
             <span class="metric neutral">monitoring=${Number(c.monitoring_n||0)}</span>
             <span class="metric bad">rolled_back=${Number(c.rolled_back_n||0)}</span>
+            <span class="metric info">runs=${Number(c.ensemble_runs||1)}</span>
+            <span class="metric info">combos=${Number(c.cycle_max_combos||0)}</span>
             <span class="metric ${avgCls}">avg ΔEq=${avgTxt}</span>
             <span class="metric info">started=${new Date((Number(c.started_ts)||0)*1000).toLocaleString()}</span>
           </div>

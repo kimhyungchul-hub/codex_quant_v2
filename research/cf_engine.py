@@ -20,9 +20,11 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import time
+import ast
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -116,6 +118,63 @@ def _norm_csv_tokens(v: Any) -> str:
         return ""
     # preserve set semantics for blocklist/hourlist style params
     return ",".join(sorted(set(toks)))
+
+
+def _parse_quantiles(raw: Any, default: list[float], *, lo: float = 0.01, hi: float = 0.99) -> list[float]:
+    out: list[float] = []
+    txt = str(raw or "")
+    for tok in txt.replace(";", ",").split(","):
+        s = str(tok or "").strip()
+        if not s:
+            continue
+        try:
+            q = float(s)
+        except Exception:
+            continue
+        q = max(float(lo), min(float(hi), float(q)))
+        if q not in out:
+            out.append(q)
+    if not out:
+        out = [float(x) for x in list(default or [])]
+    return out
+
+
+def _quantile_candidates(
+    values: list[float],
+    quantiles: list[float],
+    *,
+    lo: float | None = None,
+    hi: float | None = None,
+    as_int: bool = False,
+    relax_mult: float = 1.0,
+) -> list[Any]:
+    if not values:
+        return []
+    arr = np.asarray([float(x) for x in values if math.isfinite(float(x))], dtype=np.float64)
+    if arr.size <= 0:
+        return []
+    out: list[Any] = []
+    for q in quantiles:
+        try:
+            v = float(np.quantile(arr, float(q)))
+        except Exception:
+            continue
+        v *= float(relax_mult)
+        if lo is not None:
+            v = max(float(lo), v)
+        if hi is not None:
+            v = min(float(hi), v)
+        val: Any = int(round(v)) if as_int else float(v)
+        if val not in out:
+            out.append(val)
+    return out
+
+
+def _robust_median(vals: list[float], default: float = 0.0) -> float:
+    arr = np.asarray([float(x) for x in vals if math.isfinite(float(x))], dtype=np.float64)
+    if arr.size <= 0:
+        return float(default)
+    return float(np.median(arr))
 
 
 # CF param -> runtime env key candidates (priority order).
@@ -1135,10 +1194,12 @@ class MTFEntryGateSimulator(StageSimulator):
 
     def __init__(self):
         self.scores_path = Path(os.environ.get("CF_MTF_DL_SCORES_PATH", str(DEFAULT_DL_SCORES)))
-        self._score_map: dict[str, float] = {}
+        self._score_map_side: dict[str, float] = {}
+        self._score_map_win: dict[str, float] = {}
 
     def _load_score_map(self) -> None:
-        self._score_map = {}
+        self._score_map_side = {}
+        self._score_map_win = {}
         if not self.scores_path.exists():
             return
         try:
@@ -1154,34 +1215,551 @@ class MTFEntryGateSimulator(StageSimulator):
             if not uid:
                 continue
             try:
-                p = float(r.get("mtf_dl_prob"))
+                p_side = float(r.get("mtf_dl_prob"))
             except Exception:
                 continue
-            if not math.isfinite(p):
+            if not math.isfinite(p_side):
                 continue
-            self._score_map[uid] = p
+            p_win = r.get("mtf_dl_prob_win")
+            try:
+                p_win_f = float(p_win) if p_win is not None else float(p_side)
+            except Exception:
+                p_win_f = float(p_side)
+            if not math.isfinite(p_win_f):
+                p_win_f = float(p_side)
+            self._score_map_side[uid] = float(p_side)
+            self._score_map_win[uid] = float(p_win_f)
 
     def get_param_grid(self) -> dict[str, list]:
         self._load_score_map()
+        side_vals = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62]
+        win_vals = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
+        if self._score_map_side:
+            qs = _parse_quantiles(
+                os.environ.get("CF_MTF_ENTRY_RELAX_QUANTILES", "0.20,0.30,0.40,0.50,0.60,0.70,0.80"),
+                [0.30, 0.50, 0.70],
+                lo=0.05,
+                hi=0.95,
+            )
+            side_src = list(self._score_map_side.values())
+            win_src = list(self._score_map_win.values())
+            side_dyn = _quantile_candidates(side_src, qs, lo=0.45, hi=0.90, relax_mult=0.995)
+            win_dyn = _quantile_candidates(win_src, qs, lo=0.45, hi=0.90, relax_mult=0.995)
+            side_vals = sorted(set(side_vals + [round(float(v), 4) for v in side_dyn]))
+            win_vals = sorted(set(win_vals + [round(float(v), 4) for v in win_dyn]))
         return {
-            "mtf_dl_entry_min_side_prob": [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62],
-            "mtf_dl_entry_min_win_prob": [0.50, 0.52, 0.54, 0.56, 0.58, 0.60],
+            "mtf_dl_entry_min_side_prob": side_vals,
+            "mtf_dl_entry_min_win_prob": win_vals,
         }
 
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
-        if not self._score_map:
+        if not self._score_map_side:
             return list(trades)
         min_side = float(params.get("mtf_dl_entry_min_side_prob", 0.58))
         min_win = float(params.get("mtf_dl_entry_min_win_prob", 0.52))
         out: list[Trade] = []
         for t in trades:
-            p = self._score_map.get(str(t.trade_uid or "").strip())
+            uid = str(t.trade_uid or "").strip()
+            p_side = self._score_map_side.get(uid)
+            p_win = self._score_map_win.get(uid)
             # keep unknown-score trades to avoid coverage-bias over-blocking
-            if p is None:
+            if p_side is None:
                 out.append(t)
                 continue
-            if float(p) >= min_side and float(p) >= min_win:
+            p_win_f = float(p_side if p_win is None else p_win)
+            if float(p_side) >= min_side and p_win_f >= min_win:
                 out.append(t)
+        return out
+
+
+class VirtualEntryExpansionSimulator(StageSimulator):
+    """
+    Simulate virtual fills for historically blocked candidates.
+
+    Candidate pool is built from `[FILTER] ... blocked: [...]` log lines and
+    symbol-level realized expectancy templates. This stage is intentionally
+    conservative and applies a discount to synthetic PnL.
+    """
+
+    stage_name = "virtual_entry_expansion"
+    description = "미진입 후보 가상체결: top_n/dir_gate/net_ev/mtf 완화 시 신규 진입 효과"
+    max_combos_hint = 160
+
+    def __init__(self):
+        self.log_path = Path(os.environ.get("CF_VIRTUAL_ENTRY_LOG_PATH", str(PROJECT_ROOT / "state" / "codex_engine.log")))
+        self.scores_path = Path(os.environ.get("CF_MTF_DL_SCORES_PATH", str(DEFAULT_DL_SCORES)))
+        self._context_trades: list[Trade] = []
+        self._virtual_candidates: list[Trade] = []
+        self._symbol_side_prob: dict[str, float] = {}
+        self._symbol_win_prob: dict[str, float] = {}
+
+    def bind_context(self, trades: list[Trade]) -> None:
+        self._context_trades = list(trades or [])
+        self._virtual_candidates = []
+        self._symbol_side_prob = {}
+        self._symbol_win_prob = {}
+
+    @staticmethod
+    def _compact(values: list[Any], max_n: int = 4) -> list[Any]:
+        vals = sorted(set(values))
+        if len(vals) <= max_n:
+            return vals
+        idxs = [0, len(vals) // 3, (2 * len(vals)) // 3, len(vals) - 1]
+        out: list[Any] = []
+        for i in idxs:
+            v = vals[int(max(0, min(len(vals) - 1, i)))]
+            if v not in out:
+                out.append(v)
+        return out[:max_n]
+
+    @staticmethod
+    def _edge_proxy(t: Trade) -> float:
+        raw = abs(float(t.mu_alpha or 0.0))
+        if raw > 1.0:
+            raw = raw / 100.0
+        return float(max(0.0, min(0.20, raw)))
+
+    def _load_symbol_mtf_probs(self) -> None:
+        if not self.scores_path.exists():
+            return
+        try:
+            rows = json.loads(self.scores_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        side_buf: dict[str, list[float]] = {}
+        win_buf: dict[str, list[float]] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sym = str(r.get("symbol") or "").strip().upper()
+            if not sym:
+                continue
+            try:
+                p_side = float(r.get("mtf_dl_prob"))
+            except Exception:
+                continue
+            if not math.isfinite(p_side):
+                continue
+            p_win_raw = r.get("mtf_dl_prob_win")
+            try:
+                p_win = float(p_win_raw) if p_win_raw is not None else p_side
+            except Exception:
+                p_win = p_side
+            if not math.isfinite(p_win):
+                p_win = p_side
+            side_buf.setdefault(sym, []).append(float(p_side))
+            win_buf.setdefault(sym, []).append(float(p_win))
+        self._symbol_side_prob = {k: _robust_median(v, 0.5) for k, v in side_buf.items() if v}
+        self._symbol_win_prob = {k: _robust_median(v, 0.5) for k, v in win_buf.items() if v}
+
+    def _blocked_candidate_counts(self) -> dict[tuple[str, tuple[str, ...]], int]:
+        out: dict[tuple[str, tuple[str, ...]], int] = {}
+        if not self.log_path.exists():
+            return out
+        try:
+            lines = self.log_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            return out
+        tail_n = max(800, _env_int("CF_VIRTUAL_ENTRY_LOG_LINES", 12000))
+        lines = lines[-tail_n:]
+        pat = re.compile(r"\[FILTER\]\s+([^\s]+)\s+blocked:\s+(\[[^\]]*\])")
+        for ln in lines:
+            m = pat.search(str(ln))
+            if not m:
+                continue
+            sym = str(m.group(1) or "").strip().upper()
+            if not sym:
+                continue
+            try:
+                reasons_raw = ast.literal_eval(str(m.group(2) or "[]"))
+                reasons = tuple(sorted(set(str(x).strip().lower() for x in reasons_raw if str(x).strip())))
+            except Exception:
+                reasons = tuple()
+            if not reasons:
+                continue
+            key = (sym, reasons)
+            out[key] = int(out.get(key, 0) + 1)
+        return out
+
+    @staticmethod
+    def _expectancy_from_pnls(pnls: list[float]) -> float:
+        arr = [float(x) for x in pnls if math.isfinite(float(x))]
+        if not arr:
+            return 0.0
+        wins = [x for x in arr if x > 0]
+        losses = [x for x in arr if x <= 0]
+        wr = float(len(wins) / len(arr))
+        avg_win = float(np.mean(wins)) if wins else 0.0
+        avg_loss = float(abs(np.mean(losses))) if losses else 0.0
+        exp = wr * avg_win - (1.0 - wr) * avg_loss
+        if not math.isfinite(exp):
+            return 0.0
+        return float(exp)
+
+    def _symbol_templates(self) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        by_sym: dict[str, list[Trade]] = {}
+        for t in self._context_trades:
+            s = str(t.symbol or "").strip().upper()
+            if not s:
+                continue
+            by_sym.setdefault(s, []).append(t)
+        all_trades = list(self._context_trades)
+        global_pnls = [float(t.realized_pnl or 0.0) for t in all_trades]
+        global_tpl = {
+            "side": "LONG",
+            "regime": "chop",
+            "notional": max(20.0, _robust_median([float(t.notional or 0.0) for t in all_trades], 50.0)),
+            "leverage": max(1.0, _robust_median([float(t.leverage or 1.0) for t in all_trades], 3.0)),
+            "entry_ev": _robust_median([float(t.entry_ev or 0.0) for t in all_trades], 0.0),
+            "dir_conf": max(0.45, min(0.95, _robust_median([float(t.dir_conf or 0.5) for t in all_trades], 0.55))),
+            "mu_alpha": _robust_median([abs(float(t.mu_alpha or 0.0)) for t in all_trades], 0.06),
+            "vpin": max(0.0, min(1.0, _robust_median([float(t.vpin or 0.5) for t in all_trades], 0.5))),
+            "hurst": max(0.0, min(1.0, _robust_median([float(t.hurst or 0.5) for t in all_trades], 0.5))),
+            "sigma": max(0.01, _robust_median([float(t.sigma or 0.5) for t in all_trades], 0.5)),
+            "entry_quality": _robust_median([float(t.entry_quality or 0.5) for t in all_trades], 0.5),
+            "lev_signal": _robust_median([float(t.leverage_signal or 0.0) for t in all_trades], 0.0),
+            "hold_sec": max(30.0, _robust_median([float(t.hold_duration_sec or 120.0) for t in all_trades], 180.0)),
+            "expectancy_pnl": self._expectancy_from_pnls(global_pnls),
+        }
+
+        out: dict[str, dict[str, Any]] = {}
+        for sym, tlist in by_sym.items():
+            pnls = [float(t.realized_pnl or 0.0) for t in tlist]
+            n_long = sum(1 for t in tlist if str(t.side or "").upper() == "LONG")
+            n_short = max(0, len(tlist) - n_long)
+            reg_counts: dict[str, int] = {}
+            for t in tlist:
+                r = str(t.regime or "chop").strip().lower()
+                reg_counts[r] = int(reg_counts.get(r, 0) + 1)
+            best_regime = max(reg_counts.items(), key=lambda kv: kv[1])[0] if reg_counts else "chop"
+            out[sym] = {
+                "side": "LONG" if n_long >= n_short else "SHORT",
+                "regime": best_regime,
+                "notional": max(10.0, _robust_median([float(t.notional or 0.0) for t in tlist], global_tpl["notional"])),
+                "leverage": max(1.0, _robust_median([float(t.leverage or 1.0) for t in tlist], global_tpl["leverage"])),
+                "entry_ev": _robust_median([float(t.entry_ev or 0.0) for t in tlist], global_tpl["entry_ev"]),
+                "dir_conf": max(0.45, min(0.95, _robust_median([float(t.dir_conf or 0.5) for t in tlist], global_tpl["dir_conf"]))),
+                "mu_alpha": _robust_median([abs(float(t.mu_alpha or 0.0)) for t in tlist], global_tpl["mu_alpha"]),
+                "vpin": max(0.0, min(1.0, _robust_median([float(t.vpin or 0.5) for t in tlist], global_tpl["vpin"]))),
+                "hurst": max(0.0, min(1.0, _robust_median([float(t.hurst or 0.5) for t in tlist], global_tpl["hurst"]))),
+                "sigma": max(0.01, _robust_median([float(t.sigma or 0.5) for t in tlist], global_tpl["sigma"])),
+                "entry_quality": _robust_median([float(t.entry_quality or 0.5) for t in tlist], global_tpl["entry_quality"]),
+                "lev_signal": _robust_median([float(t.leverage_signal or 0.0) for t in tlist], global_tpl["lev_signal"]),
+                "hold_sec": max(30.0, _robust_median([float(t.hold_duration_sec or 120.0) for t in tlist], global_tpl["hold_sec"])),
+                "expectancy_pnl": self._expectancy_from_pnls(pnls),
+            }
+        return out, global_tpl
+
+    @staticmethod
+    def _reason_penalty(reasons: tuple[str, ...]) -> float:
+        penalty_map = {
+            "top_n": 0.98,
+            "dir_gate": 0.85,
+            "regime_dir_gate": 0.82,
+            "net_expectancy": 0.78,
+            "both_ev_neg": 0.70,
+            "gross_ev": 0.74,
+            "mtf_dl_entry": 0.88,
+            "mu_align_gate": 0.90,
+            "hybrid": 0.92,
+            "min_notional": 0.95,
+            "chop_vpin": 0.88,
+            "chop_vol": 0.90,
+        }
+        p = 1.0
+        for r in reasons:
+            p *= float(penalty_map.get(str(r), 0.96))
+        return float(max(0.20, min(1.05, p)))
+
+    def _build_virtual_candidates(self) -> list[Trade]:
+        if not self._context_trades:
+            return []
+        self._load_symbol_mtf_probs()
+        blocked = self._blocked_candidate_counts()
+        if not blocked:
+            return []
+        templates, gtpl = self._symbol_templates()
+        max_total = max(40, _env_int("CF_VIRTUAL_ENTRY_MAX_CANDIDATES", 520))
+        max_per_symbol = max(4, _env_int("CF_VIRTUAL_ENTRY_MAX_PER_SYMBOL", 28))
+        pnl_discount = max(0.30, min(1.00, _env_float("CF_VIRTUAL_ENTRY_PNL_DISCOUNT", 0.68)))
+        base_ts = int(max(int(t.timestamp_ms or 0) for t in self._context_trades) + 60_000)
+        created = 0
+        out: list[Trade] = []
+
+        ranked = sorted(blocked.items(), key=lambda kv: kv[1], reverse=True)
+        per_sym_cnt: dict[str, int] = {}
+        for (sym, reasons), freq in ranked:
+            if created >= max_total:
+                break
+            tpl = templates.get(sym, gtpl)
+            n_add = max(1, int(round(math.sqrt(float(max(1, freq))))))
+            n_add = min(n_add, max_per_symbol - int(per_sym_cnt.get(sym, 0)))
+            if n_add <= 0:
+                continue
+            penalty = self._reason_penalty(reasons)
+            top_only = (len(reasons) == 1 and reasons[0] == "top_n")
+            for j in range(n_add):
+                if created >= max_total:
+                    break
+                exp_pnl = float(tpl.get("expectancy_pnl", 0.0))
+                if top_only:
+                    exp_pnl *= 1.05
+                est_pnl = float(exp_pnl * penalty * pnl_discount)
+                if not math.isfinite(est_pnl):
+                    est_pnl = 0.0
+                entry_ev = float(tpl.get("entry_ev", 0.0)) * max(0.35, penalty)
+                if "net_expectancy" in reasons:
+                    entry_ev *= 0.85
+                if "both_ev_neg" in reasons:
+                    entry_ev -= 0.0002
+                dir_conf = float(tpl.get("dir_conf", 0.55))
+                if "dir_gate" in reasons:
+                    dir_conf -= 0.03
+                if "regime_dir_gate" in reasons:
+                    dir_conf -= 0.02
+                dir_conf = max(0.45, min(0.95, dir_conf))
+                notional = max(10.0, float(tpl.get("notional", 50.0)))
+                lev = max(1.0, float(tpl.get("leverage", 3.0)))
+                margin = max(1e-6, notional / lev)
+                roe = float(est_pnl / margin)
+                mu_abs = max(0.0, float(tpl.get("mu_alpha", 0.06)))
+                if "dir_gate" in reasons:
+                    mu_abs *= 0.85
+                mu_val = float(mu_abs if str(tpl.get("side", "LONG")).upper() == "LONG" else -mu_abs)
+                side_prob = self._symbol_side_prob.get(sym)
+                win_prob = self._symbol_win_prob.get(sym)
+                ts = int(base_ts + created * 30_000)
+                uid = f"virt_{sym}_{created}_{abs(hash(reasons)) % 10000:04d}"
+                t = Trade(
+                    trade_uid=uid,
+                    symbol=sym,
+                    side=str(tpl.get("side", "LONG")).upper(),
+                    entry_price=1.0,
+                    exit_price=1.0,
+                    qty=1.0,
+                    notional=notional,
+                    leverage=lev,
+                    entry_ev=float(entry_ev),
+                    entry_confidence=float(dir_conf),
+                    realized_pnl=float(est_pnl),
+                    roe=float(roe),
+                    hold_duration_sec=max(30.0, float(tpl.get("hold_sec", 180.0))),
+                    regime=str(tpl.get("regime", "chop")),
+                    exit_reason="virtual_entry_cf",
+                    mu_alpha=mu_val,
+                    dir_conf=float(dir_conf),
+                    vpin=float(tpl.get("vpin", 0.5)),
+                    hurst=float(tpl.get("hurst", 0.5)),
+                    sigma=float(tpl.get("sigma", 0.5)),
+                    entry_quality=float(tpl.get("entry_quality", 0.5)),
+                    leverage_signal=float(tpl.get("lev_signal", 0.0)),
+                    raw={
+                        "virtual_entry": True,
+                        "blocked_reasons": list(reasons),
+                        "reason_penalty": float(penalty),
+                        "mtf_side_prob": (None if side_prob is None else float(side_prob)),
+                        "mtf_win_prob": (None if win_prob is None else float(win_prob)),
+                    },
+                    timestamp_ms=ts,
+                )
+                out.append(t)
+                created += 1
+                per_sym_cnt[sym] = int(per_sym_cnt.get(sym, 0) + 1)
+        if out:
+            logger.info("[VIRTUAL_ENTRY] built candidates=%s (symbols=%s)", len(out), len(per_sym_cnt))
+        return out
+
+    def _prepare_virtual_candidates(self) -> None:
+        if self._virtual_candidates:
+            return
+        self._virtual_candidates = self._build_virtual_candidates()
+
+    @staticmethod
+    def _top_n_filter(cands: list[Trade], top_n: int, window_ms: int = 10 * 60 * 1000) -> list[Trade]:
+        if top_n <= 0 or not cands:
+            return list(cands)
+        sorted_trades = sorted(cands, key=lambda t: int(t.timestamp_ms or 0))
+        out: list[Trade] = []
+        i = 0
+        n = len(sorted_trades)
+        while i < n:
+            t0 = int(sorted_trades[i].timestamp_ms or 0)
+            j = i
+            bucket: list[Trade] = []
+            while j < n and int(sorted_trades[j].timestamp_ms or 0) <= t0 + int(window_ms):
+                bucket.append(sorted_trades[j])
+                j += 1
+            bucket_sorted = sorted(
+                bucket,
+                key=lambda t: (float(t.entry_ev or 0.0), float(t.dir_conf or 0.0)),
+                reverse=True,
+            )
+            out.extend(bucket_sorted[: int(top_n)])
+            i = j
+        return out
+
+    def get_param_grid(self) -> dict[str, list]:
+        self._prepare_virtual_candidates()
+        candidates = list(self._virtual_candidates)
+        if not candidates:
+            return {
+                "top_n_symbols": [int(_env_float("TOP_N_SYMBOLS", 12))],
+                "dir_gate_min_conf": [float(_env_float("ALPHA_DIRECTION_GATE_MIN_CONF", 0.60))],
+                "dir_gate_min_edge": [float(_env_float("ALPHA_DIRECTION_GATE_MIN_EDGE", 0.06))],
+                "dir_gate_min_side_prob": [float(_env_float("ALPHA_DIRECTION_GATE_MIN_SIDE_PROB", 0.60))],
+                "net_expectancy_min": [float(_env_float("ENTRY_NET_EXPECTANCY_MIN", -0.0002))],
+                "both_ev_neg_net_floor": [float(_env_float("ENTRY_BOTH_EV_NEG_NET_FLOOR", -0.0003))],
+                "gross_ev_min": [float(_env_float("ENTRY_GROSS_EV_MIN", 0.0005))],
+                "mtf_dl_entry_min_side_prob": [float(_env_float("MTF_DL_ENTRY_MIN_SIDE_PROB", 0.58))],
+                "mtf_dl_entry_min_win_prob": [float(_env_float("MTF_DL_ENTRY_MIN_WIN_PROB", 0.52))],
+            }
+
+        base_top = int(_env_float("TOP_N_SYMBOLS", 12))
+        counts: list[float] = []
+        sorted_cands = sorted(candidates, key=lambda t: int(t.timestamp_ms or 0))
+        i = 0
+        while i < len(sorted_cands):
+            t0 = int(sorted_cands[i].timestamp_ms or 0)
+            j = i
+            while j < len(sorted_cands) and int(sorted_cands[j].timestamp_ms or 0) <= t0 + 10 * 60 * 1000:
+                j += 1
+            counts.append(float(max(1, j - i)))
+            i = j
+        top_qs = _parse_quantiles(
+            os.environ.get("CF_VIRTUAL_TOP_N_QUANTILES", "0.55,0.70,0.85"),
+            [0.60, 0.80],
+            lo=0.10,
+            hi=0.99,
+        )
+        top_dyn = _quantile_candidates(
+            counts,
+            top_qs,
+            lo=2.0,
+            hi=100.0,
+            as_int=True,
+            relax_mult=max(1.0, min(1.8, _env_float("CF_VIRTUAL_TOP_N_RELAX_MULT", 1.20))),
+        )
+        top_vals = self._compact(
+            [int(base_top), int(max(2, round(base_top * 1.20))), int(max(2, round(base_top * 1.40)))] + [int(x) for x in top_dyn],
+            max_n=4,
+        )
+
+        base_conf = float(_env_float("ALPHA_DIRECTION_GATE_MIN_CONF", 0.60))
+        base_edge = float(_env_float("ALPHA_DIRECTION_GATE_MIN_EDGE", 0.06))
+        base_side = float(_env_float("ALPHA_DIRECTION_GATE_MIN_SIDE_PROB", 0.60))
+        conf_src = [float(t.dir_conf or 0.5) for t in candidates]
+        edge_src = [self._edge_proxy(t) for t in candidates]
+        dir_qs = _parse_quantiles(
+            os.environ.get("CF_VIRTUAL_DIR_QUANTILES", "0.10,0.20,0.35"),
+            [0.15, 0.30],
+            lo=0.05,
+            hi=0.90,
+        )
+        conf_dyn = _quantile_candidates(conf_src, dir_qs, lo=0.45, hi=0.95, relax_mult=0.99)
+        edge_dyn = _quantile_candidates(edge_src, dir_qs, lo=0.0, hi=0.20, relax_mult=0.90)
+        side_dyn = _quantile_candidates(conf_src, dir_qs, lo=0.45, hi=0.95, relax_mult=0.99)
+        conf_vals = self._compact([round(base_conf, 4), round(base_conf * 0.95, 4), round(base_conf * 0.90, 4)] + [round(float(v), 4) for v in conf_dyn], 4)
+        edge_vals = self._compact([round(base_edge, 4), round(base_edge * 0.85, 4), round(base_edge * 0.70, 4)] + [round(float(v), 4) for v in edge_dyn], 4)
+        side_vals = self._compact([round(base_side, 4), round(base_side * 0.95, 4), round(base_side * 0.90, 4)] + [round(float(v), 4) for v in side_dyn], 4)
+
+        base_net = float(_env_float("ENTRY_NET_EXPECTANCY_MIN", -0.0002))
+        base_both = float(_env_float("ENTRY_BOTH_EV_NEG_NET_FLOOR", -0.0003))
+        base_gross = float(_env_float("ENTRY_GROSS_EV_MIN", 0.0005))
+        net_vals = self._compact([round(base_net, 6), round(base_net - 0.0003, 6), round(base_net - 0.0006, 6)], 3)
+        both_vals = self._compact([round(base_both, 6), round(base_both - 0.0002, 6)], 2)
+        gross_vals = self._compact([round(base_gross, 6), round(max(0.0, base_gross * 0.60), 6)], 2)
+
+        base_mtf_side = float(_env_float("MTF_DL_ENTRY_MIN_SIDE_PROB", 0.58))
+        base_mtf_win = float(_env_float("MTF_DL_ENTRY_MIN_WIN_PROB", 0.52))
+        mtf_side_src = [float(v) for v in self._symbol_side_prob.values() if v is not None]
+        mtf_win_src = [float(v) for v in self._symbol_win_prob.values() if v is not None]
+        mtf_qs = _parse_quantiles(
+            os.environ.get("CF_VIRTUAL_MTF_QUANTILES", "0.25,0.40,0.55"),
+            [0.30, 0.50],
+            lo=0.05,
+            hi=0.95,
+        )
+        mtf_side_dyn = _quantile_candidates(mtf_side_src, mtf_qs, lo=0.45, hi=0.95, relax_mult=0.995)
+        mtf_win_dyn = _quantile_candidates(mtf_win_src, mtf_qs, lo=0.45, hi=0.95, relax_mult=0.995)
+        mtf_side_vals = self._compact([round(base_mtf_side, 4), round(base_mtf_side * 0.95, 4), round(base_mtf_side * 0.90, 4)] + [round(float(v), 4) for v in mtf_side_dyn], 4)
+        mtf_win_vals = self._compact([round(base_mtf_win, 4), round(base_mtf_win * 0.95, 4), round(base_mtf_win * 0.90, 4)] + [round(float(v), 4) for v in mtf_win_dyn], 4)
+
+        return {
+            "top_n_symbols": [int(v) for v in top_vals],
+            "dir_gate_min_conf": [float(v) for v in conf_vals],
+            "dir_gate_min_edge": [float(v) for v in edge_vals],
+            "dir_gate_min_side_prob": [float(v) for v in side_vals],
+            "net_expectancy_min": [float(v) for v in net_vals],
+            "both_ev_neg_net_floor": [float(v) for v in both_vals],
+            "gross_ev_min": [float(v) for v in gross_vals],
+            "mtf_dl_entry_min_side_prob": [float(v) for v in mtf_side_vals],
+            "mtf_dl_entry_min_win_prob": [float(v) for v in mtf_win_vals],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        self._prepare_virtual_candidates()
+        if not self._virtual_candidates:
+            return list(trades)
+
+        top_n = int(params.get("top_n_symbols", _env_int("TOP_N_SYMBOLS", 12)))
+        min_conf = float(params.get("dir_gate_min_conf", _env_float("ALPHA_DIRECTION_GATE_MIN_CONF", 0.60)))
+        min_edge = float(params.get("dir_gate_min_edge", _env_float("ALPHA_DIRECTION_GATE_MIN_EDGE", 0.06)))
+        min_side = float(params.get("dir_gate_min_side_prob", _env_float("ALPHA_DIRECTION_GATE_MIN_SIDE_PROB", 0.60)))
+        net_floor = float(params.get("net_expectancy_min", _env_float("ENTRY_NET_EXPECTANCY_MIN", -0.0002)))
+        both_floor = float(params.get("both_ev_neg_net_floor", _env_float("ENTRY_BOTH_EV_NEG_NET_FLOOR", -0.0003)))
+        gross_floor = float(params.get("gross_ev_min", _env_float("ENTRY_GROSS_EV_MIN", 0.0005)))
+        mtf_side_thr = float(params.get("mtf_dl_entry_min_side_prob", _env_float("MTF_DL_ENTRY_MIN_SIDE_PROB", 0.58)))
+        mtf_win_thr = float(params.get("mtf_dl_entry_min_win_prob", _env_float("MTF_DL_ENTRY_MIN_WIN_PROB", 0.52)))
+
+        eligible: list[Trade] = []
+        for c in self._virtual_candidates:
+            net_edge = float(c.entry_ev or 0.0)
+            if net_edge < net_floor:
+                continue
+            if net_edge <= both_floor:
+                continue
+            fee_rate = 0.0006
+            try:
+                fee_rate = float((c.raw or {}).get("fee_rate") or fee_rate)
+            except Exception:
+                fee_rate = 0.0006
+            fee_rate = max(0.0, min(0.01, float(fee_rate)))
+            gross_edge = float(net_edge + fee_rate * 2.0)
+            if gross_edge < gross_floor:
+                continue
+
+            side_prob = max(0.45, min(1.0, float(c.dir_conf or 0.5)))
+            if side_prob < min_conf:
+                continue
+            if self._edge_proxy(c) < min_edge:
+                continue
+            if side_prob < min_side:
+                continue
+
+            mtf_side = (c.raw or {}).get("mtf_side_prob")
+            mtf_win = (c.raw or {}).get("mtf_win_prob")
+            if mtf_side is not None:
+                try:
+                    if float(mtf_side) < mtf_side_thr:
+                        continue
+                except Exception:
+                    pass
+            if mtf_win is not None:
+                try:
+                    if float(mtf_win) < mtf_win_thr:
+                        continue
+                except Exception:
+                    pass
+            eligible.append(c)
+
+        eligible = self._top_n_filter(eligible, top_n=top_n)
+        max_accept = max(0, _env_int("CF_VIRTUAL_ENTRY_MAX_ACCEPTED", 280))
+        if max_accept > 0:
+            eligible = eligible[:max_accept]
+        out = list(trades)
+        out.extend(eligible)
         return out
 
 
@@ -1369,9 +1947,49 @@ class TopNSimulator(StageSimulator):
     description = "TOP_N 심볼 수 제한: TOP_N_SYMBOLS"
     max_combos_hint = 80
 
+    def __init__(self):
+        self._context_trades: list[Trade] = []
+
+    def bind_context(self, trades: list[Trade]) -> None:
+        self._context_trades = list(trades or [])
+
+    def _dynamic_top_n_values(self) -> list[int]:
+        trades = sorted(self._context_trades, key=lambda t: int(t.timestamp_ms or 0))
+        if not trades:
+            return []
+        window_ms = max(60_000, _env_int("CF_TOP_N_WINDOW_MS", 10 * 60 * 1000))
+        counts: list[int] = []
+        i = 0
+        n = len(trades)
+        while i < n:
+            t0 = int(trades[i].timestamp_ms or 0)
+            j = i
+            while j < n and int(trades[j].timestamp_ms or 0) <= t0 + window_ms:
+                j += 1
+            counts.append(max(1, j - i))
+            i = j
+        qs = _parse_quantiles(
+            os.environ.get("CF_TOP_N_DYNAMIC_QUANTILES", "0.35,0.50,0.65,0.75,0.85,0.92"),
+            [0.50, 0.70, 0.85],
+            lo=0.05,
+            hi=0.99,
+        )
+        relax_mult = max(0.7, min(1.8, _env_float("CF_TOP_N_RELAX_MULT", 1.12)))
+        out = _quantile_candidates(
+            [float(x) for x in counts],
+            qs,
+            lo=2.0,
+            hi=100.0,
+            as_int=True,
+            relax_mult=relax_mult,
+        )
+        return [int(x) for x in out]
+
     def get_param_grid(self) -> dict[str, list]:
+        dynamic = self._dynamic_top_n_values()
+        vals = sorted(set([4, 6, 8, 10, 12, 16, 20, 24, 30, 40, 50, 60] + dynamic))
         return {
-            "top_n_symbols": [4, 6, 8, 10, 12, 16, 20, 24, 30, 40, 50, 60],
+            "top_n_symbols": vals,
         }
 
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
@@ -1403,11 +2021,42 @@ class DirectionGateSimulator(StageSimulator):
     description = "방향 게이트: ALPHA_DIRECTION_GATE_MIN_CONF/EDGE"
     max_combos_hint = 100
 
+    def __init__(self):
+        self._context_trades: list[Trade] = []
+
+    def bind_context(self, trades: list[Trade]) -> None:
+        self._context_trades = list(trades or [])
+
+    @staticmethod
+    def _edge_proxy(t: Trade) -> float:
+        raw = abs(float(t.mu_alpha or 0.0))
+        if raw > 1.0:
+            raw = raw / 100.0
+        return float(max(0.0, min(0.20, raw)))
+
     def get_param_grid(self) -> dict[str, list]:
+        conf_vals = [0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70]
+        edge_vals = [0.00, 0.01, 0.02, 0.04, 0.06, 0.08, 0.10]
+        side_vals = [0.50, 0.53, 0.56, 0.58, 0.60, 0.62, 0.65, 0.70]
+        if self._context_trades:
+            conf_src = [float(t.dir_conf or 0.0) for t in self._context_trades]
+            edge_src = [self._edge_proxy(t) for t in self._context_trades]
+            qs = _parse_quantiles(
+                os.environ.get("CF_DIR_GATE_RELAX_QUANTILES", "0.10,0.15,0.20,0.25,0.30,0.40,0.50"),
+                [0.15, 0.25, 0.40],
+                lo=0.05,
+                hi=0.95,
+            )
+            conf_dyn = _quantile_candidates(conf_src, qs, lo=0.45, hi=0.90, relax_mult=0.995)
+            edge_dyn = _quantile_candidates(edge_src, qs, lo=0.0, hi=0.20, relax_mult=0.92)
+            side_dyn = _quantile_candidates(conf_src, qs, lo=0.45, hi=0.95, relax_mult=0.995)
+            conf_vals = sorted(set(conf_vals + [round(float(v), 4) for v in conf_dyn]))
+            edge_vals = sorted(set(edge_vals + [round(float(v), 4) for v in edge_dyn]))
+            side_vals = sorted(set(side_vals + [round(float(v), 4) for v in side_dyn]))
         return {
-            "dir_gate_min_conf": [0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.65, 0.70],
-            "dir_gate_min_edge": [0.00, 0.01, 0.02, 0.04, 0.06, 0.08, 0.10],
-            "dir_gate_min_side_prob": [0.50, 0.53, 0.56, 0.58, 0.60, 0.62, 0.65, 0.70],
+            "dir_gate_min_conf": conf_vals,
+            "dir_gate_min_edge": edge_vals,
+            "dir_gate_min_side_prob": side_vals,
         }
 
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
@@ -1416,8 +2065,7 @@ class DirectionGateSimulator(StageSimulator):
         min_side_prob = float(params.get("dir_gate_min_side_prob", 0.58))
         result = []
         for t in trades:
-            # edge proxy: abs(mu_alpha)
-            edge = abs(float(t.mu_alpha or 0.0))
+            edge = self._edge_proxy(t)
             side_prob = max(0.50, min(1.0, float(t.dir_conf or 0.0)))
             if float(t.dir_conf or 0.0) >= min_conf and edge >= min_edge and side_prob >= min_side_prob:
                 result.append(t)
@@ -1944,6 +2592,7 @@ ALL_SIMULATORS = [
     VolatilityGateSimulator(),
     MTFImageDLGateSimulator(),
     MTFEntryGateSimulator(),
+    VirtualEntryExpansionSimulator(),
     ExitReasonSimulator(),
     CapitalAllocationSimulator(),
     RegimeMultiplierSimulator(),
@@ -2118,6 +2767,11 @@ class CFEngine:
 
     def _run_stage(self, sim: StageSimulator, max_combos: int) -> list[Finding]:
         """Sweep parameter grid for a single stage."""
+        try:
+            if hasattr(sim, "bind_context"):
+                getattr(sim, "bind_context")(self.trades)
+        except Exception as e:
+            logger.debug(f"[CF_STAGE] bind_context skipped for {sim.stage_name}: {e}")
         grid = sim.get_param_grid()
         param_names = list(grid.keys())
         param_values = list(grid.values())
