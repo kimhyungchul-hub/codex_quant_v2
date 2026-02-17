@@ -371,6 +371,7 @@ class CFResult:
     delta: dict  # {metric: change}
     n_trades: int
     significance: float  # 0-1 score of how meaningful this change is
+    oos: dict = field(default_factory=dict)  # Walk-forward train/test validation summary
     recommendation: str = ""
     details: str = ""
 
@@ -389,6 +390,12 @@ class Finding:
     baseline_metrics: dict
     improved_metrics: dict
     recommendation: str
+    oos_pass: bool = False
+    oos_folds: int = 0
+    oos_pass_rate: float = 0.0
+    oos_train_pnl_delta: float = 0.0
+    oos_test_pnl_delta: float = 0.0
+    oos_penalty_factor: float = 1.0
     applied: bool = False
 
 
@@ -514,16 +521,138 @@ class TradeLoader:
 # Metrics Calculator
 # ─────────────────────────────────────────────────────────────────
 
+def _trade_notional(trade: Trade) -> float:
+    try:
+        n = float(trade.notional or 0.0)
+    except Exception:
+        n = 0.0
+    if n > 0:
+        return float(n)
+    try:
+        qty = abs(float(trade.qty or 0.0))
+    except Exception:
+        qty = 0.0
+    try:
+        px = float(trade.entry_price or trade.exit_price or 0.0)
+    except Exception:
+        px = 0.0
+    if qty > 0 and px > 0:
+        return float(qty * px)
+    return 0.0
+
+
+def _trade_liquidity_proxy(trade: Trade) -> float:
+    raw = trade.raw if isinstance(trade.raw, dict) else {}
+    for k in ("liquidity_score", "liq_score", "book_liquidity", "orderbook_liquidity"):
+        try:
+            v = raw.get(k)
+            if v is None:
+                continue
+            vv = float(v)
+            if math.isfinite(vv):
+                return float(max(0.0, min(1.0, vv)))
+        except Exception:
+            continue
+    try:
+        sigma = abs(float(trade.sigma or 0.0))
+    except Exception:
+        sigma = 0.0
+    try:
+        vpin = abs(float(trade.vpin or 0.0))
+    except Exception:
+        vpin = 0.0
+    spread_pct = 0.0
+    for k in ("spread_pct", "spread"):
+        try:
+            v = raw.get(k)
+            if v is None:
+                continue
+            spread_pct = max(0.0, float(v))
+            if spread_pct > 0:
+                break
+        except Exception:
+            continue
+    if spread_pct <= 0:
+        try:
+            sb = raw.get("spread_bps")
+            if sb is not None:
+                spread_pct = max(0.0, float(sb) / 10_000.0)
+        except Exception:
+            spread_pct = 0.0
+    sigma_pen = min(1.0, sigma * 2.0)
+    vpin_pen = min(1.0, max(0.0, vpin - 0.45) * 1.8)
+    spread_pen = min(1.0, spread_pct * 800.0)
+    liq = 1.0 - (0.45 * sigma_pen + 0.40 * vpin_pen + 0.15 * spread_pen)
+    return float(max(0.0, min(1.0, liq)))
+
+
+def _execution_penalty_usd(trade: Trade) -> float:
+    if not _env_bool("CF_EXECUTION_PENALTY_ENABLED", True):
+        return 0.0
+    notional = _trade_notional(trade)
+    if notional <= 0:
+        return 0.0
+    try:
+        sigma = abs(float(trade.sigma or 0.0))
+    except Exception:
+        sigma = 0.0
+    try:
+        vpin = max(0.0, float(trade.vpin or 0.0))
+    except Exception:
+        vpin = 0.0
+    try:
+        leverage = max(1.0, float(trade.leverage or 1.0))
+    except Exception:
+        leverage = 1.0
+    liq = _trade_liquidity_proxy(trade)
+
+    base_side_bps = _env_float("CF_EXEC_BASE_BPS_SIDE", 1.2)
+    sigma_bps_k = _env_float("CF_EXEC_SIGMA_BPS_K", 2.0)
+    vpin_bps_k = _env_float("CF_EXEC_VPIN_BPS_K", 6.0)
+    lev_bps_k = _env_float("CF_EXEC_LEV_BPS_K", 0.3)
+    liq_bps_k = _env_float("CF_EXEC_LIQ_BPS_K", 8.0)
+    penalty_mult = max(0.0, _env_float("CF_EXEC_PENALTY_MULT", 1.0))
+
+    side_bps = (
+        float(base_side_bps)
+        + float(sigma_bps_k) * sigma
+        + float(vpin_bps_k) * max(0.0, vpin - 0.5)
+        + float(lev_bps_k) * max(0.0, leverage - 1.0)
+        + float(liq_bps_k) * max(0.0, 1.0 - liq)
+    )
+    side_bps = max(0.0, side_bps)
+    roundtrip_bps = 2.0 * side_bps
+    penalty = notional * (roundtrip_bps / 10_000.0) * penalty_mult
+    return float(max(0.0, min(notional * 0.10, penalty)))
+
+
 def compute_metrics(trades: list[Trade]) -> dict:
-    """Compute aggregate performance metrics."""
+    """Compute aggregate performance metrics with conservative execution penalties."""
     if not trades:
-        return {"n": 0, "pnl": 0, "wr": 0, "rr": 0, "sharpe": 0, "avg_pnl": 0,
-                "avg_win": 0, "avg_loss": 0, "max_dd": 0, "pf": 0, "edge": 0}
+        return {
+            "n": 0,
+            "pnl": 0,
+            "pnl_raw": 0,
+            "execution_penalty": 0,
+            "wr": 0,
+            "rr": 0,
+            "sharpe": 0,
+            "avg_pnl": 0,
+            "avg_win": 0,
+            "avg_loss": 0,
+            "max_dd": 0,
+            "pf": 0,
+            "edge": 0,
+        }
     n = len(trades)
-    pnls = np.array([t.realized_pnl for t in trades])
+    raw_pnls = np.array([float(t.realized_pnl or 0.0) for t in trades], dtype=np.float64)
+    penalties = np.array([_execution_penalty_usd(t) for t in trades], dtype=np.float64)
+    pnls = raw_pnls - penalties
     wins = pnls[pnls > 0]
     losses = pnls[pnls <= 0]
     total_pnl = float(pnls.sum())
+    total_pnl_raw = float(raw_pnls.sum())
+    total_penalty = float(penalties.sum())
     avg_pnl = float(pnls.mean())
     wr = float(len(wins) / n) if n > 0 else 0
     avg_win = float(wins.mean()) if len(wins) > 0 else 0
@@ -545,10 +674,19 @@ def compute_metrics(trades: list[Trade]) -> dict:
     edge = wr - bep_wr
 
     return {
-        "n": n, "pnl": round(total_pnl, 4), "wr": round(wr, 4),
-        "rr": round(rr, 4), "sharpe": round(sharpe, 4), "avg_pnl": round(avg_pnl, 6),
-        "avg_win": round(avg_win, 6), "avg_loss": round(avg_loss, 6),
-        "max_dd": round(max_dd, 4), "pf": round(pf, 4), "edge": round(edge, 4),
+        "n": n,
+        "pnl": round(total_pnl, 4),
+        "pnl_raw": round(total_pnl_raw, 4),
+        "execution_penalty": round(total_penalty, 4),
+        "wr": round(wr, 4),
+        "rr": round(rr, 4),
+        "sharpe": round(sharpe, 4),
+        "avg_pnl": round(avg_pnl, 6),
+        "avg_win": round(avg_win, 6),
+        "avg_loss": round(avg_loss, 6),
+        "max_dd": round(max_dd, 4),
+        "pf": round(pf, 4),
+        "edge": round(edge, 4),
     }
 
 
@@ -1287,6 +1425,7 @@ class VirtualEntryExpansionSimulator(StageSimulator):
 
     def __init__(self):
         self.log_path = Path(os.environ.get("CF_VIRTUAL_ENTRY_LOG_PATH", str(PROJECT_ROOT / "state" / "codex_engine.log")))
+        self.db_path = Path(os.environ.get("CF_VIRTUAL_ENTRY_DB_PATH", str(PROJECT_ROOT / "state" / "bot_data_live.db")))
         self.scores_path = Path(os.environ.get("CF_MTF_DL_SCORES_PATH", str(DEFAULT_DL_SCORES)))
         self._context_trades: list[Trade] = []
         self._virtual_candidates: list[Trade] = []
@@ -1354,8 +1493,78 @@ class VirtualEntryExpansionSimulator(StageSimulator):
         self._symbol_side_prob = {k: _robust_median(v, 0.5) for k, v in side_buf.items() if v}
         self._symbol_win_prob = {k: _robust_median(v, 0.5) for k, v in win_buf.items() if v}
 
+    def _blocked_candidate_counts_from_db(self) -> dict[tuple[str, tuple[str, ...]], int]:
+        out: dict[tuple[str, tuple[str, ...]], int] = {}
+        if not self.db_path.exists():
+            return out
+        max_rows = max(1000, _env_int("CF_VIRTUAL_ENTRY_DB_ROWS", 20000))
+        mode = str(os.environ.get("CF_VIRTUAL_ENTRY_DB_MODE", "live") or "").strip().lower()
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=5)
+            conn.row_factory = sqlite3.Row
+            if mode:
+                rows = conn.execute(
+                    """
+                    SELECT symbol, blocked_filters, deny_reason
+                    FROM entry_blocked_candidates
+                    WHERE trading_mode = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (mode, int(max_rows)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT symbol, blocked_filters, deny_reason
+                    FROM entry_blocked_candidates
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (int(max_rows),),
+                ).fetchall()
+            conn.close()
+        except Exception:
+            return out
+
+        for row in rows:
+            try:
+                sym = str(row["symbol"] or "").strip().upper()
+            except Exception:
+                sym = ""
+            if not sym:
+                continue
+            reasons: list[str] = []
+            try:
+                blocked_raw = row["blocked_filters"]
+            except Exception:
+                blocked_raw = None
+            if blocked_raw:
+                try:
+                    parsed = json.loads(str(blocked_raw))
+                    if isinstance(parsed, list):
+                        reasons = [str(x).strip().lower() for x in parsed if str(x).strip()]
+                except Exception:
+                    reasons = []
+            if not reasons:
+                try:
+                    deny_reason = str(row["deny_reason"] or "").strip().lower()
+                except Exception:
+                    deny_reason = ""
+                if deny_reason:
+                    reasons = [deny_reason]
+            reasons_t = tuple(sorted(set(reasons)))
+            if not reasons_t:
+                continue
+            key = (sym, reasons_t)
+            out[key] = int(out.get(key, 0) + 1)
+        return out
+
     def _blocked_candidate_counts(self) -> dict[tuple[str, tuple[str, ...]], int]:
         out: dict[tuple[str, tuple[str, ...]], int] = {}
+        db_counts = self._blocked_candidate_counts_from_db()
+        if db_counts:
+            return db_counts
         if not self.log_path.exists():
             return out
         try:
@@ -2765,6 +2974,127 @@ class CFEngine:
 
         return selected[:stage_max_combos], "adaptive", total
 
+    def _build_walk_forward_folds(self) -> list[tuple[int, int, int]]:
+        if not _env_bool("CF_WF_ENABLED", True):
+            return []
+        n = int(len(self.trades))
+        if n <= 0:
+            return []
+        k = max(1, _env_int("CF_WF_K_FOLDS", 4))
+        min_train = max(40, _env_int("CF_WF_MIN_TRAIN_TRADES", 120))
+        min_test = max(20, _env_int("CF_WF_MIN_TEST_TRADES", 40))
+        if n < (min_train + min_test):
+            return []
+        test_size = max(min_test, n // (k + 1))
+        folds: list[tuple[int, int, int]] = []
+        for i in range(k):
+            test_start = n - (k - i) * test_size
+            test_end = min(n, test_start + test_size)
+            train_end = test_start
+            if train_end < min_train:
+                continue
+            if (test_end - test_start) < min_test:
+                continue
+            if test_start <= 0 or test_start >= n:
+                continue
+            folds.append((train_end, test_start, test_end))
+        return folds
+
+    def _evaluate_walk_forward(self, sim: StageSimulator, params: dict) -> dict[str, Any]:
+        if not _env_bool("CF_WF_ENABLED", True):
+            return {
+                "enabled": False,
+                "pass": True,
+                "folds": 0,
+                "pass_rate": 1.0,
+                "train_pnl_delta_mean": 0.0,
+                "test_pnl_delta_mean": 0.0,
+                "penalty_factor": 1.0,
+            }
+        folds = self._build_walk_forward_folds()
+        if not folds:
+            return {
+                "enabled": True,
+                "pass": False,
+                "folds": 0,
+                "pass_rate": 0.0,
+                "train_pnl_delta_mean": 0.0,
+                "test_pnl_delta_mean": 0.0,
+                "penalty_factor": 0.5,
+                "reason": "insufficient_samples",
+            }
+
+        min_pass_rate = float(max(0.0, min(1.0, _env_float("CF_WF_MIN_PASS_RATE", 0.60))))
+        min_test_delta = float(_env_float("CF_WF_MIN_TEST_PNL_DELTA", 0.0))
+        min_cov = float(max(0.0, min(1.0, _env_float("CF_WF_MIN_TEST_COVERAGE", 0.20))))
+        edge_floor = float(_env_float("CF_WF_TEST_EDGE_FLOOR_DELTA", -0.002))
+
+        fold_rows: list[dict[str, Any]] = []
+        train_deltas: list[float] = []
+        test_deltas: list[float] = []
+        pass_count = 0
+
+        for idx, (train_end, test_start, test_end) in enumerate(folds, start=1):
+            train_trades = self.trades[:train_end]
+            test_trades = self.trades[test_start:test_end]
+            base_train = compute_metrics(train_trades)
+            base_test = compute_metrics(test_trades)
+            sim_train_trades = sim.simulate(train_trades, params) or []
+            sim_test_trades = sim.simulate(test_trades, params) or []
+            sim_train = compute_metrics(sim_train_trades)
+            sim_test = compute_metrics(sim_test_trades)
+
+            d_train = float(sim_train.get("pnl", 0.0) - base_train.get("pnl", 0.0))
+            d_test = float(sim_test.get("pnl", 0.0) - base_test.get("pnl", 0.0))
+            d_edge_test = float(sim_test.get("edge", 0.0) - base_test.get("edge", 0.0))
+            cov = float(sim_test.get("n", 0) / max(1, base_test.get("n", 0)))
+
+            fold_pass = bool(d_train > 0.0 and d_test > min_test_delta and d_edge_test >= edge_floor and cov >= min_cov)
+            if fold_pass:
+                pass_count += 1
+            train_deltas.append(d_train)
+            test_deltas.append(d_test)
+            fold_rows.append(
+                {
+                    "fold": idx,
+                    "train_end": int(train_end),
+                    "test_start": int(test_start),
+                    "test_end": int(test_end),
+                    "train_pnl_delta": round(d_train, 6),
+                    "test_pnl_delta": round(d_test, 6),
+                    "test_edge_delta": round(d_edge_test, 6),
+                    "test_coverage": round(cov, 4),
+                    "pass": bool(fold_pass),
+                }
+            )
+
+        n_folds = max(1, len(fold_rows))
+        pass_rate = float(pass_count / n_folds)
+        train_mean = float(np.mean(np.asarray(train_deltas, dtype=np.float64))) if train_deltas else 0.0
+        test_mean = float(np.mean(np.asarray(test_deltas, dtype=np.float64))) if test_deltas else 0.0
+        test_med = float(np.median(np.asarray(test_deltas, dtype=np.float64))) if test_deltas else 0.0
+
+        overfit_gap = max(0.0, train_mean - test_mean)
+        overfit_ratio = overfit_gap / max(1.0, abs(train_mean))
+        penalty_overfit = max(0.25, 1.0 - min(0.75, overfit_ratio))
+        penalty_pass = max(0.25, min(1.0, pass_rate / max(min_pass_rate, 1e-6)))
+        penalty_factor = float(max(0.20, min(1.0, penalty_overfit * penalty_pass)))
+
+        passed = bool(pass_rate >= min_pass_rate and test_mean >= min_test_delta and test_med >= min_test_delta)
+        return {
+            "enabled": True,
+            "pass": bool(passed),
+            "folds": int(n_folds),
+            "pass_rate": float(pass_rate),
+            "train_pnl_delta_mean": float(train_mean),
+            "test_pnl_delta_mean": float(test_mean),
+            "test_pnl_delta_median": float(test_med),
+            "penalty_factor": float(penalty_factor),
+            "min_pass_rate": float(min_pass_rate),
+            "min_test_pnl_delta": float(min_test_delta),
+            "rows": fold_rows,
+        }
+
     def _run_stage(self, sim: StageSimulator, max_combos: int) -> list[Finding]:
         """Sweep parameter grid for a single stage."""
         try:
@@ -2795,6 +3125,9 @@ class CFEngine:
         stage_findings: list[Finding] = []
         best_delta_pnl = 0.0
         best_result = None
+        min_significance = float(max(0.0, min(1.0, _env_float("CF_SIGNIFICANCE_MIN", 0.30))))
+        wf_eval_min_sig = float(max(0.0, min(1.0, _env_float("CF_WF_EVAL_MIN_SIGNIFICANCE", 0.20))))
+        wf_require_pass = bool(_env_bool("CF_WF_REQUIRE_PASS", True))
 
         for combo in combos:
             params = dict(zip(param_names, combo))
@@ -2811,6 +3144,29 @@ class CFEngine:
                     if isinstance(self.baseline[k], (int, float)):
                         delta[k] = round(simulated[k] - self.baseline[k], 6)
 
+                sig_raw = float(self._compute_significance(delta, simulated, self.baseline))
+                oos = {
+                    "enabled": False,
+                    "pass": True,
+                    "folds": 0,
+                    "pass_rate": 1.0,
+                    "train_pnl_delta_mean": 0.0,
+                    "test_pnl_delta_mean": 0.0,
+                    "penalty_factor": 1.0,
+                }
+                if delta.get("pnl", 0.0) > 0.0 and sig_raw >= wf_eval_min_sig:
+                    oos = self._evaluate_walk_forward(sim, params)
+                oos_penalty = float(oos.get("penalty_factor", 1.0) or 1.0)
+                oos_pass = bool(oos.get("pass", True))
+                sig_adj = float(max(0.0, min(1.0, sig_raw * max(0.0, oos_penalty))))
+                if wf_require_pass and bool(oos.get("enabled", False)) and (not oos_pass):
+                    sig_adj = float(min(sig_adj, min_significance * 0.95))
+
+                delta["oos_train_pnl_delta"] = round(float(oos.get("train_pnl_delta_mean", 0.0) or 0.0), 6)
+                delta["oos_test_pnl_delta"] = round(float(oos.get("test_pnl_delta_mean", 0.0) or 0.0), 6)
+                delta["oos_pass_rate"] = round(float(oos.get("pass_rate", 0.0) or 0.0), 6)
+                delta["oos_penalty_factor"] = round(float(oos_penalty), 6)
+
                 result = CFResult(
                     scenario_id=scenario_id,
                     stage=sim.stage_name,
@@ -2819,35 +3175,52 @@ class CFEngine:
                     simulated=simulated,
                     delta=delta,
                     n_trades=simulated["n"],
-                    significance=self._compute_significance(delta, simulated, self.baseline),
+                    significance=sig_adj,
+                    oos=oos,
                 )
                 self.results.append(result)
 
                 # Check if this is a significant finding
-                if result.significance >= 0.3 and delta.get("pnl", 0) > best_delta_pnl:
+                if result.significance >= min_significance and delta.get("pnl", 0) > best_delta_pnl:
+                    if wf_require_pass and bool(oos.get("enabled", False)) and (not bool(oos.get("pass", False))):
+                        continue
                     best_delta_pnl = delta.get("pnl", 0)
                     best_result = result
 
             except Exception as e:
                 logger.warning(f"CF sim error {scenario_id}: {e}")
 
-        if best_result and best_result.significance >= 0.3:
+        if best_result and best_result.significance >= min_significance:
             self._finding_id += 1
+            oos_obj = best_result.oos if isinstance(best_result.oos, dict) else {}
+            oos_penalty = float(oos_obj.get("penalty_factor", 1.0) or 1.0)
+            effective_delta_pnl = float(best_result.delta.get("pnl", 0.0) * oos_penalty)
             finding = Finding(
                 finding_id=f"F{self._finding_id:04d}",
                 timestamp=time.time(),
                 stage=sim.stage_name,
-                title=f"{sim.stage_name}: PnL +${best_result.delta.get('pnl', 0):.2f}",
+                title=f"{sim.stage_name}: OOS-adjusted PnL +${effective_delta_pnl:.2f}",
                 description=f"Stage: {sim.description}\n"
                            f"Params: {best_result.param_changes}\n"
                            f"Baseline: WR={self.baseline['wr']:.1%} R:R={self.baseline['rr']:.2f} PnL=${self.baseline['pnl']:.2f}\n"
-                           f"CF: WR={best_result.simulated['wr']:.1%} R:R={best_result.simulated['rr']:.2f} PnL=${best_result.simulated['pnl']:.2f}",
-                improvement_pct=float(best_result.delta.get("pnl", 0)),
+                           f"CF: WR={best_result.simulated['wr']:.1%} R:R={best_result.simulated['rr']:.2f} PnL=${best_result.simulated['pnl']:.2f}\n"
+                           f"OOS: pass={bool(oos_obj.get('pass', False))} "
+                           f"rate={float(oos_obj.get('pass_rate', 0.0) or 0.0):.0%} "
+                           f"trainΔ={float(oos_obj.get('train_pnl_delta_mean', 0.0) or 0.0):+.2f} "
+                           f"testΔ={float(oos_obj.get('test_pnl_delta_mean', 0.0) or 0.0):+.2f} "
+                           f"penalty={oos_penalty:.2f}",
+                improvement_pct=float(effective_delta_pnl),
                 confidence=best_result.significance,
                 param_changes=best_result.param_changes,
                 baseline_metrics=best_result.baseline,
                 improved_metrics=best_result.simulated,
                 recommendation=self._generate_recommendation(sim, best_result),
+                oos_pass=bool(oos_obj.get("pass", False)),
+                oos_folds=int(oos_obj.get("folds", 0) or 0),
+                oos_pass_rate=float(oos_obj.get("pass_rate", 0.0) or 0.0),
+                oos_train_pnl_delta=float(oos_obj.get("train_pnl_delta_mean", 0.0) or 0.0),
+                oos_test_pnl_delta=float(oos_obj.get("test_pnl_delta_mean", 0.0) or 0.0),
+                oos_penalty_factor=float(oos_penalty),
             )
             self.findings.append(finding)
             stage_findings.append(finding)

@@ -5,16 +5,13 @@ research/auto_apply.py — CF 결과 자동 적용 엔진
   - 1사이클당 최대 1개 변수만 변경
   - 적용 후 30분 모니터링 → 손실 시 자동 롤백
   - 모든 변경은 backup + audit log 기록
-  - 엔진 자동 재시작 (pkill + restart)
+  - 엔진 무중단 Hot-Reload (DB runtime_config polling 기반)
 """
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
-import re
-import shutil
 import sqlite3
 import subprocess
 import time
@@ -22,11 +19,17 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
+from core.runtime_config_store import (
+    ensure_runtime_config_schema,
+    get_runtime_config_values,
+    set_runtime_config_values,
+)
+
 logger = logging.getLogger("research.auto_apply")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_PATH = PROJECT_ROOT / "state" / "bybit.env"
-BACKUP_DIR = PROJECT_ROOT / "state" / "env_backups"
+ENV_FALLBACK_PATH = PROJECT_ROOT / "state" / "bybit.env"
+BACKUP_DIR = PROJECT_ROOT / "state" / "runtime_config_backups"
 APPLY_LOG = PROJECT_ROOT / "state" / "auto_apply_log.json"
 DB_PATH = PROJECT_ROOT / "state" / "bot_data_live.db"
 
@@ -261,24 +264,41 @@ def _get_current_equity() -> float:
 
 
 def _read_env_value(key: str) -> Optional[str]:
-    """Read a value from bybit.env."""
-    if not ENV_PATH.exists():
+    """
+    Read runtime value with priority:
+    1) runtime_config table
+    2) process env
+    3) fallback file (state/bybit.env)
+    """
+    k = str(key or "").strip().upper()
+    if not k:
         return None
-    for line in ENV_PATH.read_text().splitlines():
+    try:
+        ensure_runtime_config_schema(str(DB_PATH))
+        vals = get_runtime_config_values(str(DB_PATH), keys=[k])
+        v = vals.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    except Exception:
+        pass
+    raw = os.environ.get(k)
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip()
+    if not ENV_FALLBACK_PATH.exists():
+        return None
+    for line in ENV_FALLBACK_PATH.read_text(encoding="utf-8", errors="ignore").splitlines():
         stripped = line.strip()
         if stripped.startswith("#") or "=" not in stripped:
             continue
-        k, _, v = stripped.partition("=")
-        if k.strip() == key:
-            return v.strip()
+        kk, _, vv = stripped.partition("=")
+        if kk.strip().upper() == k:
+            return vv.strip()
     return None
 
 
 def _env_float_runtime(key: str, default: float) -> float:
-    """Prefer process env, then state/bybit.env fallback."""
-    raw = os.environ.get(key)
-    if raw is None:
-        raw = _read_env_value(key)
+    """Prefer runtime_config/env, then fallback file."""
+    raw = _read_env_value(key)
     try:
         if raw is None:
             return float(default)
@@ -288,135 +308,117 @@ def _env_float_runtime(key: str, default: float) -> float:
 
 
 def _env_bool_runtime(key: str, default: bool) -> bool:
-    """Prefer process env, then state/bybit.env fallback."""
-    raw = os.environ.get(key)
-    if raw is None:
-        raw = _read_env_value(key)
+    """Prefer runtime_config/env, then fallback file."""
+    raw = _read_env_value(key)
     if raw is None:
         return bool(default)
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _update_env_value(key: str, new_value: str) -> Optional[str]:
+def _apply_runtime_updates(
+    updates: dict[str, str],
+    *,
+    source: str,
+    reason: str,
+    batch_id: str,
+) -> dict[str, dict[str, str | None]]:
     """
-    Update a value in bybit.env. Returns old value or None if key not found.
-    Handles duplicate keys (updates last occurrence only).
+    Persist config updates atomically to SQLite runtime_config and mirror to process env.
+    Returns actual changed keys with old/new values.
     """
-    if not ENV_PATH.exists():
-        return None
-    lines = ENV_PATH.read_text().splitlines()
-    old_value = None
-    last_idx = -1
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("#") or "=" not in stripped:
+    clean: dict[str, str] = {}
+    for k, v in (updates or {}).items():
+        kk = str(k or "").strip().upper()
+        vv = str(v).strip() if v is not None else ""
+        if not kk or not vv:
             continue
-        k, _, v = stripped.partition("=")
-        if k.strip() == key:
-            old_value = v.strip()
-            last_idx = i
-    if last_idx >= 0:
-        # Preserve comment on same line
-        comment = ""
-        ln = lines[last_idx]
-        parts = ln.split("#", 1)
-        if len(parts) > 1 and "=" not in parts[0].split("#")[0]:
-            pass
-        # Simple replacement
-        lines[last_idx] = f"{key}={new_value}"
-        ENV_PATH.write_text("\n".join(lines) + "\n")
-        return old_value
-    else:
-        # Key not found — append
-        with open(ENV_PATH, "a") as f:
-            f.write(f"\n# [AUTO_APPLY {time.strftime('%Y-%m-%d %H:%M')}]\n{key}={new_value}\n")
-        return None
+        if not all(ch.isalnum() or ch == "_" for ch in kk):
+            continue
+        clean[kk] = vv
+    if not clean:
+        return {}
+    ensure_runtime_config_schema(str(DB_PATH))
+    changed = set_runtime_config_values(
+        str(DB_PATH),
+        clean,
+        source=str(source or "auto_apply"),
+        reason=str(reason or ""),
+        batch_id=str(batch_id or ""),
+    )
+    for key, payload in (changed or {}).items():
+        new_val = payload.get("new")
+        if new_val is None:
+            continue
+        os.environ[str(key)] = str(new_val)
+    return changed
 
 
-def backup_env() -> str:
-    """Backup bybit.env and return backup path."""
+def backup_env(keys: list[str] | None = None) -> str:
+    """Backup current runtime config snapshot and return backup path."""
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     ts = time.strftime("%Y%m%d_%H%M%S")
-    dest = BACKUP_DIR / f"bybit.env.{ts}"
-    shutil.copy2(ENV_PATH, dest)
+    dest = BACKUP_DIR / f"runtime_config.{ts}.json"
+    if keys:
+        norm_keys = sorted({str(k or "").strip().upper() for k in keys if str(k or "").strip()})
+    else:
+        ensure_runtime_config_schema(str(DB_PATH))
+        norm_keys = sorted(get_runtime_config_values(str(DB_PATH)).keys())
+    snapshot = {k: _read_env_value(k) for k in norm_keys}
+    payload = {
+        "timestamp": time.time(),
+        "db_path": str(DB_PATH),
+        "keys": norm_keys,
+        "values": snapshot,
+    }
+    dest.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     # Keep only last 50 backups
-    backups = sorted(BACKUP_DIR.glob("bybit.env.*"))
+    backups = sorted(BACKUP_DIR.glob("runtime_config.*.json"))
     for old in backups[:-50]:
-        old.unlink()
-    logger.info(f"Backed up bybit.env → {dest}")
+        try:
+            old.unlink()
+        except Exception:
+            pass
+    logger.info(f"Backed up runtime_config snapshot → {dest}")
     return str(dest)
 
 
 def rollback_env(backup_path: str) -> bool:
-    """Restore bybit.env from backup."""
+    """Restore runtime_config values from backup snapshot."""
     bp = Path(backup_path)
     if not bp.exists():
         logger.error(f"Backup not found: {backup_path}")
         return False
-    shutil.copy2(bp, ENV_PATH)
-    logger.warning(f"ROLLED BACK bybit.env from {backup_path}")
+    try:
+        obj = json.loads(bp.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.error(f"Backup parse failed: {backup_path} ({e})")
+        return False
+    vals = obj.get("values") if isinstance(obj, dict) else {}
+    if not isinstance(vals, dict) or not vals:
+        logger.error(f"Backup has no values: {backup_path}")
+        return False
+    updates = {str(k).strip().upper(): str(v).strip() for k, v in vals.items() if v is not None and str(k).strip()}
+    if not updates:
+        logger.error(f"Backup values empty (all null): {backup_path}")
+        return False
+    batch_id = f"rollback-{int(time.time())}"
+    changed = _apply_runtime_updates(
+        updates,
+        source="auto_apply_rollback",
+        reason=f"rollback:{bp.name}",
+        batch_id=batch_id,
+    )
+    if not changed:
+        logger.warning(f"Rollback requested but no changes applied: {backup_path}")
+        return True
+    logger.warning(f"ROLLED BACK runtime_config from {backup_path} (keys={len(changed)})")
     return True
 
 
 def restart_engine() -> bool:
-    """Kill and restart the trading engine."""
-    try:
-        # Kill existing
-        subprocess.run(
-            ["pkill", "-f", "main_engine_mc_v2_final.py"],
-            capture_output=True,
-            timeout=10,
-        )
-        time.sleep(3)
-
-        pybin = PROJECT_ROOT / ".venv" / "bin" / "python"
-        py_exec = str(pybin) if pybin.exists() else "python3"
-
-        # Syntax check
-        result = subprocess.run(
-            [py_exec, "-m", "py_compile", "main_engine_mc_v2_final.py"],
-            capture_output=True, timeout=30, cwd=str(PROJECT_ROOT),
-        )
-        if result.returncode != 0:
-            logger.error(f"Syntax check failed: {result.stderr.decode()}")
-            return False
-
-        # Restart
-        cmd = (
-            f"cd {PROJECT_ROOT} && "
-            f"set -a && source state/bybit.env && set +a && "
-            f"ENABLE_LIVE_ORDERS=1 PYTHONUNBUFFERED=1 "
-            f"nohup {py_exec} main_engine_mc_v2_final.py "
-            f">> state/codex_engine.log 2>&1 &"
-        )
-        subprocess.Popen(cmd, shell=True, executable="/bin/zsh")
-        # Health check: process + dashboard listener should both stay up.
-        stable_ticks = 0
-        for _ in range(40):
-            chk_proc = subprocess.run(
-                ["pgrep", "-f", "main_engine_mc_v2_final.py"],
-                capture_output=True,
-                timeout=5,
-            )
-            chk_port = subprocess.run(
-                ["lsof", "-nP", "-iTCP:9999", "-sTCP:LISTEN"],
-                capture_output=True,
-                timeout=5,
-            )
-            if chk_proc.returncode == 0 and chk_port.returncode == 0:
-                stable_ticks += 1
-                if stable_ticks >= 8:  # ~8s of continuous stability
-                    logger.info("Engine restarted successfully")
-                    return True
-            else:
-                stable_ticks = 0
-            time.sleep(1)
-
-        logger.error("Engine restart verification failed: process not running")
-        return False
-    except Exception as e:
-        logger.error(f"Engine restart failed: {e}")
-        return False
+    """Deprecated: hot-reload architecture no longer restarts the process."""
+    logger.info("[AUTO_APPLY] restart skipped: runtime_config hot-reload is active")
+    return True
 
 
 def _is_in_cooldown() -> bool:
@@ -548,6 +550,9 @@ def should_apply(finding: dict) -> bool:
     pnl = float(finding.get("improvement_pct", 0) or 0.0)  # This is actually delta PnL in $
     min_conf = float(_env_float_runtime("AUTO_APPLY_MIN_CONFIDENCE", MIN_CONFIDENCE))
     high_pnl = float(_env_float_runtime("AUTO_APPLY_HIGH_PNL_IMPROVEMENT", MIN_PNL_IMPROVEMENT))
+    require_oos = bool(_env_bool_runtime("AUTO_APPLY_REQUIRE_OOS_PASS", True))
+    min_oos_pass_rate = float(_env_float_runtime("AUTO_APPLY_MIN_OOS_PASS_RATE", 0.60))
+    min_oos_test_delta = float(_env_float_runtime("AUTO_APPLY_MIN_OOS_TEST_PNL_DELTA", 0.0))
     conf_ok = bool(conf >= min_conf)
     pnl_ok = bool(pnl >= high_pnl)
     if not (conf_ok or pnl_ok):
@@ -556,6 +561,17 @@ def should_apply(finding: dict) -> bool:
             f"and pnl=${pnl:.2f}<${high_pnl:.2f}"
         )
         return False
+    if require_oos:
+        oos_pass = bool(finding.get("oos_pass", False))
+        oos_rate = float(finding.get("oos_pass_rate", finding.get("walk_forward_pass_rate", 0.0)) or 0.0)
+        oos_test_delta = float(finding.get("oos_test_pnl_delta", finding.get("walk_forward_test_pnl_delta", 0.0)) or 0.0)
+        if (not oos_pass) or (oos_rate < min_oos_pass_rate) or (oos_test_delta < min_oos_test_delta):
+            logger.debug(
+                f"Skip {finding.get('finding_id')}: oos_pass={oos_pass} "
+                f"oos_rate={oos_rate:.2f}<{min_oos_pass_rate:.2f} "
+                f"oos_test_delta={oos_test_delta:.2f}<{min_oos_test_delta:.2f}"
+            )
+            return False
     if finding.get("applied"):
         return False
     return True
@@ -607,14 +623,23 @@ def apply_finding(finding: dict, *, restart_after_apply: bool = True) -> Optiona
         return None
 
     # Backup
-    backup_path = backup_env()
+    backup_path = backup_env(list(env_changes.keys()))
     equity_now = _get_current_equity()
 
     # Apply changes
-    for env_key, change in env_changes.items():
-        old_val = _update_env_value(env_key, change["new"])
+    updates = {k: v["new"] for k, v in env_changes.items()}
+    changed = _apply_runtime_updates(
+        updates,
+        source="auto_apply",
+        reason=f"finding:{finding.get('finding_id')}",
+        batch_id=f"{finding.get('finding_id')}-{int(time.time())}",
+    )
+    if not changed:
+        logger.info(f"No runtime_config changes persisted for finding {finding.get('finding_id')}")
+        return None
+    for env_key, change in changed.items():
         logger.info(
-            f"[AUTO_APPLY] {env_key}: {change['old']} → {change['new']} "
+            f"[AUTO_APPLY] {env_key}: {change.get('old')} → {change.get('new')} "
             f"(finding={finding.get('finding_id')}, stage={finding.get('stage')})"
         )
 
@@ -623,7 +648,7 @@ def apply_finding(finding: dict, *, restart_after_apply: bool = True) -> Optiona
         finding_id=finding.get("finding_id", ""),
         stage=finding.get("stage", ""),
         param_changes=param_changes,
-        env_changes=env_changes,
+        env_changes=changed,
         backup_path=backup_path,
         equity_at_apply=equity_now,
         status="monitoring",
@@ -634,19 +659,9 @@ def apply_finding(finding: dict, *, restart_after_apply: bool = True) -> Optiona
     records.append(asdict(record))
     _save_apply_log(records)
 
-    # Restart engine (optional in batch mode)
+    # restart_after_apply is retained for API compatibility only.
     if restart_after_apply:
-        if not restart_engine():
-            logger.error("Engine restart failed — rolling back")
-            rollback_env(backup_path)
-            restart_engine()
-            record.status = "rolled_back"
-            record.rollback_reason = "engine_restart_failed"
-            record.rolled_back = True
-            records[-1] = asdict(record)
-            _save_apply_log(records)
-            return None
-
+        restart_engine()
     return record
 
 
@@ -664,8 +679,6 @@ def check_and_rollback_all() -> dict:
     equity_now = _get_current_equity()
     processed = applied = rolled_back = monitoring = 0
     messages: list[str] = []
-    need_engine_restart = False
-
     for rec in records:
         if rec.get("status") != "monitoring":
             continue
@@ -687,7 +700,6 @@ def check_and_rollback_all() -> dict:
             rec["rolled_back"] = True
             rec["rollback_reason"] = f"equity_drop_{delta:.2f}"
             rolled_back += 1
-            need_engine_restart = True
             messages.append(f"rolled_back {rec.get('finding_id')} (Δ${delta:.2f})")
         else:
             rec["status"] = "applied"
@@ -696,8 +708,6 @@ def check_and_rollback_all() -> dict:
 
     if processed > 0:
         _save_apply_log(records)
-    if need_engine_restart:
-        restart_engine()
 
     return {
         "processed": processed,
@@ -709,10 +719,10 @@ def check_and_rollback_all() -> dict:
 
 
 def git_commit_and_push(message: str = "auto: CF parameter update") -> bool:
-    """Git commit bybit.env changes and push."""
+    """Git commit audit artifacts and push."""
     try:
         subprocess.run(
-            ["git", "add", "state/bybit.env", "state/auto_apply_log.json"],
+            ["git", "add", "state/auto_apply_log.json"],
             cwd=str(PROJECT_ROOT), capture_output=True, timeout=10,
         )
         subprocess.run(
@@ -837,18 +847,35 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
                 status["last_action"] = "qualifying_findings_but_no_effective_env_changes"
         return status
 
-    backup_path = backup_env()
+    backup_path = backup_env(list(used_env_keys))
     equity_now = _get_current_equity()
     records = _load_apply_log()
     new_records = []
+    batch_updates: dict[str, str] = {}
+    for item in planned:
+        for env_key, change in (item.get("env_changes") or {}).items():
+            batch_updates[str(env_key)] = str(change.get("new"))
+    batch_id = f"batch-{int(time.time())}"
+    changed_batch = _apply_runtime_updates(
+        batch_updates,
+        source="auto_apply",
+        reason="batch_apply",
+        batch_id=batch_id,
+    )
+    if not changed_batch:
+        status["last_action"] = "no_runtime_config_changes_applied"
+        return status
 
     for item in planned:
         f = item["finding"]
-        env_changes = item["env_changes"]
+        env_changes = {
+            k: v for k, v in changed_batch.items() if k in (item.get("env_changes") or {})
+        }
+        if not env_changes:
+            continue
         for env_key, change in env_changes.items():
-            _update_env_value(env_key, change["new"])
             logger.info(
-                f"[AUTO_APPLY] {env_key}: {change['old']} → {change['new']} "
+                f"[AUTO_APPLY] {env_key}: {change.get('old')} → {change.get('new')} "
                 f"(finding={f.get('finding_id')}, stage={f.get('stage')})"
             )
         record = ApplyRecord(
@@ -866,23 +893,13 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
 
     _save_apply_log(records)
 
-    if not restart_engine():
-        logger.error("Batch restart failed — rolling back")
-        rollback_env(backup_path)
-        restart_engine()
-        for rec in records:
-            if rec.get("backup_path") == backup_path and rec.get("status") == "monitoring":
-                rec["status"] = "rolled_back"
-                rec["rolled_back"] = True
-                rec["rollback_reason"] = "engine_restart_failed"
-        _save_apply_log(records)
-        status["last_action"] = "batch_apply_failed_rollback"
-        return status
-
     status["applied_count"] = len(new_records)
     status["monitoring_count"] = status.get("monitoring_count", 0) + len(new_records)
     applied_ids = [r.finding_id for r in new_records]
-    status["last_action"] = f"applied {len(new_records)} findings (apply_all={int(apply_all_qualified)}) → monitoring 30min each"
+    status["last_action"] = (
+        f"applied {len(new_records)} findings (apply_all={int(apply_all_qualified)}) "
+        f"→ monitoring 30min each (hot_reload)"
+    )
     git_commit_and_push(
         f"auto: apply {len(new_records)} CF findings ({', '.join(applied_ids[:6])})"
     )
