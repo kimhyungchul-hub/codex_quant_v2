@@ -2,7 +2,7 @@
 research/runner.py — Main Research Engine Runner (v2)
 ======================================================
 5분마다 CF 시뮬레이션 → 조건 충족 시 자동 적용 (보수적 모드)
-1시간마다 Gemini 코드 리뷰 → git push
+1시간마다 OpenAI 코드 리뷰 → git push
 
 Usage:
   python -m research.runner              # 기본 (5분 주기 + auto-apply)
@@ -10,7 +10,7 @@ Usage:
   python -m research.runner --stage leverage  # 특정 스테이지만
   python -m research.runner --no-dashboard    # 대시보드 없이
   python -m research.runner --no-auto-apply   # 자동 적용 비활성화
-  python -m research.runner --no-gemini       # Gemini 리뷰 비활성화
+  python -m research.runner --no-openai-review  # OpenAI 리뷰 비활성화
 """
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ logger = logging.getLogger("research.runner")
 # ─────────────────────────────────────────────────────────────────
 DEFAULT_DB = os.path.join(PROJECT_ROOT, "state", "bot_data_live.db")
 CF_INTERVAL_SEC = 300          # 5분마다 CF 분석
-GEMINI_INTERVAL_SEC = 3600     # 1시간마다 Gemini 리뷰
+OPENAI_INTERVAL_SEC = 3600     # 1시간마다 OpenAI 리뷰
 MAX_COMBOS_PER_STAGE = 220
 DASHBOARD_PORT = 9998
 FINDINGS_OUTPUT = os.path.join(PROJECT_ROOT, "docs", "RESEARCH_FINDINGS.md")
@@ -848,26 +848,27 @@ def run_auto_apply(findings: list[dict]) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Gemini Review Integration
+# OpenAI Review Integration
 # ─────────────────────────────────────────────────────────────────
 
-def run_gemini_cycle(findings: list[dict]) -> dict:
-    """Run Gemini code review."""
+def run_openai_cycle(findings: list[dict]) -> dict:
+    """Run OpenAI code review."""
     try:
-        from research.gemini_reviewer import run_gemini_review, is_available
+        from research.openai_reviewer import run_openai_review, is_available
         if not is_available():
-            logger.debug("Gemini API key not set — skipping review")
+            logger.debug("OpenAI API key not set — skipping review")
             return {"status": "disabled"}
         from research.auto_apply import get_apply_history
-        status = run_gemini_review(
+        status = run_openai_review(
             findings=findings,
             apply_history=get_apply_history(),
-            auto_apply_env=False,  # Conservative: Gemini suggests only
+            auto_apply_env=False,  # Conservative: suggest only
         )
-        _update_dashboard({"gemini_review": status})
+        # Keep both keys for dashboard backward compatibility.
+        _update_dashboard({"openai_review": status, "gemini_review": status})
         return status
     except Exception as e:
-        logger.error(f"Gemini review error: {e}", exc_info=True)
+        logger.error(f"OpenAI review error: {e}", exc_info=True)
         return {"status": "error", "reason": str(e)}
 
 
@@ -891,10 +892,12 @@ def main():
     parser.add_argument("--stage", default=None, help="Run specific stage only")
     parser.add_argument("--no-dashboard", action="store_true", help="Disable dashboard")
     parser.add_argument("--no-auto-apply", action="store_true", help="Disable auto-apply")
-    parser.add_argument("--no-gemini", action="store_true", help="Disable Gemini review")
+    parser.add_argument("--no-gemini", dest="no_openai_review", action="store_true", help="Disable OpenAI review (legacy flag)")
+    parser.add_argument("--no-openai-review", dest="no_openai_review", action="store_true", help="Disable OpenAI review")
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT, help="Dashboard port")
     parser.add_argument("--interval", type=int, default=CF_INTERVAL_SEC, help="CF cycle interval (sec)")
-    parser.add_argument("--gemini-interval", type=int, default=GEMINI_INTERVAL_SEC, help="Gemini review interval (sec)")
+    parser.add_argument("--gemini-interval", dest="openai_interval", type=int, default=OPENAI_INTERVAL_SEC, help="OpenAI review interval (legacy flag)")
+    parser.add_argument("--openai-interval", dest="openai_interval", type=int, default=OPENAI_INTERVAL_SEC, help="OpenAI review interval (sec)")
     parser.add_argument("--max-combos", type=int, default=MAX_COMBOS_PER_STAGE, help="Max parameter combos per stage")
     args = parser.parse_args()
 
@@ -905,7 +908,7 @@ def main():
     boot_interval = _runtime_interval_sec(args.interval, deep_mode=False)
     logger.info(f"  CF interval: {boot_interval}s ({boot_interval//60}min)")
     logger.info(f"  Auto-apply: {'ON (qualifying findings all apply, 30min monitor each, rollback on -$10)' if not args.no_auto_apply else 'OFF'}")
-    logger.info(f"  Gemini review: {'ON' if not args.no_gemini else 'OFF'} (every {args.gemini_interval//60}min)")
+    logger.info(f"  OpenAI review: {'ON' if not args.no_openai_review else 'OFF'} (every {args.openai_interval//60}min)")
     logger.info(f"  Dashboard: {'OFF' if args.no_dashboard else f'http://0.0.0.0:{args.port}'}")
     logger.info("=" * 60)
 
@@ -924,7 +927,7 @@ def main():
         except Exception:
             pass
 
-    last_gemini_ts = 0
+    last_openai_ts = 0
     last_findings: list[dict] = []
 
     try:
@@ -998,18 +1001,18 @@ def main():
                 "last_cycle_report": cycle_report,
             })
 
-            # ── Phase 3: Gemini Review (hourly) ──
-            if not args.no_gemini and (time.time() - last_gemini_ts) >= args.gemini_interval:
-                logger.info("Starting Gemini code review...")
-                gemini_status = run_gemini_cycle(last_findings)
-                last_gemini_ts = time.time()
-                if gemini_status.get("status") == "ok":
+            # ── Phase 3: OpenAI Review (hourly) ──
+            if not args.no_openai_review and (time.time() - last_openai_ts) >= args.openai_interval:
+                logger.info("Starting OpenAI code review...")
+                openai_status = run_openai_cycle(last_findings)
+                last_openai_ts = time.time()
+                if openai_status.get("status") == "ok":
                     logger.info(
-                        f"[GEMINI] Review complete: {gemini_status.get('n_suggestions', 0)} suggestions, "
-                        f"risk={gemini_status.get('risk_score', '?')}/10"
+                        f"[OPENAI] Review complete: {openai_status.get('n_suggestions', 0)} suggestions, "
+                        f"risk={openai_status.get('risk_score', '?')}/10"
                     )
-                elif gemini_status.get("status") != "disabled":
-                    logger.warning(f"[GEMINI] {gemini_status}")
+                elif openai_status.get("status") != "disabled":
+                    logger.warning(f"[OPENAI] {openai_status}")
 
             if args.once:
                 break
