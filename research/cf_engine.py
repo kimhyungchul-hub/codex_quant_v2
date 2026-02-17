@@ -70,14 +70,24 @@ def _env_float(name: str, default: float) -> float:
 
 
 _ENV_FILE_CACHE: dict[str, str] | None = None
+_ENV_FILE_CACHE_MTIME: float | None = None
 
 
 def _env_file_values() -> dict[str, str]:
-    global _ENV_FILE_CACHE
-    if _ENV_FILE_CACHE is not None:
-        return _ENV_FILE_CACHE
+    global _ENV_FILE_CACHE, _ENV_FILE_CACHE_MTIME
     out: dict[str, str] = {}
     env_path = PROJECT_ROOT / "state" / "bybit.env"
+    current_mtime: float | None = None
+    try:
+        if env_path.exists():
+            current_mtime = float(env_path.stat().st_mtime)
+    except Exception:
+        current_mtime = None
+
+    # Reuse cache only when file mtime is unchanged.
+    if _ENV_FILE_CACHE is not None and _ENV_FILE_CACHE_MTIME == current_mtime:
+        return _ENV_FILE_CACHE
+
     try:
         if env_path.exists():
             for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
@@ -89,6 +99,7 @@ def _env_file_values() -> dict[str, str]:
     except Exception:
         out = {}
     _ENV_FILE_CACHE = out
+    _ENV_FILE_CACHE_MTIME = current_mtime
     return out
 
 
