@@ -24,6 +24,7 @@ import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 # Add project root to path
 PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -851,7 +852,12 @@ def run_auto_apply(findings: list[dict]) -> dict:
 # OpenAI Review Integration
 # ─────────────────────────────────────────────────────────────────
 
-def run_openai_cycle(findings: list[dict]) -> dict:
+def run_openai_cycle(
+    findings: list[dict],
+    *,
+    prompt_override: str | None = None,
+    source: str = "scheduled",
+) -> dict:
     """Run OpenAI code review."""
     try:
         from research.openai_reviewer import run_openai_review, is_available
@@ -863,6 +869,8 @@ def run_openai_cycle(findings: list[dict]) -> dict:
             findings=findings,
             apply_history=get_apply_history(),
             auto_apply_env=False,  # Conservative: suggest only
+            prompt_override=prompt_override,
+            source=source,
         )
         # Keep both keys for dashboard backward compatibility.
         _update_dashboard({"openai_review": status, "gemini_review": status})
@@ -870,6 +878,155 @@ def run_openai_cycle(findings: list[dict]) -> dict:
     except Exception as e:
         logger.error(f"OpenAI review error: {e}", exc_info=True)
         return {"status": "error", "reason": str(e)}
+
+
+def _build_openai_telegram_message(status: dict, *, source_label: str) -> str:
+    s = str(status.get("status") or "unknown")
+    model = str(status.get("model") or "?")
+    if s != "ok":
+        reason = str(status.get("reason") or "unknown")
+        return (
+            f"[OpenAI Review/{source_label}] 실패\n"
+            f"- status: {s}\n"
+            f"- model: {model}\n"
+            f"- reason: {reason}"
+        )
+
+    lines = [
+        f"[OpenAI Review/{source_label}] 완료",
+        f"- model: {model}",
+        f"- risk: {status.get('risk_score', '?')}/10",
+        f"- suggestions: {int(status.get('n_suggestions') or 0)}",
+        f"- summary: {str(status.get('summary') or '').strip()}",
+        "",
+        "[제안 목록]",
+    ]
+    suggestions = status.get("suggestions")
+    if isinstance(suggestions, list) and suggestions:
+        for i, row in enumerate(suggestions[:10], 1):
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "?")
+            conf = float(row.get("confidence") or 0.0)
+            env_changes = row.get("env_changes") if isinstance(row.get("env_changes"), dict) else {}
+            env_keys = ", ".join(list(env_changes.keys())[:4]) if env_changes else "-"
+            lines.append(f"{i}. {title} (conf={conf:.0%}, env={env_keys})")
+        if len(suggestions) > 10:
+            lines.append(f"... ({len(suggestions) - 10}개 추가 제안은 /Users/jeonghwakim/codex_quant_clean/docs/OPENAI_REVIEW.md 참고)")
+    else:
+        lines.append("- 제안 없음")
+
+    lines.extend([
+        "",
+        "적용 명령:",
+        "- /rq_apply all",
+        "- /rq_apply 1,3",
+    ])
+    return "\n".join(lines)
+
+
+def _build_apply_telegram_message(status: dict) -> str:
+    s = str(status.get("status") or "unknown")
+    if s != "ok":
+        return f"[OpenAI Apply] 실패: {status.get('reason', 'unknown')}"
+    lines = [
+        "[OpenAI Apply] 완료",
+        f"- selected: {int(status.get('selected_count') or 0)}",
+        f"- applied: {int(status.get('applied_count') or 0)}",
+    ]
+    changes = status.get("applied_env_changes")
+    if isinstance(changes, list) and changes:
+        lines.append("[변경 내역]")
+        for c in changes[:20]:
+            if not isinstance(c, dict):
+                continue
+            lines.append(f"- {c.get('key')}: {c.get('old')} -> {c.get('new')}")
+    else:
+        lines.append("- 실제 적용된 env 변경 없음(범위 밖/동일 값/파싱 실패)")
+    return "\n".join(lines)
+
+
+def _build_telegram_runtime_status(
+    *,
+    args: argparse.Namespace,
+    last_result: dict | None,
+) -> str:
+    scope = args.stage or f"ALL ({len(ALL_SIMULATORS)} simulators)"
+    interval_normal = _runtime_interval_sec(args.interval, deep_mode=False)
+    interval_deep = _runtime_interval_sec(args.interval, deep_mode=True)
+    openai_interval = int(args.openai_interval)
+    mode = str((last_result or {}).get("research_mode") or "normal")
+    combos = int((last_result or {}).get("cycle_max_combos") or args.max_combos)
+    runs = int((last_result or {}).get("ensemble_runs") or 1)
+    status = str((last_result or {}).get("status") or "unknown")
+    return (
+        "[Research Status]\n"
+        f"- scope: {scope}\n"
+        f"- last_status: {status} (mode={mode}, combos={combos}, runs={runs})\n"
+        f"- CF interval(normal): {interval_normal}s\n"
+        f"- CF interval(deep): {interval_deep}s\n"
+        f"- OpenAI review interval: {openai_interval}s\n"
+        f"- OpenAI review enabled: {str(not args.no_openai_review)}\n"
+        f"- auto_apply enabled: {str(not args.no_auto_apply)}\n"
+    )
+
+
+def _handle_telegram_actions(
+    *,
+    actions: list[dict],
+    telegram_ctl: Any,
+    args: argparse.Namespace,
+    last_findings: list[dict],
+    last_result: dict | None,
+    last_openai_ts: float,
+) -> tuple[bool, float]:
+    force_cf_now = False
+    ts = float(last_openai_ts)
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        atype = str(action.get("type") or "").strip()
+        try:
+            if atype == "help":
+                telegram_ctl.send_text(telegram_ctl.help_text())
+            elif atype == "status":
+                telegram_ctl.send_text(_build_telegram_runtime_status(args=args, last_result=last_result))
+            elif atype == "list_models":
+                from research.openai_reviewer import list_available_models
+
+                mids = list_available_models()
+                if not mids:
+                    telegram_ctl.send_text("[OpenAI Models] 모델 조회 실패 또는 결과 없음")
+                else:
+                    telegram_ctl.send_text("[OpenAI Models]\n" + "\n".join(mids))
+            elif atype == "run_openai_review":
+                prompt_override = action.get("prompt")
+                telegram_ctl.send_text("[Research] OpenAI 리뷰 수동 실행 시작")
+                status = run_openai_cycle(
+                    last_findings,
+                    prompt_override=(str(prompt_override).strip() if prompt_override else None),
+                    source="telegram_manual",
+                )
+                ts = time.time()
+                telegram_ctl.send_text(_build_openai_telegram_message(status, source_label="manual"))
+            elif atype == "apply_openai_suggestions":
+                from research.openai_reviewer import apply_latest_review_suggestions
+
+                selection = action.get("selection")
+                status = apply_latest_review_suggestions(selection=selection, allow_low_confidence=True)
+                telegram_ctl.send_text(_build_apply_telegram_message(status))
+            elif atype == "run_cf_now":
+                force_cf_now = True
+                telegram_ctl.send_text("[Research] 다음 대기 없이 CF 사이클을 즉시 시작합니다.")
+            elif atype == "error":
+                telegram_ctl.send_text(str(action.get("message") or "명령 파싱 오류"))
+        except Exception as e:
+            logger.error(f"Telegram action failed ({atype}): {e}", exc_info=True)
+            try:
+                telegram_ctl.send_text(f"[Research] 명령 처리 실패: {atype} ({e})")
+            except Exception:
+                pass
+    return force_cf_now, ts
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -929,15 +1086,53 @@ def main():
 
     last_openai_ts = 0
     last_findings: list[dict] = []
+    last_result: dict | None = None
+    telegram_ctl = None
+    try:
+        from research.telegram_research_control import TelegramResearchControl
+
+        telegram_ctl = TelegramResearchControl(Path(PROJECT_ROOT))
+        if telegram_ctl.enabled:
+            logger.info("Telegram research control: ON")
+            try:
+                telegram_ctl.send_text(
+                    "[Research] 엔진 시작됨\n"
+                    "명령 확인: /rq_help\n"
+                    f"OpenAI review interval={args.openai_interval}s, CF interval={_runtime_interval_sec(args.interval, deep_mode=False)}s"
+                )
+            except Exception:
+                pass
+        else:
+            logger.info("Telegram research control: OFF (missing TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID)")
+    except Exception as e:
+        logger.warning(f"Telegram research control unavailable: {e}")
 
     try:
         while True:
+            if telegram_ctl and telegram_ctl.enabled:
+                try:
+                    actions = telegram_ctl.poll_actions()
+                    if actions:
+                        force_now, last_openai_ts = _handle_telegram_actions(
+                            actions=actions,
+                            telegram_ctl=telegram_ctl,
+                            args=args,
+                            last_findings=last_findings,
+                            last_result=last_result,
+                            last_openai_ts=last_openai_ts,
+                        )
+                        if force_now:
+                            logger.info("Telegram requested immediate CF cycle")
+                except Exception as e:
+                    logger.error(f"Telegram poll failed: {e}", exc_info=True)
+
             # ── Phase 1: CF Analysis (expanded stage simulators) ──
             result = run_cf_cycle(
                 db_path=args.db,
                 stage_filter=args.stage,
                 max_combos=args.max_combos,
             )
+            last_result = result
 
             findings = result.get("findings", [])
             if findings:
@@ -1013,6 +1208,11 @@ def main():
                     )
                 elif openai_status.get("status") != "disabled":
                     logger.warning(f"[OPENAI] {openai_status}")
+                if telegram_ctl and telegram_ctl.enabled:
+                    try:
+                        telegram_ctl.send_text(_build_openai_telegram_message(openai_status, source_label="scheduled"))
+                    except Exception:
+                        pass
 
             if args.once:
                 break
@@ -1022,7 +1222,32 @@ def main():
                 f"Next CF cycle in {next_interval}s... "
                 f"(mode={result.get('research_mode', 'normal')}, combos={result.get('cycle_max_combos')}, runs={result.get('ensemble_runs')})"
             )
-            time.sleep(next_interval)
+            if telegram_ctl and telegram_ctl.enabled and next_interval > 0:
+                remaining = int(next_interval)
+                while remaining > 0:
+                    step = min(10, remaining)
+                    time.sleep(step)
+                    remaining -= step
+                    try:
+                        actions = telegram_ctl.poll_actions()
+                    except Exception as e:
+                        logger.error(f"Telegram poll failed during wait: {e}", exc_info=True)
+                        continue
+                    if not actions:
+                        continue
+                    force_now, last_openai_ts = _handle_telegram_actions(
+                        actions=actions,
+                        telegram_ctl=telegram_ctl,
+                        args=args,
+                        last_findings=last_findings,
+                        last_result=last_result,
+                        last_openai_ts=last_openai_ts,
+                    )
+                    if force_now:
+                        logger.info("Telegram requested immediate CF cycle (break sleep)")
+                        break
+            else:
+                time.sleep(next_interval)
 
     except KeyboardInterrupt:
         logger.info("Research engine stopped by user")

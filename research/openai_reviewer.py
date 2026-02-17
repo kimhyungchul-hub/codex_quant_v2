@@ -22,7 +22,7 @@ import re
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -31,9 +31,10 @@ logger = logging.getLogger("research.openai_reviewer")
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REVIEW_OUTPUT = PROJECT_ROOT / "docs" / "OPENAI_REVIEW.md"
 REVIEW_HISTORY = PROJECT_ROOT / "state" / "openai_review_history.json"
+REVIEW_LATEST = PROJECT_ROOT / "state" / "openai_review_latest.json"
 
-OPENAI_MODEL = str(os.environ.get("OPENAI_REVIEW_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini").strip()
-OPENAI_API_URL = str(os.environ.get("OPENAI_API_URL", "https://api.openai.com/v1/responses") or "https://api.openai.com/v1/responses").strip()
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_OPENAI_API_URL = "https://api.openai.com/v1/responses"
 
 # Files to review (relative to project root)
 REVIEW_FILES = [
@@ -56,6 +57,16 @@ MAX_TOTAL_CHARS = 120000
 
 def _get_api_key() -> Optional[str]:
     return os.environ.get("OPENAI_API_KEY") or _read_env_key()
+
+
+def _runtime_model() -> str:
+    model = str(os.environ.get("OPENAI_REVIEW_MODEL", DEFAULT_OPENAI_MODEL) or DEFAULT_OPENAI_MODEL).strip()
+    return model or DEFAULT_OPENAI_MODEL
+
+
+def _runtime_api_url() -> str:
+    url = str(os.environ.get("OPENAI_API_URL", DEFAULT_OPENAI_API_URL) or DEFAULT_OPENAI_API_URL).strip()
+    return url or DEFAULT_OPENAI_API_URL
 
 
 def _read_env_key() -> Optional[str]:
@@ -218,16 +229,16 @@ def _extract_response_text(resp_json: dict) -> Optional[str]:
     return None
 
 
-def _call_openai(prompt: str, api_key: str) -> Optional[str]:
+def _call_openai(prompt: str, api_key: str, *, model: str, api_url: str) -> Optional[str]:
     payload = {
-        "model": OPENAI_MODEL,
+        "model": model,
         "input": prompt,
         "temperature": 0.3,
         "max_output_tokens": 8192,
     }
     body = json.dumps(payload).encode("utf-8")
     req = Request(
-        OPENAI_API_URL,
+        api_url,
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -277,21 +288,23 @@ def _parse_openai_response(text: str) -> Optional[dict]:
     return None
 
 
-def _save_review(review: dict, timestamp: float) -> None:
+def _save_review(review: dict, timestamp: float, *, model: str, source: str = "scheduled") -> None:
     history = []
     if REVIEW_HISTORY.exists():
         try:
             history = json.loads(REVIEW_HISTORY.read_text(encoding="utf-8"))
         except Exception:
             history = []
-    history.append({"timestamp": timestamp, "review": review})
+    entry = {"timestamp": float(timestamp), "model": str(model), "source": str(source), "review": review}
+    history.append(entry)
     history = history[-50:]
     REVIEW_HISTORY.write_text(json.dumps(history, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+    REVIEW_LATEST.write_text(json.dumps(entry, indent=2, ensure_ascii=False), encoding="utf-8")
 
     lines = [
         f"# OpenAI Code Review — {time.strftime('%Y-%m-%d %H:%M', time.localtime(timestamp))}",
         "",
-        f"**Model:** {OPENAI_MODEL}",
+        f"**Model:** {model}",
         f"**Risk Score:** {review.get('risk_score', '?')}/10",
         f"**Summary:** {review.get('summary', '?')}",
         "",
@@ -344,7 +357,7 @@ def git_push_all(message: str = "auto: pre-OpenAI review snapshot") -> bool:
         return False
 
 
-def _apply_env_suggestions(suggestions: list[dict]) -> list[dict]:
+def _apply_env_suggestions(suggestions: list[dict], *, min_confidence: float = 0.7) -> list[dict]:
     """Apply env variable changes from OpenAI suggestions (safe keys only)."""
     from research.auto_apply import (
         _clamp_value,
@@ -355,7 +368,7 @@ def _apply_env_suggestions(suggestions: list[dict]) -> list[dict]:
 
     applied = []
     for s in suggestions:
-        if s.get("confidence", 0) < 0.7:
+        if float(s.get("confidence", 0) or 0.0) < float(min_confidence):
             continue
         env_changes = s.get("env_changes", {})
         if not env_changes:
@@ -378,27 +391,146 @@ def _apply_env_suggestions(suggestions: list[dict]) -> list[dict]:
     return applied
 
 
+def get_latest_review_entry() -> Optional[dict]:
+    try:
+        if REVIEW_LATEST.exists():
+            row = json.loads(REVIEW_LATEST.read_text(encoding="utf-8"))
+            if isinstance(row, dict):
+                return row
+    except Exception:
+        pass
+    try:
+        if REVIEW_HISTORY.exists():
+            rows = json.loads(REVIEW_HISTORY.read_text(encoding="utf-8"))
+            if isinstance(rows, list) and rows:
+                last = rows[-1]
+                if isinstance(last, dict):
+                    return last
+    except Exception:
+        pass
+    return None
+
+
+def list_available_models() -> list[str]:
+    api_key = _get_api_key()
+    if not api_key:
+        return []
+    api_url = _runtime_api_url().strip()
+    if "/v1/" in api_url:
+        base = api_url.split("/v1/", 1)[0].rstrip("/")
+        models_url = f"{base}/v1/models"
+    else:
+        models_url = "https://api.openai.com/v1/models"
+    req = Request(
+        models_url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except Exception as e:
+        logger.error(f"Failed to list OpenAI models: {e}")
+        return []
+    rows = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    ids: list[str] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        mid = str(r.get("id") or "").strip()
+        if mid:
+            ids.append(mid)
+    return sorted(set(ids))
+
+
+def apply_latest_review_suggestions(
+    *,
+    selection: str | list[int] | None = None,
+    allow_low_confidence: bool = True,
+) -> dict:
+    latest = get_latest_review_entry()
+    if not latest:
+        return {"status": "error", "reason": "no_latest_review"}
+    review = latest.get("review") if isinstance(latest.get("review"), dict) else {}
+    suggestions = review.get("suggestions") if isinstance(review.get("suggestions"), list) else []
+    if not suggestions:
+        return {"status": "error", "reason": "no_suggestions"}
+
+    selected: list[dict] = []
+    selected_ids: list[int] = []
+    if selection is None:
+        return {"status": "error", "reason": "selection_required"}
+
+    if isinstance(selection, str) and selection.strip().lower() == "all":
+        selected = [s for s in suggestions if isinstance(s, dict)]
+        selected_ids = list(range(1, len(selected) + 1))
+    else:
+        raw_ids = selection if isinstance(selection, list) else []
+        for i in raw_ids:
+            try:
+                idx = int(i)
+            except Exception:
+                continue
+            if 1 <= idx <= len(suggestions):
+                s = suggestions[idx - 1]
+                if isinstance(s, dict):
+                    selected.append(s)
+                    selected_ids.append(idx)
+    if not selected:
+        return {"status": "error", "reason": "empty_selection"}
+
+    from research.auto_apply import backup_env
+
+    backup_env()
+    min_conf = -1.0 if allow_low_confidence else 0.7
+    applied = _apply_env_suggestions(selected, min_confidence=min_conf)
+    if applied:
+        keys = ", ".join(sorted({str(a.get("key") or "") for a in applied if a.get("key")}))
+        git_push_all(f"auto: OpenAI manual apply ({len(applied)} params) [{keys}]")
+    return {
+        "status": "ok",
+        "selected_count": len(selected),
+        "selected_indices": selected_ids,
+        "applied_count": len(applied),
+        "applied_env_changes": applied,
+        "review_timestamp": float(latest.get("timestamp") or 0.0),
+        "model": str(latest.get("model") or _runtime_model()),
+    }
+
+
 def run_openai_review(
     findings: list[dict] | None = None,
     apply_history: list[dict] | None = None,
     auto_apply_env: bool = False,
+    prompt_override: str | None = None,
+    source: str = "scheduled",
 ) -> dict:
     """Run one OpenAI review cycle and return dashboard status."""
     api_key = _get_api_key()
     if not api_key:
         return {"status": "disabled", "reason": "no_api_key"}
 
+    model = _runtime_model()
+    api_url = _runtime_api_url()
     ts = time.time()
-    status = {"status": "running", "timestamp": ts, "model": OPENAI_MODEL}
+    status = {"status": "running", "timestamp": ts, "model": model, "source": str(source)}
 
     # Phase 1: snapshot
     git_push_all(f"auto: pre-openai-review snapshot {time.strftime('%Y-%m-%d %H:%M')}")
 
     # Phase 2: prompt/call
     prompt = _build_review_prompt(findings or [], apply_history or [])
-    logger.info(f"Calling OpenAI ({OPENAI_MODEL}), prompt={len(prompt)} chars...")
+    if prompt_override:
+        prompt = (
+            f"{prompt}\n\n## 사용자 추가 분석 요청\n"
+            f"{str(prompt_override).strip()[:12000]}\n"
+        )
+        status["prompt_override"] = str(prompt_override).strip()[:500]
+    logger.info(f"Calling OpenAI ({model}), prompt={len(prompt)} chars...")
 
-    response_text = _call_openai(prompt, api_key)
+    response_text = _call_openai(prompt, api_key, model=model, api_url=api_url)
     if not response_text:
         status["status"] = "error"
         status["reason"] = "api_call_failed"
@@ -413,19 +545,22 @@ def run_openai_review(
         return status
 
     # Phase 4: save
-    _save_review(review, ts)
+    _save_review(review, ts, model=model, source=source)
     status["status"] = "ok"
     status["summary"] = review.get("summary", "")
     status["risk_score"] = review.get("risk_score", 0)
     status["n_suggestions"] = len(review.get("suggestions", []))
     status["warnings"] = review.get("warnings", [])
+    status["suggestions"] = review.get("suggestions", [])
+    status["review_output_path"] = str(REVIEW_OUTPUT)
+    status["review_timestamp"] = float(ts)
 
     # Phase 5: optional apply
     if auto_apply_env and review.get("suggestions"):
         from research.auto_apply import backup_env
 
         backup_env()
-        applied = _apply_env_suggestions(review["suggestions"])
+        applied = _apply_env_suggestions(review["suggestions"], min_confidence=0.7)
         status["applied_env_changes"] = applied
         if applied:
             git_push_all(
