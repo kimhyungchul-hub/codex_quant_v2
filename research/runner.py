@@ -30,7 +30,15 @@ PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from research.cf_engine import CFEngine, TradeLoader, ALL_SIMULATORS, compute_metrics_by_regime
+from research.cf_engine import (
+    CFEngine,
+    TradeLoader,
+    ALL_SIMULATORS,
+    compute_metrics_by_regime,
+    DEFAULT_DL_REPORT,
+    DEFAULT_DL_SCORES,
+    DEFAULT_DL_MODEL,
+)
 from research.documenter import (
     save_findings_json,
     generate_findings_markdown,
@@ -53,6 +61,7 @@ RESEARCH_CYCLES_JSON = os.path.join(PROJECT_ROOT, "state", "research_cycles.json
 LAST_ANALYZED_JSON = os.path.join(PROJECT_ROOT, "state", "research_last_analyzed.json")
 MAX_CYCLE_HISTORY = 80
 MIN_NEW_TRADES_FOR_REANALYSIS = 3  # 최소 3개의 새 거래가 있어야 재분석
+MTF_STAGE_NAME = "mtf_image_dl_gate"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -174,6 +183,139 @@ def _latest_apply_lookup(apply_history: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _resolve_path(path_like: str | os.PathLike | None, fallback: str | os.PathLike) -> Path:
+    raw = str(path_like or "").strip()
+    p = Path(raw) if raw else Path(fallback)
+    if not p.is_absolute():
+        p = Path(PROJECT_ROOT) / p
+    return p
+
+
+def _path_mtime(path: Path) -> float | None:
+    try:
+        if path.exists():
+            return float(path.stat().st_mtime)
+    except Exception:
+        return None
+    return None
+
+
+def _path_size(path: Path) -> int | None:
+    try:
+        if path.exists():
+            return int(path.stat().st_size)
+    except Exception:
+        return None
+    return None
+
+
+def _read_json(path: Path) -> dict | list | None:
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _collect_mtf_imageh_state(
+    *,
+    result: dict,
+    findings: list[dict],
+    apply_history: list[dict],
+) -> dict:
+    report_path = _resolve_path(os.environ.get("CF_MTF_DL_REPORT_PATH"), DEFAULT_DL_REPORT)
+    scores_path = _resolve_path(os.environ.get("CF_MTF_DL_SCORES_PATH"), DEFAULT_DL_SCORES)
+    model_path = _resolve_path(os.environ.get("CF_MTF_DL_MODEL_PATH"), DEFAULT_DL_MODEL)
+
+    report_raw = _read_json(report_path)
+    report = report_raw if isinstance(report_raw, dict) else {}
+    training = report.get("training") if isinstance(report.get("training"), dict) else {}
+    dataset = report.get("dataset") if isinstance(report.get("dataset"), dict) else {}
+    best = report.get("best") if isinstance(report.get("best"), dict) else {}
+    baseline = report.get("baseline") if isinstance(report.get("baseline"), dict) else {}
+    sweep = report.get("threshold_sweep") if isinstance(report.get("threshold_sweep"), dict) else {}
+
+    stage_prog = {}
+    try:
+        stage_prog = dict((result.get("sweep_progress") or {}).get(MTF_STAGE_NAME) or {})
+    except Exception:
+        stage_prog = {}
+
+    mtf_findings = []
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        if str(f.get("stage") or "").strip() == MTF_STAGE_NAME:
+            mtf_findings.append({
+                "finding_id": str(f.get("finding_id") or ""),
+                "title": f.get("title"),
+                "confidence": float(f.get("confidence") or 0.0),
+                "improvement_pct": float(f.get("improvement_pct") or 0.0),
+                "recommendation": f.get("recommendation"),
+                "param_changes": f.get("param_changes") or {},
+            })
+
+    mtf_apply_hist = []
+    for rec in apply_history or []:
+        if not isinstance(rec, dict):
+            continue
+        if str(rec.get("stage") or "").strip() == MTF_STAGE_NAME:
+            mtf_apply_hist.append({
+                "timestamp": float(rec.get("timestamp") or 0.0),
+                "finding_id": str(rec.get("finding_id") or ""),
+                "status": str(rec.get("status") or ""),
+                "equity_at_apply": rec.get("equity_at_apply"),
+                "equity_after_monitor": rec.get("equity_after_monitor"),
+                "rolled_back": bool(rec.get("rolled_back")),
+                "rollback_reason": rec.get("rollback_reason"),
+                "env_changes": rec.get("env_changes") or {},
+            })
+    mtf_apply_hist = sorted(mtf_apply_hist, key=lambda x: float(x.get("timestamp") or 0.0), reverse=True)
+
+    runtime_env = {
+        "CF_MTF_DL_ENABLED": _env_bool("CF_MTF_DL_ENABLED", True),
+        "CF_MTF_DL_REFRESH_EACH_CYCLE": _env_bool("CF_MTF_DL_REFRESH_EACH_CYCLE", True),
+        "MTF_DL_RUNTIME_ENABLED": _env_bool("MTF_DL_RUNTIME_ENABLED", True),
+        "MTF_DL_ENTRY_GATE_ENABLED": _env_bool("MTF_DL_ENTRY_GATE_ENABLED", True),
+        "MTF_DL_EXIT_HEAD_ENABLED": _env_bool("MTF_DL_EXIT_HEAD_ENABLED", True),
+        "MTF_DL_ENTRY_MIN_SIDE_PROB": _file_env_float("MTF_DL_ENTRY_MIN_SIDE_PROB", 0.58),
+        "MTF_DL_ENTRY_MIN_WIN_PROB": _file_env_float("MTF_DL_ENTRY_MIN_WIN_PROB", 0.52),
+        "MTF_DL_EXIT_MIN_CONF": _file_env_float("MTF_DL_EXIT_MIN_CONF", 0.62),
+        "MTF_DL_EXIT_MIN_PROGRESS": _file_env_float("MTF_DL_EXIT_MIN_PROGRESS", 0.95),
+    }
+
+    return {
+        "stage_name": MTF_STAGE_NAME,
+        "stage_progress": stage_prog,
+        "running": bool(result.get("running")),
+        "cycle_count": int(result.get("cycle_count") or 0),
+        "report": {
+            "path": str(report_path),
+            "mtime": _path_mtime(report_path),
+            "timestamp": int(report.get("timestamp") or 0) if report else 0,
+        },
+        "scores": {
+            "path": str(scores_path),
+            "mtime": _path_mtime(scores_path),
+            "size_bytes": _path_size(scores_path),
+        },
+        "model": {
+            "path": str(model_path),
+            "mtime": _path_mtime(model_path),
+            "size_bytes": _path_size(model_path),
+        },
+        "dataset": dataset,
+        "training": training,
+        "baseline": baseline,
+        "best": best,
+        "sweep": sweep,
+        "runtime_env": runtime_env,
+        "mtf_findings": mtf_findings[:12],
+        "mtf_apply_history": mtf_apply_hist[:30],
+    }
+
+
 def _build_cycle_report(
     *,
     cycle_index: int,
@@ -278,12 +420,18 @@ def run_cf_cycle(
     if not trades:
         logger.warning("No trades found. Skipping CF cycle.")
         run_cf_cycle._cycle = cycle_index
+        mtf_state = _collect_mtf_imageh_state(
+            result={"running": False, "cycle_count": cycle_index, "sweep_progress": {}},
+            findings=[],
+            apply_history=[],
+        )
         return {
             "status": "no_trades",
             "cycle_count": cycle_index,
             "cycle_started_ts": cycle_started_ts,
             "last_update_ts": time.time(),
             "running": False,
+            "mtf_imageh": mtf_state,
         }
 
     # ── Check for new trades to avoid repeated analysis ──
@@ -315,10 +463,16 @@ def run_cf_cycle(
     if (not always_run_cf) and (not forced_by_idle) and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
         logger.info(f"[SKIP] No significant new trades (new={new_trade_count}, min={MIN_NEW_TRADES_FOR_REANALYSIS}). Skipping CF cycle.")
         run_cf_cycle._cycle = cycle_index
+        mtf_state = _collect_mtf_imageh_state(
+            result={"running": False, "cycle_count": cycle_index, "sweep_progress": {}},
+            findings=[],
+            apply_history=[],
+        )
         _update_dashboard({
             "running": False,
             "stage_current": "skipped",
             "skip_reason": "no_new_trades",
+            "mtf_imageh": mtf_state,
         })
         return {
             "status": "skipped_no_new_trades",
@@ -332,6 +486,7 @@ def run_cf_cycle(
             "forced_by_idle": forced_by_idle,
             "idle_elapsed_sec": idle_elapsed_sec,
             "idle_force_sec": idle_force_sec,
+            "mtf_imageh": mtf_state,
         }
 
     if always_run_cf and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
@@ -389,6 +544,15 @@ def run_cf_cycle(
         apply_history_snapshot = get_apply_history()
     except Exception:
         apply_history_snapshot = []
+    mtf_state = _collect_mtf_imageh_state(
+        result={
+            "running": False,
+            "cycle_count": cycle_index,
+            "sweep_progress": sweep_progress,
+        },
+        findings=[asdict(f) for f in findings],
+        apply_history=apply_history_snapshot,
+    )
 
     result = {
         "status": "ok",
@@ -414,6 +578,7 @@ def run_cf_cycle(
         "cycle_started_ts": cycle_started_ts,
         "stage_current": "done",
         "last_update_ts": time.time(),
+        "mtf_imageh": mtf_state,
     }
     run_cf_cycle._cycle = cycle_index
 

@@ -69,6 +69,7 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
   <div class="tab" onclick="switchTab('trace')">Research Trace</div>
   <div class="tab" onclick="switchTab('findings')">Findings</div>
   <div class="tab" onclick="switchTab('sweep')">Sweep Progress</div>
+  <div class="tab" onclick="switchTab('mtf_imageh')">MTF ImageH</div>
   <div class="tab" onclick="switchTab('regime')">Regime Analysis</div>
   <div class="tab" onclick="switchTab('log')">Log</div>
 </div>
@@ -116,6 +117,38 @@ td{padding:5px 8px;border-bottom:1px solid rgba(48,54,61,0.4)}
   <div class="card">
     <h2>⚡ Parameter Sweep Progress</h2>
     <div id="sweepProgress"></div>
+  </div>
+</div>
+
+<!-- MTF IMAGEH TAB -->
+<div class="tab-content" id="tab-mtf_imageh">
+  <div class="grid">
+    <div class="card">
+      <h2>🧠 Stage / Runtime 상태</h2>
+      <div id="mtfSummary"></div>
+    </div>
+    <div class="card">
+      <h2>📦 Artifacts</h2>
+      <div id="mtfArtifacts"></div>
+    </div>
+  </div>
+  <div class="grid">
+    <div class="card">
+      <h2>🎯 Training / Validation</h2>
+      <div id="mtfTraining"></div>
+    </div>
+    <div class="card">
+      <h2>📈 CF Best Gate</h2>
+      <div id="mtfBest"></div>
+    </div>
+  </div>
+  <div class="card" style="margin-bottom:12px">
+    <h2>🧪 MTF Findings</h2>
+    <div id="mtfFindings"></div>
+  </div>
+  <div class="card">
+    <h2>✅ Applied / Monitoring (MTF stage)</h2>
+    <div id="mtfApply"></div>
   </div>
 </div>
 
@@ -276,6 +309,97 @@ function render(data) {
     </div>`;
   }).join('') || '<span style="color:var(--text2)">Not started</span>';
 
+  // MTF ImageH
+  const mtf = data.mtf_imageh || {};
+  const mtfStage = mtf.stage_progress || {};
+  const mtfSummary = document.getElementById('mtfSummary');
+  mtfSummary.innerHTML = `
+    <span class="metric info">stage=${esc(String(mtf.stage_name || 'mtf_image_dl_gate'))}</span>
+    <span class="metric ${String(mtfStage.status||'').toLowerCase()==='done'?'good':String(mtfStage.status||'').toLowerCase()==='error'?'bad':'neutral'}">status=${esc(String(mtfStage.status || '-'))}</span>
+    <span class="metric info">progress=${Number(mtfStage.done||0)}/${Number(mtfStage.total||0)}</span>
+    <span class="metric ${mtf.runtime_env?.CF_MTF_DL_ENABLED ? 'good':'bad'}">CF_MTF_DL=${mtf.runtime_env?.CF_MTF_DL_ENABLED ? 'ON':'OFF'}</span>
+    <span class="metric ${mtf.runtime_env?.MTF_DL_RUNTIME_ENABLED ? 'good':'bad'}">Runtime=${mtf.runtime_env?.MTF_DL_RUNTIME_ENABLED ? 'ON':'OFF'}</span>
+    <span class="metric ${mtf.runtime_env?.MTF_DL_ENTRY_GATE_ENABLED ? 'good':'neutral'}">EntryGate=${mtf.runtime_env?.MTF_DL_ENTRY_GATE_ENABLED ? 'ON':'OFF'}</span>
+    <span class="metric ${mtf.runtime_env?.MTF_DL_EXIT_HEAD_ENABLED ? 'good':'neutral'}">ExitHead=${mtf.runtime_env?.MTF_DL_EXIT_HEAD_ENABLED ? 'ON':'OFF'}</span>
+    <div style="margin-top:8px;color:var(--text2);font-size:0.78em">
+      cycle=${Number(mtf.cycle_count||0)} | updated=${fmtTime((data.last_update_ts||0)*1000)}
+    </div>
+  `;
+
+  const mtfArtifacts = document.getElementById('mtfArtifacts');
+  const report = mtf.report || {};
+  const model = mtf.model || {};
+  const scores = mtf.scores || {};
+  mtfArtifacts.innerHTML = `
+    <table>
+      <tr><th>Artifact</th><th>Path</th><th>Updated</th><th>Size</th></tr>
+      <tr><td>report</td><td>${esc(String(report.path||'-'))}</td><td>${fmtTime((Number(report.mtime)||0)*1000)}</td><td>-</td></tr>
+      <tr><td>model</td><td>${esc(String(model.path||'-'))}</td><td>${fmtTime((Number(model.mtime)||0)*1000)}</td><td>${fmtSize(model.size_bytes)}</td></tr>
+      <tr><td>scores</td><td>${esc(String(scores.path||'-'))}</td><td>${fmtTime((Number(scores.mtime)||0)*1000)}</td><td>${fmtSize(scores.size_bytes)}</td></tr>
+    </table>
+  `;
+
+  const mtfTraining = document.getElementById('mtfTraining');
+  const ds = mtf.dataset || {};
+  const trn = mtf.training || {};
+  mtfTraining.innerHTML = `
+    <span class="metric info">samples=${Number(ds.n_samples_built||0)}</span>
+    <span class="metric info">train=${Number(ds.n_train||0)}</span>
+    <span class="metric info">val=${Number(ds.n_val||0)}</span>
+    <span class="metric ${Number(trn.val_side_auc_last||0)>=0.55?'good':Number(trn.val_side_auc_last||0)>=0.50?'neutral':'bad'}">val_side_auc=${Number(trn.val_side_auc_last||0).toFixed(4)}</span>
+    <span class="metric ${Number(trn.val_win_auc_last||0)>=0.55?'good':Number(trn.val_win_auc_last||0)>=0.50?'neutral':'bad'}">val_win_auc=${Number(trn.val_win_auc_last||0).toFixed(4)}</span>
+    <span class="metric neutral">val_hold_mae=${Number(trn.val_hold_mae_last||0).toFixed(1)}s</span>
+    <span class="metric neutral">val_exit_acc=${Number(trn.val_exit_acc_last||0).toFixed(3)}</span>
+    <div style="margin-top:8px;color:var(--text2);font-size:0.78em">
+      eval_side_auc=${Number(trn.eval_side_auc||0).toFixed(4)} | eval_win_auc=${Number(trn.eval_win_auc||0).toFixed(4)}
+    </div>
+  `;
+
+  const mtfBest = document.getElementById('mtfBest');
+  const best = mtf.best || {};
+  const bg = best.global_gate || {};
+  const bgq = best.global_gate_quantile || {};
+  const bcq = best.chop_only_gate_quantile || {};
+  mtfBest.innerHTML = `
+    <table>
+      <tr><th>Mode</th><th>Thr/Q</th><th>N</th><th>PnL</th><th>WR</th></tr>
+      <tr><td>global</td><td>${Number(bg.threshold||0).toFixed(2)}</td><td>${Number(bg.n||0)}</td><td style="color:${Number(bg.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(bg.pnl||0).toFixed(2)}</td><td>${(Number(bg.wr||0)*100).toFixed(1)}%</td></tr>
+      <tr><td>global_q</td><td>q=${Number(bgq.quantile||0).toFixed(2)} / ${Number(bgq.threshold||0).toFixed(2)}</td><td>${Number(bgq.n||0)}</td><td style="color:${Number(bgq.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(bgq.pnl||0).toFixed(2)}</td><td>${(Number(bgq.wr||0)*100).toFixed(1)}%</td></tr>
+      <tr><td>chop_q</td><td>q=${Number(bcq.quantile||0).toFixed(2)} / ${Number(bcq.threshold||0).toFixed(2)}</td><td>${Number(bcq.n||0)}</td><td style="color:${Number(bcq.pnl||0)>=0?'var(--green)':'var(--red)'}">${Number(bcq.pnl||0).toFixed(2)}</td><td>${(Number(bcq.wr||0)*100).toFixed(1)}%</td></tr>
+    </table>
+  `;
+
+  const mtfFindings = document.getElementById('mtfFindings');
+  const mtfF = Array.isArray(mtf.mtf_findings) ? mtf.mtf_findings : [];
+  mtfFindings.innerHTML = mtfF.map((f, i) => `
+    <div class="finding">
+      <div class="title">#${i+1} ${esc(String(f.title||'-'))}</div>
+      <div class="improvement ${Number(f.improvement_pct||0)>=0?'pos':'neg'}">ΔPnL: ${Number(f.improvement_pct||0).toFixed(2)} | conf ${(Number(f.confidence||0)*100).toFixed(0)}%</div>
+      <div class="detail">${esc(String(f.recommendation||''))}</div>
+    </div>
+  `).join('') || '<span style="color:var(--text2)">No MTF-stage findings in this cycle.</span>';
+
+  const mtfApply = document.getElementById('mtfApply');
+  const ah = Array.isArray(mtf.mtf_apply_history) ? mtf.mtf_apply_history : [];
+  mtfApply.innerHTML = ah.length ? `
+    <table>
+      <tr><th>Time</th><th>Finding</th><th>Status</th><th>ΔEquity</th><th>Rollback</th></tr>
+      ${ah.slice(0, 12).map(h => {
+        const a = Number(h.equity_at_apply), b = Number(h.equity_after_monitor);
+        const d = (Number.isFinite(a) && Number.isFinite(b)) ? (b-a) : null;
+        const dTxt = d===null ? '-' : `${d>=0?'+':''}$${d.toFixed(2)}`;
+        const dColor = d===null ? 'var(--text2)' : (d>=0?'var(--green)':'var(--red)');
+        return `<tr>
+          <td>${fmtTime((Number(h.timestamp)||0)*1000)}</td>
+          <td>${esc(String(h.finding_id||'-'))}</td>
+          <td>${esc(String(h.status||'-'))}</td>
+          <td style="color:${dColor}">${dTxt}</td>
+          <td>${h.rolled_back ? 'Y' : 'N'} ${h.rollback_reason ? `(${esc(String(h.rollback_reason))})` : ''}</td>
+        </tr>`;
+      }).join('')}
+    </table>
+  ` : '<span style="color:var(--text2)">No MTF apply history yet.</span>';
+
   // Regime
   const rt = document.getElementById('regimeTable');
   const byRegime = data.baseline_by_regime || {};
@@ -372,6 +496,18 @@ function addLog(msg) {
 }
 
 function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+function fmtTime(ms) {
+  const n = Number(ms || 0);
+  if (!Number.isFinite(n) || n <= 0) return '-';
+  return new Date(n).toLocaleString();
+}
+function fmtSize(bytes) {
+  const b = Number(bytes || 0);
+  if (!Number.isFinite(b) || b <= 0) return '-';
+  if (b < 1024) return `${b.toFixed(0)} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 connect();
 </script>
