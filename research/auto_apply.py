@@ -34,7 +34,7 @@ DB_PATH = PROJECT_ROOT / "state" / "bot_data_live.db"
 # Safety Thresholds
 # ─────────────────────────────────────────────────────────────────
 MIN_CONFIDENCE = 0.80          # 최소 신뢰도 80%
-MIN_PNL_IMPROVEMENT = 100.0    # 최소 PnL 개선 $100
+MIN_PNL_IMPROVEMENT = 100.0    # 예상 PnL 개선 "high" 기준(USD)
 MONITOR_DURATION_SEC = 1800    # 30분 모니터링
 ROLLBACK_LOSS_USD = 10.0       # $10 이상 손실 시 롤백
 MAX_CHANGES_PER_CYCLE = 9999   # 제한 없음(사실상 무제한)
@@ -248,6 +248,29 @@ def _read_env_value(key: str) -> Optional[str]:
     return None
 
 
+def _env_float_runtime(key: str, default: float) -> float:
+    """Prefer process env, then state/bybit.env fallback."""
+    raw = os.environ.get(key)
+    if raw is None:
+        raw = _read_env_value(key)
+    try:
+        if raw is None:
+            return float(default)
+        return float(str(raw).strip())
+    except Exception:
+        return float(default)
+
+
+def _env_bool_runtime(key: str, default: bool) -> bool:
+    """Prefer process env, then state/bybit.env fallback."""
+    raw = os.environ.get(key)
+    if raw is None:
+        raw = _read_env_value(key)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _update_env_value(key: str, new_value: str) -> Optional[str]:
     """
     Update a value in bybit.env. Returns old value or None if key not found.
@@ -389,12 +412,16 @@ def _format_env_value(value, env_key: str) -> str:
 
 def should_apply(finding: dict) -> bool:
     """Check if a finding meets auto-apply criteria."""
-    conf = finding.get("confidence", 0)
-    pnl = finding.get("improvement_pct", 0)  # This is actually delta PnL in $
-    if conf < MIN_CONFIDENCE and pnl < MIN_PNL_IMPROVEMENT:
+    conf = float(finding.get("confidence", 0) or 0.0)
+    pnl = float(finding.get("improvement_pct", 0) or 0.0)  # This is actually delta PnL in $
+    min_conf = float(_env_float_runtime("AUTO_APPLY_MIN_CONFIDENCE", MIN_CONFIDENCE))
+    high_pnl = float(_env_float_runtime("AUTO_APPLY_HIGH_PNL_IMPROVEMENT", MIN_PNL_IMPROVEMENT))
+    conf_ok = bool(conf >= min_conf)
+    pnl_ok = bool(pnl >= high_pnl)
+    if not (conf_ok or pnl_ok):
         logger.debug(
-            f"Skip {finding.get('finding_id')}: conf={conf:.2f} < {MIN_CONFIDENCE} "
-            f"and pnl=${pnl:.2f} < ${MIN_PNL_IMPROVEMENT}"
+            f"Skip {finding.get('finding_id')}: conf={conf:.2f}<{min_conf:.2f} "
+            f"and pnl=${pnl:.2f}<${high_pnl:.2f}"
         )
         return False
     if finding.get("applied"):
@@ -613,8 +640,12 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
             status["last_action"] = "no_qualifying_findings"
         return status
 
-    # Phase 3: Apply ALL qualifying findings (resolve env-key conflicts by higher ΔPnL)
+    # Phase 3: Apply qualifying findings.
+    # Default: apply all qualified findings (no count cap), keep only one per env-key by higher ΔPnL.
     sorted_applicable = sorted(applicable, key=lambda f: float(f.get("improvement_pct", 0) or 0), reverse=True)
+    apply_all_qualified = _env_bool_runtime("AUTO_APPLY_APPLY_ALL_QUALIFIED", True)
+    if not apply_all_qualified and sorted_applicable:
+        sorted_applicable = sorted_applicable[:1]
     planned: list[dict] = []
     used_env_keys: set[str] = set()
     unmapped_findings: list[dict] = []
@@ -696,7 +727,7 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
     status["applied_count"] = len(new_records)
     status["monitoring_count"] = status.get("monitoring_count", 0) + len(new_records)
     applied_ids = [r.finding_id for r in new_records]
-    status["last_action"] = f"applied {len(new_records)} findings → monitoring 30min each"
+    status["last_action"] = f"applied {len(new_records)} findings (apply_all={int(apply_all_qualified)}) → monitoring 30min each"
     git_commit_and_push(
         f"auto: apply {len(new_records)} CF findings ({', '.join(applied_ids[:6])})"
     )

@@ -1,14 +1,14 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-16 15:39
-> Baseline: 4909 trades, PnL=$-59.16, WR=36.5%, R:R=1.48
+> Auto-generated: 2026-02-17 20:06
+> Baseline: 4634 trades, PnL=$-70.00, WR=36.5%, R:R=1.44
 
 ## Pipeline Stage Impact Summary
 
 ### MC_HYBRID_PATHS — mc_hybrid_paths
 
-**Best Finding:** mc_hybrid_paths: PnL +$845.29
-- Improvement: $+845.29
+**Best Finding:** mc_hybrid_paths: PnL +$848.17
+- Improvement: $+848.17
 - Confidence: 80%
 - Parameters: `{"mc_hybrid_n_paths": 16384, "mc_hybrid_horizon_steps": 300}`
 
@@ -16,24 +16,24 @@
 [MC_HYBRID_PATHS] 파라미터 변경 제안:
   mc_hybrid_n_paths = 16384
   mc_hybrid_horizon_steps = 300
-예상 효과: PnL $+845.29, WR +0.0%, R:R +4.99
+예상 효과: PnL $+848.17, WR +0.0%, R:R +4.85
 신뢰도: 80.0%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | 786.13 | +845.29 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 6.47 | +4.99 |
-| edge | -0.0383 | 0.2311 | +0.2694 |
-| sharpe | -1.07 | 5.26 | +6.33 |
-| pf | 0.85 | 3.72 | +2.87 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | 778.16 | +848.17 |
+| wr | 0.3653 | 0.3653 | +0.0000 |
+| rr | 1.44 | 6.29 | +4.85 |
+| edge | -0.0449 | 0.2281 | +0.2730 |
+| sharpe | -1.26 | 5.21 | +6.46 |
+| pf | 0.83 | 3.62 | +2.79 |
 
 ### TP_SL — TP/SL 타겟
 
-**Best Finding:** tp_sl: PnL +$127.47
-- Improvement: $+127.47
+**Best Finding:** tp_sl: PnL +$147.18
+- Improvement: $+147.18
 - Confidence: 80%
 - Parameters: `{"tp_pct": 0.04, "sl_pct": 0.005}`
 
@@ -41,73 +41,73 @@
 [TP_SL] 파라미터 변경 제안:
   tp_pct = 0.04
   sl_pct = 0.005
-예상 효과: PnL $+127.47, WR -0.5%, R:R +1.46
+예상 효과: PnL $+147.18, WR -0.5%, R:R +1.78
 신뢰도: 80.0%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | 68.31 | +127.47 |
-| wr | 0.3650 | 0.3604 | -0.0046 |
-| rr | 1.48 | 2.93 | +1.46 |
-| edge | -0.0383 | 0.1062 | +0.1445 |
-| sharpe | -1.07 | 3.23 | +4.30 |
-| pf | 0.85 | 1.65 | +0.80 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | 77.18 | +147.18 |
+| wr | 0.3653 | 0.3602 | -0.0051 |
+| rr | 1.44 | 3.22 | +1.78 |
+| edge | -0.0449 | 0.1230 | +0.1679 |
+| sharpe | -1.26 | 3.71 | +4.97 |
+| pf | 0.83 | 1.81 | +0.98 |
 
 ### CHOP_GUARD — chop_guard
 
-**Best Finding:** chop_guard: PnL +$110.09
-- Improvement: $+110.09
-- Confidence: 81%
+**Best Finding:** chop_guard: PnL +$126.14
+- Improvement: $+126.14
+- Confidence: 83%
 - Parameters: `{"chop_entry_floor_add": 0.003, "chop_entry_min_dir_conf": 0.8}`
 
 ```
 [CHOP_GUARD] 파라미터 변경 제안:
   chop_entry_floor_add = 0.003
   chop_entry_min_dir_conf = 0.8
-예상 효과: PnL $+110.09, WR +6.4%, R:R +0.40
-신뢰도: 80.7%
+예상 효과: PnL $+126.14, WR +7.1%, R:R +0.46
+신뢰도: 83.4%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 1045 | -3864 |
-| pnl | -59.16 | 50.93 | +110.09 |
-| wr | 0.3650 | 0.4287 | +0.0637 |
-| rr | 1.48 | 1.88 | +0.40 |
-| edge | -0.0383 | 0.0810 | +0.1193 |
-| sharpe | -1.07 | 1.20 | +2.27 |
-| pf | 0.85 | 1.41 | +0.56 |
+| n | 4634 | 955 | -3679 |
+| pnl | -70.00 | 56.14 | +126.14 |
+| wr | 0.3653 | 0.4366 | +0.0713 |
+| rr | 1.44 | 1.89 | +0.46 |
+| edge | -0.0449 | 0.0911 | +0.1360 |
+| sharpe | -1.26 | 1.33 | +2.58 |
+| pf | 0.83 | 1.47 | +0.64 |
 
 ### REGIME_SIDE_BLOCK — regime_side_block
 
-**Best Finding:** regime_side_block: PnL +$93.67
-- Improvement: $+93.67
+**Best Finding:** regime_side_block: PnL +$102.91
+- Improvement: $+102.91
 - Confidence: 77%
 - Parameters: `{"regime_side_block_list": "bear_long,bull_short,chop_long"}`
 
 ```
 [REGIME_SIDE_BLOCK] 파라미터 변경 제안:
   regime_side_block_list = bear_long,bull_short,chop_long
-예상 효과: PnL $+93.67, WR +6.9%, R:R +0.15
-신뢰도: 76.7%
+예상 효과: PnL $+102.91, WR +7.1%, R:R +0.16
+신뢰도: 77.4%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 1998 | -2911 |
-| pnl | -59.16 | 34.51 | +93.67 |
-| wr | 0.3650 | 0.4339 | +0.0689 |
-| rr | 1.48 | 1.63 | +0.15 |
-| edge | -0.0383 | 0.0532 | +0.0915 |
-| sharpe | -1.07 | 1.08 | +2.15 |
-| pf | 0.85 | 1.25 | +0.40 |
+| n | 4634 | 1861 | -2773 |
+| pnl | -70.00 | 32.91 | +102.91 |
+| wr | 0.3653 | 0.4363 | +0.0710 |
+| rr | 1.44 | 1.60 | +0.16 |
+| edge | -0.0449 | 0.0512 | +0.0961 |
+| sharpe | -1.26 | 1.03 | +2.29 |
+| pf | 0.83 | 1.24 | +0.41 |
 
 ### DIRECTION_GATE — direction_gate
 
-**Best Finding:** direction_gate: PnL +$83.04
-- Improvement: $+83.04
+**Best Finding:** direction_gate: PnL +$91.08
+- Improvement: $+91.08
 - Confidence: 78%
 - Parameters: `{"dir_gate_min_conf": 0.7, "dir_gate_min_edge": 0.0}`
 
@@ -115,25 +115,25 @@
 [DIRECTION_GATE] 파라미터 변경 제안:
   dir_gate_min_conf = 0.7
   dir_gate_min_edge = 0.0
-예상 효과: PnL $+83.04, WR -0.3%, R:R +0.92
-신뢰도: 78.3%
+예상 효과: PnL $+91.08, WR -0.5%, R:R +0.88
+신뢰도: 77.6%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 883 | -4026 |
-| pnl | -59.16 | 23.89 | +83.04 |
-| wr | 0.3650 | 0.3624 | -0.0026 |
-| rr | 1.48 | 2.40 | +0.92 |
-| edge | -0.0383 | 0.0679 | +0.1062 |
-| sharpe | -1.07 | 0.67 | +1.74 |
-| pf | 0.85 | 1.36 | +0.51 |
+| n | 4634 | 843 | -3791 |
+| pnl | -70.00 | 21.07 | +91.08 |
+| wr | 0.3653 | 0.3606 | -0.0047 |
+| rr | 1.44 | 2.32 | +0.88 |
+| edge | -0.0449 | 0.0590 | +0.1039 |
+| sharpe | -1.26 | 0.58 | +1.84 |
+| pf | 0.83 | 1.31 | +0.48 |
 
 ### HYBRID_LEVERAGE — hybrid_leverage
 
-**Best Finding:** hybrid_leverage: PnL +$79.52
-- Improvement: $+79.52
-- Confidence: 67%
+**Best Finding:** hybrid_leverage: PnL +$89.39
+- Improvement: $+89.39
+- Confidence: 68%
 - Parameters: `{"hybrid_lev_sweep_min": 1.0, "hybrid_lev_sweep_max": 3.0, "hybrid_lev_ev_scale": 100}`
 
 ```
@@ -141,78 +141,78 @@
   hybrid_lev_sweep_min = 1.0
   hybrid_lev_sweep_max = 3.0
   hybrid_lev_ev_scale = 100
-예상 효과: PnL $+79.52, WR +0.0%, R:R +0.37
-신뢰도: 67.4%
+예상 효과: PnL $+89.39, WR +0.0%, R:R +0.41
+신뢰도: 68.1%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | 20.36 | +79.52 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 1.85 | +0.37 |
-| edge | -0.0383 | 0.0143 | +0.0526 |
-| sharpe | -1.07 | 0.26 | +1.33 |
-| pf | 0.85 | 1.06 | +0.21 |
-
-### ENTRY_FILTER — 진입 필터
-
-**Best Finding:** entry_filter: PnL +$77.83
-- Improvement: $+77.83
-- Confidence: 69%
-- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.2, "min_ev": 0.03}`
-
-```
-[ENTRY_FILTER] 파라미터 변경 제안:
-  min_confidence = 0.55
-  min_dir_conf = 0.65
-  min_entry_quality = 0.2
-  min_ev = 0.03
-예상 효과: PnL $+77.83, WR +8.6%, R:R +0.37
-신뢰도: 69.1%
-```
-
-| Metric | Baseline | CF | Delta |
-|--------|----------|----|----|
-| n | 4909 | 495 | -4414 |
-| pnl | -59.16 | 18.68 | +77.83 |
-| wr | 0.3650 | 0.4505 | +0.0855 |
-| rr | 1.48 | 1.85 | +0.37 |
-| edge | -0.0383 | 0.0994 | +0.1377 |
-| sharpe | -1.07 | 0.80 | +1.87 |
-| pf | 0.85 | 1.52 | +0.66 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | 19.38 | +89.39 |
+| wr | 0.3653 | 0.3653 | +0.0000 |
+| rr | 1.44 | 1.84 | +0.41 |
+| edge | -0.0449 | 0.0136 | +0.0585 |
+| sharpe | -1.26 | 0.24 | +1.50 |
+| pf | 0.83 | 1.06 | +0.23 |
 
 ### DIRECTION — 방향 결정
 
-**Best Finding:** direction: PnL +$75.15
-- Improvement: $+75.15
+**Best Finding:** direction: PnL +$89.34
+- Improvement: $+89.34
 - Confidence: 80%
-- Parameters: `{"chop_prefer_short": true, "min_dir_conf_for_entry": 0.6, "mu_alpha_sign_override": true}`
+- Parameters: `{"chop_prefer_short": true, "min_dir_conf_for_entry": 0.5, "mu_alpha_sign_override": true}`
 
 ```
 [DIRECTION] 파라미터 변경 제안:
   chop_prefer_short = True
-  min_dir_conf_for_entry = 0.6
+  min_dir_conf_for_entry = 0.5
   mu_alpha_sign_override = True
-예상 효과: PnL $+75.15, WR +26.6%, R:R -0.83
+예상 효과: PnL $+89.34, WR +19.9%, R:R -0.62
 신뢰도: 80.0%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 2153 | -2756 |
-| pnl | -59.16 | 16.00 | +75.15 |
-| wr | 0.3650 | 0.6307 | +0.2657 |
-| rr | 1.48 | 0.65 | -0.83 |
-| edge | -0.0383 | 0.0231 | +0.0614 |
-| sharpe | -1.07 | 0.36 | +1.43 |
-| pf | 0.85 | 1.10 | +0.25 |
+| n | 4634 | 3820 | -814 |
+| pnl | -70.00 | 19.34 | +89.34 |
+| wr | 0.3653 | 0.5644 | +0.1991 |
+| rr | 1.44 | 0.82 | -0.62 |
+| edge | -0.0449 | 0.0143 | +0.0592 |
+| sharpe | -1.26 | 0.35 | +1.61 |
+| pf | 0.83 | 1.06 | +0.23 |
+
+### ENTRY_FILTER — 진입 필터
+
+**Best Finding:** entry_filter: PnL +$88.34
+- Improvement: $+88.34
+- Confidence: 68%
+- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.3, "min_ev": 0.02}`
+
+```
+[ENTRY_FILTER] 파라미터 변경 제안:
+  min_confidence = 0.55
+  min_dir_conf = 0.65
+  min_entry_quality = 0.3
+  min_ev = 0.02
+예상 효과: PnL $+88.34, WR +9.2%, R:R +0.28
+신뢰도: 68.3%
+```
+
+| Metric | Baseline | CF | Delta |
+|--------|----------|----|----|
+| n | 4634 | 494 | -4140 |
+| pnl | -70.00 | 18.34 | +88.34 |
+| wr | 0.3653 | 0.4575 | +0.0922 |
+| rr | 1.44 | 1.71 | +0.28 |
+| edge | -0.0449 | 0.0889 | +0.1338 |
+| sharpe | -1.26 | 0.77 | +2.03 |
+| pf | 0.83 | 1.44 | +0.62 |
 
 ### LEVERAGE — 레버리지 결정
 
-**Best Finding:** leverage: PnL +$73.33
-- Improvement: $+73.33
-- Confidence: 67%
+**Best Finding:** leverage: PnL +$82.31
+- Improvement: $+82.31
+- Confidence: 68%
 - Parameters: `{"max_leverage": 50, "regime_max_bull": 20, "regime_max_chop": 3, "regime_max_bear": 5}`
 
 ```
@@ -221,199 +221,174 @@
   regime_max_bull = 20
   regime_max_chop = 3
   regime_max_bear = 5
-예상 효과: PnL $+73.33, WR +0.0%, R:R +0.37
-신뢰도: 67.3%
+예상 효과: PnL $+82.31, WR +0.0%, R:R +0.39
+신뢰도: 67.8%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | 14.17 | +73.33 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 1.84 | +0.37 |
-| edge | -0.0383 | 0.0135 | +0.0518 |
-| sharpe | -1.07 | 0.31 | +1.38 |
-| pf | 0.85 | 1.06 | +0.21 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | 12.31 | +82.31 |
+| wr | 0.3653 | 0.3653 | +0.0000 |
+| rr | 1.44 | 1.83 | +0.39 |
+| edge | -0.0449 | 0.0119 | +0.0568 |
+| sharpe | -1.26 | 0.27 | +1.52 |
+| pf | 0.83 | 1.05 | +0.23 |
 
 ### VPIN_FILTER — VPIN 필터
 
-**Best Finding:** vpin_filter: PnL +$70.19
-- Improvement: $+70.19
-- Confidence: 69%
+**Best Finding:** vpin_filter: PnL +$77.01
+- Improvement: $+77.01
+- Confidence: 70%
 - Parameters: `{"max_vpin": 0.3}`
 
 ```
 [VPIN_FILTER] 파라미터 변경 제안:
   max_vpin = 0.3
-예상 효과: PnL $+70.19, WR +3.7%, R:R +0.09
-신뢰도: 69.3%
+예상 효과: PnL $+77.01, WR +3.9%, R:R +0.09
+신뢰도: 69.5%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 2136 | -2773 |
-| pnl | -59.16 | 11.03 | +70.19 |
-| wr | 0.3650 | 0.4022 | +0.0372 |
-| rr | 1.48 | 1.57 | +0.09 |
-| edge | -0.0383 | 0.0137 | +0.0520 |
-| sharpe | -1.07 | 0.24 | +1.31 |
-| pf | 0.85 | 1.06 | +0.21 |
+| n | 4634 | 2109 | -2525 |
+| pnl | -70.00 | 7.01 | +77.01 |
+| wr | 0.3653 | 0.4040 | +0.0387 |
+| rr | 1.44 | 1.53 | +0.09 |
+| edge | -0.0449 | 0.0084 | +0.0533 |
+| sharpe | -1.26 | 0.15 | +1.41 |
+| pf | 0.83 | 1.04 | +0.21 |
 
 ### HYBRID_EXIT_TIMING — hybrid_exit_timing
 
-**Best Finding:** hybrid_exit_timing: PnL +$69.36
-- Improvement: $+69.36
+**Best Finding:** hybrid_exit_timing: PnL +$71.22
+- Improvement: $+71.22
 - Confidence: 66%
-- Parameters: `{"hybrid_exit_confirm_shock": 4, "hybrid_exit_confirm_normal": 8, "hybrid_exit_confirm_noise": 12}`
+- Parameters: `{"hybrid_exit_confirm_shock": 5, "hybrid_exit_confirm_normal": 8, "hybrid_exit_confirm_noise": 12}`
 
 ```
 [HYBRID_EXIT_TIMING] 파라미터 변경 제안:
-  hybrid_exit_confirm_shock = 4
+  hybrid_exit_confirm_shock = 5
   hybrid_exit_confirm_normal = 8
   hybrid_exit_confirm_noise = 12
-예상 효과: PnL $+69.36, WR +0.0%, R:R +0.31
-신뢰도: 66.2%
+예상 효과: PnL $+71.22, WR +0.0%, R:R +0.31
+신뢰도: 66.1%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | 10.20 | +69.36 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 1.79 | +0.31 |
-| edge | -0.0383 | 0.0065 | +0.0448 |
-| sharpe | -1.07 | 0.18 | +1.25 |
-| pf | 0.85 | 1.03 | +0.18 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | 1.22 | +71.22 |
+| wr | 0.3653 | 0.3653 | +0.0000 |
+| rr | 1.44 | 1.74 | +0.31 |
+| edge | -0.0449 | 0.0008 | +0.0457 |
+| sharpe | -1.26 | 0.02 | +1.28 |
+| pf | 0.83 | 1.00 | +0.18 |
 
 ### PRE_MC_GATE — pre_mc_gate
 
-**Best Finding:** pre_mc_gate: PnL +$58.29
-- Improvement: $+58.29
-- Confidence: 42%
+**Best Finding:** pre_mc_gate: PnL +$69.14
+- Improvement: $+69.14
+- Confidence: 44%
 - Parameters: `{"pre_mc_min_expected_pnl": 0.0, "pre_mc_max_liq_prob": 0.1}`
 
 ```
 [PRE_MC_GATE] 파라미터 변경 제안:
   pre_mc_min_expected_pnl = 0.0
   pre_mc_max_liq_prob = 0.1
-예상 효과: PnL $+58.29, WR +6.8%, R:R -0.92
-신뢰도: 42.4%
+예상 효과: PnL $+69.14, WR +7.6%, R:R -0.90
+신뢰도: 43.8%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 104 | -4805 |
-| pnl | -59.16 | -0.86 | +58.29 |
-| wr | 0.3650 | 0.4327 | +0.0677 |
-| rr | 1.48 | 0.56 | -0.92 |
-| edge | -0.0383 | -0.2089 | -0.1706 |
-| sharpe | -1.07 | -1.79 | -0.72 |
-| pf | 0.85 | 0.43 | -0.42 |
+| n | 4634 | 102 | -4532 |
+| pnl | -70.00 | -0.86 | +69.14 |
+| wr | 0.3653 | 0.4412 | +0.0759 |
+| rr | 1.44 | 0.54 | -0.90 |
+| edge | -0.0449 | -0.2083 | -0.1634 |
+| sharpe | -1.26 | -1.79 | -0.53 |
+| pf | 0.83 | 0.43 | -0.40 |
 
 ### PRE_MC_BLOCK_MODE — pre_mc_block_mode
 
-**Best Finding:** pre_mc_block_mode: PnL +$57.69
-- Improvement: $+57.69
-- Confidence: 44%
+**Best Finding:** pre_mc_block_mode: PnL +$68.53
+- Improvement: $+68.53
+- Confidence: 45%
 - Parameters: `{"pre_mc_block_on_fail": 1, "pre_mc_min_cvar": -0.05}`
 
 ```
 [PRE_MC_BLOCK_MODE] 파라미터 변경 제안:
   pre_mc_block_on_fail = 1
   pre_mc_min_cvar = -0.05
-예상 효과: PnL $+57.69, WR +8.0%, R:R -0.82
-신뢰도: 44.0%
+예상 효과: PnL $+68.53, WR +8.3%, R:R -0.79
+신뢰도: 44.6%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 200 | -4709 |
-| pnl | -59.16 | -1.46 | +57.69 |
-| wr | 0.3650 | 0.4450 | +0.0800 |
-| rr | 1.48 | 0.66 | -0.82 |
-| edge | -0.0383 | -0.1560 | -0.1177 |
-| sharpe | -1.07 | -1.14 | -0.07 |
-| pf | 0.85 | 0.53 | -0.32 |
+| n | 4634 | 194 | -4440 |
+| pnl | -70.00 | -1.47 | +68.53 |
+| wr | 0.3653 | 0.4485 | +0.0832 |
+| rr | 1.44 | 0.65 | -0.79 |
+| edge | -0.0449 | -0.1568 | -0.1119 |
+| sharpe | -1.26 | -1.14 | +0.11 |
+| pf | 0.83 | 0.53 | -0.30 |
 
 ### DIRECTION_CONFIRM — direction_confirm
 
-**Best Finding:** direction_confirm: PnL +$56.88
-- Improvement: $+56.88
-- Confidence: 69%
+**Best Finding:** direction_confirm: PnL +$68.34
+- Improvement: $+68.34
+- Confidence: 72%
 - Parameters: `{"dir_gate_confirm_ticks": 1, "dir_gate_confirm_ticks_chop": 4}`
 
 ```
 [DIRECTION_CONFIRM] 파라미터 변경 제안:
   dir_gate_confirm_ticks = 1
   dir_gate_confirm_ticks_chop = 4
-예상 효과: PnL $+56.88, WR -4.3%, R:R +0.61
-신뢰도: 68.6%
+예상 효과: PnL $+68.34, WR -4.3%, R:R +0.65
+신뢰도: 72.0%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 2449 | -2460 |
-| pnl | -59.16 | -2.27 | +56.88 |
-| wr | 0.3650 | 0.3218 | -0.0432 |
-| rr | 1.48 | 2.09 | +0.61 |
-| edge | -0.0383 | -0.0023 | +0.0360 |
-| sharpe | -1.07 | -0.05 | +1.02 |
-| pf | 0.85 | 0.99 | +0.14 |
+| n | 4634 | 2307 | -2327 |
+| pnl | -70.00 | -1.66 | +68.34 |
+| wr | 0.3653 | 0.3225 | -0.0428 |
+| rr | 1.44 | 2.08 | +0.65 |
+| edge | -0.0449 | -0.0017 | +0.0432 |
+| sharpe | -1.26 | -0.03 | +1.22 |
+| pf | 0.83 | 0.99 | +0.16 |
 
 ### MU_SIGN_FLIP — mu_sign_flip
 
-**Best Finding:** mu_sign_flip: PnL +$48.82
-- Improvement: $+48.82
-- Confidence: 53%
+**Best Finding:** mu_sign_flip: PnL +$47.45
+- Improvement: $+47.45
+- Confidence: 46%
 - Parameters: `{"mu_sign_flip_min_age": 1800, "mu_sign_flip_confirm_ticks": 4}`
 
 ```
 [MU_SIGN_FLIP] 파라미터 변경 제안:
   mu_sign_flip_min_age = 1800
   mu_sign_flip_confirm_ticks = 4
-예상 효과: PnL $+48.82, WR +0.0%, R:R +0.21
-신뢰도: 53.0%
+예상 효과: PnL $+47.45, WR +0.0%, R:R +0.19
+신뢰도: 46.1%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | -10.33 | +48.82 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 1.69 | +0.21 |
-| edge | -0.0383 | -0.0068 | +0.0315 |
-| sharpe | -1.07 | -0.19 | +0.88 |
-| pf | 0.85 | 0.97 | +0.12 |
-
-### PRE_MC_SCALED_SIZE — pre_mc_scaled_size
-
-**Best Finding:** pre_mc_scaled_size: PnL +$44.37
-- Improvement: $+44.37
-- Confidence: 30%
-- Parameters: `{"pre_mc_size_scale": 0.25, "pre_mc_max_liq_prob": 0.03}`
-
-```
-[PRE_MC_SCALED_SIZE] 파라미터 변경 제안:
-  pre_mc_size_scale = 0.25
-  pre_mc_max_liq_prob = 0.03
-예상 효과: PnL $+44.37, WR +0.0%, R:R +0.00
-신뢰도: 30.0%
-```
-
-| Metric | Baseline | CF | Delta |
-|--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | -14.79 | +44.37 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 1.48 | +0.00 |
-| edge | -0.0383 | -0.0383 | +0.0000 |
-| sharpe | -1.07 | -1.07 | +0.00 |
-| pf | 0.85 | 0.85 | +0.00 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | -22.55 | +47.45 |
+| wr | 0.3653 | 0.3653 | +0.0000 |
+| rr | 1.44 | 1.63 | +0.19 |
+| edge | -0.0449 | -0.0146 | +0.0303 |
+| sharpe | -1.26 | -0.40 | +0.85 |
+| pf | 0.83 | 0.94 | +0.11 |
 
 ### SYMBOL_QUALITY_TIME — symbol_quality_time
 
-**Best Finding:** symbol_quality_time: PnL +$36.06
-- Improvement: $+36.06
+**Best Finding:** symbol_quality_time: PnL +$41.55
+- Improvement: $+41.55
 - Confidence: 31%
 - Parameters: `{"sq_time_window_hours": 1, "sq_time_weight": 0.5}`
 
@@ -421,94 +396,46 @@
 [SYMBOL_QUALITY_TIME] 파라미터 변경 제안:
   sq_time_window_hours = 1
   sq_time_weight = 0.5
-예상 효과: PnL $+36.06, WR +0.0%, R:R +0.07
-신뢰도: 31.2%
+예상 효과: PnL $+41.55, WR +0.0%, R:R +0.07
+신뢰도: 31.0%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4909 | 4909 | +0 |
-| pnl | -59.16 | -23.09 | +36.06 |
-| wr | 0.3650 | 0.3650 | +0.0000 |
-| rr | 1.48 | 1.55 | +0.07 |
-| edge | -0.0383 | -0.0275 | +0.0108 |
-| sharpe | -1.07 | -0.71 | +0.36 |
-| pf | 0.85 | 0.89 | +0.04 |
-
-### TOP_N — top_n
-
-**Best Finding:** top_n: PnL +$34.59
-- Improvement: $+34.59
-- Confidence: 35%
-- Parameters: `{"top_n_symbols": 4}`
-
-```
-[TOP_N] 파라미터 변경 제안:
-  top_n_symbols = 4
-예상 효과: PnL $+34.59, WR +4.7%, R:R -0.24
-신뢰도: 35.1%
-```
-
-| Metric | Baseline | CF | Delta |
-|--------|----------|----|----|
-| n | 4909 | 1203 | -3706 |
-| pnl | -59.16 | -24.57 | +34.59 |
-| wr | 0.3650 | 0.4123 | +0.0473 |
-| rr | 1.48 | 1.24 | -0.24 |
-| edge | -0.0383 | -0.0337 | +0.0046 |
-| sharpe | -1.07 | -0.63 | +0.44 |
-| pf | 0.85 | 0.87 | +0.02 |
-
-### UNIFIED_FLOOR — unified_floor
-
-**Best Finding:** unified_floor: PnL +$27.39
-- Improvement: $+27.39
-- Confidence: 34%
-- Parameters: `{"min_ev": 0.003}`
-
-```
-[UNIFIED_FLOOR] 파라미터 변경 제안:
-  min_ev = 0.003
-예상 효과: PnL $+27.39, WR +4.5%, R:R -0.18
-신뢰도: 33.6%
-```
-
-| Metric | Baseline | CF | Delta |
-|--------|----------|----|----|
-| n | 4909 | 3261 | -1648 |
-| pnl | -59.16 | -31.76 | +27.40 |
-| wr | 0.3650 | 0.4097 | +0.0447 |
-| rr | 1.48 | 1.30 | -0.18 |
-| edge | -0.0383 | -0.0260 | +0.0123 |
-| sharpe | -1.07 | -0.59 | +0.48 |
-| pf | 0.85 | 0.90 | +0.05 |
+| n | 4634 | 4634 | +0 |
+| pnl | -70.00 | -28.45 | +41.55 |
+| wr | 0.3653 | 0.3653 | +0.0000 |
+| rr | 1.44 | 1.51 | +0.07 |
+| edge | -0.0449 | -0.0333 | +0.0116 |
+| sharpe | -1.26 | -0.86 | +0.39 |
+| pf | 0.83 | 0.87 | +0.04 |
 
 ## Regime Performance Breakdown
 
 | Regime | N | PnL | WR | R:R | Edge |
 |--------|---|-----|----|----|------|
-| chop | 4039 | $-73.54 | 35.0% | 1.38 | -7.0% |
-| bull | 558 | $39.43 | 47.1% | 1.93 | +13.0% |
-| bear | 311 | $-25.07 | 37.3% | 0.89 | -15.6% |
+| chop | 3852 | $-87.08 | 34.9% | 1.33 | -8.0% |
+| bull | 478 | $36.82 | 47.7% | 1.89 | +13.1% |
+| bear | 303 | $-19.77 | 39.6% | 0.95 | -11.8% |
 | volatile | 1 | $0.02 | 100.0% | 18.80 | +95.0% |
 
 ## 🎯 Recommended Actions
 
-1. **mc_hybrid_paths: PnL +$845.29** (ΔPnL: $+845.29, confidence: 80%)
+1. **mc_hybrid_paths: PnL +$848.17** (ΔPnL: $+848.17, confidence: 80%)
    - `mc_hybrid_n_paths` = `16384`
    - `mc_hybrid_horizon_steps` = `300`
 
-2. **tp_sl: PnL +$127.47** (ΔPnL: $+127.47, confidence: 80%)
+2. **tp_sl: PnL +$147.18** (ΔPnL: $+147.18, confidence: 80%)
    - `tp_pct` = `0.04`
    - `sl_pct` = `0.005`
 
-3. **chop_guard: PnL +$110.09** (ΔPnL: $+110.09, confidence: 81%)
+3. **chop_guard: PnL +$126.14** (ΔPnL: $+126.14, confidence: 83%)
    - `chop_entry_floor_add` = `0.003`
    - `chop_entry_min_dir_conf` = `0.8`
 
-4. **regime_side_block: PnL +$93.67** (ΔPnL: $+93.67, confidence: 77%)
+4. **regime_side_block: PnL +$102.91** (ΔPnL: $+102.91, confidence: 77%)
    - `regime_side_block_list` = `bear_long,bull_short,chop_long`
 
-5. **direction_gate: PnL +$83.04** (ΔPnL: $+83.04, confidence: 78%)
+5. **direction_gate: PnL +$91.08** (ΔPnL: $+91.08, confidence: 78%)
    - `dir_gate_min_conf` = `0.7`
    - `dir_gate_min_edge` = `0.0`

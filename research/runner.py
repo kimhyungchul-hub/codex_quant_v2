@@ -83,6 +83,27 @@ def _file_env_bool(name: str, default: bool = False) -> bool:
     return bool(default)
 
 
+def _file_env_float(name: str, default: float = 0.0) -> float:
+    """Read float env from state/bybit.env when process env is not exported."""
+    try:
+        env_path = Path(PROJECT_ROOT) / "state" / "bybit.env"
+        if not env_path.exists():
+            return float(default)
+        for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = raw.strip()
+            if (not s) or s.startswith("#") or ("=" not in s):
+                continue
+            k, v = s.split("=", 1)
+            if str(k).strip() == name:
+                try:
+                    return float(str(v).strip())
+                except Exception:
+                    return float(default)
+    except Exception:
+        return float(default)
+    return float(default)
+
+
 def _load_cycle_history() -> list[dict]:
     p = Path(RESEARCH_CYCLES_JSON)
     if not p.exists():
@@ -267,15 +288,31 @@ def run_cf_cycle(
 
     # ── Check for new trades to avoid repeated analysis ──
     always_run_cf = _env_bool("ALWAYS_RUN_CF", _file_env_bool("ALWAYS_RUN_CF", False))
+    try:
+        idle_force_sec = float(
+            os.environ.get(
+                "CF_FORCE_RUN_MAX_IDLE_SEC",
+                _file_env_float("CF_FORCE_RUN_MAX_IDLE_SEC", 1800.0),
+            ) or 1800.0
+        )
+    except Exception:
+        idle_force_sec = 1800.0
+    idle_force_sec = max(0.0, float(idle_force_sec))
     last_analyzed = _load_last_analyzed()
     current_hash = _compute_trades_hash(trades)
     current_count = len(trades)
     latest_ts = max((getattr(t, "timestamp_ms", 0) for t in trades), default=0)
-    
+
     new_trade_count = current_count - int(last_analyzed.get("last_trade_count", 0))
     hash_changed = current_hash != last_analyzed.get("last_pnl_hash", "")
-    
-    if (not always_run_cf) and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
+    try:
+        last_analyzed_at = float(last_analyzed.get("analyzed_at", 0.0) or 0.0)
+    except Exception:
+        last_analyzed_at = 0.0
+    idle_elapsed_sec = (time.time() - last_analyzed_at) if last_analyzed_at > 0 else 1e18
+    forced_by_idle = bool(idle_force_sec > 0 and idle_elapsed_sec >= idle_force_sec)
+
+    if (not always_run_cf) and (not forced_by_idle) and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
         logger.info(f"[SKIP] No significant new trades (new={new_trade_count}, min={MIN_NEW_TRADES_FOR_REANALYSIS}). Skipping CF cycle.")
         run_cf_cycle._cycle = cycle_index
         _update_dashboard({
@@ -292,12 +329,20 @@ def run_cf_cycle(
             "new_trade_count": new_trade_count,
             "min_required": MIN_NEW_TRADES_FOR_REANALYSIS,
             "always_run_cf": always_run_cf,
+            "forced_by_idle": forced_by_idle,
+            "idle_elapsed_sec": idle_elapsed_sec,
+            "idle_force_sec": idle_force_sec,
         }
 
     if always_run_cf and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
         logger.info(
             f"[CF_FORCE] ALWAYS_RUN_CF=1 -> running CF with unchanged trades "
             f"(new={new_trade_count}, min={MIN_NEW_TRADES_FOR_REANALYSIS})"
+        )
+    elif forced_by_idle and (not hash_changed) and new_trade_count < MIN_NEW_TRADES_FOR_REANALYSIS:
+        logger.info(
+            f"[CF_FORCE] idle timeout -> running CF with unchanged trades "
+            f"(idle={idle_elapsed_sec:.1f}s >= {idle_force_sec:.1f}s)"
         )
 
     # Update last analyzed info
@@ -350,6 +395,9 @@ def run_cf_cycle(
         "elapsed_sec": round(elapsed, 1),
         "running": False,
         "always_run_cf": always_run_cf,
+        "forced_by_idle": forced_by_idle,
+        "idle_elapsed_sec": float(idle_elapsed_sec),
+        "idle_force_sec": float(idle_force_sec),
         "sample_seed": int(sample_seed),
         "baseline": engine.baseline,
         "baseline_by_regime": engine.baseline_by_regime,

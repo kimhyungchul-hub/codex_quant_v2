@@ -1414,6 +1414,106 @@ class CFEngine:
                 return self._run_stage(sim, max_combos)
         return []
 
+    def _stage_rng(self, stage_name: str):
+        if self.sample_seed is None:
+            return np.random.default_rng()
+        stage_salt = sum((i + 1) * ord(ch) for i, ch in enumerate(str(stage_name)))
+        stage_seed = int((int(self.sample_seed) + int(stage_salt)) % (2**32 - 1))
+        if stage_seed <= 0:
+            stage_seed = int(stage_salt or 1)
+        return np.random.default_rng(stage_seed)
+
+    @staticmethod
+    def _focus_values(values: list[Any], max_n: int = 3) -> list[Any]:
+        vals = list(values or [])
+        if len(vals) <= max_n:
+            return vals
+        idxs = [0, len(vals) // 2, len(vals) - 1]
+        out: list[Any] = []
+        for i in idxs:
+            v = vals[int(max(0, min(len(vals) - 1, i)))]
+            if v not in out:
+                out.append(v)
+        return out[:max_n]
+
+    def _select_stage_combos(
+        self,
+        *,
+        sim: StageSimulator,
+        param_values: list[list[Any]],
+        stage_max_combos: int,
+    ) -> tuple[list[tuple[Any, ...]], str, int]:
+        combos_all = list(itertools.product(*param_values))
+        total = len(combos_all)
+        if total <= stage_max_combos:
+            return combos_all, "full", total
+
+        rng = self._stage_rng(sim.stage_name)
+        mode = str(os.environ.get("CF_COMBO_SEARCH_MODE", "adaptive") or "adaptive").strip().lower()
+        if mode in ("random", "rand", "legacy"):
+            indices = rng.choice(total, size=stage_max_combos, replace=False)
+            sampled = [combos_all[int(i)] for i in indices]
+            return sampled, "random", total
+
+        selected: list[tuple[Any, ...]] = []
+        seen: set[tuple[Any, ...]] = set()
+
+        def _add(combo: tuple[Any, ...]) -> None:
+            if combo in seen:
+                return
+            seen.add(combo)
+            selected.append(combo)
+
+        baseline = tuple(vals[0] for vals in param_values)
+        _add(baseline)
+        _add(tuple(vals[len(vals) // 2] for vals in param_values))
+        _add(tuple(vals[-1] for vals in param_values))
+
+        # 1) Marginal one-factor sweep around baseline
+        for i, vals in enumerate(param_values):
+            for v in vals:
+                c = list(baseline)
+                c[i] = v
+                _add(tuple(c))
+                if len(selected) >= stage_max_combos:
+                    return selected[:stage_max_combos], "adaptive_marginal", total
+
+        # 2) Pairwise interactions on top-variance dimensions
+        ranked_idx = sorted(range(len(param_values)), key=lambda j: len(param_values[j]), reverse=True)
+        top_idx = ranked_idx[: min(4, len(ranked_idx))]
+        for a in range(len(top_idx)):
+            for b in range(a + 1, len(top_idx)):
+                i = top_idx[a]
+                j = top_idx[b]
+                vals_i = self._focus_values(param_values[i], max_n=3)
+                vals_j = self._focus_values(param_values[j], max_n=3)
+                for vi in vals_i:
+                    for vj in vals_j:
+                        c = list(baseline)
+                        c[i] = vi
+                        c[j] = vj
+                        _add(tuple(c))
+                        if len(selected) >= stage_max_combos:
+                            return selected[:stage_max_combos], "adaptive_interaction", total
+
+        # 3) Diversity fill from seeded random subset + deterministic stride
+        if len(selected) < stage_max_combos:
+            need = int(stage_max_combos - len(selected))
+            sample_n = min(total, max(need * 4, need))
+            idxs = rng.choice(total, size=sample_n, replace=False)
+            for idx in idxs:
+                _add(combos_all[int(idx)])
+                if len(selected) >= stage_max_combos:
+                    break
+        if len(selected) < stage_max_combos:
+            stride = max(1, total // max(1, stage_max_combos))
+            for idx in range(0, total, stride):
+                _add(combos_all[int(idx)])
+                if len(selected) >= stage_max_combos:
+                    break
+
+        return selected[:stage_max_combos], "adaptive", total
+
     def _run_stage(self, sim: StageSimulator, max_combos: int) -> list[Finding]:
         """Sweep parameter grid for a single stage."""
         grid = sim.get_param_grid()
@@ -1424,21 +1524,15 @@ class CFEngine:
         except Exception:
             stage_max_combos = int(max_combos)
         stage_max_combos = int(max(1, min(int(max_combos), stage_max_combos)))
-
-        # Generate all combinations (capped)
-        combos = list(itertools.product(*param_values))
-        if len(combos) > stage_max_combos:
-            # Random sample (cycle/seed aware): avoid identical subset every cycle
-            if self.sample_seed is None:
-                rng = np.random.default_rng()
-            else:
-                stage_salt = sum((i + 1) * ord(ch) for i, ch in enumerate(str(sim.stage_name)))
-                stage_seed = int((int(self.sample_seed) + int(stage_salt)) % (2**32 - 1))
-                if stage_seed <= 0:
-                    stage_seed = int(stage_salt or 1)
-                rng = np.random.default_rng(stage_seed)
-            indices = rng.choice(len(combos), size=stage_max_combos, replace=False)
-            combos = [combos[i] for i in indices]
+        combos, combo_mode, total_combos = self._select_stage_combos(
+            sim=sim,
+            param_values=param_values,
+            stage_max_combos=stage_max_combos,
+        )
+        logger.info(
+            f"[CF_STAGE] {sim.stage_name} search={combo_mode} "
+            f"evaluated={len(combos)}/{total_combos} cap={stage_max_combos}"
+        )
 
         stage_findings: list[Finding] = []
         best_delta_pnl = 0.0

@@ -2372,6 +2372,79 @@ class LiveOrchestrator:
         txt = str(value).strip()
         return txt if txt else None
 
+    @staticmethod
+    def _auto_tune_override_alias_targets(key: str) -> list[str]:
+        key_u = str(key or "").strip().upper()
+        alias_map: dict[str, list[str]] = {
+            # Legacy tuner leverage keys -> runtime-consumed keys
+            "LEVERAGE_TARGET_MAX": ["MAX_LEVERAGE", "UNI_LEV_MAX"],
+            "LEVERAGE_REGIME_MAX_BULL": ["UNI_LEV_MAX_TREND"],
+            "LEVERAGE_REGIME_MAX_TREND": ["UNI_LEV_MAX_TREND"],
+            "LEVERAGE_REGIME_MAX_BEAR": ["UNI_LEV_MAX_BEAR"],
+            "LEVERAGE_REGIME_MAX_CHOP": ["UNI_LEV_MAX_CHOP"],
+            "LEVERAGE_REGIME_MAX_VOLATILE": ["UNI_LEV_MAX_VOLATILE"],
+            "LEVERAGE_TARGET_MAX_BULL": ["UNI_LEV_MAX_TREND"],
+            "LEVERAGE_TARGET_MAX_TREND": ["UNI_LEV_MAX_TREND"],
+            "LEVERAGE_TARGET_MAX_BEAR": ["UNI_LEV_MAX_BEAR"],
+            "LEVERAGE_TARGET_MAX_CHOP": ["UNI_LEV_MAX_CHOP"],
+            "LEVERAGE_TARGET_MAX_VOLATILE": ["UNI_LEV_MAX_VOLATILE"],
+            # Legacy direction gate alias
+            "ALPHA_DIRECTION_MIN_CONFIDENCE": ["ALPHA_DIRECTION_GATE_MIN_CONF"],
+            # Exposure aliases
+            "KELLY_TOTAL_EXPOSURE": ["MAX_NOTIONAL_EXPOSURE", "LIVE_MAX_NOTIONAL_EXPOSURE", "UNI_MAX_TOTAL_EXPOSURE"],
+            "MAX_NOTIONAL_EXPOSURE": ["MAX_NOTIONAL_EXPOSURE", "UNI_MAX_TOTAL_EXPOSURE"],
+            "LIVE_MAX_NOTIONAL_EXPOSURE": ["LIVE_MAX_NOTIONAL_EXPOSURE", "UNI_MAX_TOTAL_EXPOSURE"],
+        }
+        raw_targets = alias_map.get(key_u, [key_u])
+        out: list[str] = []
+        for t in raw_targets:
+            t_u = str(t or "").strip().upper()
+            if t_u and t_u not in out:
+                out.append(t_u)
+        if key_u and key_u not in out:
+            out.insert(0, key_u)
+        return out
+
+    def _sync_auto_tune_runtime_fields(self, applied_keys: set[str]) -> None:
+        keys = {str(k or "").strip().upper() for k in (applied_keys or set()) if str(k or "").strip()}
+        if not keys:
+            return
+
+        if ("MAX_LEVERAGE" in keys) or ("UNI_LEV_MAX" in keys):
+            try:
+                raw_max = os.environ.get("MAX_LEVERAGE")
+                if raw_max is None:
+                    raw_max = os.environ.get("UNI_LEV_MAX")
+                new_max = float(raw_max) if raw_max is not None else None
+            except Exception:
+                new_max = None
+            if new_max is not None and new_max > 0:
+                self.max_leverage = float(new_max)
+                try:
+                    if hasattr(self, "kelly_allocator") and self.kelly_allocator is not None:
+                        self.kelly_allocator.MAX_LEVERAGE = float(new_max)
+                        if hasattr(self.kelly_allocator, "max_leverage"):
+                            self.kelly_allocator.max_leverage = float(new_max)
+                except Exception:
+                    pass
+
+        if ("MAX_NOTIONAL_EXPOSURE" in keys) or ("LIVE_MAX_NOTIONAL_EXPOSURE" in keys) or ("UNI_MAX_TOTAL_EXPOSURE" in keys):
+            try:
+                max_exp = float(os.environ.get("MAX_NOTIONAL_EXPOSURE", self.max_notional_frac) or self.max_notional_frac)
+            except Exception:
+                max_exp = float(self.max_notional_frac or 0.0)
+            try:
+                live_exp = float(os.environ.get("LIVE_MAX_NOTIONAL_EXPOSURE", max_exp) or max_exp)
+            except Exception:
+                live_exp = float(max_exp)
+            try:
+                if bool(getattr(self, "enable_live_orders", False)):
+                    self.max_notional_frac = float(max(0.0, max(max_exp, live_exp)))
+                else:
+                    self.max_notional_frac = float(max(0.0, max_exp))
+            except Exception:
+                pass
+
     def _maybe_reload_auto_tune_overrides(self, ts_ms: int) -> None:
         try:
             interval_ms = int(max(1.0, float(self._auto_tune_reload_sec)) * 1000.0)
@@ -2423,21 +2496,38 @@ class LiveOrchestrator:
             except Exception:
                 block_keys = set()
             applied = 0
+            alias_applied = 0
             cleaned: dict[str, object] = {}
+            source_keys: set[str] = set()
+            for k, _ in ov.items():
+                src_key = str(k or "").strip().upper()
+                if src_key and all(ch.isalnum() or ch == "_" for ch in src_key):
+                    source_keys.add(src_key)
+            applied_keys: set[str] = set()
             for k, v in ov.items():
-                key = str(k or "").strip().upper()
-                if not key:
+                source_key = str(k or "").strip().upper()
+                if not source_key:
                     continue
-                if not all(ch.isalnum() or ch == "_" for ch in key):
+                if not all(ch.isalnum() or ch == "_" for ch in source_key):
                     continue
-                if key in block_keys:
+                if source_key in block_keys:
                     continue
                 val_txt = self._normalize_auto_tune_env_value(v)
                 if val_txt is None:
                     continue
-                os.environ[key] = str(val_txt)
-                cleaned[key] = v
-                applied += 1
+                for idx, target_key in enumerate(self._auto_tune_override_alias_targets(source_key)):
+                    if target_key in block_keys:
+                        continue
+                    # If a target is explicitly included in payload, keep explicit key authoritative.
+                    if idx > 0 and target_key in source_keys:
+                        continue
+                    os.environ[target_key] = str(val_txt)
+                    cleaned[target_key] = v
+                    applied += 1
+                    applied_keys.add(target_key)
+                    if target_key != source_key:
+                        alias_applied += 1
+            self._sync_auto_tune_runtime_fields(applied_keys)
             self._auto_tune_overrides_cache = cleaned
             self._auto_tune_overrides_mtime = mt
             self._auto_tune_last_apply_ms = int(ts_ms)
@@ -2450,7 +2540,7 @@ class LiveOrchestrator:
                     self._auto_tune_last_batch_id = int(batch_id)
                 self._log(
                     f"[AUTO_TUNE] overrides applied: n={applied} "
-                    f"batch={batch_id} file={str(p)}"
+                    f"alias={alias_applied} batch={batch_id} file={str(p)}"
                 )
         except Exception as e:
             self._log_err(f"[AUTO_TUNE] override reload failed: {e}")

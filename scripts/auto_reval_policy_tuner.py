@@ -16,6 +16,28 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+_OVERRIDE_RUNTIME_ALIAS: dict[str, list[str]] = {
+    # Legacy leverage keys -> runtime-consumed keys
+    "LEVERAGE_TARGET_MAX": ["MAX_LEVERAGE", "UNI_LEV_MAX"],
+    "LEVERAGE_REGIME_MAX_BULL": ["UNI_LEV_MAX_TREND"],
+    "LEVERAGE_REGIME_MAX_TREND": ["UNI_LEV_MAX_TREND"],
+    "LEVERAGE_REGIME_MAX_BEAR": ["UNI_LEV_MAX_BEAR"],
+    "LEVERAGE_REGIME_MAX_CHOP": ["UNI_LEV_MAX_CHOP"],
+    "LEVERAGE_REGIME_MAX_VOLATILE": ["UNI_LEV_MAX_VOLATILE"],
+    "LEVERAGE_TARGET_MAX_BULL": ["UNI_LEV_MAX_TREND"],
+    "LEVERAGE_TARGET_MAX_TREND": ["UNI_LEV_MAX_TREND"],
+    "LEVERAGE_TARGET_MAX_BEAR": ["UNI_LEV_MAX_BEAR"],
+    "LEVERAGE_TARGET_MAX_CHOP": ["UNI_LEV_MAX_CHOP"],
+    "LEVERAGE_TARGET_MAX_VOLATILE": ["UNI_LEV_MAX_VOLATILE"],
+    # Legacy direction gate alias
+    "ALPHA_DIRECTION_MIN_CONFIDENCE": ["ALPHA_DIRECTION_GATE_MIN_CONF"],
+    # Exposure aliases
+    "KELLY_TOTAL_EXPOSURE": ["MAX_NOTIONAL_EXPOSURE", "LIVE_MAX_NOTIONAL_EXPOSURE", "UNI_MAX_TOTAL_EXPOSURE"],
+    "MAX_NOTIONAL_EXPOSURE": ["MAX_NOTIONAL_EXPOSURE", "UNI_MAX_TOTAL_EXPOSURE"],
+    "LIVE_MAX_NOTIONAL_EXPOSURE": ["LIVE_MAX_NOTIONAL_EXPOSURE", "UNI_MAX_TOTAL_EXPOSURE"],
+}
+
+
 def _safe_float(v: Any, default: float | None = None) -> float | None:
     try:
         return float(v)
@@ -77,6 +99,35 @@ def _sanitize_override_value(v: Any) -> Any:
         return int(s)
     except Exception:
         return s
+
+
+def _expand_runtime_aliases(overrides: dict[str, Any]) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    out: dict[str, Any] = {}
+    alias_applied: dict[str, list[str]] = {}
+    source_keys: set[str] = set()
+    for k, v in (overrides or {}).items():
+        key = str(k or "").strip().upper()
+        if not key:
+            continue
+        if not all(ch.isalnum() or ch == "_" for ch in key):
+            continue
+        sv = _sanitize_override_value(v)
+        if sv is None:
+            continue
+        source_keys.add(key)
+        out[key] = sv
+
+    for source_key, source_val in list(out.items()):
+        for target in _OVERRIDE_RUNTIME_ALIAS.get(source_key, []):
+            target_key = str(target or "").strip().upper()
+            if not target_key:
+                continue
+            if target_key in source_keys:
+                continue
+            if target_key not in out:
+                out[target_key] = source_val
+                alias_applied.setdefault(source_key, []).append(target_key)
+    return out, alias_applied
 
 
 def _pick_metric(status: dict[str, Any], path: list[str]) -> Any:
@@ -890,7 +941,12 @@ def main() -> int:
     reval_loss_driver = _load_json(reval_loss_driver_path)
     stage4 = _load_json(stage4_path)
     existing_override_payload = _load_json(override_in_path)
-    existing_overrides = existing_override_payload.get("overrides") if isinstance(existing_override_payload.get("overrides"), dict) else {}
+    existing_overrides_raw = (
+        existing_override_payload.get("overrides")
+        if isinstance(existing_override_payload.get("overrides"), dict)
+        else {}
+    )
+    existing_overrides, existing_aliases = _expand_runtime_aliases(existing_overrides_raw)
     last_state = _load_json(state_file_path)
 
     ready = bool(status.get("ready") is True)
@@ -960,6 +1016,7 @@ def main() -> int:
             "db": str(db_path),
             "since_id": int(since_id),
         },
+        "runtime_key_aliases_existing": existing_aliases,
         "reason_matrix_metrics": reason_matrix_metrics,
         "entry_score_driver_metrics": entry_score_driver_metrics,
         "reval_loss_driver_metrics": reval_loss_driver_metrics,
@@ -2131,12 +2188,16 @@ def main() -> int:
         actions.append("no_change:metrics_within_thresholds")
 
     payload_overrides: dict[str, Any] = {}
+    runtime_aliases_out: dict[str, list[str]] = {}
     if out_overrides:
-        payload_overrides = {
+        payload_raw = {
             k: _sanitize_override_value(v)
             for k, v in out_overrides.items()
             if _sanitize_override_value(v) is not None
         }
+        payload_overrides, runtime_aliases_out = _expand_runtime_aliases(payload_raw)
+        if runtime_aliases_out:
+            actions.append(f"runtime_key_alias_expand:{sum(len(v) for v in runtime_aliases_out.values())}")
 
     # Recovery mode: allow entry-gate relaxation only.
     # Tightening (higher value) of UNIFIED_ENTRY_FLOOR / ENTRY_NET_EXPECTANCY_* is blocked.
@@ -2199,6 +2260,7 @@ def main() -> int:
         "reason_matrix_metrics": reason_matrix_metrics,
         "reval_loss_driver_metrics": reval_loss_driver_metrics,
         "overrides": {k: _sanitize_override_value(v) for k, v in payload_overrides.items()},
+        "runtime_key_aliases_out": runtime_aliases_out,
         "retrain": {
             "requested": bool(retrain_info.get("requested")),
             "ran": bool(retrain_info.get("ran")),
@@ -2229,6 +2291,7 @@ def main() -> int:
     result["actions"] = list(actions)
     result["overrides"] = dict(payload_overrides)
     result["override_count"] = int(len(payload_overrides))
+    result["runtime_key_aliases_out"] = dict(runtime_aliases_out)
     result["retrain"] = dict(retrain_info)
     result["applied"] = bool((not args.dry_run) and bool(payload_overrides))
 

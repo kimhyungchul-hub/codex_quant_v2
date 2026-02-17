@@ -1346,6 +1346,93 @@ class MonteCarloDecisionMixin:
                 score_hold = None
                 exp_list = None
 
+        try:
+            hybrid_dir_policy = str(os.environ.get("HYBRID_DIRECTION_POLICY", "mu_consensus") or "mu_consensus").strip().lower()
+        except Exception:
+            hybrid_dir_policy = "mu_consensus"
+        if hybrid_dir_policy in ("1", "true", "yes", "on", "auto", "default"):
+            hybrid_dir_policy = "mu_consensus"
+        if hybrid_dir_policy not in ("mu_consensus", "consensus", "direction_model", "exp_vals", "planner", "off"):
+            hybrid_dir_policy = "mu_consensus"
+        direction_model_meta = None
+        direction_override_applied = False
+        direction_override_reason = "disabled"
+
+        # Optional hybrid direction policy:
+        # - exp_vals/planner: keep planner direction (legacy hybrid behavior)
+        # - mu_consensus/direction_model: allow DirectionModel override for flat entries
+        if hybrid_dir_policy in ("mu_consensus", "consensus", "direction_model"):
+            direction_override_reason = "not_evaluated"
+            try:
+                from engines.mc.direction_model import compute_direction_override
+
+                try:
+                    pos_side_now = ctx.get("position_side", ctx.get("position", 0) or 0)
+                    if isinstance(pos_side_now, str):
+                        flat_for_dir = pos_side_now.upper() not in ("LONG", "SHORT")
+                    else:
+                        flat_for_dir = float(pos_side_now) == 0.0
+                except Exception:
+                    flat_for_dir = True
+
+                try:
+                    mu_for_dir = float(ctx.get("mu_alpha", (hybrid_meta or {}).get("mu_alpha", 0.0)) or 0.0)
+                except Exception:
+                    mu_for_dir = 0.0
+                try:
+                    s_long_dir = float(score_long if score_long is not None else (ctx.get("score_long", 0.0) or 0.0))
+                except Exception:
+                    s_long_dir = 0.0
+                try:
+                    s_short_dir = float(score_short if score_short is not None else (ctx.get("score_short", 0.0) or 0.0))
+                except Exception:
+                    s_short_dir = 0.0
+
+                direction_model_meta = compute_direction_override(
+                    mu_alpha=float(mu_for_dir),
+                    meta=(hybrid_meta or {}),
+                    ctx=ctx,
+                    score_long=float(s_long_dir),
+                    score_short=float(s_short_dir),
+                    ev_long=float(s_long_dir),
+                    ev_short=float(s_short_dir),
+                )
+
+                dm_dir = int(direction_model_meta.get("direction", 0) or 0)
+                preferred_action = "LONG" if dm_dir == 1 else ("SHORT" if dm_dir == -1 else "WAIT")
+                if flat_for_dir and preferred_action in ("LONG", "SHORT"):
+                    try:
+                        override_mode = str(os.environ.get("HYBRID_DIRECTION_OVERRIDE_MODE", "soft") or "soft").strip().lower()
+                    except Exception:
+                        override_mode = "soft"
+                    try:
+                        max_gap = float(os.environ.get("HYBRID_DIRECTION_MAX_SCORE_GAP", 0.0030) or 0.0030)
+                    except Exception:
+                        max_gap = 0.0030
+                    score_gap = abs(float(s_long_dir) - float(s_short_dir))
+                    should_override = bool(
+                        override_mode in ("hard", "force")
+                        or action == "WAIT"
+                        or score_gap <= max_gap
+                    )
+                    if should_override:
+                        direction_override_applied = bool(action != preferred_action)
+                        action = preferred_action
+                        action_idx = 1 if preferred_action == "LONG" else 2
+                        direction_override_reason = f"applied:{override_mode}"
+                    else:
+                        direction_override_reason = "gap_guard"
+                elif not flat_for_dir:
+                    direction_override_reason = "not_flat"
+                else:
+                    direction_override_reason = "no_direction"
+            except Exception:
+                direction_override_reason = "error"
+        elif hybrid_dir_policy in ("exp_vals", "planner"):
+            direction_override_reason = "planner"
+        else:
+            direction_override_reason = "off"
+
         # Optional: use exp_vals-based scoring instead of beam score
         score_source = str(os.environ.get("HYBRID_SCORE_SOURCE", "beam")).strip().lower()
         if score_source in ("exp", "exp_vals", "lsm", "exp_diff", "exp_delta") and exp_list:
@@ -1936,6 +2023,14 @@ class MonteCarloDecisionMixin:
         mu_dir_prob_long_meta = _opt_float(obs_mu_dir_prob_long)
         if mu_dir_prob_long_meta is None:
             mu_dir_prob_long_meta = _opt_float(ctx.get("mu_dir_prob_long"))
+        if isinstance(direction_model_meta, dict):
+            dm_conf = _opt_float(direction_model_meta.get("confidence"))
+            dm_consensus = _opt_float(direction_model_meta.get("consensus_score"))
+            if dm_conf is not None:
+                mu_dir_conf_meta = dm_conf
+            if dm_consensus is not None:
+                mu_dir_prob_long_meta = float(max(0.0, min(1.0, 0.5 + 0.5 * float(dm_consensus))))
+                mu_dir_edge_meta = abs(float(dm_consensus))
 
         meta = {
             "hybrid_action": hybrid_decision,
@@ -1950,6 +2045,30 @@ class MonteCarloDecisionMixin:
             "hybrid_score_hold": score_hold,
             "hybrid_entry_floor": entry_floor,
             "hybrid_biased_entry": bool(biased_entry),
+            "hybrid_direction_policy": str(hybrid_dir_policy),
+            "hybrid_direction_override_applied": bool(direction_override_applied),
+            "hybrid_direction_override_reason": str(direction_override_reason),
+            "direction_model_used": bool(isinstance(direction_model_meta, dict)),
+            "direction_model_source": (
+                str(direction_model_meta.get("direction_source", ""))
+                if isinstance(direction_model_meta, dict)
+                else ""
+            ),
+            "direction_model_consensus": (
+                float(direction_model_meta.get("consensus_score", 0.0) or 0.0)
+                if isinstance(direction_model_meta, dict)
+                else 0.0
+            ),
+            "direction_model_agreement": (
+                bool(direction_model_meta.get("agreement", True))
+                if isinstance(direction_model_meta, dict)
+                else None
+            ),
+            "direction_model_signal_count": (
+                int(direction_model_meta.get("signal_count", 0) or 0)
+                if isinstance(direction_model_meta, dict)
+                else 0
+            ),
             "hybrid_conf_scale": float(conf_scale),
             "hybrid_score_steps": int(score_steps),
             "hybrid_score_per_step": bool(per_step),
