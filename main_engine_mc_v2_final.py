@@ -21884,7 +21884,19 @@ async def main():
                 # in-process EngineHub where possible to avoid startup failures.
                 if not bool(getattr(config, "USE_PROCESS_ENGINE_SET", False)):
                     config.USE_PROCESS_ENGINE = False
-                real_orch = LiveOrchestrator(exchange, data_exchange=data_exchange)
+                requested_process = bool(getattr(config, "USE_PROCESS_ENGINE", False))
+                try:
+                    real_orch = LiveOrchestrator(exchange, data_exchange=data_exchange)
+                except Exception as init_exc:
+                    if requested_process:
+                        print(
+                            f"[WARN] ProcessEngineHub init failed ({init_exc}); "
+                            "retrying with local EngineHub"
+                        )
+                        config.USE_PROCESS_ENGINE = False
+                        real_orch = LiveOrchestrator(exchange, data_exchange=data_exchange)
+                    else:
+                        raise
 
                 # Transfer any connected WS clients from the stub to the real orchestrator
                 try:

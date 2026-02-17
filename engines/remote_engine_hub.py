@@ -315,6 +315,8 @@ class ProcessEngineHub:
         timeout_batch: float = 10.0,
         cpu_affinity: Optional[list[int]] = None,
         worker_count: int = 1,
+        startup_timeout: float | None = None,
+        startup_retries: int = 2,
     ) -> None:
         self.capacity = capacity
         self.slot_size = slot_size
@@ -322,8 +324,30 @@ class ProcessEngineHub:
         self.timeout_batch = timeout_batch
         self.cpu_affinity = cpu_affinity
         self._closed = False
+        self._last_error: Optional[str] = None
+        self._last_success_ts: float = 0.0
         self._worker_count = max(1, int(worker_count))
         self._next_worker_idx = 0
+        try:
+            default_startup_timeout = max(float(self.timeout_single) * 3.0, 8.0)
+        except Exception:
+            default_startup_timeout = 8.0
+        if startup_timeout is None:
+            try:
+                startup_timeout = float(
+                    os.environ.get("MC_ENGINE_STARTUP_TIMEOUT_SEC", default_startup_timeout)
+                    or default_startup_timeout
+                )
+            except Exception:
+                startup_timeout = float(default_startup_timeout)
+        self._startup_timeout = max(1.0, float(startup_timeout))
+        try:
+            startup_retries = int(
+                os.environ.get("MC_ENGINE_STARTUP_RETRIES", startup_retries) or startup_retries
+            )
+        except Exception:
+            startup_retries = 2
+        self._startup_retries = max(1, int(startup_retries))
 
         env_copy = _worker_env_copy()
         self._workers: list[_ProcessWorkerClient] = []
@@ -343,8 +367,36 @@ class ProcessEngineHub:
         _PROCESS_HUBS.add(self)
         _register_atexit_cleanup()
 
-        # Ensure worker is ready.
-        _ = self._workers[0].send({"type": "ping"}, timeout=self.timeout_single)
+        # Ensure every worker is ready before serving requests.
+        try:
+            self._ensure_workers_ready()
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
+
+    def _ensure_workers_ready(self) -> None:
+        for idx, worker in enumerate(self._workers):
+            last_exc: Exception | None = None
+            for attempt in range(1, self._startup_retries + 1):
+                try:
+                    _ = worker.send({"type": "ping"}, timeout=self._startup_timeout)
+                    self._last_success_ts = worker._last_success_ts
+                    self._last_error = None
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    self._last_error = str(exc)
+                    if attempt < self._startup_retries:
+                        time.sleep(min(1.0, 0.2 * attempt))
+            if last_exc is not None:
+                raise TimeoutError(
+                    f"worker[{idx}] startup ping failed after {self._startup_retries} attempts "
+                    f"(timeout={self._startup_timeout:.1f}s): {last_exc}"
+                )
 
     def _next_worker(self) -> _ProcessWorkerClient:
         worker = self._workers[self._next_worker_idx % len(self._workers)]

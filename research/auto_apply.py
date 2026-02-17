@@ -38,7 +38,11 @@ MIN_PNL_IMPROVEMENT = 100.0    # 예상 PnL 개선 "high" 기준(USD)
 MONITOR_DURATION_SEC = 1800    # 30분 모니터링
 ROLLBACK_LOSS_USD = 10.0       # $10 이상 손실 시 롤백
 MAX_CHANGES_PER_CYCLE = 9999   # 제한 없음(사실상 무제한)
-COOLDOWN_BETWEEN_APPLY_SEC = 0  # 쿨다운 비활성
+# Anti-flap guards:
+# - global cooldown: minimum gap between apply batches
+# - per-key cooldown: minimum gap before the same env key is changed again
+COOLDOWN_BETWEEN_APPLY_SEC = 900
+KEY_COOLDOWN_BETWEEN_APPLY_SEC = 1800
 
 # ─────────────────────────────────────────────────────────────────
 # CF Parameter → bybit.env Variable Mapping
@@ -347,43 +351,149 @@ def restart_engine() -> bool:
     """Kill and restart the trading engine."""
     try:
         # Kill existing
-        subprocess.run(["pkill", "-f", "main_engine_mc_v2_final.py"],
-                       capture_output=True, timeout=10)
+        subprocess.run(
+            ["pkill", "-f", "main_engine_mc_v2_final.py"],
+            capture_output=True,
+            timeout=10,
+        )
         time.sleep(3)
+
+        pybin = PROJECT_ROOT / ".venv" / "bin" / "python"
+        py_exec = str(pybin) if pybin.exists() else "python3"
+
         # Syntax check
         result = subprocess.run(
-            ["python3", "-m", "py_compile", "main_engine_mc_v2_final.py"],
+            [py_exec, "-m", "py_compile", "main_engine_mc_v2_final.py"],
             capture_output=True, timeout=30, cwd=str(PROJECT_ROOT),
         )
         if result.returncode != 0:
             logger.error(f"Syntax check failed: {result.stderr.decode()}")
             return False
+
         # Restart
         cmd = (
-            f"cd {PROJECT_ROOT} && source state/bybit.env && "
-            f"ENABLE_LIVE_ORDERS=1 nohup python3 main_engine_mc_v2_final.py "
-            f"> /tmp/engine.log 2>&1 &"
+            f"cd {PROJECT_ROOT} && "
+            f"set -a && source state/bybit.env && set +a && "
+            f"ENABLE_LIVE_ORDERS=1 PYTHONUNBUFFERED=1 "
+            f"nohup {py_exec} main_engine_mc_v2_final.py "
+            f">> state/codex_engine.log 2>&1 &"
         )
         subprocess.Popen(cmd, shell=True, executable="/bin/zsh")
-        logger.info("Engine restarted successfully")
-        time.sleep(5)
-        return True
+        # Health check: process + dashboard listener should both stay up.
+        stable_ticks = 0
+        for _ in range(40):
+            chk_proc = subprocess.run(
+                ["pgrep", "-f", "main_engine_mc_v2_final.py"],
+                capture_output=True,
+                timeout=5,
+            )
+            chk_port = subprocess.run(
+                ["lsof", "-nP", "-iTCP:9999", "-sTCP:LISTEN"],
+                capture_output=True,
+                timeout=5,
+            )
+            if chk_proc.returncode == 0 and chk_port.returncode == 0:
+                stable_ticks += 1
+                if stable_ticks >= 8:  # ~8s of continuous stability
+                    logger.info("Engine restarted successfully")
+                    return True
+            else:
+                stable_ticks = 0
+            time.sleep(1)
+
+        logger.error("Engine restart verification failed: process not running")
+        return False
     except Exception as e:
         logger.error(f"Engine restart failed: {e}")
         return False
 
 
 def _is_in_cooldown() -> bool:
-    """Check if we're still in cooldown from last apply."""
+    """Check global cooldown and active monitoring window."""
+    remain = _cooldown_remaining_sec()
+    return bool(remain > 0)
+
+
+def _cooldown_seconds() -> int:
+    try:
+        return max(0, int(_env_float_runtime("AUTO_APPLY_COOLDOWN_SEC", COOLDOWN_BETWEEN_APPLY_SEC)))
+    except Exception:
+        return int(COOLDOWN_BETWEEN_APPLY_SEC)
+
+
+def _key_cooldown_seconds() -> int:
+    try:
+        return max(0, int(_env_float_runtime("AUTO_APPLY_KEY_COOLDOWN_SEC", KEY_COOLDOWN_BETWEEN_APPLY_SEC)))
+    except Exception:
+        return int(KEY_COOLDOWN_BETWEEN_APPLY_SEC)
+
+
+def _cooldown_remaining_sec(now_ts: float | None = None) -> int:
+    """Remaining seconds for global cooldown (includes active monitoring)."""
     records = _load_apply_log()
     if not records:
-        return False
-    last = records[-1]
-    ts = last.get("timestamp", 0)
-    status = last.get("status", "")
-    if status == "monitoring":
-        return True  # Still monitoring
-    return (time.time() - ts) < COOLDOWN_BETWEEN_APPLY_SEC
+        return 0
+    if now_ts is None:
+        now_ts = time.time()
+
+    # If any change is still monitoring, block until monitor end.
+    monitor_remains: list[float] = []
+    for rec in records:
+        if str(rec.get("status", "")) == "monitoring":
+            ts = float(rec.get("timestamp", 0) or 0)
+            monitor_remains.append((ts + float(MONITOR_DURATION_SEC)) - float(now_ts))
+    if monitor_remains:
+        return int(max(0.0, max(monitor_remains)))
+
+    cooldown_sec = _cooldown_seconds()
+    if cooldown_sec <= 0:
+        return 0
+
+    # Fallback global cooldown after the latest apply-related record.
+    last_ts = 0.0
+    for rec in records:
+        st = str(rec.get("status", "")).strip().lower()
+        if st in ("applied", "rolled_back", "monitoring"):
+            try:
+                ts = float(rec.get("timestamp", 0) or 0)
+            except Exception:
+                ts = 0.0
+            if ts > last_ts:
+                last_ts = ts
+    if last_ts <= 0:
+        return 0
+    remain = (last_ts + float(cooldown_sec)) - float(now_ts)
+    return int(max(0.0, remain))
+
+
+def _env_key_cooldown_remaining_sec(env_key: str, now_ts: float | None = None) -> int:
+    """Remaining cooldown seconds for a specific env key."""
+    key = str(env_key or "").strip()
+    if not key:
+        return 0
+    key_cd_sec = _key_cooldown_seconds()
+    if key_cd_sec <= 0:
+        return 0
+    if now_ts is None:
+        now_ts = time.time()
+    records = _load_apply_log()
+    if not records:
+        return 0
+    for rec in reversed(records):
+        env_changes = rec.get("env_changes") or {}
+        if not isinstance(env_changes, dict):
+            continue
+        if key not in env_changes:
+            continue
+        try:
+            ts = float(rec.get("timestamp", 0) or 0)
+        except Exception:
+            ts = 0.0
+        if ts <= 0:
+            continue
+        remain = (ts + float(key_cd_sec)) - float(now_ts)
+        return int(max(0.0, remain))
+    return 0
 
 
 def _clamp_value(env_key: str, value: float) -> float:
@@ -627,6 +737,7 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
         "auto_apply_enabled": True,
         "last_check_ts": time.time(),
         "cooldown": False,
+        "cooldown_remaining_sec": 0,
         "applied_count": 0,
         "rollback_count": 0,
         "last_action": None,
@@ -643,6 +754,15 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
             git_commit_and_push("auto: rollback — performance degradation")
         elif mon.get("applied", 0) > 0:
             git_commit_and_push("auto: CF changes confirmed — performance maintained")
+
+    # Phase 1.5: Global cooldown guard
+    remain_cd = _cooldown_remaining_sec()
+    if remain_cd > 0:
+        status["cooldown"] = True
+        status["cooldown_remaining_sec"] = int(remain_cd)
+        if not status.get("last_action"):
+            status["last_action"] = f"in_cooldown ({int(remain_cd)}s remaining)"
+        return status
 
     # Phase 2: Find applicable findings (OR condition)
     applicable = [f for f in findings if should_apply(f)]
@@ -675,6 +795,19 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
                 no_effective_findings.append(str(f.get("finding_id") or ""))
             continue
         filtered_changes = {k: v for k, v in env_changes.items() if k not in used_env_keys}
+        # Per-key cooldown guard: avoid rapid oscillation on same env key.
+        now_ts = time.time()
+        blocked_keys: dict[str, int] = {}
+        kept_changes: dict[str, dict] = {}
+        for env_key, change in filtered_changes.items():
+            remain = _env_key_cooldown_remaining_sec(env_key, now_ts=now_ts)
+            if remain > 0:
+                blocked_keys[str(env_key)] = int(remain)
+                continue
+            kept_changes[env_key] = change
+        if blocked_keys:
+            status.setdefault("key_cooldown_blocked", {})[str(f.get("finding_id") or "")] = blocked_keys
+        filtered_changes = kept_changes
         if not filtered_changes:
             no_effective_findings.append(str(f.get("finding_id") or ""))
             continue
