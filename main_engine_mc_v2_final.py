@@ -150,6 +150,7 @@ from engines.kelly_allocator import KellyAllocator
 from core.continuous_opportunity import ContinuousOpportunityChecker
 from core.multi_timeframe_scoring import check_position_switching
 from core.database_manager import DatabaseManager, TradingMode
+from utils.mtf_dl_runtime import MTFDLRuntimeScorer
 
 PORT = 9999
 DASHBOARD_HOST = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1")).strip() or "127.0.0.1"
@@ -626,6 +627,11 @@ class LiveOrchestrator:
         self._last_kline_ts = {s: 0 for s in SYMBOLS}      # 마지막 캔들 timestamp(ms)
         self._last_kline_ok_ms = {s: 0 for s in SYMBOLS}   # 마지막으로 buffer 갱신 성공한 시각(ms)
         self._preloaded = {s: False for s in SYMBOLS}
+        # MTF DL runtime scorer cache
+        self._mtf_dl_runtime: MTFDLRuntimeScorer | None = None
+        self._mtf_dl_runtime_enabled = False
+        self._mtf_dl_pred_cache: dict[str, dict[str, object]] = {}
+        self._mtf_dl_warned = False
 
         self._last_feed_ok_ms = 0
         self._equity_history = deque(maxlen=20_000)
@@ -641,6 +647,7 @@ class LiveOrchestrator:
             "positions": self.state_dir / f"positions_{mode_suffix}.json",
             "balance": self.state_dir / f"balance_{mode_suffix}.json",
         }
+        self._init_mtf_dl_runtime()
         self._exit_trade_types = {"EXIT", "REBAL_EXIT", "KILL", "MANUAL", "EXTERNAL"}
         self._closed_trade_count = 0
         self._reval_baseline_path = self.state_dir / "reval_baseline.json"
@@ -3521,6 +3528,156 @@ class LiveOrchestrator:
         except Exception:
             return float(default)
 
+    def _init_mtf_dl_runtime(self) -> None:
+        try:
+            enabled = str(os.environ.get("MTF_DL_RUNTIME_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            enabled = True
+        self._mtf_dl_runtime_enabled = bool(enabled)
+        self._mtf_dl_runtime = None
+        self._mtf_dl_pred_cache = {}
+        self._mtf_dl_warned = False
+
+        if not self._mtf_dl_runtime_enabled:
+            self._log("[MTF_DL] runtime disabled")
+            return
+
+        raw_model_path = str(os.environ.get("MTF_DL_MODEL_PATH", "") or "").strip()
+        if raw_model_path:
+            model_path = Path(raw_model_path)
+            if not model_path.is_absolute():
+                model_path = (BASE_DIR / model_path).resolve()
+        else:
+            model_path = self.state_dir / "mtf_image_model.pt"
+        try:
+            device = str(os.environ.get("MTF_DL_RUNTIME_DEVICE", "cpu") or "cpu").strip().lower()
+        except Exception:
+            device = "cpu"
+
+        try:
+            scorer = MTFDLRuntimeScorer(
+                model_path=str(model_path),
+                enabled=True,
+                device=device,
+            )
+        except Exception as e:
+            self._log_err(f"[MTF_DL] runtime init failed: {e}")
+            return
+
+        if scorer.ready:
+            self._mtf_dl_runtime = scorer
+            tf_txt = ",".join(str(int(x)) for x in (scorer.timeframes or []))
+            self._log(
+                f"[MTF_DL] runtime ready model={model_path} "
+                f"tf=[{tf_txt}] lookback={int(scorer.lookback_bars)} device={scorer.device}"
+            )
+        else:
+            self._log(f"[MTF_DL] runtime unavailable model={model_path} reason={scorer.error}")
+
+    def _build_mtf_dl_ts_series(self, sym: str, n: int, ts_hint_ms: int) -> np.ndarray:
+        n = int(max(0, int(n)))
+        if n <= 0:
+            return np.zeros(0, dtype=np.int64)
+        bar_ms = 60_000
+        last_ts = int(self._last_kline_ts.get(sym, 0) or 0)
+        if last_ts <= 0:
+            hint = int(ts_hint_ms or now_ms())
+            last_ts = int(hint // bar_ms * bar_ms)
+        start = int(last_ts - (n - 1) * bar_ms)
+        return np.arange(start, start + n * bar_ms, bar_ms, dtype=np.int64)
+
+    def _inject_mtf_dl_features(
+        self,
+        sym: str,
+        ctx: dict,
+        ts_ms: int,
+        closes: list[float],
+        opens: list[float],
+        highs: list[float],
+        lows: list[float],
+        volumes: list[float],
+        regime: str,
+    ) -> None:
+        if not isinstance(ctx, dict):
+            return
+        ctx["mtf_dl_enabled"] = bool(self._mtf_dl_runtime_enabled)
+        runtime = self._mtf_dl_runtime
+        if (not self._mtf_dl_runtime_enabled) or runtime is None or (not getattr(runtime, "ready", False)):
+            ctx["mtf_dl_ready"] = False
+            return
+        ctx["mtf_dl_ready"] = True
+
+        n = min(len(closes), len(opens), len(highs), len(lows), len(volumes))
+        if n <= 0:
+            return
+        closes_n = closes[-n:]
+        opens_n = opens[-n:]
+        highs_n = highs[-n:]
+        lows_n = lows[-n:]
+        volumes_n = volumes[-n:]
+
+        kline_ts = int(self._last_kline_ts.get(sym, 0) or 0)
+        cache_key_ts = int(kline_ts if kline_ts > 0 else int(ts_ms // 60_000))
+        pred: dict[str, object] | None = None
+        cached = self._mtf_dl_pred_cache.get(sym)
+        if isinstance(cached, dict) and int(cached.get("cache_key_ts", -1) or -1) == cache_key_ts:
+            cp = cached.get("pred")
+            if isinstance(cp, dict):
+                pred = dict(cp)
+
+        if pred is None:
+            try:
+                ts_arr = self._build_mtf_dl_ts_series(sym, n, int(ts_ms))
+                pred_raw = runtime.predict(
+                    symbol=sym,
+                    regime=str(regime or "unknown"),
+                    ts_ms=ts_arr,
+                    open_=opens_n,
+                    high=highs_n,
+                    low=lows_n,
+                    close=closes_n,
+                    volume=volumes_n,
+                    entry_ts_ms=int(ts_ms),
+                )
+                if isinstance(pred_raw, dict):
+                    pred = dict(pred_raw)
+                    self._mtf_dl_pred_cache[sym] = {
+                        "cache_key_ts": int(cache_key_ts),
+                        "pred": pred,
+                    }
+            except Exception as e:
+                if not self._mtf_dl_warned:
+                    self._log_err(f"[MTF_DL] predict failed: {e}")
+                    self._mtf_dl_warned = True
+                return
+
+        if not isinstance(pred, dict):
+            return
+        for k in (
+            "mtf_dl_prob_win",
+            "mtf_dl_prob_long",
+            "mtf_dl_prob_short",
+            "mtf_dl_hold_sec_pred",
+            "mtf_dl_exit_reason_top",
+            "mtf_dl_exit_reason_conf",
+            "mtf_dl_regime_norm",
+            "mtf_dl_symbol_group",
+        ):
+            if k in pred:
+                ctx[k] = pred.get(k)
+        try:
+            side_hint = "LONG" if int(ctx.get("direction", 1) or 1) >= 0 else "SHORT"
+        except Exception:
+            side_hint = "LONG"
+        p_long = pred.get("mtf_dl_prob_long")
+        p_short = pred.get("mtf_dl_prob_short")
+        try:
+            p_side = float(p_long) if side_hint == "LONG" else float(p_short)
+            ctx["mtf_dl_prob_side"] = float(max(0.0, min(1.0, p_side)))
+        except Exception:
+            pass
+        ctx["mtf_dl_cache_key_ts"] = int(cache_key_ts)
+
     @staticmethod
     def _extract_filter_states(decision: dict) -> dict:
         """decision 객체에서 filter_states 추출 (여러 위치에서 찾기)"""
@@ -3539,6 +3696,7 @@ class LiveOrchestrator:
             "liq": None,
             "min_notional": None,
             "min_exposure": None,
+            "mtf_dl_entry": None,
             "tick_vol": None,
             "fee": None,
             "top_n": None,
@@ -6089,6 +6247,7 @@ class LiveOrchestrator:
                 liq_ok = None
         min_notional_ok = None
         min_exposure_ok = None
+        mtf_dl_entry_ok = None
         tick_vol_ok = None
         both_ev_neg_ok = None
         gross_ev_ok = None
@@ -6227,6 +6386,59 @@ class LiveOrchestrator:
                 tick_vol_ok = float(tick_vol) >= float(MIN_TICK_VOL)
             except Exception:
                 tick_vol_ok = None
+        if is_entry:
+            try:
+                mtf_dl_entry_enabled = _env_regime_bool("MTF_DL_ENTRY_GATE_ENABLED", True)
+            except Exception:
+                mtf_dl_entry_enabled = True
+            if mtf_dl_entry_enabled:
+                try:
+                    mtf_min_side = float(_env_regime_float("MTF_DL_ENTRY_MIN_SIDE_PROB", 0.58))
+                except Exception:
+                    mtf_min_side = 0.58
+                try:
+                    mtf_min_win = float(_env_regime_float("MTF_DL_ENTRY_MIN_WIN_PROB", 0.52))
+                except Exception:
+                    mtf_min_win = 0.52
+                action_side = str((decision or {}).get("action") or "").upper()
+                p_win = self._decision_metric_float(decision, meta, ("mtf_dl_prob_win",), default=None)
+                p_long = self._decision_metric_float(decision, meta, ("mtf_dl_prob_long",), default=None)
+                p_short = self._decision_metric_float(decision, meta, ("mtf_dl_prob_short",), default=None)
+                p_side = self._decision_metric_float(decision, meta, ("mtf_dl_prob_side",), default=None)
+                if p_side is None:
+                    if action_side == "LONG":
+                        p_side = p_long
+                    elif action_side == "SHORT":
+                        p_side = p_short
+                observed = False
+                gate_ok = True
+                if p_side is not None:
+                    observed = True
+                    gate_ok = gate_ok and (float(p_side) >= float(mtf_min_side))
+                if p_win is not None:
+                    observed = True
+                    gate_ok = gate_ok and (float(p_win) >= float(mtf_min_win))
+                if observed:
+                    mtf_dl_entry_ok = bool(gate_ok)
+                else:
+                    mtf_dl_entry_ok = None
+                try:
+                    meta["mtf_dl_entry_gate_enabled"] = True
+                    meta["mtf_dl_entry_min_side_prob"] = float(mtf_min_side)
+                    meta["mtf_dl_entry_min_win_prob"] = float(mtf_min_win)
+                    meta["mtf_dl_entry_prob_side"] = float(p_side) if p_side is not None else None
+                    meta["mtf_dl_entry_prob_win"] = float(p_win) if p_win is not None else None
+                    meta["mtf_dl_entry_ok"] = mtf_dl_entry_ok
+                    decision["meta"] = meta
+                except Exception:
+                    pass
+            else:
+                mtf_dl_entry_ok = None
+                try:
+                    meta["mtf_dl_entry_gate_enabled"] = False
+                    decision["meta"] = meta
+                except Exception:
+                    pass
         if self.exposure_cap_enabled:
             try:
                 cap_frac = self._effective_total_exposure_cap(float(cap_balance))
@@ -7152,6 +7364,7 @@ class LiveOrchestrator:
             "liq": liq_ok,
             "min_notional": min_notional_ok,
             "min_exposure": min_exposure_ok,
+            "mtf_dl_entry": mtf_dl_entry_ok,
             "tick_vol": tick_vol_ok,
             "fee": fee_ok,
             "top_n": None,
@@ -7163,7 +7376,7 @@ class LiveOrchestrator:
         }
         if not is_entry:
             # Entry-only filters shouldn't show as blocked for non-entry decisions.
-            for k in ("unified", "spread", "event_cvar", "event_exit", "both_ev_neg", "gross_ev", "net_expectancy", "dir_gate", "regime_dir_gate", "mu_align_gate", "tod_filter", "symbol_quality", "lev_floor_lock", "chop_guard", "chop_vpin", "chop_vol", "liq", "min_notional", "min_exposure", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
+            for k in ("unified", "spread", "event_cvar", "event_exit", "both_ev_neg", "gross_ev", "net_expectancy", "dir_gate", "regime_dir_gate", "mu_align_gate", "tod_filter", "symbol_quality", "lev_floor_lock", "chop_guard", "chop_vpin", "chop_vol", "liq", "min_notional", "min_exposure", "mtf_dl_entry", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
                 out[k] = None
         return out
 
@@ -7328,6 +7541,8 @@ class LiveOrchestrator:
             return False, "min_notional"
         if fs.get("min_exposure") is False and "min_exposure" not in overrides:
             return False, "min_exposure"
+        if fs.get("mtf_dl_entry") is False and "mtf_dl_entry" not in overrides:
+            return False, "mtf_dl_entry"
         if fs.get("fee") is False and "fee" not in overrides:
             return False, "fee"
         if fs.get("top_n") is False and "top_n" not in overrides:
@@ -8895,6 +9110,61 @@ class LiveOrchestrator:
             mu_dir_prob_long = None
         if mu_dir_prob_long is not None:
             pos["pred_mu_dir_prob_long"] = float(max(0.0, min(1.0, mu_dir_prob_long)))
+        mtf_prob_win = _pick_float(
+            meta.get("mtf_dl_prob_win"),
+            (decision or {}).get("mtf_dl_prob_win") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_prob_win"),
+        )
+        mtf_prob_long = _pick_float(
+            meta.get("mtf_dl_prob_long"),
+            (decision or {}).get("mtf_dl_prob_long") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_prob_long"),
+        )
+        mtf_prob_short = _pick_float(
+            meta.get("mtf_dl_prob_short"),
+            (decision or {}).get("mtf_dl_prob_short") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_prob_short"),
+        )
+        mtf_prob_side = _pick_float(
+            meta.get("mtf_dl_prob_side"),
+            (decision or {}).get("mtf_dl_prob_side") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_prob_side"),
+        )
+        mtf_hold_sec = _pick_float(
+            meta.get("mtf_dl_hold_sec_pred"),
+            (decision or {}).get("mtf_dl_hold_sec_pred") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_hold_sec"),
+        )
+        mtf_exit_reason = _pick_str(
+            meta.get("mtf_dl_exit_reason_top"),
+            (decision or {}).get("mtf_dl_exit_reason_top") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_exit_reason"),
+        )
+        mtf_exit_conf = _pick_float(
+            meta.get("mtf_dl_exit_reason_conf"),
+            (decision or {}).get("mtf_dl_exit_reason_conf") if isinstance(decision, dict) else None,
+            pos.get("pred_mtf_dl_exit_conf"),
+        )
+        if mtf_prob_side is None:
+            side_now = str(pos.get("side") or "").upper()
+            if side_now == "LONG" and mtf_prob_long is not None:
+                mtf_prob_side = float(mtf_prob_long)
+            elif side_now == "SHORT" and mtf_prob_short is not None:
+                mtf_prob_side = float(mtf_prob_short)
+        if mtf_prob_win is not None:
+            pos["pred_mtf_dl_prob_win"] = float(max(0.0, min(1.0, mtf_prob_win)))
+        if mtf_prob_long is not None:
+            pos["pred_mtf_dl_prob_long"] = float(max(0.0, min(1.0, mtf_prob_long)))
+        if mtf_prob_short is not None:
+            pos["pred_mtf_dl_prob_short"] = float(max(0.0, min(1.0, mtf_prob_short)))
+        if mtf_prob_side is not None:
+            pos["pred_mtf_dl_prob_side"] = float(max(0.0, min(1.0, mtf_prob_side)))
+        if mtf_hold_sec is not None:
+            pos["pred_mtf_dl_hold_sec"] = float(max(0.0, mtf_hold_sec))
+        if mtf_exit_reason is not None:
+            pos["pred_mtf_dl_exit_reason"] = str(mtf_exit_reason)
+        if mtf_exit_conf is not None:
+            pos["pred_mtf_dl_exit_conf"] = float(max(0.0, min(1.0, mtf_exit_conf)))
         entry_quality_score = _pick_float(
             meta.get("entry_quality_score"),
             (decision or {}).get("entry_quality_score") if isinstance(decision, dict) else None,
@@ -12218,22 +12488,30 @@ class LiveOrchestrator:
                     notional_scaled = float(max(0.0, qty_scaled * float(price))) if qty_scaled > 0 else 0.0
                     can_enter_scaled, reason_scaled = self._can_enter_position(notional_scaled)
                     if can_enter_scaled and qty_scaled > 0:
-                        self._log(
-                            f"[CAP_ADAPTIVE_EXEC] {sym} notional {notional:.2f} -> {notional_scaled:.2f} "
-                            f"(remaining={remaining_cap:.2f}, ratio={ratio:.3f})"
-                        )
-                        qty = float(qty_scaled)
-                        notional = float(notional_scaled)
-                        can_enter = True
-                        reason = ""
-                        try:
-                            meta_now = dict(decision.get("meta") or {})
-                            meta_now["cap_dynamic_exec_scaled"] = True
-                            meta_now["cap_dynamic_exec_ratio"] = float(ratio)
-                            meta_now["cap_dynamic_exec_notional"] = float(notional_scaled)
-                            decision["meta"] = meta_now
-                        except Exception:
-                            pass
+                        if min_entry_notional > 0.0 and float(notional_scaled) < float(min_entry_notional):
+                            reason = "min_notional_after_cap_scale"
+                            can_enter = False
+                            self._log(
+                                f"[CAP_ADAPTIVE_SKIP_MIN_NOTIONAL] {sym} notional={notional_scaled:.4f} "
+                                f"< floor={min_entry_notional:.4f} after cap scaling"
+                            )
+                        else:
+                            self._log(
+                                f"[CAP_ADAPTIVE_EXEC] {sym} notional {notional:.2f} -> {notional_scaled:.2f} "
+                                f"(remaining={remaining_cap:.2f}, ratio={ratio:.3f})"
+                            )
+                            qty = float(qty_scaled)
+                            notional = float(notional_scaled)
+                            can_enter = True
+                            reason = ""
+                            try:
+                                meta_now = dict(decision.get("meta") or {})
+                                meta_now["cap_dynamic_exec_scaled"] = True
+                                meta_now["cap_dynamic_exec_ratio"] = float(ratio)
+                                meta_now["cap_dynamic_exec_notional"] = float(notional_scaled)
+                                decision["meta"] = meta_now
+                            except Exception:
+                                pass
                     else:
                         reason = str(reason_scaled or reason)
         if (not can_enter) and ignore_caps and reason == "exposure capped":
@@ -12455,6 +12733,33 @@ class LiveOrchestrator:
         mu_alpha_entry = self._safe_float(_dget("mu_alpha"), None)
         if mu_alpha_entry is not None:
             mu_alpha_entry = float(mu_alpha_entry)
+        def _opt_float(v):
+            try:
+                if v is None:
+                    return None
+                return float(v)
+            except Exception:
+                return None
+        mtf_prob_win = _opt_float(_dget("mtf_dl_prob_win", (ctx or {}).get("mtf_dl_prob_win")))
+        mtf_prob_long = _opt_float(_dget("mtf_dl_prob_long", (ctx or {}).get("mtf_dl_prob_long")))
+        mtf_prob_short = _opt_float(_dget("mtf_dl_prob_short", (ctx or {}).get("mtf_dl_prob_short")))
+        mtf_prob_side = _opt_float(_dget("mtf_dl_prob_side", (ctx or {}).get("mtf_dl_prob_side")))
+        if mtf_prob_side is None:
+            if str(side).upper() == "LONG":
+                mtf_prob_side = mtf_prob_long
+            elif str(side).upper() == "SHORT":
+                mtf_prob_side = mtf_prob_short
+        mtf_hold_sec_pred = _opt_float(_dget("mtf_dl_hold_sec_pred", (ctx or {}).get("mtf_dl_hold_sec_pred")))
+        if mtf_hold_sec_pred is not None:
+            mtf_hold_sec_pred = float(max(0.0, mtf_hold_sec_pred))
+        mtf_exit_reason_top = str(
+            _dget("mtf_dl_exit_reason_top", (ctx or {}).get("mtf_dl_exit_reason_top")) or ""
+        ).strip().lower() or None
+        mtf_exit_reason_conf = _opt_float(
+            _dget("mtf_dl_exit_reason_conf", (ctx or {}).get("mtf_dl_exit_reason_conf"))
+        )
+        if mtf_exit_reason_conf is not None:
+            mtf_exit_reason_conf = float(max(0.0, min(1.0, mtf_exit_reason_conf)))
         pos = {
             "symbol": sym,
             "side": side,
@@ -12486,6 +12791,13 @@ class LiveOrchestrator:
             "pred_mu_dir_conf": _dget("mu_dir_conf"),
             "pred_mu_dir_edge": _dget("mu_dir_edge"),
             "pred_mu_dir_prob_long": _dget("mu_dir_prob_long"),
+            "pred_mtf_dl_prob_side": mtf_prob_side,
+            "pred_mtf_dl_prob_win": mtf_prob_win,
+            "pred_mtf_dl_prob_long": mtf_prob_long,
+            "pred_mtf_dl_prob_short": mtf_prob_short,
+            "pred_mtf_dl_hold_sec": mtf_hold_sec_pred,
+            "pred_mtf_dl_exit_reason": mtf_exit_reason_top,
+            "pred_mtf_dl_exit_conf": mtf_exit_reason_conf,
             "pred_hmm_state": (ctx or {}).get("hmm_state") if decision else None,
             "pred_hmm_conf": (ctx or {}).get("hmm_conf") if decision else None,
             "alpha_vpin": (ctx or {}).get("vpin") if decision else None,
@@ -13481,6 +13793,97 @@ class LiveOrchestrator:
                     pass
             return default
 
+        mtf_dl_exit_candidate = False
+        mtf_dl_exit_reason = None
+        mtf_dl_exit_conf = None
+        mtf_dl_hold_pred_sec = None
+        mtf_dl_hold_progress = None
+        mtf_dl_exit_reason_top = None
+        try:
+            mtf_dl_exit_enabled = str(os.environ.get("MTF_DL_EXIT_HEAD_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        except Exception:
+            mtf_dl_exit_enabled = True
+        if hold_ok and mtf_dl_exit_enabled:
+            age_sec_now = max(0.0, float(age_ms) / 1000.0)
+            mtf_dl_hold_pred_sec = _decision_metric_float("mtf_dl_hold_sec_pred", default=None)
+            if mtf_dl_hold_pred_sec is None:
+                try:
+                    mtf_dl_hold_pred_sec = float(pos.get("pred_mtf_dl_hold_sec")) if pos.get("pred_mtf_dl_hold_sec") is not None else None
+                except Exception:
+                    mtf_dl_hold_pred_sec = None
+            if mtf_dl_hold_pred_sec is not None:
+                mtf_dl_hold_pred_sec = float(max(0.0, mtf_dl_hold_pred_sec))
+                if mtf_dl_hold_pred_sec > 0:
+                    mtf_dl_hold_progress = float(age_sec_now / max(mtf_dl_hold_pred_sec, 1e-6))
+            try:
+                mtf_dl_exit_conf = float(
+                    _decision_metric_float("mtf_dl_exit_reason_conf", default=pos.get("pred_mtf_dl_exit_conf"))
+                    or 0.0
+                )
+            except Exception:
+                mtf_dl_exit_conf = 0.0
+            mtf_dl_exit_conf = float(max(0.0, min(1.0, mtf_dl_exit_conf)))
+            try:
+                mmeta = (decision or {}).get("meta") if isinstance(decision, dict) else {}
+                mtf_dl_exit_reason_top = str(
+                    (mmeta or {}).get("mtf_dl_exit_reason_top")
+                    or pos.get("pred_mtf_dl_exit_reason")
+                    or ""
+                ).strip().lower()
+            except Exception:
+                mtf_dl_exit_reason_top = ""
+            try:
+                mtf_dl_exit_min_conf = float(os.environ.get("MTF_DL_EXIT_MIN_CONF", 0.62) or 0.62)
+            except Exception:
+                mtf_dl_exit_min_conf = 0.62
+            try:
+                mtf_dl_exit_min_progress = float(os.environ.get("MTF_DL_EXIT_MIN_PROGRESS", 0.95) or 0.95)
+            except Exception:
+                mtf_dl_exit_min_progress = 0.95
+            allow_raw = str(
+                os.environ.get(
+                    "MTF_DL_EXIT_ALLOWED_REASONS",
+                    "event_mc_exit,unrealized_dd,unified_flip,hybrid_exit,prelev_stop2,unified_cash,take_profit,stop_or_liq",
+                )
+                or ""
+            )
+            allow_reasons = {x.strip().lower() for x in allow_raw.replace(";", ",").split(",") if x.strip()}
+            if not allow_reasons:
+                allow_reasons = {
+                    "event_mc_exit",
+                    "unrealized_dd",
+                    "unified_flip",
+                    "hybrid_exit",
+                    "prelev_stop2",
+                    "unified_cash",
+                    "take_profit",
+                    "stop_or_liq",
+                }
+            reason_allowed = False
+            if mtf_dl_exit_reason_top:
+                for tag in allow_reasons:
+                    if mtf_dl_exit_reason_top == tag or mtf_dl_exit_reason_top.startswith(f"{tag}_") or mtf_dl_exit_reason_top.startswith(tag):
+                        reason_allowed = True
+                        break
+            progress_ok = True
+            if mtf_dl_hold_progress is not None:
+                progress_ok = float(mtf_dl_hold_progress) >= float(max(0.0, mtf_dl_exit_min_progress))
+            conf_ok = float(mtf_dl_exit_conf) >= float(max(0.0, mtf_dl_exit_min_conf))
+            if reason_allowed and progress_ok and conf_ok:
+                mtf_dl_exit_candidate = True
+                mtf_dl_exit_reason = f"mtf_dl_exit_{mtf_dl_exit_reason_top}"
+                exit_reasons.append(str(mtf_dl_exit_reason))
+        if isinstance(decision, dict):
+            meta = dict(decision.get("meta") or {})
+            meta["mtf_dl_exit_enabled"] = bool(mtf_dl_exit_enabled)
+            meta["mtf_dl_exit_candidate"] = bool(mtf_dl_exit_candidate)
+            meta["mtf_dl_exit_reason_top"] = str(mtf_dl_exit_reason_top or "")
+            meta["mtf_dl_exit_reason_conf"] = float(mtf_dl_exit_conf or 0.0) if mtf_dl_exit_conf is not None else None
+            meta["mtf_dl_hold_sec_pred"] = float(mtf_dl_hold_pred_sec) if mtf_dl_hold_pred_sec is not None else None
+            meta["mtf_dl_hold_progress"] = float(mtf_dl_hold_progress) if mtf_dl_hold_progress is not None else None
+            meta["mtf_dl_exit_reason"] = str(mtf_dl_exit_reason or "")
+            decision["meta"] = meta
+
         cash_normal_required, cash_confirm_reset_sec, _cash_ticks = self._get_exit_confirmation_rule(
             "UNIFIED_CASH_EXIT",
             "normal",
@@ -14219,10 +14622,12 @@ class LiveOrchestrator:
                     return (4, 0)
                 if t.startswith("prelev_stop2"):
                     return (5, 0)
-                if t == "unified_flip":
+                if t.startswith("mtf_dl_exit"):
                     return (6, 0)
-                if t == "unified_cash":
+                if t == "unified_flip":
                     return (7, 0)
+                if t == "unified_cash":
+                    return (8, 0)
                 # Fallback: keep deterministic ordering by tag.
                 return (50, 0)
 
@@ -14444,6 +14849,13 @@ class LiveOrchestrator:
             "pred_mu_dir_conf": pos.get("pred_mu_dir_conf"),
             "pred_mu_dir_edge": pos.get("pred_mu_dir_edge"),
             "pred_mu_dir_prob_long": pos.get("pred_mu_dir_prob_long"),
+            "pred_mtf_dl_prob_side": pos.get("pred_mtf_dl_prob_side"),
+            "pred_mtf_dl_prob_win": pos.get("pred_mtf_dl_prob_win"),
+            "pred_mtf_dl_prob_long": pos.get("pred_mtf_dl_prob_long"),
+            "pred_mtf_dl_prob_short": pos.get("pred_mtf_dl_prob_short"),
+            "pred_mtf_dl_hold_sec": pos.get("pred_mtf_dl_hold_sec"),
+            "pred_mtf_dl_exit_reason": pos.get("pred_mtf_dl_exit_reason"),
+            "pred_mtf_dl_exit_conf": pos.get("pred_mtf_dl_exit_conf"),
             "pred_hmm_state": pos.get("pred_hmm_state"),
             "pred_hmm_conf": pos.get("pred_hmm_conf"),
             "regime": pos.get("regime"),
@@ -14574,6 +14986,13 @@ class LiveOrchestrator:
                 "sigma": pos.get("lev_sigma_used"),
                 "pred_mu_alpha": pos.get("pred_mu_alpha"),
                 "pred_mu_dir_conf": pos.get("pred_mu_dir_conf"),
+                "pred_mtf_dl_prob_side": pos.get("pred_mtf_dl_prob_side"),
+                "pred_mtf_dl_prob_win": pos.get("pred_mtf_dl_prob_win"),
+                "pred_mtf_dl_prob_long": pos.get("pred_mtf_dl_prob_long"),
+                "pred_mtf_dl_prob_short": pos.get("pred_mtf_dl_prob_short"),
+                "pred_mtf_dl_hold_sec": pos.get("pred_mtf_dl_hold_sec"),
+                "pred_mtf_dl_exit_reason": pos.get("pred_mtf_dl_exit_reason"),
+                "pred_mtf_dl_exit_conf": pos.get("pred_mtf_dl_exit_conf"),
                 "policy_score_threshold": pos.get("policy_score_threshold"),
                 "policy_event_exit_min_score": pos.get("policy_event_exit_min_score"),
                 "policy_unrealized_dd_floor": pos.get("policy_unrealized_dd_floor"),
@@ -15054,6 +15473,20 @@ class LiveOrchestrator:
             ctx_out.update(rt_breakout)
         if tick_feats:
             ctx_out.update(tick_feats)
+        try:
+            self._inject_mtf_dl_features(
+                sym,
+                ctx_out,
+                int(ts),
+                closes,
+                opens,
+                highs,
+                lows,
+                volumes,
+                regime,
+            )
+        except Exception:
+            pass
         return ctx_out
 
     def _build_batch_context_soa(self, ts: int) -> tuple[list[dict], np.ndarray]:
@@ -15210,6 +15643,20 @@ class LiveOrchestrator:
                 ctx.update(rt_breakout)
             if tick_feats:
                 ctx.update(tick_feats)
+            try:
+                self._inject_mtf_dl_features(
+                    sym,
+                    ctx,
+                    int(ts),
+                    closes,
+                    opens,
+                    highs,
+                    lows,
+                    volumes,
+                    regime,
+                )
+            except Exception:
+                pass
             if self._hybrid_entry_floor_dyn is not None:
                 ctx["hybrid_entry_floor_dyn"] = float(self._hybrid_entry_floor_dyn)
             if self._hybrid_conf_scale_dyn is not None:
@@ -15629,6 +16076,15 @@ class LiveOrchestrator:
                 decision_meta.setdefault("tick_window_sec", ctx.get("tick_window_sec"))
                 decision_meta.setdefault("tick_samples", ctx.get("tick_samples"))
                 decision_meta.setdefault("min_tick_vol", float(MIN_TICK_VOL) if MIN_TICK_VOL > 0 else None)
+                decision_meta.setdefault("mtf_dl_enabled", ctx.get("mtf_dl_enabled"))
+                decision_meta.setdefault("mtf_dl_ready", ctx.get("mtf_dl_ready"))
+                decision_meta.setdefault("mtf_dl_prob_win", ctx.get("mtf_dl_prob_win"))
+                decision_meta.setdefault("mtf_dl_prob_long", ctx.get("mtf_dl_prob_long"))
+                decision_meta.setdefault("mtf_dl_prob_short", ctx.get("mtf_dl_prob_short"))
+                decision_meta.setdefault("mtf_dl_prob_side", ctx.get("mtf_dl_prob_side"))
+                decision_meta.setdefault("mtf_dl_hold_sec_pred", ctx.get("mtf_dl_hold_sec_pred"))
+                decision_meta.setdefault("mtf_dl_exit_reason_top", ctx.get("mtf_dl_exit_reason_top"))
+                decision_meta.setdefault("mtf_dl_exit_reason_conf", ctx.get("mtf_dl_exit_reason_conf"))
             except Exception:
                 pass
 
@@ -15817,6 +16273,8 @@ class LiveOrchestrator:
                     blocked.append("min_notional")
                 if fs.get("min_exposure") is False:
                     blocked.append("min_exposure")
+                if fs.get("mtf_dl_entry") is False:
+                    blocked.append("mtf_dl_entry")
                 if fs.get("tick_vol") is False:
                     blocked.append("tick_vol")
                 if fs.get("top_n") is False:
