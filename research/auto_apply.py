@@ -108,6 +108,15 @@ PARAM_TO_ENV: dict[str, list[str]] = {
     "dir_gate_confirm_ticks_chop": ["ALPHA_DIRECTION_GATE_CONFIRM_TICKS_CHOP"],
     "sq_time_window_hours": ["SYMBOL_QUALITY_TIME_WINDOW_HOURS"],
     "sq_time_weight": ["SYMBOL_QUALITY_TIME_WEIGHT"],
+    # Hybrid-expanded research params
+    "hybrid_exit_confirm_shock": ["HYBRID_EXIT_CONFIRM_TICKS_SHOCK"],
+    "hybrid_exit_confirm_normal": ["HYBRID_EXIT_CONFIRM_TICKS_NORMAL"],
+    "hybrid_exit_confirm_noise": ["HYBRID_EXIT_CONFIRM_TICKS_NOISE"],
+    "hybrid_lev_sweep_min": ["HYBRID_LEV_MIN"],
+    "hybrid_lev_sweep_max": ["HYBRID_LEV_MAX"],
+    "mc_hybrid_n_paths": ["MC_HYBRID_N_PATHS"],
+    "mc_hybrid_horizon_steps": ["MC_HYBRID_HORIZON_STEPS"],
+    "hybrid_cash_penalty": ["HYBRID_CASH_PENALTY"],
 }
 
 # 값 범위 제한 (안전 가드)
@@ -156,6 +165,14 @@ PARAM_BOUNDS: dict[str, tuple[float, float]] = {
     "ALPHA_DIRECTION_GATE_CONFIRM_TICKS_CHOP": (1, 8),
     "SYMBOL_QUALITY_TIME_WINDOW_HOURS": (1, 12),
     "SYMBOL_QUALITY_TIME_WEIGHT": (0.0, 1.0),
+    "HYBRID_EXIT_CONFIRM_TICKS_SHOCK": (1, 8),
+    "HYBRID_EXIT_CONFIRM_TICKS_NORMAL": (1, 8),
+    "HYBRID_EXIT_CONFIRM_TICKS_NOISE": (1, 12),
+    "HYBRID_LEV_MIN": (0.5, 20.0),
+    "HYBRID_LEV_MAX": (1.0, 100.0),
+    "MC_HYBRID_N_PATHS": (512, 32768),
+    "MC_HYBRID_HORIZON_STEPS": (15, 1200),
+    "HYBRID_CASH_PENALTY": (0.0, 0.02),
 }
 
 
@@ -406,6 +423,15 @@ def _build_env_changes_for_finding(finding: dict) -> dict[str, dict]:
     return env_changes
 
 
+def _unmapped_params_for_finding(finding: dict) -> list[str]:
+    param_changes = finding.get("param_changes", {}) or {}
+    out: list[str] = []
+    for cf_param in param_changes.keys():
+        if not PARAM_TO_ENV.get(str(cf_param)):
+            out.append(str(cf_param))
+    return out
+
+
 def apply_finding(finding: dict, *, restart_after_apply: bool = True) -> Optional[ApplyRecord]:
     """
     Apply a single CF finding to bybit.env.
@@ -591,19 +617,38 @@ def auto_apply_cycle(findings: list[dict]) -> dict:
     sorted_applicable = sorted(applicable, key=lambda f: float(f.get("improvement_pct", 0) or 0), reverse=True)
     planned: list[dict] = []
     used_env_keys: set[str] = set()
+    unmapped_findings: list[dict] = []
+    no_effective_findings: list[str] = []
     for f in sorted_applicable:
         env_changes = _build_env_changes_for_finding(f)
         if not env_changes:
+            unmapped = _unmapped_params_for_finding(f)
+            if unmapped:
+                unmapped_findings.append({
+                    "finding_id": str(f.get("finding_id") or ""),
+                    "stage": str(f.get("stage") or ""),
+                    "unmapped_params": unmapped,
+                })
+            else:
+                no_effective_findings.append(str(f.get("finding_id") or ""))
             continue
         filtered_changes = {k: v for k, v in env_changes.items() if k not in used_env_keys}
         if not filtered_changes:
+            no_effective_findings.append(str(f.get("finding_id") or ""))
             continue
         planned.append({"finding": f, "env_changes": filtered_changes})
         used_env_keys.update(filtered_changes.keys())
 
     if not planned:
+        status["unmapped_findings"] = unmapped_findings[:10]
+        status["no_effective_findings"] = [fid for fid in no_effective_findings if fid][:20]
+        status["unmapped_count"] = int(len(unmapped_findings))
+        status["no_effective_count"] = int(len(no_effective_findings))
         if not status.get("last_action"):
-            status["last_action"] = "qualifying_findings_but_no_effective_env_changes"
+            if unmapped_findings:
+                status["last_action"] = "qualifying_findings_unmapped_params"
+            else:
+                status["last_action"] = "qualifying_findings_but_no_effective_env_changes"
         return status
 
     backup_path = backup_env()

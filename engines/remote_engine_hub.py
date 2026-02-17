@@ -25,6 +25,9 @@ import requests
 
 from core.ring_buffer import SharedMemoryRingBuffer
 
+os.environ.setdefault("MC_STREAMING_PARALLEL", "1")
+os.environ.setdefault("MC_STREAMING_PARALLEL_WORKERS", "2")
+
 
 _ATEXIT_REGISTERED = False
 _PROCESS_HUBS: set["ProcessEngineHub"] = set()
@@ -163,61 +166,55 @@ class MCEngineWorker(Process):
         resp_buf.close()
 
 
-class ProcessEngineHub:
-    """Run MonteCarloEngine in a separate process via shared memory."""
+def _worker_env_copy() -> dict[str, str]:
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k in {"MC_VERBOSE_PRINT", "MC_TAIL_MODE"}
+    }
 
+
+class _ProcessWorkerClient:
     def __init__(
         self,
-        capacity: int = 32,
-        slot_size: int = 131072,
-        timeout_single: float = 2.0,
-        timeout_batch: float = 10.0,
-        cpu_affinity: Optional[list[int]] = None,
+        name_suffix: str,
+        size: int,
+        slot_size: int,
+        timeout_single: float,
+        timeout_batch: float,
+        cpu_affinity: Optional[list[int]],
+        env: dict[str, str],
     ) -> None:
-        self.capacity = capacity
-        self.slot_size = slot_size
         self.timeout_single = timeout_single
         self.timeout_batch = timeout_batch
-        self.cpu_affinity = cpu_affinity
-        self._closed = False
-
-        ts_suffix = f"{os.getpid()}_{int(time.time() * 1000)}"
-        self._req_name = f"mc_req_{ts_suffix}"
-        self._resp_name = f"mc_resp_{ts_suffix}"
-
-        self._req_buf = SharedMemoryRingBuffer(
-            name=self._req_name, size=self.capacity, slot_size=self.slot_size, create=True, overwrite=True
-        )
-        self._resp_buf = SharedMemoryRingBuffer(
-            name=self._resp_name, size=self.capacity, slot_size=self.slot_size, create=True, overwrite=True
-        )
-
-        env_copy = {
-            k: v
-            for k, v in os.environ.items()
-            if k in {"MC_VERBOSE_PRINT", "MC_TAIL_MODE"}
-        }
-
-        self._proc = MCEngineWorker(
-            req_name=self._req_name,
-            resp_name=self._resp_name,
-            size=self.capacity,
-            slot_size=self.slot_size,
-            cpu_affinity=cpu_affinity,
-            env=env_copy,
-        )
-        self._proc.start()
-
         self._id_gen = count(1)
         self._pending: Dict[int, dict] = {}
         self._last_error: Optional[str] = None
         self._last_success_ts: float = 0.0
+        self._closed = False
 
-        _PROCESS_HUBS.add(self)
-        _register_atexit_cleanup()
+        self._req_name = f"mc_req_{name_suffix}"
+        self._resp_name = f"mc_resp_{name_suffix}"
 
-        # Ensure worker is ready.
-        self._send({"type": "ping"}, self.timeout_single)
+        self._req_buf = SharedMemoryRingBuffer(
+            name=self._req_name, size=size, slot_size=slot_size, create=True, overwrite=True
+        )
+        self._resp_buf = SharedMemoryRingBuffer(
+            name=self._resp_name, size=size, slot_size=slot_size, create=True, overwrite=True
+        )
+
+        self._proc = MCEngineWorker(
+            req_name=self._req_name,
+            resp_name=self._resp_name,
+            size=size,
+            slot_size=slot_size,
+            cpu_affinity=cpu_affinity,
+            env=env,
+        )
+        self._proc.start()
+
+    def _pack(self, obj: dict) -> bytes:
+        return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _poll_once(self) -> None:
         while True:
@@ -229,99 +226,69 @@ class ProcessEngineHub:
             except Exception:
                 continue
             rid = resp.get("id")
+            if rid is None:
+                continue
             self._pending[rid] = resp
 
-    def submit(self, msg_type: str, payload: Any) -> int:
-        req_id = next(self._id_gen)
-        msg = {"id": req_id, "type": msg_type, "payload": payload}
-        self._req_buf.write(pickle.dumps(msg, protocol=pickle.HIGHEST_PROTOCOL))
-        return req_id
-
-    async def decide_batch_async(self, ctx_list: list[dict], timeout: float | None = None) -> list[dict]:
-        if not ctx_list:
-            return []
-        req_id = self.submit("decide_batch", ctx_list)
-        deadline = time.perf_counter() + (timeout if timeout is not None else self.timeout_batch)
-        while time.perf_counter() < deadline:
-            self._poll_once()
-            resp = self._pending.pop(req_id, None)
-            if resp:
-                if not resp.get("ok", False):
-                    raise RuntimeError(resp.get("error", "worker error"))
-                self._last_success_ts = time.time()
-                return resp.get("result")
-            await asyncio.sleep(0)
-        self._last_error = "timeout"
-        raise TimeoutError("worker response timeout (async)")
-
-    def _send(self, msg: dict, timeout: float) -> Any:
+    def _submit(self, msg: dict) -> int:
         req_id = next(self._id_gen)
         payload = {"id": req_id, **msg}
-        self._req_buf.write(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+        self._req_buf.write(self._pack(payload))
+        return req_id
 
-        if req_id in self._pending:
-            cached = self._pending.pop(req_id)
-            if not cached.get("ok", False):
-                raise RuntimeError(cached.get("error", "worker error"))
-            self._last_success_ts = time.time()
-            return cached.get("result")
+    def _process_response(self, resp: dict, msg: dict) -> Any:
+        if not resp.get("ok", False):
+            self._last_error = resp.get("error")
+            raise RuntimeError(resp.get("error", "worker error"))
+        self._last_success_ts = time.time()
+        self._last_error = None
+        return resp.get("result")
 
+    def _await_response_sync(self, msg: dict, timeout: float) -> Any:
+        req_id = self._submit(msg)
         deadline = time.perf_counter() + timeout
         while time.perf_counter() < deadline:
-            raw = self._resp_buf.read()
-            if raw is None:
-                time.sleep(0)
-                continue
-            try:
-                resp = pickle.loads(raw)
-            except Exception:
-                continue
-
-            rid = resp.get("id")
-            if rid != req_id:
-                self._pending[rid] = resp
-                continue
-
-            if not resp.get("ok", False):
-                self._last_error = resp.get("error")
-                raise RuntimeError(resp.get("error", "worker error"))
-
-            self._last_success_ts = time.time()
-            return resp.get("result")
-
+            resp = self._pending.pop(req_id, None)
+            if resp is None:
+                self._poll_once()
+                resp = self._pending.pop(req_id, None)
+            if resp:
+                return self._process_response(resp, msg)
+            time.sleep(0)
         self._last_error = "timeout"
         raise TimeoutError(f"worker response timeout (msg={msg.get('type')})")
 
-    def decide(self, ctx: dict) -> dict:
-        return self._send({"type": "decide", "payload": ctx}, timeout=self.timeout_single)
+    async def _await_response_async(self, msg: dict, timeout: float) -> Any:
+        req_id = self._submit(msg)
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            resp = self._pending.pop(req_id, None)
+            if resp is None:
+                self._poll_once()
+                resp = self._pending.pop(req_id, None)
+            if resp:
+                return self._process_response(resp, msg)
+            await asyncio.sleep(0)
+        self._last_error = "timeout"
+        raise TimeoutError(f"worker response timeout (msg={msg.get('type')})")
 
-    def decide_batch(self, ctx_list: list[dict]) -> list[dict]:
-        if not ctx_list:
-            return []
-        return self._send({"type": "decide_batch", "payload": ctx_list}, timeout=self.timeout_batch)
+    def send(self, msg: dict, timeout: float) -> Any:
+        return self._await_response_sync(msg, timeout)
+
+    async def send_async(self, msg: dict, timeout: float) -> Any:
+        return await self._await_response_async(msg, timeout)
 
     def is_connected(self) -> bool:
-        return self._proc.is_alive() and (time.time() - self._last_success_ts) < 60
-
-    def get_status(self) -> dict:
-        return {
-            "mode": "process",
-            "pid": self._proc.pid,
-            "connected": self.is_connected(),
-            "last_error": self._last_error,
-            "last_success": self._last_success_ts,
-        }
+        return bool(self._proc.is_alive()) and (time.time() - self._last_success_ts) < 60
 
     def close(self) -> None:
-        if getattr(self, "_closed", False):
+        if self._closed:
             return
         self._closed = True
-
         try:
-            self._send({"type": "stop"}, timeout=min(self.timeout_single, 2.0))
+            self.send({"type": "stop"}, timeout=min(self.timeout_single, self.timeout_batch, 2.0))
         except Exception:
             pass
-
         try:
             if self._proc.is_alive():
                 self._proc.join(timeout=5.0)
@@ -330,29 +297,112 @@ class ProcessEngineHub:
                     self._proc.join(timeout=1.0)
         except Exception:
             pass
-
-        for buf in (getattr(self, "_req_buf", None), getattr(self, "_resp_buf", None)):
-            if buf is None:
-                continue
+        for buf in (self._req_buf, self._resp_buf):
             try:
                 buf.close(unlink=True)
-            except FileNotFoundError:
+            except Exception:
                 pass
-            except BufferError:
-                try:
-                    buf.close(unlink=False)
-                except Exception:
-                    pass
+
+
+class ProcessEngineHub:
+    """Run MonteCarloEngine in a separate process via shared memory."""
+
+    def __init__(
+        self,
+        capacity: int = 32,
+        slot_size: int = 131072,
+        timeout_single: float = 2.0,
+        timeout_batch: float = 10.0,
+        cpu_affinity: Optional[list[int]] = None,
+        worker_count: int = 1,
+    ) -> None:
+        self.capacity = capacity
+        self.slot_size = slot_size
+        self.timeout_single = timeout_single
+        self.timeout_batch = timeout_batch
+        self.cpu_affinity = cpu_affinity
+        self._closed = False
+        self._worker_count = max(1, int(worker_count))
+        self._next_worker_idx = 0
+
+        env_copy = _worker_env_copy()
+        self._workers: list[_ProcessWorkerClient] = []
+        for idx in range(self._worker_count):
+            suffix = f"{os.getpid()}_{int(time.time() * 1000)}_{idx}"
+            worker = _ProcessWorkerClient(
+                suffix,
+                size=self.capacity,
+                slot_size=self.slot_size,
+                timeout_single=self.timeout_single,
+                timeout_batch=self.timeout_batch,
+                cpu_affinity=self.cpu_affinity,
+                env=env_copy,
+            )
+            self._workers.append(worker)
+
+        _PROCESS_HUBS.add(self)
+        _register_atexit_cleanup()
+
+        # Ensure worker is ready.
+        _ = self._workers[0].send({"type": "ping"}, timeout=self.timeout_single)
+
+    def _next_worker(self) -> _ProcessWorkerClient:
+        worker = self._workers[self._next_worker_idx % len(self._workers)]
+        self._next_worker_idx = (self._next_worker_idx + 1) % len(self._workers)
+        return worker
+
+    def decide(self, ctx: dict) -> dict:
+        worker = self._next_worker()
+        result = worker.send({"type": "decide", "payload": ctx}, timeout=self.timeout_single)
+        self._last_success_ts = worker._last_success_ts
+        self._last_error = worker._last_error
+        return result
+
+    def decide_batch(self, ctx_list: list[dict]) -> list[dict]:
+        if not ctx_list:
+            return []
+        worker = self._next_worker()
+        result = worker.send({"type": "decide_batch", "payload": ctx_list}, timeout=self.timeout_batch)
+        self._last_success_ts = worker._last_success_ts
+        self._last_error = worker._last_error
+        return result
+
+    async def decide_batch_async(self, ctx_list: list[dict], timeout: float | None = None) -> list[dict]:
+        if not ctx_list:
+            return []
+        worker = self._next_worker()
+        result = await worker.send_async(
+            {"type": "decide_batch", "payload": ctx_list},
+            timeout if timeout is not None else self.timeout_batch,
+        )
+        self._last_success_ts = worker._last_success_ts
+        self._last_error = worker._last_error
+        return result
+
+    def is_connected(self) -> bool:
+        return any(worker.is_connected() for worker in self._workers)
+
+    def get_status(self) -> dict:
+        return {
+            "mode": "process",
+            "workers": len(self._workers),
+            "connected": self.is_connected(),
+            "last_error": self._last_error,
+            "last_success": self._last_success_ts,
+        }
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        for worker in self._workers:
+            try:
+                worker.close()
             except Exception:
                 pass
 
         _PROCESS_HUBS.discard(self)
-
-    def __del__(self) -> None:  # best-effort cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
 
 
 class RemoteEngineHub:
@@ -576,12 +626,18 @@ def create_engine_hub(
 
     if use_process:
         print("[create_engine_hub] Using ProcessEngineHub (shared memory IPC)")
+        try:
+            worker_count = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", "2") or 2)
+        except Exception:
+            worker_count = 2
+        worker_count = max(1, worker_count)
         return ProcessEngineHub(
             capacity=int(getattr(config, "MC_ENGINE_SHM_SLOTS", 32)),
             slot_size=int(getattr(config, "MC_ENGINE_SHM_SLOT_SIZE", 131072)),
             timeout_single=float(getattr(config, "MC_ENGINE_TIMEOUT_SINGLE", 2.0)),
             timeout_batch=float(getattr(config, "MC_ENGINE_TIMEOUT_BATCH", 10.0)),
             cpu_affinity=cpu_affinity,
+            worker_count=worker_count,
         )
 
     print("[create_engine_hub] Using local EngineHub")

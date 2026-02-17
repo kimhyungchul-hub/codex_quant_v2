@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import os
 import sqlite3
 import time
 import urllib.parse
@@ -62,6 +63,28 @@ def _safe_float(v: Any, default: float | None = None) -> float | None:
         return float(v)
     except Exception:
         return default
+
+
+def _parse_excluded_symbols(raw: str | None) -> set[str]:
+    txt = str(raw or "").strip()
+    out: set[str] = set()
+    if not txt:
+        return out
+    for tok in txt.replace(";", ",").split(","):
+        sym = str(tok or "").strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _symbol_exclusions_from_args(raw: str | None) -> set[str]:
+    if str(raw or "").strip():
+        return _parse_excluded_symbols(raw)
+    return _parse_excluded_symbols(
+        os.environ.get("AUTO_REVAL_EXCLUDE_SYMBOLS")
+        or os.environ.get("RESEARCH_EXCLUDE_SYMBOLS")
+        or ""
+    )
 
 
 def _safe_rate(n: int, d: int) -> float | None:
@@ -239,7 +262,12 @@ def _derive_entry_basis(en: EntryRow) -> str:
     return f"reg:{regime}|conf:{conf}|tox:{tox}|eq:{eq}|psl:{psl}|{mu_tag}"
 
 
-def _load_rows(db_path: Path, since_id: int, recent_exits: int) -> tuple[list[EntryRow], list[ExitRow]]:
+def _load_rows(
+    db_path: Path,
+    since_id: int,
+    recent_exits: int,
+    excluded_symbols: set[str] | None = None,
+) -> tuple[list[EntryRow], list[ExitRow]]:
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -273,8 +301,12 @@ def _load_rows(db_path: Path, since_id: int, recent_exits: int) -> tuple[list[En
     exit_rows_desc = cur.execute(exits_sql, (int(since_id), int(recent_exits))).fetchall()
     conn.close()
 
+    excluded = excluded_symbols or set()
     entries: list[EntryRow] = []
     for r in entry_rows:
+        symbol = str(r["symbol"] or "")
+        if excluded and symbol.strip().upper() in excluded:
+            continue
         raw_obj: dict[str, Any] = {}
         raw_txt = r["raw_data"]
         if raw_txt:
@@ -287,7 +319,7 @@ def _load_rows(db_path: Path, since_id: int, recent_exits: int) -> tuple[list[En
         entries.append(
             EntryRow(
                 id=int(r["id"]),
-                symbol=str(r["symbol"]),
+                symbol=symbol,
                 side=str(r["side"]).upper(),
                 fill_price=float(r["fill_price"]),
                 ts_ms=int(r["timestamp_ms"]),
@@ -306,10 +338,13 @@ def _load_rows(db_path: Path, since_id: int, recent_exits: int) -> tuple[list[En
 
     exits: list[ExitRow] = []
     for r in list(exit_rows_desc)[::-1]:
+        symbol = str(r["symbol"] or "")
+        if excluded and symbol.strip().upper() in excluded:
+            continue
         exits.append(
             ExitRow(
                 id=int(r["id"]),
-                symbol=str(r["symbol"]),
+                symbol=symbol,
                 side=str(r["side"]).upper(),
                 fill_price=float(r["fill_price"]),
                 ts_ms=int(r["timestamp_ms"]),
@@ -367,6 +402,11 @@ def main() -> None:
     ap.add_argument("--max-cell-top", type=int, default=20)
     ap.add_argument("--horizons-min", default="5,10,15,20,30,45,60")
     ap.add_argument("--out", default="state/entry_exit_reason_matrix_report.json")
+    ap.add_argument(
+        "--exclude-symbols",
+        default="",
+        help="Comma-separated symbols to exclude. Empty -> AUTO_REVAL_EXCLUDE_SYMBOLS/RESEARCH_EXCLUDE_SYMBOLS.",
+    )
     args = ap.parse_args()
 
     db_path = Path(args.db)
@@ -377,7 +417,13 @@ def main() -> None:
     if not horizons:
         horizons = [5, 10, 15, 20, 30, 45, 60]
 
-    entries, exits = _load_rows(db_path, int(args.since_id), int(args.recent_exits))
+    excluded_symbols = _symbol_exclusions_from_args(args.exclude_symbols)
+    entries, exits = _load_rows(
+        db_path,
+        int(args.since_id),
+        int(args.recent_exits),
+        excluded_symbols=excluded_symbols,
+    )
     matched = _match_exits(entries, exits, int(args.fallback_lookback_sec))
     if not matched:
         out = {
@@ -587,6 +633,7 @@ def main() -> None:
             "horizons_min": horizons,
             "fallback_lookback_sec": int(args.fallback_lookback_sec),
             "max_symbols": int(args.max_symbols),
+            "exclude_symbols": sorted(excluded_symbols),
         },
         "coverage": {
             "entries_total": int(len(entries)),

@@ -315,7 +315,8 @@ def run_cf_cycle(
             logger.error(f"Unknown stage: {stage_filter}")
             return {"status": "unknown_stage"}
 
-    engine = CFEngine(trades, simulators)
+    sample_seed = (int(cycle_started_ts * 1000) ^ (int(cycle_index) * 7919)) & 0xFFFFFFFF
+    engine = CFEngine(trades, simulators, sample_seed=sample_seed)
     sweep_progress = {}
 
     for sim in simulators:
@@ -349,6 +350,7 @@ def run_cf_cycle(
         "elapsed_sec": round(elapsed, 1),
         "running": False,
         "always_run_cf": always_run_cf,
+        "sample_seed": int(sample_seed),
         "baseline": engine.baseline,
         "baseline_by_regime": engine.baseline_by_regime,
         "n_trades": len(trades),

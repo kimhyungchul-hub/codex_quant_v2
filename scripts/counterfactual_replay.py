@@ -5,6 +5,7 @@ import argparse
 import bisect
 import json
 import math
+import os
 import sqlite3
 import time
 import urllib.parse
@@ -130,6 +131,28 @@ def _safe_float(v: Any, default: float | None = None) -> float | None:
         return default
 
 
+def _parse_excluded_symbols(raw: str | None) -> set[str]:
+    txt = str(raw or "").strip()
+    out: set[str] = set()
+    if not txt:
+        return out
+    for tok in txt.replace(";", ",").split(","):
+        sym = str(tok or "").strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _symbol_exclusions_from_args(raw: str | None) -> set[str]:
+    if str(raw or "").strip():
+        return _parse_excluded_symbols(raw)
+    return _parse_excluded_symbols(
+        os.environ.get("AUTO_REVAL_EXCLUDE_SYMBOLS")
+        or os.environ.get("RESEARCH_EXCLUDE_SYMBOLS")
+        or ""
+    )
+
+
 def _canonical_regime(raw: str | None) -> str:
     txt = str(raw or "").strip().lower()
     if ("trend" in txt) or (txt in ("bull", "bear")):
@@ -160,7 +183,7 @@ def _pearson(xs: list[float], ys: list[float]) -> float | None:
     return float(sxy / den)
 
 
-def _load_entries(conn: sqlite3.Connection) -> list[EntryRow]:
+def _load_entries(conn: sqlite3.Connection, excluded_symbols: set[str] | None = None) -> list[EntryRow]:
     rows = conn.execute(
         """
         SELECT
@@ -191,11 +214,15 @@ def _load_entries(conn: sqlite3.Connection) -> list[EntryRow]:
         """
     ).fetchall()
     out: list[EntryRow] = []
+    excluded = excluded_symbols or set()
     for r in rows:
+        symbol = str(r[1] or "")
+        if excluded and symbol.strip().upper() in excluded:
+            continue
         out.append(
             EntryRow(
                 id=int(r[0]),
-                symbol=str(r[1]),
+                symbol=symbol,
                 side=str(r[2]).upper(),
                 fill_price=float(r[3]),
                 ts_ms=int(r[4]),
@@ -220,7 +247,7 @@ def _load_entries(conn: sqlite3.Connection) -> list[EntryRow]:
     return out
 
 
-def _load_exits(conn: sqlite3.Connection, since_id: int = 0) -> list[ExitRow]:
+def _load_exits(conn: sqlite3.Connection, since_id: int = 0, excluded_symbols: set[str] | None = None) -> list[ExitRow]:
     if int(since_id) > 0:
         rows = conn.execute(
             """
@@ -250,11 +277,15 @@ def _load_exits(conn: sqlite3.Connection, since_id: int = 0) -> list[ExitRow]:
             """
         ).fetchall()
     out: list[ExitRow] = []
+    excluded = excluded_symbols or set()
     for r in rows:
+        symbol = str(r[1] or "")
+        if excluded and symbol.strip().upper() in excluded:
+            continue
         out.append(
             ExitRow(
                 id=int(r[0]),
-                symbol=str(r[1]),
+                symbol=symbol,
                 side=str(r[2]).upper(),
                 fill_price=float(r[3]),
                 ts_ms=int(r[4]),
@@ -577,6 +608,11 @@ def main() -> None:
         default=14_400,
         help="Fallback lookback for unmatched EXIT->ENTER pairing (seconds)",
     )
+    ap.add_argument(
+        "--exclude-symbols",
+        default="",
+        help="Comma-separated symbols to exclude (e.g. XRP/USDT:USDT). Empty -> AUTO_REVAL_EXCLUDE_SYMBOLS/RESEARCH_EXCLUDE_SYMBOLS.",
+    )
     args = ap.parse_args()
 
     db_path = Path(args.db)
@@ -590,8 +626,9 @@ def main() -> None:
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    entries = _load_entries(conn)
-    exits = _load_exits(conn, since_id=int(args.since_id))
+    excluded_symbols = _symbol_exclusions_from_args(args.exclude_symbols)
+    entries = _load_entries(conn, excluded_symbols=excluded_symbols)
+    exits = _load_exits(conn, since_id=int(args.since_id), excluded_symbols=excluded_symbols)
     conn.close()
 
     if args.entry_sample_limit and args.entry_sample_limit > 0:
@@ -943,6 +980,7 @@ def main() -> None:
             "default_exit_fee_rate": float(args.default_exit_fee_rate),
             "default_slippage_bps_side": float(max(0.0, args.default_slippage_bps_side)),
             "carry_bps_per_hour": float(max(0.0, args.carry_bps_per_hour)),
+            "exclude_symbols": sorted(excluded_symbols),
         },
         "coverage": {
             "entries_total": int(len(entries)),

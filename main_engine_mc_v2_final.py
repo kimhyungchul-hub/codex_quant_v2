@@ -3296,12 +3296,24 @@ class LiveOrchestrator:
             self.safety_mode = False
             self._emergency_stop_handled = False
             self._emergency_stop_ts = None
+            self._error_burst = 0
+            self._last_error_ts = 0.0
+        except Exception:
+            pass
+        try:
+            # Safety mode may disable live order execution during runtime errors.
+            # Re-enable to configured default when operator clears safety mode.
+            self.enable_orders = bool(getattr(config, "ENABLE_LIVE_ORDERS", self.enable_orders))
         except Exception:
             pass
         try:
             if hasattr(self, "risk_manager") and self.risk_manager is not None:
                 self.risk_manager._emergency_stop_triggered = False
                 self.risk_manager._dd_stop_triggered = False
+                try:
+                    self.risk_manager._blocked_new_entries_until_ms = 0
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -3335,6 +3347,8 @@ class LiveOrchestrator:
             pass
         return {
             "safety_mode": bool(getattr(self, "safety_mode", False)),
+            "enable_orders": bool(getattr(self, "enable_orders", False)),
+            "error_burst": int(getattr(self, "_error_burst", 0) or 0),
             "reset_equity": bool(reset_equity),
             "equity": reset_val,
         }
@@ -6152,6 +6166,39 @@ class LiveOrchestrator:
                             
                             est_notional = scaled_notional
                             cap_exposure_ok = True  # 동적 스케일링으로 해결
+                            # 스케일링 결과를 실제 엔트리 sizing 경로에 전달
+                            try:
+                                base_size_frac = decision.get("size_frac")
+                                if base_size_frac is None:
+                                    base_size_frac = meta.get("size_fraction")
+                                if base_size_frac is None:
+                                    base_size_frac = self.default_size_frac
+                                base_size_frac = float(base_size_frac or 0.0)
+                                scaled_size_frac = float(max(0.0, base_size_frac * float(scaling_ratio)))
+                                decision["size_frac"] = scaled_size_frac
+                                if isinstance(meta, dict):
+                                    meta["size_fraction"] = scaled_size_frac
+                                    meta["cap_dynamic_scaled"] = True
+                                    meta["cap_dynamic_base_size_frac"] = float(base_size_frac)
+                                    meta["cap_dynamic_scaled_size_frac"] = float(scaled_size_frac)
+                                    meta["cap_dynamic_scaling_ratio"] = float(scaling_ratio)
+                                    meta["cap_dynamic_remaining_cap"] = float(remaining_cap)
+                                    meta["cap_dynamic_scaled_notional"] = float(scaled_notional)
+                                    decision["meta"] = meta
+                            except Exception:
+                                pass
+
+                            # 축소 후 최소 notional/exposure 필터를 재계산해 일관성 유지
+                            if min_notional_floor > 0:
+                                try:
+                                    min_notional_ok = float(est_notional) >= float(min_notional_floor)
+                                except Exception:
+                                    min_notional_ok = None
+                            if min_exposure_floor > 0:
+                                try:
+                                    min_exposure_ok = float(est_notional) >= (float(cap_balance) * float(min_exposure_floor))
+                                except Exception:
+                                    min_exposure_ok = None
                         # else: scaling 후에도 min_size_mult 이하면 진입 불가 유지
             except Exception:
                 cap_exposure_ok = None
@@ -11973,6 +12020,63 @@ class LiveOrchestrator:
             )
             return
         can_enter, reason = self._can_enter_position(notional)
+
+        # Exposure cap 초과 시, 남은 cap으로 수량 축소 후 재검증(실주문 경로 안전장치)
+        if (not can_enter) and reason == "exposure capped":
+            try:
+                cap_dynamic_enabled = str(os.environ.get("CAP_FILTER_DYNAMIC_SCALING_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                cap_dynamic_enabled = True
+            if cap_dynamic_enabled and price > 0 and qty > 0 and notional > 0:
+                try:
+                    cap_balance = float(self._exposure_cap_balance())
+                except Exception:
+                    cap_balance = float(self.balance or 0.0)
+                try:
+                    cap_frac = float(self._effective_total_exposure_cap(cap_balance))
+                except Exception:
+                    cap_frac = 0.0
+                remaining_cap = 0.0
+                if cap_frac > 0:
+                    remaining_cap = max(0.0, float(cap_balance) * float(cap_frac) - float(self._total_open_notional()))
+                try:
+                    min_size_mult = float(os.environ.get("CAP_FILTER_DYNAMIC_MIN_SIZE_MULT", 0.25) or 0.25)
+                except Exception:
+                    min_size_mult = 0.25
+                min_notional_for_scaling = float(notional) * float(max(0.0, min_size_mult))
+                if remaining_cap >= min_notional_for_scaling and remaining_cap > 0:
+                    ratio = float(remaining_cap) / float(notional + 1e-12)
+                    qty_scaled = float(qty) * float(ratio)
+                    qty_scaled = self._precision_aware_entry_quantity(
+                        sym,
+                        side,
+                        qty_scaled,
+                        lev,
+                        price_hint=price,
+                        context="entry_cap_dynamic",
+                        regime_hint=((ctx or {}).get("regime") or ((decision.get("meta") or {}).get("regime") if decision else None)),
+                    )
+                    notional_scaled = float(max(0.0, qty_scaled * float(price))) if qty_scaled > 0 else 0.0
+                    can_enter_scaled, reason_scaled = self._can_enter_position(notional_scaled)
+                    if can_enter_scaled and qty_scaled > 0:
+                        self._log(
+                            f"[CAP_ADAPTIVE_EXEC] {sym} notional {notional:.2f} -> {notional_scaled:.2f} "
+                            f"(remaining={remaining_cap:.2f}, ratio={ratio:.3f})"
+                        )
+                        qty = float(qty_scaled)
+                        notional = float(notional_scaled)
+                        can_enter = True
+                        reason = ""
+                        try:
+                            meta_now = dict(decision.get("meta") or {})
+                            meta_now["cap_dynamic_exec_scaled"] = True
+                            meta_now["cap_dynamic_exec_ratio"] = float(ratio)
+                            meta_now["cap_dynamic_exec_notional"] = float(notional_scaled)
+                            decision["meta"] = meta_now
+                        except Exception:
+                            pass
+                    else:
+                        reason = str(reason_scaled or reason)
         if (not can_enter) and ignore_caps and reason == "exposure capped":
             can_enter = True
             reason = ""
@@ -20450,6 +20554,15 @@ class LiveOrchestrator:
                     if stream_batch <= 0:
                         stream_batch = 1
                     stream_broadcast = bool(getattr(config, "MC_STREAMING_BROADCAST", True))
+                    try:
+                        stream_parallel = str(os.environ.get("MC_STREAMING_PARALLEL", "0")).strip().lower() in ("1", "true", "yes", "on")
+                    except Exception:
+                        stream_parallel = False
+                    try:
+                        stream_parallel_workers = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", 2) or 2)
+                    except Exception:
+                        stream_parallel_workers = 2
+                    stream_parallel_workers = max(1, stream_parallel_workers)
 
                     async def _run_decide_batch(ctx_subset: list[dict]) -> tuple[list[dict], str, float]:
                         if not ctx_subset:
@@ -20534,10 +20647,8 @@ class LiveOrchestrator:
                         mc_total_ms = 0.0
                         mc_status_final = "ok"
                         processed = 0
-
-                        for start in range(0, len(ctx_list), stream_batch):
-                            chunk = ctx_list[start:start + stream_batch]
-                            decisions, mc_status, elapsed_ms = await _run_decide_batch(chunk)
+                        async def _consume_stream_chunk(start: int, chunk: list[dict], decisions: list[dict], mc_status: str, elapsed_ms: float):
+                            nonlocal mc_total_ms, mc_status_final, processed
 
                             # Update MC timing/progress for streaming
                             mc_total_ms += float(elapsed_ms or 0.0)
@@ -20586,6 +20697,31 @@ class LiveOrchestrator:
                                 except Exception as e:
                                     self._log_err(f"[ERR] broadcast(stream): {e}")
                                     self._note_runtime_error("broadcast_stream", str(e))
+
+                        chunk_specs = [(start, ctx_list[start:start + stream_batch]) for start in range(0, len(ctx_list), stream_batch)]
+
+                        # True parallelism is useful mostly for remote async hub; local GPU path uses single-worker executor.
+                        can_parallel_stream = bool(stream_parallel and hasattr(self.hub, "decide_batch_async") and asyncio.iscoroutinefunction(getattr(self.hub, "decide_batch_async")))
+
+                        if can_parallel_stream and len(chunk_specs) > 1:
+                            self._log(f"[MC_STREAM] parallel chunks enabled workers={stream_parallel_workers} chunks={len(chunk_specs)} batch={stream_batch}")
+                            sem = asyncio.Semaphore(stream_parallel_workers)
+
+                            async def _run_chunk_parallel(start: int, chunk: list[dict]):
+                                async with sem:
+                                    decisions, mc_status, elapsed_ms = await _run_decide_batch(chunk)
+                                    return start, chunk, decisions, mc_status, elapsed_ms
+
+                            tasks = [asyncio.create_task(_run_chunk_parallel(start, chunk)) for start, chunk in chunk_specs]
+                            for fut in asyncio.as_completed(tasks):
+                                start, chunk, decisions, mc_status, elapsed_ms = await fut
+                                await _consume_stream_chunk(start, chunk, decisions, mc_status, elapsed_ms)
+                        else:
+                            if stream_parallel and len(chunk_specs) > 1 and not can_parallel_stream:
+                                self._log("[MC_STREAM] parallel requested but async hub unavailable; fallback to sequential streaming")
+                            for start, chunk in chunk_specs:
+                                decisions, mc_status, elapsed_ms = await _run_decide_batch(chunk)
+                                await _consume_stream_chunk(start, chunk, decisions, mc_status, elapsed_ms)
 
                         # Final MC status after streaming chunks
                         try:
@@ -20636,22 +20772,34 @@ class LiveOrchestrator:
                     hybrid_only = use_hybrid if hybrid_only_env is None else str(hybrid_only_env).strip().lower() in ("1", "true", "yes", "on")
 
                     def _pick_score(dec: dict, keys: list[str]) -> float:
+                        vals: list[float] = []
+
+                        def _collect(v):
+                            try:
+                                if v is None:
+                                    return
+                                fv = float(v)
+                                if not np.isfinite(fv):
+                                    return
+                                vals.append(fv)
+                            except Exception:
+                                return
+
                         for k in keys:
-                            v = dec.get(k)
-                            if v is not None:
-                                return float(v)
+                            _collect(dec.get(k))
                         meta = dec.get("meta") or {}
                         for k in keys:
-                            v = meta.get(k)
-                            if v is not None:
-                                return float(v)
+                            _collect(meta.get(k))
                         for d in dec.get("details", []):
                             m = d.get("meta") or {}
                             for k in keys:
-                                v = m.get(k)
-                                if v is not None:
-                                    return float(v)
-                        return float(dec.get("ev", 0.0) or 0.0)
+                                _collect(m.get(k))
+                        _collect(dec.get("ev", 0.0))
+
+                        for fv in vals:
+                            if abs(float(fv)) > 1e-12:
+                                return float(fv)
+                        return float(vals[0]) if vals else 0.0
 
                     scores_list = []
                     for i, dec in enumerate(batch_decisions):
@@ -20674,7 +20822,10 @@ class LiveOrchestrator:
 
                         sym_ev_map = {}
                         for i, dec in enumerate(batch_decisions):
-                            score = float(dec.get("unified_score", dec.get("ev", 0.0)) or 0.0)
+                            if hybrid_only:
+                                score = _pick_score(dec, ["hybrid_score", "unified_score"])
+                            else:
+                                score = _pick_score(dec, ["unified_score"])
                             sym_ev_map[ctx_list[i]["symbol"]] = (dec.get("action", "WAIT"), score, dec.get("ev", 0.0))
                             
                         if scores_list:
@@ -21477,7 +21628,7 @@ async def api_restart_live_handler(request: web.Request) -> web.Response:
         f"cd {cwd} && "
         f"pkill -f main_engine_mc_v2_final.py && "
         f"sleep 2 && "
-        f"source state/bybit.env && "
+        f"set -a && source state/bybit.env && set +a && "
         f"ENABLE_LIVE_ORDERS=1 nohup python3 main_engine_mc_v2_final.py > /tmp/engine.log 2>&1 &"
     )
     

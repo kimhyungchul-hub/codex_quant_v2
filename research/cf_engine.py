@@ -110,7 +110,27 @@ class TradeLoader:
     def __init__(self, db_path: str = "state/bot_data_live.db"):
         self.db_path = db_path
 
-    def load_trades(self, limit: int = 0, since_ms: int = 0) -> list[Trade]:
+    @staticmethod
+    def _parse_excluded_symbols(raw: Any) -> set[str]:
+        txt = ""
+        if raw is None:
+            txt = (
+                os.environ.get("RESEARCH_EXCLUDE_SYMBOLS")
+                or os.environ.get("AUTO_REVAL_EXCLUDE_SYMBOLS")
+                or ""
+            )
+        elif isinstance(raw, (list, tuple, set)):
+            txt = ",".join(str(x) for x in raw if str(x).strip())
+        else:
+            txt = str(raw or "")
+        out: set[str] = set()
+        for tok in txt.replace(";", ",").split(","):
+            sym = str(tok or "").strip().upper()
+            if sym:
+                out.add(sym)
+        return out
+
+    def load_trades(self, limit: int = 0, since_ms: int = 0, exclude_symbols: Any = None) -> list[Trade]:
         """Load paired ENTER+EXIT trades."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
@@ -118,9 +138,12 @@ class TradeLoader:
         rows = conn.execute(query).fetchall()
         conn.close()
 
+        excluded = self._parse_excluded_symbols(exclude_symbols)
+
         # Pair ENTER/EXIT by entry_link_id
         enters: dict[str, dict] = {}
         trades: list[Trade] = []
+        skipped_excluded = 0
         for r in rows:
             d = dict(r)
             action = (d.get("action") or "").upper()
@@ -168,11 +191,21 @@ class TradeLoader:
                     raw=raw,
                     timestamp_ms=ts,
                 )
+                if excluded and str(t.symbol or "").strip().upper() in excluded:
+                    skipped_excluded += 1
+                    continue
                 trades.append(t)
 
         if limit > 0:
             trades = trades[-limit:]
-        logger.info(f"Loaded {len(trades)} round-trip trades from {self.db_path}")
+        logger.info(
+            f"Loaded {len(trades)} round-trip trades from {self.db_path}"
+            + (
+                f" (excluded_symbols={len(excluded)}, skipped={skipped_excluded})"
+                if excluded
+                else ""
+            )
+        )
         return trades
 
 
@@ -1353,9 +1386,10 @@ class CFEngine:
     Sweeps parameter grids per pipeline stage and discovers significant improvements.
     """
 
-    def __init__(self, trades: list[Trade], simulators: list[StageSimulator] | None = None):
+    def __init__(self, trades: list[Trade], simulators: list[StageSimulator] | None = None, sample_seed: int | None = None):
         self.trades = trades
         self.simulators = simulators or ALL_SIMULATORS
+        self.sample_seed = sample_seed
         self.baseline = compute_metrics(trades)
         self.baseline_by_regime = compute_metrics_by_regime(trades)
         self.results: list[CFResult] = []
@@ -1394,8 +1428,15 @@ class CFEngine:
         # Generate all combinations (capped)
         combos = list(itertools.product(*param_values))
         if len(combos) > stage_max_combos:
-            # Random sample
-            rng = np.random.default_rng(42)
+            # Random sample (cycle/seed aware): avoid identical subset every cycle
+            if self.sample_seed is None:
+                rng = np.random.default_rng()
+            else:
+                stage_salt = sum((i + 1) * ord(ch) for i, ch in enumerate(str(sim.stage_name)))
+                stage_seed = int((int(self.sample_seed) + int(stage_salt)) % (2**32 - 1))
+                if stage_seed <= 0:
+                    stage_seed = int(stage_salt or 1)
+                rng = np.random.default_rng(stage_seed)
             indices = rng.choice(len(combos), size=stage_max_combos, replace=False)
             combos = [combos[i] for i in indices]
 

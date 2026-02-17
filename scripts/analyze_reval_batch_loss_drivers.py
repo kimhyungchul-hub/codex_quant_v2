@@ -91,6 +91,28 @@ def _parse_float_list(raw: str) -> list[float]:
     return out
 
 
+def _parse_excluded_symbols(raw: str | None) -> set[str]:
+    txt = str(raw or "").strip()
+    out: set[str] = set()
+    if not txt:
+        return out
+    for tok in txt.replace(";", ",").split(","):
+        sym = str(tok or "").strip().upper()
+        if sym:
+            out.add(sym)
+    return out
+
+
+def _symbol_exclusions_from_args(raw: str | None) -> set[str]:
+    if str(raw or "").strip():
+        return _parse_excluded_symbols(raw)
+    return _parse_excluded_symbols(
+        os.environ.get("AUTO_REVAL_EXCLUDE_SYMBOLS")
+        or os.environ.get("RESEARCH_EXCLUDE_SYMBOLS")
+        or ""
+    )
+
+
 def _load_env_file(path: Path) -> None:
     if not path.exists():
         return
@@ -197,7 +219,7 @@ def _equity_at(ts_ms: int, eq_ts: list[int], eq_val: list[float]) -> float | Non
     return float(eq_val[idx])
 
 
-def _load_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+def _load_trades(conn: sqlite3.Connection, excluded_symbols: set[str] | None = None) -> list[dict[str, Any]]:
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     rows = cur.execute(
@@ -214,7 +236,11 @@ def _load_trades(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         """
     ).fetchall()
     out = []
+    excluded = excluded_symbols or set()
     for r in rows:
+        symbol = str(r["symbol"] or "")
+        if excluded and symbol.strip().upper() in excluded:
+            continue
         out.append({k: r[k] for k in r.keys()})
     return out
 
@@ -943,6 +969,11 @@ def main() -> None:
     ap.add_argument("--reason-matrix-file", default="state/entry_exit_reason_matrix_report.json")
     ap.add_argument("--env-file", default="state/bybit.env")
     ap.add_argument("--capital-steps", default="1500,3000,6000,9000")
+    ap.add_argument(
+        "--exclude-symbols",
+        default="",
+        help="Comma-separated symbols to exclude. Empty -> AUTO_REVAL_EXCLUDE_SYMBOLS/RESEARCH_EXCLUDE_SYMBOLS.",
+    )
     args = ap.parse_args()
 
     db_path = Path(args.db).resolve()
@@ -956,6 +987,7 @@ def main() -> None:
         raise SystemExit(f"db not found: {db_path}")
     if env_path is not None:
         _load_env_file(env_path)
+    excluded_symbols = _symbol_exclusions_from_args(args.exclude_symbols)
 
     since_id = int(max(0, args.since_id))
     capitals = _parse_float_list(args.capital_steps)
@@ -964,7 +996,7 @@ def main() -> None:
 
     with sqlite3.connect(str(db_path)) as conn:
         eq_ts, eq_val = _load_equity(conn)
-        trades = _load_trades(conn)
+        trades = _load_trades(conn, excluded_symbols=excluded_symbols)
 
     all_rows, cover_all = _build_enriched_exits(trades, eq_ts, eq_val)
     post_rows = [r for r in all_rows if int(r.get("exit_id") or 0) > since_id]
@@ -1037,6 +1069,7 @@ def main() -> None:
         "generated_at_ms": int(dt.datetime.now().timestamp() * 1000),
         "mode": "since_id",
         "db_path": str(db_path),
+        "exclude_symbols": sorted(excluded_symbols),
         "batch_window": {
             "since_id": int(since_id),
             "batch_id": int(max(0, args.batch_id)),
@@ -1120,4 +1153,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

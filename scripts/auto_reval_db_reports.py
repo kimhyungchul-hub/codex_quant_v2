@@ -1186,6 +1186,11 @@ def main() -> int:
     ap.add_argument("--stage4-set-baseline-if-missing", type=int, default=1)
     ap.add_argument("--stage4-reset-baseline", type=int, default=0)
     ap.add_argument("--roll-baseline", type=int, default=0, help="1 to set baseline_closed=closed_total after run")
+    ap.add_argument(
+        "--exclude-symbols",
+        default=(os.environ.get("AUTO_REVAL_EXCLUDE_SYMBOLS") or os.environ.get("RESEARCH_EXCLUDE_SYMBOLS") or ""),
+        help="Comma-separated symbols to exclude from CF/reason/loss-driver reports.",
+    )
     args = ap.parse_args()
 
     cwd = Path(__file__).resolve().parents[1]
@@ -1217,6 +1222,7 @@ def main() -> int:
     )
 
     baseline_closed = _load_baseline_closed(baseline_path)
+    exclude_symbols_raw = str(args.exclude_symbols or "").strip()
     start = time.time()
     closed_total = 0
     new_closed_total = 0
@@ -1246,6 +1252,7 @@ def main() -> int:
             "stage4_compare_out": str(stage4_compare_out),
             "progress_file": str(progress_path),
             "roll_baseline": bool(int(args.roll_baseline) == 1),
+            "exclude_symbols": exclude_symbols_raw,
             },
         "baseline_closed": int(baseline_closed),
     }
@@ -1343,46 +1350,42 @@ def main() -> int:
             cwd,
         )
     )
-    runs.append(
-        _run(
-            [
-                "python3",
-                "scripts/counterfactual_replay.py",
-                "--db",
-                str(args.db),
-                "--out",
-                str(args.cf_out),
-                "--max-hold-min",
-                str(int(args.max_hold_min)),
-                "--entry-sample-limit",
-                str(int(args.entry_sample_limit)),
-                "--since-id",
-                str(int(since_id)),
-            ],
-            cwd,
-        )
-    )
-    runs.append(
-        _run(
-            [
-                "python3",
-                "scripts/analyze_entry_exit_reason_matrix.py",
-                "--db",
-                str(args.db),
-                "--since-id",
-                str(int(since_id)),
-                "--recent-exits",
-                str(int(args.recent)),
-                "--max-symbols",
-                str(int(args.reason_matrix_max_symbols)),
-                "--max-cell-top",
-                str(int(args.reason_matrix_max_cell_top)),
-                "--out",
-                str(reason_matrix_out),
-            ],
-            cwd,
-        )
-    )
+    cf_cmd = [
+        "python3",
+        "scripts/counterfactual_replay.py",
+        "--db",
+        str(args.db),
+        "--out",
+        str(args.cf_out),
+        "--max-hold-min",
+        str(int(args.max_hold_min)),
+        "--entry-sample-limit",
+        str(int(args.entry_sample_limit)),
+        "--since-id",
+        str(int(since_id)),
+    ]
+    if exclude_symbols_raw:
+        cf_cmd += ["--exclude-symbols", exclude_symbols_raw]
+    runs.append(_run(cf_cmd, cwd))
+    reason_matrix_cmd = [
+        "python3",
+        "scripts/analyze_entry_exit_reason_matrix.py",
+        "--db",
+        str(args.db),
+        "--since-id",
+        str(int(since_id)),
+        "--recent-exits",
+        str(int(args.recent)),
+        "--max-symbols",
+        str(int(args.reason_matrix_max_symbols)),
+        "--max-cell-top",
+        str(int(args.reason_matrix_max_cell_top)),
+        "--out",
+        str(reason_matrix_out),
+    ]
+    if exclude_symbols_raw:
+        reason_matrix_cmd += ["--exclude-symbols", exclude_symbols_raw]
+    runs.append(_run(reason_matrix_cmd, cwd))
     runs.append(
         _run(
             [
@@ -1400,37 +1403,35 @@ def main() -> int:
             cwd,
         )
     )
-    runs.append(
-        _run(
-            [
-                "python3",
-                "scripts/analyze_reval_batch_loss_drivers.py",
-                "--db",
-                str(args.db),
-                "--since-id",
-                str(int(since_id)),
-                "--batch-id",
-                str(int(next_batch_id)),
-                "--target-new",
-                str(int(args.target_new)),
-                "--out",
-                str(args.reval_loss_driver_out),
-                "--top-csv",
-                str(args.reval_loss_driver_top_csv),
-                "--history-out",
-                str(args.reval_loss_driver_history_out),
-                "--cf-file",
-                str(args.cf_out),
-                "--reason-matrix-file",
-                str(args.reason_matrix_out),
-                "--env-file",
-                "state/bybit.env",
-                "--capital-steps",
-                str(args.capital_steps),
-            ],
-            cwd,
-        )
-    )
+    reval_loss_cmd = [
+        "python3",
+        "scripts/analyze_reval_batch_loss_drivers.py",
+        "--db",
+        str(args.db),
+        "--since-id",
+        str(int(since_id)),
+        "--batch-id",
+        str(int(next_batch_id)),
+        "--target-new",
+        str(int(args.target_new)),
+        "--out",
+        str(args.reval_loss_driver_out),
+        "--top-csv",
+        str(args.reval_loss_driver_top_csv),
+        "--history-out",
+        str(args.reval_loss_driver_history_out),
+        "--cf-file",
+        str(args.cf_out),
+        "--reason-matrix-file",
+        str(args.reason_matrix_out),
+        "--env-file",
+        "state/bybit.env",
+        "--capital-steps",
+        str(args.capital_steps),
+    ]
+    if exclude_symbols_raw:
+        reval_loss_cmd += ["--exclude-symbols", exclude_symbols_raw]
+    runs.append(_run(reval_loss_cmd, cwd))
     reports_ok = 0
     for r in runs:
         if not isinstance(r, dict):

@@ -2229,8 +2229,40 @@ class MonteCarloDecisionMixin:
         use_hybrid_batch = str(os.environ.get("MC_HYBRID_IN_BATCH", "0")).strip().lower() in ("1", "true", "yes", "on")
 
         if hybrid_only:
-            # Hybrid-only: run per-symbol decisions (keeps legacy batch path untouched)
-            return [self.decide(ctx) for ctx in ctx_list]
+            # Hybrid-only: keep planner semantics, but prevent O(N_symbols * high_paths) latency explosion.
+            # Use adaptive per-symbol n_paths when symbol count is large.
+            try:
+                base_n_paths = int(os.environ.get("MC_HYBRID_N_PATHS", config.n_paths_live) or config.n_paths_live)
+            except Exception:
+                base_n_paths = int(config.n_paths_live)
+            base_n_paths = max(128, int(base_n_paths))
+            min_n_paths = 512
+            min_n_paths = max(128, int(min_n_paths))
+            target_symbols_ref = 12
+            target_symbols_ref = max(1, int(target_symbols_ref))
+
+            n_syms = max(1, int(len(ctx_list)))
+            if n_syms > target_symbols_ref:
+                scaled_n_paths = int(base_n_paths * float(target_symbols_ref) / float(n_syms))
+            else:
+                scaled_n_paths = int(base_n_paths)
+            adaptive_n_paths = int(max(min_n_paths, min(base_n_paths, scaled_n_paths)))
+
+            if adaptive_n_paths < base_n_paths:
+                logger.info(
+                    f"[HYBRID_BATCH_FAST] symbols={n_syms} n_paths {base_n_paths} -> {adaptive_n_paths} "
+                    f"(ref={target_symbols_ref})"
+                )
+
+            decisions: list[Dict[str, Any]] = []
+            for ctx in ctx_list:
+                try:
+                    ctx_fast = dict(ctx)
+                    ctx_fast["n_paths"] = int(adaptive_n_paths)
+                except Exception:
+                    ctx_fast = ctx
+                decisions.append(self.decide(ctx_fast))
+            return decisions
         
         # 1. Prepare tasks for evaluation
         tasks = []
