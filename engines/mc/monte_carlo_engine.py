@@ -334,8 +334,33 @@ class MonteCarloEngine(
                     lsm_cfg.use_dynamic_cost = str(use_dyn_env).strip().lower() in ("1", "true", "yes", "on")
             except Exception:
                 pass
+            try:
+                lsm_deg_env = os.environ.get("LSM_POLY_DEGREE")
+                if lsm_deg_env is not None and str(lsm_deg_env).strip() != "":
+                    lsm_cfg.degree = int(max(1, min(6, int(lsm_deg_env))))
+            except Exception:
+                pass
+            try:
+                reg_paths_env = os.environ.get("LSM_REGRESSION_MAX_PATHS")
+                if reg_paths_env is not None and str(reg_paths_env).strip() != "":
+                    lsm_cfg.regression_max_paths = int(max(0, int(reg_paths_env)))
+            except Exception:
+                pass
             self.lsm_solver = LSMSwitchingSolver(self.device, lsm_cfg)
-            self.beam_optimizer = BeamTrajectoryOptimizer(self.device, BeamConfig())
+            beam_cfg = BeamConfig()
+            try:
+                beam_w_env = os.environ.get("HYBRID_BEAM_WIDTH")
+                if beam_w_env is not None and str(beam_w_env).strip() != "":
+                    beam_cfg.beam_width = int(max(1, min(4096, int(beam_w_env))))
+            except Exception:
+                pass
+            try:
+                switch_cand_env = os.environ.get("HYBRID_SWITCH_CANDIDATES")
+                if switch_cand_env is not None and str(switch_cand_env).strip() != "":
+                    beam_cfg.switch_candidates = int(max(1, min(64, int(switch_cand_env))))
+            except Exception:
+                pass
+            self.beam_optimizer = BeamTrajectoryOptimizer(self.device, beam_cfg)
             planner_cfg = HybridPlannerConfig()
             try:
                 lsm_h_env = os.environ.get("MC_HYBRID_HORIZON_STEPS")
@@ -432,7 +457,15 @@ class MonteCarloEngine(
         if pos_val is None and isinstance(current_state, dict):
             pos_val = current_state.get("position_side")
 
-        horizon_steps = int(max(0, price_tensor.shape[-1] - 1))
+        try:
+            h_default = int(getattr(getattr(self.hybrid_planner, "cfg", None), "lsm_horizon_steps", max(2, int(price_tensor.shape[-1] - 1))))
+        except Exception:
+            h_default = max(2, int(price_tensor.shape[-1] - 1))
+        try:
+            horizon_steps = int(mc_paths.get("horizon_steps", h_default) or h_default)
+        except Exception:
+            horizon_steps = int(h_default)
+        horizon_steps = max(2, min(horizon_steps, max(2, int(price_tensor.shape[-1] - 1))))
         exposure = float(mc_paths.get("exposure", 1.0) or 1.0)
         cash_penalty = float(mc_paths.get("cash_penalty", 0.0) or 0.0)
         result = self.hybrid_planner.step(
@@ -445,6 +478,7 @@ class MonteCarloEngine(
             exposure=exposure,
             cash_penalty=cash_penalty,
             cost_matrix=self.cost_matrix,
+            horizon_steps=int(horizon_steps),
             state=current_state,
         )
 
@@ -560,7 +594,15 @@ class MonteCarloEngine(
         except Exception:
             pass
         step_sec = int(max(1, step_sec))
-        horizon_steps = int(os.environ.get("MC_HYBRID_HORIZON_STEPS", getattr(self.hybrid_planner.cfg, "lsm_horizon_steps", 60)))
+        h_steps_override = None
+        try:
+            h_steps_override = int(ctx.get("hybrid_horizon_steps_override"))
+        except Exception:
+            h_steps_override = None
+        if h_steps_override is not None and h_steps_override > 0:
+            horizon_steps = int(h_steps_override)
+        else:
+            horizon_steps = int(os.environ.get("MC_HYBRID_HORIZON_STEPS", getattr(self.hybrid_planner.cfg, "lsm_horizon_steps", 60)))
         horizon_steps = max(2, horizon_steps)
         n_steps = horizon_steps
 
@@ -570,7 +612,15 @@ class MonteCarloEngine(
             n_paths_default = int(params.get("n_paths", mc_config.n_paths_live))
         else:
             n_paths_default = int(mc_config.n_paths_live)
-        n_paths = int(os.environ.get("MC_HYBRID_N_PATHS", min(4096, n_paths_default)))
+        n_paths_override = None
+        try:
+            n_paths_override = int(ctx.get("hybrid_n_paths_override"))
+        except Exception:
+            n_paths_override = None
+        if n_paths_override is not None and n_paths_override > 0:
+            n_paths = int(n_paths_override)
+        else:
+            n_paths = int(os.environ.get("MC_HYBRID_N_PATHS", min(4096, n_paths_default)))
         n_paths = max(128, n_paths)
 
         price = float(ctx.get("price", 0.0) or 0.0)
@@ -704,6 +754,8 @@ class MonteCarloEngine(
         return {
             "prices": price_t,
             "features": feat_t,
+            "n_paths": int(n_paths),
+            "horizon_steps": int(n_steps),
             "mu_used": mu_used,
             "sigma_used": sigma_used,
             "dt_used": float(dt_used),

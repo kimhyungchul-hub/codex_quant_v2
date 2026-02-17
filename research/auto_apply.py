@@ -48,7 +48,7 @@ COOLDOWN_BETWEEN_APPLY_SEC = 900
 KEY_COOLDOWN_BETWEEN_APPLY_SEC = 1800
 
 # ─────────────────────────────────────────────────────────────────
-# CF Parameter → bybit.env Variable Mapping
+# CF Parameter → runtime_config key mapping (env-compatible key names)
 # ─────────────────────────────────────────────────────────────────
 PARAM_TO_ENV: dict[str, list[str]] = {
     # Leverage
@@ -609,7 +609,7 @@ def _unmapped_params_for_finding(finding: dict) -> list[str]:
 
 def apply_finding(finding: dict, *, restart_after_apply: bool = True) -> Optional[ApplyRecord]:
     """
-    Apply a single CF finding to bybit.env.
+    Apply a single CF finding to SQLite runtime_config.
     Returns ApplyRecord on success, None on failure.
     """
     param_changes = finding.get("param_changes", {})

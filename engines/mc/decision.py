@@ -50,6 +50,13 @@ def _is_auto_value(value: Any) -> bool:
         return False
 
 
+def _perf_log_enabled() -> bool:
+    try:
+        return str(os.environ.get("MC_PERF_LOG", "0")).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
 def _calc_unified_score(
     horizons: list[int] | list[float],
     cumulative_ev: list[float],
@@ -581,6 +588,15 @@ class MonteCarloDecisionMixin:
     ) -> Dict[str, Any]:
         # Optionally compute leverage before simulation (Kelly-style via leverage optimizer).
         ctx_for_sim = ctx
+        try:
+            hybrid_fast_mode = bool(ctx.get("hybrid_fast_mode", False))
+        except Exception:
+            hybrid_fast_mode = False
+        if not hybrid_fast_mode:
+            try:
+                hybrid_fast_mode = str(os.environ.get("MC_HYBRID_FAST_MODE", "0")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                hybrid_fast_mode = False
         optimal_leverage = None
         mc_vol_step = None
         mc_vol_ann = None
@@ -600,11 +616,19 @@ class MonteCarloDecisionMixin:
             # Horizon seconds for leverage optimizer
             h_steps = 0
             try:
-                h_env = os.environ.get("MC_HYBRID_HORIZON_STEPS")
-                if h_env is not None:
-                    h_steps = int(h_env)
+                h_override = ctx.get("hybrid_horizon_steps_override")
+                if h_override is not None:
+                    h_steps = int(h_override)
             except Exception:
                 h_steps = 0
+            try:
+                if h_steps <= 0:
+                    h_env = os.environ.get("MC_HYBRID_HORIZON_STEPS")
+                    if h_env is not None:
+                        h_steps = int(h_env)
+            except Exception:
+                if h_steps <= 0:
+                    h_steps = 0
             if h_steps <= 0:
                 try:
                     h_steps = int(getattr(getattr(self, "hybrid_planner", None), "cfg", None).lsm_horizon_steps)
@@ -1826,6 +1850,8 @@ class MonteCarloDecisionMixin:
             force_ev = str(os.environ.get("FORCE_EV_DIRECTION", "0")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             force_ev = False
+        if hybrid_fast_mode:
+            force_ev = False
 
         # [FIX 2026-02-16] Chop regime에서 FORCE_EV_DIRECTION 비활성화
         # CF evidence: chop에서 MC EV 차이가 미미하여 FORCE_EV가 랜덤에 가까운 방향 선택을 유발
@@ -1932,6 +1958,8 @@ class MonteCarloDecisionMixin:
             tstar_on = str(os.environ.get("HYBRID_TSTAR_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         except Exception:
             tstar_on = False
+        if hybrid_fast_mode:
+            tstar_on = False
         if tstar_on and flat and action in ("LONG", "SHORT"):
             try:
                 ctx_eval = dict(ctx)
@@ -1996,6 +2024,14 @@ class MonteCarloDecisionMixin:
                         tstar_src = "entry_eval"
             except Exception as e:
                 logger.warning(f"[HYBRID_TSTAR] {symbol} | compute failed: {e}")
+        if tstar is None and hybrid_fast_mode:
+            try:
+                tstar_fast = float(ctx.get("hybrid_horizon_steps_override", 0) or 0)
+            except Exception:
+                tstar_fast = 0.0
+            if tstar_fast > 0:
+                tstar = float(tstar_fast)
+                tstar_src = "fast_horizon"
 
         def _opt_float(v):
             try:
@@ -2072,6 +2108,17 @@ class MonteCarloDecisionMixin:
             "hybrid_conf_scale": float(conf_scale),
             "hybrid_score_steps": int(score_steps),
             "hybrid_score_per_step": bool(per_step),
+            "hybrid_fast_mode": bool(hybrid_fast_mode),
+            "hybrid_horizon_steps": (
+                int(hybrid_meta.get("horizon_steps", 0) or 0)
+                if isinstance(hybrid_meta, dict)
+                else None
+            ),
+            "hybrid_n_paths": (
+                int(mc_paths.get("n_paths", 0) or 0)
+                if isinstance(mc_paths, dict)
+                else None
+            ),
             "hybrid_score_time_step_sec": float(step_sec),
             "hybrid_score_total_sec": float(total_seconds) if total_seconds is not None else None,
             "momentum_z": float(momentum_z),
@@ -2340,7 +2387,9 @@ class MonteCarloDecisionMixin:
         num_symbols = len(ctx_list)
         ts_ms = now_ms()
         seed_window = int(ts_ms // 5000)
-        print(f"[DECIDE_BATCH] START symbols={num_symbols} ts={ts_ms}")
+        perf_log_on = MC_VERBOSE_PRINT or _perf_log_enabled()
+        if perf_log_on:
+            print(f"[DECIDE_BATCH] START symbols={num_symbols} ts={ts_ms}")
 
         use_hybrid = str(os.environ.get("MC_USE_HYBRID_PLANNER", "0")).strip().lower() in ("1", "true", "yes", "on")
         hybrid_only_env = os.environ.get("MC_HYBRID_ONLY")
@@ -2355,22 +2404,58 @@ class MonteCarloDecisionMixin:
             except Exception:
                 base_n_paths = int(config.n_paths_live)
             base_n_paths = max(128, int(base_n_paths))
-            min_n_paths = 512
+            try:
+                batch_max_n_paths = int(os.environ.get("MC_HYBRID_BATCH_MAX_N_PATHS", 2048) or 2048)
+            except Exception:
+                batch_max_n_paths = 2048
+            batch_max_n_paths = max(128, int(batch_max_n_paths))
+            try:
+                min_n_paths = int(os.environ.get("MC_HYBRID_BATCH_MIN_N_PATHS", 512) or 512)
+            except Exception:
+                min_n_paths = 512
             min_n_paths = max(128, int(min_n_paths))
+            try:
+                h_base = int(os.environ.get("MC_HYBRID_HORIZON_STEPS", 0) or 0)
+            except Exception:
+                h_base = 0
+            if h_base <= 0:
+                try:
+                    h_base = int(getattr(getattr(self, "hybrid_planner", None), "cfg", None).lsm_horizon_steps)
+                except Exception:
+                    h_base = 120
+            h_base = max(2, int(h_base))
+            try:
+                batch_max_h_steps = int(os.environ.get("MC_HYBRID_BATCH_MAX_HORIZON_STEPS", 90) or 90)
+            except Exception:
+                batch_max_h_steps = 90
+            batch_max_h_steps = max(2, int(batch_max_h_steps))
+            try:
+                min_h_steps = int(os.environ.get("MC_HYBRID_BATCH_MIN_HORIZON_STEPS", 60) or 60)
+            except Exception:
+                min_h_steps = 60
+            min_h_steps = max(2, int(min_h_steps))
+            try:
+                fast_aux_mode = str(os.environ.get("MC_HYBRID_BATCH_FAST_AUX", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                fast_aux_mode = True
             target_symbols_ref = 12
             target_symbols_ref = max(1, int(target_symbols_ref))
 
             n_syms = max(1, int(len(ctx_list)))
             if n_syms > target_symbols_ref:
                 scaled_n_paths = int(base_n_paths * float(target_symbols_ref) / float(n_syms))
+                scaled_h_steps = int(h_base * float(target_symbols_ref) / float(n_syms))
             else:
                 scaled_n_paths = int(base_n_paths)
-            adaptive_n_paths = int(max(min_n_paths, min(base_n_paths, scaled_n_paths)))
+                scaled_h_steps = int(h_base)
+            adaptive_n_paths = int(max(min_n_paths, min(base_n_paths, batch_max_n_paths, scaled_n_paths)))
+            adaptive_h_steps = int(max(min_h_steps, min(h_base, batch_max_h_steps, scaled_h_steps)))
 
-            if adaptive_n_paths < base_n_paths:
+            if adaptive_n_paths < base_n_paths or adaptive_h_steps < h_base:
                 logger.info(
-                    f"[HYBRID_BATCH_FAST] symbols={n_syms} n_paths {base_n_paths} -> {adaptive_n_paths} "
-                    f"(ref={target_symbols_ref})"
+                    f"[HYBRID_BATCH_FAST] symbols={n_syms} "
+                    f"n_paths {base_n_paths}->{adaptive_n_paths} "
+                    f"h_steps {h_base}->{adaptive_h_steps} (ref={target_symbols_ref})"
                 )
 
             decisions: list[Dict[str, Any]] = []
@@ -2378,6 +2463,10 @@ class MonteCarloDecisionMixin:
                 try:
                     ctx_fast = dict(ctx)
                     ctx_fast["n_paths"] = int(adaptive_n_paths)
+                    ctx_fast["hybrid_n_paths_override"] = int(adaptive_n_paths)
+                    ctx_fast["hybrid_horizon_steps_override"] = int(adaptive_h_steps)
+                    if fast_aux_mode:
+                        ctx_fast["hybrid_fast_mode"] = True
                 except Exception:
                     ctx_fast = ctx
                 decisions.append(self.decide(ctx_fast))
@@ -2398,7 +2487,8 @@ class MonteCarloDecisionMixin:
         # 2. Call Batch Evaluation (Multi-fidelity optional)
         import time
         t_eval_start = time.perf_counter()
-        print(f"[DECIDE_BATCH] evaluate_entry_metrics_batch START num_tasks={len(tasks)}")
+        if perf_log_on:
+            print(f"[DECIDE_BATCH] evaluate_entry_metrics_batch START num_tasks={len(tasks)}")
 
         mf_enabled = str(os.environ.get("MC_MULTI_FIDELITY_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         if mf_enabled:
@@ -2447,7 +2537,8 @@ class MonteCarloDecisionMixin:
             batch_metrics = self.evaluate_entry_metrics_batch(tasks)
 
         t_eval_end = time.perf_counter()
-        print(f"[DECIDE_BATCH] evaluate_entry_metrics_batch END elapsed={(t_eval_end-t_eval_start):.3f}s")
+        if perf_log_on:
+            print(f"[DECIDE_BATCH] evaluate_entry_metrics_batch END elapsed={(t_eval_end-t_eval_start):.3f}s")
         
         # 3. Post-process and map back to input order
         results_map = {t["ctx"].get("symbol"): batch_metrics[i] for i, t in enumerate(tasks)}
@@ -2704,5 +2795,6 @@ class MonteCarloDecisionMixin:
                 final_decisions.append({
                     "ok": False, "reason": "NO_METRICS", "action": "WAIT", "score": 0.0,
                 })
-        print(f"[DECIDE_BATCH] END symbols={num_symbols} elapsed={(time.time()*1000 - ts_ms):.0f}ms")
+        if perf_log_on:
+            print(f"[DECIDE_BATCH] END symbols={num_symbols} elapsed={(time.time()*1000 - ts_ms):.0f}ms")
         return final_decisions

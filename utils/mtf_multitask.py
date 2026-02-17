@@ -273,19 +273,23 @@ class MTFMultiTaskNet(nn.Module):
         x: torch.Tensor,
         regime_id: torch.Tensor,
         group_id: torch.Tensor,
+        return_latent: bool = False,
     ) -> dict[str, torch.Tensor]:
         z = self.conv(x)
         z = z.view(z.size(0), -1)
         er = self.reg_emb(regime_id.long())
         eg = self.grp_emb(group_id.long())
         h = self.body(torch.cat([z, er, eg], dim=-1))
-        return {
+        out = {
             "win": self.head_win(h).squeeze(-1),
             "long": self.head_long(h).squeeze(-1),
             "short": self.head_short(h).squeeze(-1),
             "hold": self.head_hold(h).squeeze(-1),
             "exit": self.head_exit(h),
         }
+        if bool(return_latent):
+            out["latent"] = h
+        return out
 
 
 def binary_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:

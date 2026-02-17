@@ -13,6 +13,8 @@ class LSMConfig:
     degree: int = 3
     ridge_lambda: float = 1e-3
     eps: float = 1e-12
+    # 0 means use all paths in regression.
+    regression_max_paths: int = 0
 
     # Stability & Penalty
     switch_hysteresis: float = 2e-4
@@ -265,9 +267,23 @@ class LSMSwitchingSolver:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         cfg = self.cfg
         S, P, B = X.shape
-        X_t = X.transpose(1, 2)  # (S, B, P)
-        XtX = torch.matmul(X_t, X)  # (S, B, B)
-        XtY = torch.matmul(X_t, Y_hold.unsqueeze(-1)).squeeze(-1)  # (S, B)
+        X_reg = X
+        Y_reg = Y_hold
+        try:
+            reg_max_paths = int(getattr(cfg, "regression_max_paths", 0) or 0)
+        except Exception:
+            reg_max_paths = 0
+        if reg_max_paths > 0 and P > reg_max_paths:
+            step = max(1, int(P // reg_max_paths))
+            X_reg = X[:, ::step, :]
+            Y_reg = Y_hold[:, ::step]
+            if X_reg.shape[1] > reg_max_paths:
+                X_reg = X_reg[:, :reg_max_paths, :]
+                Y_reg = Y_reg[:, :reg_max_paths]
+
+        X_t = X_reg.transpose(1, 2)  # (S, B, P_reg)
+        XtX = torch.matmul(X_t, X_reg)  # (S, B, B)
+        XtY = torch.matmul(X_t, Y_reg.unsqueeze(-1)).squeeze(-1)  # (S, B)
 
         ridge = cfg.ridge_lambda * torch.eye(B, device=X.device, dtype=torch.float32).unsqueeze(0)
         XtX = XtX + ridge

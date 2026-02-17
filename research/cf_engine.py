@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+from core.runtime_config_store import get_runtime_config_values
 
 logger = logging.getLogger("research.cf_engine")
 
@@ -106,10 +107,20 @@ def _env_file_values() -> dict[str, str]:
 
 
 def _env_runtime_raw(key: str) -> str | None:
-    raw = os.environ.get(str(key))
+    k = str(key or "").strip().upper()
+    if not k:
+        return None
+    raw = os.environ.get(k)
     if raw is not None:
         return str(raw).strip()
-    return _env_file_values().get(str(key))
+    try:
+        vals = get_runtime_config_values(str(PROJECT_ROOT / "state" / "bot_data_live.db"), keys=[k])
+        v = vals.get(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    except Exception:
+        pass
+    return _env_file_values().get(k)
 
 
 def _norm_csv_tokens(v: Any) -> str:
@@ -3262,9 +3273,23 @@ class CFEngine:
         lines = [f"[{sim.stage_name.upper()}] 파라미터 변경 제안:"]
         for k, v in result.param_changes.items():
             lines.append(f"  {k} = {v}")
-        lines.append(f"예상 효과: PnL ${result.delta.get('pnl', 0):+.2f}, "
-                     f"WR {result.delta.get('wr', 0):+.1%}, "
-                     f"R:R {result.delta.get('rr', 0):+.2f}")
+        oos = result.oos if isinstance(result.oos, dict) else {}
+        oos_penalty = float(oos.get("penalty_factor", 1.0) or 1.0)
+        oos_adj_pnl = float(result.delta.get("pnl", 0.0) * oos_penalty)
+        lines.append(
+            f"예상 효과: PnL ${result.delta.get('pnl', 0):+.2f} "
+            f"(OOS 보정 ${oos_adj_pnl:+.2f}), "
+            f"WR {result.delta.get('wr', 0):+.1%}, "
+            f"R:R {result.delta.get('rr', 0):+.2f}"
+        )
+        if bool(oos.get("enabled", False)):
+            lines.append(
+                f"OOS 검증: pass={bool(oos.get('pass', False))} "
+                f"rate={float(oos.get('pass_rate', 0.0) or 0.0):.0%} "
+                f"trainΔ={float(oos.get('train_pnl_delta_mean', 0.0) or 0.0):+.2f} "
+                f"testΔ={float(oos.get('test_pnl_delta_mean', 0.0) or 0.0):+.2f} "
+                f"penalty={oos_penalty:.2f}"
+            )
         lines.append(f"신뢰도: {result.significance:.1%}")
         return "\n".join(lines)
 

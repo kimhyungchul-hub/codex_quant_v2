@@ -467,6 +467,94 @@
       font-weight: 700;
       font-size: 12px
     }
+
+    .mtf-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .mtf-block {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fcfdff;
+      overflow: hidden;
+    }
+
+    .mtf-head {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 12px;
+      font-weight: 700;
+      color: #1f2937;
+      background: #f8fafc;
+    }
+
+    .mtf-body {
+      padding: 8px 10px;
+      max-height: 220px;
+      overflow: auto;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .mtf-row {
+      margin-bottom: 8px;
+      padding-bottom: 8px;
+      border-bottom: 1px dashed #e5e7eb;
+    }
+
+    .mtf-row:last-child {
+      margin-bottom: 0;
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+
+    .mtf-title {
+      font-weight: 700;
+      color: #111827;
+    }
+
+    .mtf-detail {
+      margin-top: 3px;
+      color: #4b5563;
+    }
+
+    .mtf-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 1px 7px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      font-size: 10px;
+      font-weight: 700;
+      margin-right: 6px;
+      background: #fff;
+    }
+
+    .mtf-badge.done {
+      color: var(--good);
+      border-color: #86efac;
+      background: #f0fdf4;
+    }
+
+    .mtf-badge.run {
+      color: var(--warn);
+      border-color: #fcd34d;
+      background: #fffbeb;
+    }
+
+    .mtf-badge.wait {
+      color: var(--muted);
+      border-color: #d1d5db;
+      background: #f9fafb;
+    }
+
+    @media (max-width: 980px) {
+      .mtf-grid {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 </head>
 
@@ -698,6 +786,36 @@
       </details>
     </div>
 
+    <div class="panel" id="mtfResearchPanel" style="margin-top:12px;">
+      <h3>MTF-XAI 진행/연구 리포트 <span class="sub" id="mtfUpdated">데이터 로딩 중...</span></h3>
+      <div class="body">
+        <div class="mtf-block" style="margin-bottom:10px;">
+          <div class="mtf-head">요약</div>
+          <div class="mtf-body" id="mtfOverview"></div>
+        </div>
+        <div class="mtf-grid">
+          <div class="mtf-block">
+            <div class="mtf-head">진행상황</div>
+            <div class="mtf-body" id="mtfProgress"></div>
+          </div>
+          <div class="mtf-block">
+            <div class="mtf-head">진행기록</div>
+            <div class="mtf-body" id="mtfTimeline"></div>
+          </div>
+        </div>
+        <div class="mtf-grid" style="margin-top:10px;">
+          <div class="mtf-block">
+            <div class="mtf-head">연구 결과</div>
+            <div class="mtf-body" id="mtfResearch"></div>
+          </div>
+          <div class="mtf-block">
+            <div class="mtf-head">산출물 파일 상태</div>
+            <div class="mtf-body" id="mtfArtifacts"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="panel" id="mcHealthPanel" style="margin-top:12px; display:none;">
       <h3>MC 파이프라인 건강 모니터 <span class="sub" id="mcHealthTs">-</span></h3>
       <div id="mcHealthDetail" class="log" style="max-height:240px; overflow-y:auto;"></div>
@@ -756,6 +874,12 @@
     const selSymEl = $('selSym'), searchEl = $('search');
     const outsideWarnEl = $('outsideWarn');
     const mktBody = $('mktBody'), posBody = $('posBody'), posWrap = $('posWrap'), archBody = $('archBody'), tradeBody = $('tradeBody'), logsEl = $('logs'), alertsEl = $('alerts');
+    const mtfUpdatedEl = $('mtfUpdated');
+    const mtfOverviewEl = $('mtfOverview');
+    const mtfProgressEl = $('mtfProgress');
+    const mtfTimelineEl = $('mtfTimeline');
+    const mtfResearchEl = $('mtfResearch');
+    const mtfArtifactsEl = $('mtfArtifacts');
     const balKpi = $('balKpi'), eqKpi = $('eqKpi'), ddKpi = $('ddKpi');
     const liveWalletKpi = $('liveWalletKpi'), liveEqKpi = $('liveEqKpi'), liveFreeKpi = $('liveFreeKpi');
     const liveMarginKpi = $('liveMarginKpi'), liveSyncKpi = $('liveSyncKpi');
@@ -964,6 +1088,7 @@
     let latestPayload = null;
     let rafScheduled = false;
     let safetyReqInFlight = false;
+    let mtfLastFetchTs = 0;
 
     // ✅ market row cache for smooth update
     const rowCache = new Map(); // symbol -> {tr, cells[]}
@@ -1037,6 +1162,10 @@
       .replace(/&/g, '&amp;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+    const escHtml = (s) => String(s ?? '')
+      .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
     const fmtNum = (v, digits = 6) => (isNum(v) ? Number(v).toFixed(digits) : 'n/a');
@@ -2211,6 +2340,142 @@
       }
     }
 
+    function mtfStatusBadge(status) {
+      const s = String(status || '').toLowerCase();
+      if (s === 'done' || s === 'completed') return { cls: 'done', label: '완료' };
+      if (s === 'in_progress' || s === 'running') return { cls: 'run', label: '진행중' };
+      return { cls: 'wait', label: '대기' };
+    }
+
+    function fmtDateTime(ms) {
+      if (!isNum(ms) || Number(ms) <= 0) return '-';
+      return new Date(Number(ms)).toLocaleString();
+    }
+
+    function renderMtfResearch(data) {
+      if (!mtfOverviewEl || !mtfProgressEl || !mtfTimelineEl || !mtfResearchEl || !mtfArtifactsEl || !mtfUpdatedEl) return;
+      const d = (data && typeof data === 'object') ? data : {};
+      const title = d.title ? escHtml(d.title) : 'MTF-XAI 연구 진행 현황';
+      const overview = d.overview
+        ? escHtml(d.overview)
+        : 'MTF 잠재벡터와 OFI/VPIN 시계열 상호작용 분석 데이터가 아직 로드되지 않았습니다.';
+      const updatedTxt = fmtDateTime(d.updated_at_ms);
+      mtfUpdatedEl.textContent = `${title} | ${updatedTxt}`;
+
+      mtfOverviewEl.innerHTML = `<div class="mtf-row"><div class="mtf-detail">${overview}</div></div>`;
+
+      const progress = Array.isArray(d.progress) ? d.progress : [];
+      if (!progress.length) {
+        mtfProgressEl.innerHTML = `<div class="muted">진행상황 데이터 없음</div>`;
+      } else {
+        mtfProgressEl.innerHTML = progress.map((p) => {
+          const b = mtfStatusBadge(p.status);
+          return `
+            <div class="mtf-row">
+              <div class="mtf-title"><span class="mtf-badge ${b.cls}">${b.label}</span>${escHtml(p.title || '-')}</div>
+              <div class="mtf-detail">${escHtml(p.detail || '')}</div>
+            </div>
+          `;
+        }).join('');
+      }
+
+      const timeline = Array.isArray(d.timeline) ? d.timeline : [];
+      if (!timeline.length) {
+        mtfTimelineEl.innerHTML = `<div class="muted">진행기록 데이터 없음</div>`;
+      } else {
+        mtfTimelineEl.innerHTML = timeline.map((t) => `
+          <div class="mtf-row">
+            <div class="mtf-title">${escHtml(t.date || '-')} | ${escHtml(t.title || '-')}</div>
+            <div class="mtf-detail">${escHtml(t.detail || '')}</div>
+          </div>
+        `).join('');
+      }
+
+      const research = (d.research && typeof d.research === 'object') ? d.research : {};
+      const sample = (research.sample && typeof research.sample === 'object') ? research.sample : {};
+      const cand = Array.isArray(research.threshold_candidates) ? research.threshold_candidates : [];
+      const top = Array.isArray(research.top_attribution_steps) ? research.top_attribution_steps : [];
+      const notes = Array.isArray(research.notes) ? research.notes : [];
+      const nextActions = Array.isArray(research.next_actions) ? research.next_actions : [];
+
+      let researchHtml = '';
+      researchHtml += `
+        <div class="mtf-row">
+          <div class="mtf-title">샘플 요약</div>
+          <div class="mtf-detail">index=${isNum(sample.selected_sample_index) ? Number(sample.selected_sample_index) : '-'}, id=${escHtml(sample.selected_sample_id || '-')}, end_ts=${fmtDateTime(sample.selected_end_ts_ms)}, win_prob=${isNum(sample.selected_win_prob) ? Number(sample.selected_win_prob).toFixed(4) : '-'}</div>
+        </div>
+      `;
+      if (cand.length) {
+        researchHtml += `<div class="mtf-row"><div class="mtf-title">임계치 후보(분위수)</div>`;
+        researchHtml += cand.map((c) => {
+          const q = isNum(c.quantile) ? Number(c.quantile).toFixed(2) : '-';
+          const w = isNum(c.win_prob_threshold) ? Number(c.win_prob_threshold).toFixed(4) : '-';
+          const cnt = isNum(c.count) ? Number(c.count) : '-';
+          const ofi = isNum(c.ofi_median) ? Number(c.ofi_median).toFixed(4) : '-';
+          const vpin = isNum(c.vpin_median) ? Number(c.vpin_median).toFixed(4) : '-';
+          return `<div class="mtf-detail">q=${q}, win≥${w}, n=${cnt}, OFI중앙값=${ofi}, VPIN중앙값=${vpin}</div>`;
+        }).join('');
+        researchHtml += `</div>`;
+      }
+      if (top.length) {
+        researchHtml += `<div class="mtf-row"><div class="mtf-title">Top Attribution 시점</div>`;
+        researchHtml += top.slice(0, 6).map((x, i) => {
+          const ts = fmtDateTime(x.ts_ms);
+          const ofi = isNum(x.ofi) ? Number(x.ofi).toFixed(4) : '-';
+          const vpin = isNum(x.vpin) ? Number(x.vpin).toFixed(4) : '-';
+          const attr = isNum(x.attr_abs_total) ? Number(x.attr_abs_total).toFixed(6) : '-';
+          return `<div class="mtf-detail">#${i + 1} | ${ts} | OFI=${ofi}, VPIN=${vpin}, |attr|=${attr}</div>`;
+        }).join('');
+        researchHtml += `</div>`;
+      }
+      if (notes.length) {
+        researchHtml += `<div class="mtf-row"><div class="mtf-title">해석 메모</div>`;
+        researchHtml += notes.map((x) => `<div class="mtf-detail">- ${escHtml(x)}</div>`).join('');
+        researchHtml += `</div>`;
+      }
+      if (nextActions.length) {
+        researchHtml += `<div class="mtf-row"><div class="mtf-title">다음 연구 액션</div>`;
+        researchHtml += nextActions.map((x) => `<div class="mtf-detail">- ${escHtml(x)}</div>`).join('');
+        researchHtml += `</div>`;
+      }
+      mtfResearchEl.innerHTML = researchHtml || `<div class="muted">연구 결과 데이터 없음</div>`;
+
+      const files = (d.files && typeof d.files === 'object') ? d.files : {};
+      const fileEntries = Object.entries(files);
+      if (!fileEntries.length) {
+        mtfArtifactsEl.innerHTML = `<div class="muted">산출물 상태 데이터 없음</div>`;
+      } else {
+        mtfArtifactsEl.innerHTML = fileEntries.map(([k, v]) => {
+          const info = (v && typeof v === 'object') ? v : {};
+          const exists = info.exists === true;
+          const size = isNum(info.size_bytes) ? `${Number(info.size_bytes).toLocaleString()} bytes` : '-';
+          const up = fmtDateTime(info.updated_at_ms);
+          const badge = exists ? `<span class="mtf-badge done">OK</span>` : `<span class="mtf-badge wait">MISSING</span>`;
+          return `
+            <div class="mtf-row">
+              <div class="mtf-title">${badge}${escHtml(k)}</div>
+              <div class="mtf-detail">path=${escHtml(info.path || '-')}</div>
+              <div class="mtf-detail">size=${size}, updated=${up}</div>
+            </div>
+          `;
+        }).join('');
+      }
+    }
+
+    async function refreshMtfResearch(force = false) {
+      const now = Date.now();
+      if (!force && (now - mtfLastFetchTs) < 15000) return;
+      mtfLastFetchTs = now;
+      try {
+        const res = await fetch(`/api/mtf_research?t=${now}`, { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderMtfResearch(data);
+      } catch (err) {
+        if (mtfUpdatedEl) mtfUpdatedEl.textContent = `MTF-XAI 리포트 조회 실패: ${err && err.message ? err.message : err}`;
+      }
+    }
+
     // Sorting
     document.querySelectorAll('#mktTable thead th').forEach(th => {
       th.addEventListener('click', () => {
@@ -3000,6 +3265,9 @@
       renderMcHealth(d.mc_health || null);
       renderMcSanity(d.mc_sanity || null);
       renderAlerts(d.alerts || []);
+      if (d.mtf_research) {
+        renderMtfResearch(d.mtf_research);
+      }
     }
 
     let lastUiErrorMsg = '';
@@ -3124,6 +3392,8 @@
       }
     });
 
+    refreshMtfResearch(true);
+    setInterval(() => { refreshMtfResearch(false); }, 20000);
     connectWs();
 
     // ---------- Top-4 rendering ----------

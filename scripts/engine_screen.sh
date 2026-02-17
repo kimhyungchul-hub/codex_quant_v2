@@ -34,12 +34,49 @@ require_prereqs() {
 }
 
 find_pid() {
+  find_pids | tail -n 1
+}
+
+find_pids() {
   local entry_base
   entry_base="$(basename "$ENTRY_FILE")"
   {
     pgrep -f "Python.*${ENTRY_FILE}" || true
+    pgrep -f "python.*${ENTRY_FILE}" || true
     pgrep -f "Python.*${entry_base}" || true
-  } | awk '!seen[$0]++' | sort -n | tail -n 1
+    pgrep -f "python.*${entry_base}" || true
+  } | awk '!seen[$0]++' | sort -n
+}
+
+collect_descendants() {
+  local pid="$1"
+  local child
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do
+    collect_descendants "$child"
+  done
+  echo "$pid"
+}
+
+kill_pid_tree() {
+  local pid="$1"
+  local sig="${2:-TERM}"
+  [ -n "$pid" ] || return 0
+
+  local target
+  for target in $(collect_descendants "$pid" | awk '!seen[$0]++'); do
+    kill "-${sig}" "$target" 2>/dev/null || true
+  done
+}
+
+find_orphan_worker_pids() {
+  local pid cwd
+  ps -axo pid,ppid,command | awk '$2 == 1 && ($0 ~ /Python\.app\/Contents\/MacOS\/Python -c from multiprocessing\.spawn import spawn_main/ || $0 ~ /Python\.app\/Contents\/MacOS\/Python -c from multiprocessing\.resource_tracker import main;main/) { print $1 }' | while read -r pid; do
+    [ -n "${pid:-}" ] || continue
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '/^n/{print substr($0,2)}' | head -n 1)"
+    if [ "$cwd" = "$ROOT_DIR" ]; then
+      echo "$pid"
+    fi
+  done | awk '!seen[$0]++' | sort -n
 }
 
 write_pid_file() {
@@ -53,11 +90,31 @@ write_pid_file() {
 stop_engine() {
   local entry_base
   entry_base="$(basename "$ENTRY_FILE")"
+  local pid
   if screen -ls 2>/dev/null | grep -q "[[:space:]]${SESSION_NAME}[[:space:]]"; then
     screen -S "$SESSION_NAME" -X quit || true
   fi
+
+  for pid in $(find_pids); do
+    kill_pid_tree "$pid" TERM
+  done
+  sleep 1
+  for pid in $(find_pids); do
+    kill_pid_tree "$pid" KILL
+  done
+
   pkill -f "$ENTRY_FILE" 2>/dev/null || true
   pkill -f "$entry_base" 2>/dev/null || true
+
+  local orphan_pid
+  for orphan_pid in $(find_orphan_worker_pids); do
+    kill -TERM "$orphan_pid" 2>/dev/null || true
+  done
+  sleep 0.5
+  for orphan_pid in $(find_orphan_worker_pids); do
+    kill -KILL "$orphan_pid" 2>/dev/null || true
+  done
+
   rm -f "$PID_FILE"
 }
 

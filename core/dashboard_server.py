@@ -2,9 +2,13 @@ import json
 import asyncio
 import config
 import time
+from pathlib import Path
 from aiohttp import web
 from config import PORT, DASHBOARD_FILE, DASHBOARD_HISTORY_MAX, DASHBOARD_TRADE_TAPE_MAX, MAX_NOTIONAL_EXPOSURE
 from utils.helpers import now_ms, _sanitize_for_json
+from utils.mtf_dashboard import build_mtf_dashboard_payload
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def _fallback_rows(orch, ts: int):
     rows = []
@@ -287,6 +291,15 @@ async def handle_api_score_debug(request):
         return web.json_response(_sanitize_for_json(out))
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_api_mtf_research(request):
+    """API endpoint for /api/mtf_research"""
+    try:
+        payload = build_mtf_dashboard_payload(PROJECT_ROOT, now_ts_ms=now_ms())
+        return web.json_response(payload, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 async def handle_dashboard(request):
     """Serve dashboard HTML"""
@@ -611,6 +624,7 @@ class DashboardServer:
             web.get('/api/status', handle_api_status),
             web.get('/api/positions', handle_api_positions),
             web.get('/api/score_debug', handle_api_score_debug),
+            web.get('/api/mtf_research', handle_api_mtf_research),
         ])
         self.runner = None
         self.site = None

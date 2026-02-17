@@ -53,6 +53,11 @@ class HybridPlanner:
             A = int(price_paths.shape[0])
             num_pos = 1 + (2 * A if getattr(self.lsm.cfg, "allow_short", True) else A)
             cost_matrix = self.lsm._build_cost_matrix(A, num_pos).to(self.device)
+        try:
+            horizon_steps = int(mc_data.get("horizon_steps", self.cfg.lsm_horizon_steps) or self.cfg.lsm_horizon_steps)
+        except Exception:
+            horizon_steps = int(self.cfg.lsm_horizon_steps)
+        horizon_steps = max(2, horizon_steps)
 
         # 1) LSM for global guidance
         action_lsm, score_lsm, debug_lsm = self.lsm.solve(
@@ -64,7 +69,7 @@ class HybridPlanner:
             prev_action_idx=prev_action_idx,
             exposure=exposure,
             cash_penalty=cash_penalty,
-            horizon_steps=int(self.cfg.lsm_horizon_steps),
+            horizon_steps=int(horizon_steps),
             cost_matrix=cost_matrix,
         )
         betas = self.lsm._cached_betas_by_t

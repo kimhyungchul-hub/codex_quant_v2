@@ -49,6 +49,24 @@ def _throttled_log(symbol: str, key: str, interval_ms: int) -> bool:
         return True
 
 
+def _env_flag(name: str, default: str = "0") -> bool:
+    try:
+        return str(os.environ.get(name, default)).strip().lower() in ("1", "true", "yes", "on")
+    except Exception:
+        return False
+
+
+def _perf_log_enabled() -> bool:
+    return _env_flag("MC_PERF_LOG", "0")
+
+
+def _summary_log_interval_ms() -> int:
+    try:
+        return int(float(os.environ.get("MC_EV_SUMMARY_EVERY_MS", "60000") or 60000))
+    except Exception:
+        return 60000
+
+
 def _summary_to_numpy(res: Any) -> Any:
     """Convert torch-backed summary dict to numpy arrays."""
     if isinstance(res, dict):
@@ -1398,88 +1416,36 @@ class MonteCarloEntryEvaluationMixin:
             print(f"[HORIZON_LOOP_DEBUG] {symbol} | Starting horizon loop with {len(policy_horizons)} horizons: {policy_horizons}")
         
         
-        # ✅ JAX VMAP OPTIMIZATION: Prepare batched inputs for all horizons and directions
-        # This allows running all horizons for both directions in a SINGLE JAX call on GPU.
-        batch_horizons = []
-        batch_directions = []
-        tp_target_roe_batch = []
-        sl_target_roe_batch = []
-        dd_stop_roe_batch = []
-        
-        # We'll use a fixed drawdown stop ROE for the batch (usually -0.01 or from environment)
-        dd_stop_roe_val = float(getattr(base_config, "PAPER_EXIT_POLICY_DD_STOP_ROE", -0.01))
-        
-        for idx, h in enumerate(policy_horizons):
-            tp_r = float(tp_r_by_h.get(int(h), tp_r_by_h.get(str(int(h)), 0.0)))
-            
-            # Long direction
-            batch_horizons.append(h)
-            batch_directions.append(1)
-            tp_target_roe_batch.append(float(tp_r * leverage))
-            sl_target_roe_batch.append(float(sl_r * leverage))
-            dd_stop_roe_batch.append(dd_stop_roe_val)
-            
-            # Short direction
-            batch_horizons.append(h)
-            batch_directions.append(-1)
-            tp_target_roe_batch.append(float(tp_r * leverage))
-            sl_target_roe_batch.append(float(sl_r * leverage))
-            dd_stop_roe_batch.append(dd_stop_roe_val)
+        perf_log_on = MC_VERBOSE_PRINT or _perf_log_enabled()
+        if MC_VERBOSE_PRINT or (perf_log_on and _throttled_log(symbol, "JAX_SHAPE_DEBUG", 60_000)):
+            print(
+                f"[SHAPE_DEBUG] {symbol} | price_paths_policy shape={getattr(price_paths_policy, 'shape', 'N/A')} "
+                f"mu={mu_exit:.6f} sigma={sigma_exit:.6f}"
+            )
 
-        if MC_VERBOSE_PRINT or _throttled_log(symbol, "JAX_SHAPE_DEBUG", 60_000):
-            print(f"[SHAPE_DEBUG] {symbol} | price_paths_policy shape={getattr(price_paths_policy, 'shape', 'N/A')} mu={mu_exit:.6f} sigma={sigma_exit:.6f}")
-        
-        # Call the batched version (massive parallelization on GPU)
+        # NOTE:
+        # Legacy exit-policy batch call used to run here via compute_exit_policy_metrics_batched(),
+        # but its outputs were discarded immediately by the clean evaluator path below.
+        # That duplicated heavy MC work for every symbol. Keep timing fields for compatibility.
         t0_jax = time.perf_counter()
-        batch_results_list = self.compute_exit_policy_metrics_batched(
-            symbol=symbol,
-            price=price,
-            mu=mu_exit,
-            sigma=sigma_exit,
-            leverage=leverage,
-            fee_roundtrip=cost_exit_roe,
-            exec_oneway=exec_oneway,
-            impact_cost=impact_cost,
-            regime=regime_ctx,
-            batch_directions=np.array(batch_directions),
-            batch_horizons=np.array(batch_horizons),
-            price_paths=price_paths_policy,
-            cvar_alpha=params.cvar_alpha,
-            tp_target_roe_batch=np.array(tp_target_roe_batch),
-            sl_target_roe_batch=np.array(sl_target_roe_batch),
-            enable_dd_stop=True,
-            dd_stop_roe_batch=np.array(dd_stop_roe_batch),
-        )
-        t1_jax = time.perf_counter()
-        # Detailed batch perf logging
-        try:
-            # Unconditional perf print for batch internals (always emit)
-            total = time.perf_counter() - t_start
-            print(f"[BATCH_PERF] gen={(t1_gen-t0_gen):.3f}s sum={(t1_sum-t1_gen):.3f}s exit_jax={(t1_jax-t0_jax):.3f}s total={total:.3f}s num_symbols={num_symbols} n_paths={n_paths}")
-        except Exception:
-            pass
-        if MC_VERBOSE_PRINT or (t1_jax - t0_jax) > 1.0:
-            print(f"[RE-VAMP_DEBUG] {symbol} | compute_exit_policy_metrics_batched took {(t1_jax - t0_jax)*1000:.2f}ms")
-            logger.info(f"[RE-VAMP_DEBUG] {symbol} | compute_exit_policy_metrics_batched took {(t1_jax - t0_jax)*1000:.2f}ms")
-
-
-
-
+        t1_jax = t0_jax
 
         t_end = time.perf_counter()
-        if MC_VERBOSE_PRINT or (t_end - t_start) > 0.5:
-            msg = (f"[PERF_BREAKDOWN] {symbol} | Total: {(t_end - t_start)*1000:.1f}ms | "
-                   f"Gen1: {(t1_gen1 - t0_gen1)*1000:.1f}ms | "
-                   f"CPUSum: {(t1_cpu_sum - t0_cpu_sum)*1000:.1f}ms | "
-                   f"Gen2: {(t1_gen2 - t0_gen2)*1000:.1f}ms | "
-                   f"JAXBat: {(t1_jax - t0_jax)*1000:.2f}ms")
+        if perf_log_on and (MC_VERBOSE_PRINT or (t_end - t_start) > 0.5):
+            msg = (
+                f"[PERF_BREAKDOWN] {symbol} | Total: {(t_end - t_start)*1000:.1f}ms | "
+                f"Gen1: {(t1_gen1 - t0_gen1)*1000:.1f}ms | "
+                f"CPUSum: {(t1_cpu_sum - t0_cpu_sum)*1000:.1f}ms | "
+                f"Gen2: {(t1_gen2 - t0_gen2)*1000:.1f}ms | "
+                f"JAXBat: {(t1_jax - t0_jax)*1000:.2f}ms"
+            )
             print(msg)
             logger.info(msg)
 
-        # ✅ FORCE CLEAN EVALUATOR (No fallback)
-        print(f"[DEBUG] Force-using clean evaluator. _CLEAN_EVALUATOR_AVAILABLE={_CLEAN_EVALUATOR_AVAILABLE}")
-        
         # Use clean evaluator to process horizons correctly
+        if perf_log_on and _throttled_log(symbol, "CLEAN_EVAL_MODE", 300_000):
+            logger.info(f"[CLEAN_EVAL] {symbol} clean evaluator active")
+
         clean_eval = get_clean_evaluator()
         
         # Convert price_paths_policy to numpy if needed
@@ -1492,7 +1458,7 @@ class MonteCarloEntryEvaluationMixin:
         tp_targets_clean = []
         sl_targets_clean = []
         for h in policy_horizons:
-            tp_r_h = float(tp_r_by_h.get(int(h), tp_r_by_h.get(str(int(h)), tp_r)))
+            tp_r_h = float(tp_r_by_h.get(int(h), tp_r_by_h.get(str(int(h)), 0.0)))
             sl_r_h = float(sl_r_by_h.get(int(h), sl_r_by_h.get(str(int(h)), sl_r)))
             tp_targets_clean.append(tp_r_h * leverage)
             sl_targets_clean.append(sl_r_h * leverage)
@@ -1746,14 +1712,19 @@ class MonteCarloEntryEvaluationMixin:
                 f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}"
             )
 
-        # Always-on short summary for troubleshooting (helps when MC_VERBOSE_PRINT is False)
+        # Short summary (throttled unless verbose)
         try:
             el_len = len(evs_long) if ("evs_long" in locals() and hasattr(evs_long, '__len__')) else 0
             es_len = len(evs_short) if ("evs_short" in locals() and hasattr(evs_short, '__len__')) else 0
         except Exception:
             el_len = 0
             es_len = 0
-        print(f"[EV_SUMMARY] {symbol} n_paths={n_paths} ev_mix_long={policy_ev_mix_long:.8f} ev_mix_short={policy_ev_mix_short:.8f} evs_long_len={el_len} evs_short_len={es_len}")
+        summary_interval_ms = _summary_log_interval_ms()
+        if MC_VERBOSE_PRINT or _throttled_log(symbol, "EV_SUMMARY", summary_interval_ms):
+            print(
+                f"[EV_SUMMARY] {symbol} n_paths={n_paths} ev_mix_long={policy_ev_mix_long:.8f} "
+                f"ev_mix_short={policy_ev_mix_short:.8f} evs_long_len={el_len} evs_short_len={es_len}"
+            )
         logger.info(f"[EV_DEBUG] {symbol} | policy_ev_mix calculation: policy_ev_mix_long={policy_ev_mix_long:.8f} policy_ev_mix_short={policy_ev_mix_short:.8f}")
         
         # ✅ 모든 심볼의 policy_ev_mix가 음수인 경우 검증 (LINK 제외)
@@ -3419,6 +3390,33 @@ class MonteCarloEntryEvaluationMixin:
         sl_pct = config.default_sl_pct
         # ✅ 격리 테스트: dist를 gaussian으로 고정
         dist_mode = "gaussian" if getattr(self, "_force_gaussian_dist", False) else str(getattr(self, "_tail_mode", self.default_tail_mode))
+        # Event MC is meta/diagnostics oriented here. Bound runtime with dedicated budget.
+        try:
+            event_max_steps = int(os.environ.get("EVENT_MC_MAX_STEPS", 0) or 0)
+        except Exception:
+            event_max_steps = 0
+        if event_max_steps <= 0:
+            try:
+                event_max_steps = int(getattr(config, "event_mc_max_steps", 0) or 0)
+            except Exception:
+                event_max_steps = 0
+        if event_max_steps <= 0:
+            # Conservative default budget for meta event-MC (user can override via EVENT_MC_MAX_STEPS).
+            event_max_steps = int(min(int(max(self.horizons)), 240))
+        event_max_steps = int(max(1, event_max_steps))
+
+        try:
+            event_n_paths_cap = int(os.environ.get("EVENT_MC_N_PATHS", 0) or 0)
+        except Exception:
+            event_n_paths_cap = 0
+        if event_n_paths_cap <= 0:
+            try:
+                cfg_exit_paths = int(getattr(config, "n_paths_exit", 2048) or 2048)
+            except Exception:
+                cfg_exit_paths = 2048
+            event_n_paths_cap = int(min(max(512, cfg_exit_paths), 2048))
+        event_n_paths = int(max(128, min(int(params.n_paths), int(event_n_paths_cap))))
+
         event_metrics = self.mc_first_passage_tp_sl(
             s0=price,
             tp_pct=tp_pct,
@@ -3426,8 +3424,8 @@ class MonteCarloEntryEvaluationMixin:
             mu=mu_adj,
             sigma=sigma,
             dt=self.dt,
-            max_steps=int(max(self.horizons)),
-            n_paths=int(params.n_paths),
+            max_steps=int(event_max_steps),
+            n_paths=int(event_n_paths),
             cvar_alpha=params.cvar_alpha,
             seed=seed,
             dist_override=dist_mode,
@@ -3556,6 +3554,8 @@ class MonteCarloEntryEvaluationMixin:
             "event_unified_score": event_unified_score,
             "event_sl_pct": float(sl_pct),
             "event_tp_pct": float(tp_pct),
+            "event_n_paths": int(event_n_paths),
+            "event_max_steps": int(event_max_steps),
             "event_t_median": event_metrics.get("event_t_median"),
             "event_t_mean": event_metrics.get("event_t_mean"),
             "unified_lambda": float(ctx.get("unified_lambda", config.unified_risk_lambda)),
@@ -4051,16 +4051,23 @@ class MonteCarloEntryEvaluationMixin:
         policy_horizons_all = list(getattr(self, "POLICY_MULTI_HORIZONS_SEC", h_cols)) or list(h_cols)
 
         t_prep1 = time.perf_counter()
+        perf_log_on = MC_VERBOSE_PRINT or _perf_log_enabled()
 
         price_paths_batch = None
         t_sim0 = time.perf_counter()
 
-        print(f"[BATCH_TIMING] prep={(t_prep1-t_prep0):.3f}s n_paths={n_paths} max_steps={max_steps} step_sec={step_sec} dt={dt:.2e}", flush=True)
+        if perf_log_on:
+            print(
+                f"[BATCH_TIMING] prep={(t_prep1-t_prep0):.3f}s n_paths={n_paths} max_steps={max_steps} "
+                f"step_sec={step_sec} dt={dt:.2e}",
+                flush=True,
+            )
 
         use_torch = bool(getattr(self, "_use_torch", True)) and bool(getattr(jax_backend, "_TORCH_OK", False)) and (not bool(getattr(jax_backend, "DEV_MODE", False)))
 
         if use_torch:
-            print("[BATCH_TIMING] Torch batch path simulation...", flush=True)
+            if perf_log_on:
+                print("[BATCH_TIMING] Torch batch path simulation...", flush=True)
             price_paths_batch = self.simulate_paths_price_batch(
                 seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
                 n_paths=n_paths, n_steps=max_steps, dt=dt, return_torch=True
@@ -4072,9 +4079,11 @@ class MonteCarloEntryEvaluationMixin:
             )
             summary_cpu = _summary_to_numpy(summary_results)
             t_sum1 = time.perf_counter()
-            print(f"[BATCH_TIMING] torch sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
+            if perf_log_on:
+                print(f"[BATCH_TIMING] torch sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
         else:
-            print("[BATCH_TIMING] NumPy batch fallback...", flush=True)
+            if perf_log_on:
+                print("[BATCH_TIMING] NumPy batch fallback...", flush=True)
             from engines.mc.torch_backend import summarize_gbm_horizons_multi_symbol_numpy
             price_paths_batch = self.simulate_paths_price_batch(
                 seeds=seeds_jax, s0s=s0s_jax, mus=mus_jax, sigmas=sigmas_jax,
@@ -4091,7 +4100,8 @@ class MonteCarloEntryEvaluationMixin:
                 0.05,
             )
             t_sum1 = time.perf_counter()
-            print(f"[BATCH_TIMING] numpy sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
+            if perf_log_on:
+                print(f"[BATCH_TIMING] numpy sim={(t_sim1-t_sim0):.3f}s sum={(t_sum1-t_sum0):.3f}s", flush=True)
 
         # No explicit GPU->CPU transfer stage in this path; keep perf keys stable.
         t_xfer0 = t_sum1
@@ -4140,17 +4150,23 @@ class MonteCarloEntryEvaluationMixin:
         
         if SKIP_EXIT_POLICY:
             # Skip Exit Policy - use simplified EV from summary_cpu
-            print("[BATCH_TIMING] SKIP_EXIT_POLICY=true, using summary-based EV", flush=True)
+            if perf_log_on:
+                print("[BATCH_TIMING] SKIP_EXIT_POLICY=true, using summary-based EV", flush=True)
             # Debug: Print EV values for first few symbols
-            for dbg_i in range(min(3, num_symbols)):
-                sym_name = tasks[dbg_i]["ctx"].get("symbol", f"sym{dbg_i}")
-                ev_l = summary_cpu["ev_long"][dbg_i]  # shape (n_horizons,)
-                ev_s = summary_cpu["ev_short"][dbg_i]
-                mu_val = float(mus[dbg_i])
-                sigma_val = float(sigmas[dbg_i])
-                fee_val = float(fees_jax[dbg_i])
-                lev_val = float(leverages_jax[dbg_i])
-                print(f"[EV_DEBUG] {sym_name}: mu={mu_val:.4f} sigma={sigma_val:.4f} fee={fee_val:.6f} lev={lev_val:.1f} ev_long={ev_l.max():.6f} ev_short={ev_s.max():.6f}", flush=True)
+            if perf_log_on:
+                for dbg_i in range(min(3, num_symbols)):
+                    sym_name = tasks[dbg_i]["ctx"].get("symbol", f"sym{dbg_i}")
+                    ev_l = summary_cpu["ev_long"][dbg_i]  # shape (n_horizons,)
+                    ev_s = summary_cpu["ev_short"][dbg_i]
+                    mu_val = float(mus[dbg_i])
+                    sigma_val = float(sigmas[dbg_i])
+                    fee_val = float(fees_jax[dbg_i])
+                    lev_val = float(leverages_jax[dbg_i])
+                    print(
+                        f"[EV_DEBUG] {sym_name}: mu={mu_val:.4f} sigma={sigma_val:.4f} fee={fee_val:.6f} "
+                        f"lev={lev_val:.1f} ev_long={ev_l.max():.6f} ev_short={ev_s.max():.6f}",
+                        flush=True,
+                    )
             # Build simplified results from summary_cpu
             exit_policy_results = []
             h_list = list(h_cols)
@@ -4748,22 +4764,23 @@ class MonteCarloEntryEvaluationMixin:
 
         t_asm1 = time.perf_counter()
 
-        # Detailed perf logging for batch internals (always emit)
-        try:
-            print(
-                "[BATCH_PIPE] "
-                f"prep={(t_prep1-t_prep0):.3f}s "
-                f"sim={(t_sim1-t_sim0):.3f}s "
-                f"sum={(t_sum1-t_sum0):.3f}s "
-                f"xfer={(t_xfer1-t_xfer0):.3f}s "
-                f"exit_prep={(t_exit_prep1-t_exit_prep0):.3f}s "
-                f"exit={(t_exit1-t_exit0):.3f}s "
-                f"asm={(t_asm1-t_asm0):.3f}s "
-                f"total={(time.perf_counter()-t_start):.3f}s "
-                f"num_symbols={num_symbols} pad={pad_size} n_paths={n_paths} step_sec={step_sec} max_steps={max_steps}"
-            )
-        except Exception:
-            pass
+        # Detailed perf logging for batch internals (opt-in)
+        if perf_log_on:
+            try:
+                print(
+                    "[BATCH_PIPE] "
+                    f"prep={(t_prep1-t_prep0):.3f}s "
+                    f"sim={(t_sim1-t_sim0):.3f}s "
+                    f"sum={(t_sum1-t_sum0):.3f}s "
+                    f"xfer={(t_xfer1-t_xfer0):.3f}s "
+                    f"exit_prep={(t_exit_prep1-t_exit_prep0):.3f}s "
+                    f"exit={(t_exit1-t_exit0):.3f}s "
+                    f"asm={(t_asm1-t_asm0):.3f}s "
+                    f"total={(time.perf_counter()-t_start):.3f}s "
+                    f"num_symbols={num_symbols} pad={pad_size} n_paths={n_paths} step_sec={step_sec} max_steps={max_steps}"
+                )
+            except Exception:
+                pass
 
         t_end = time.perf_counter()
         logger.info(f"🚀 [GLOBAL_VMAP] Processed {num_symbols} symbols in {(t_end - t_start)*1000:.1f}ms")

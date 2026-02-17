@@ -67,6 +67,7 @@ from engines.kelly_allocator import KellyAllocator
 from core.continuous_opportunity import ContinuousOpportunityChecker
 #from core.napv_engine_jax import get_napv_engine, NAPVEngineJAX  # Removed - not needed
 from core.multi_timeframe_scoring import check_position_switching
+from utils.mtf_dashboard import build_mtf_dashboard_payload
 
 PORT = 9999
 
@@ -2948,6 +2949,15 @@ async def ws_handler(request):
     return ws
 
 
+async def api_mtf_research_handler(request: web.Request) -> web.Response:
+    """Serve MTF-XAI implementation progress/research summary for dashboard."""
+    try:
+        payload = build_mtf_dashboard_payload(BASE_DIR, now_ts_ms=now_ms())
+        return web.json_response(payload, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
 async def main():
     exchange = ccxt.bybit({
         "enableRateLimit": True,
@@ -2966,7 +2976,11 @@ async def main():
         # Start the web server immediately so the dashboard can connect quickly.
         app = web.Application()
         app["orchestrator"] = orchestrator
-        app.add_routes([web.get("/", index_handler), web.get("/ws", ws_handler)])
+        app.add_routes([
+            web.get("/", index_handler),
+            web.get("/ws", ws_handler),
+            web.get("/api/mtf_research", api_mtf_research_handler),
+        ])
 
         runner = web.AppRunner(app)
         await runner.setup()

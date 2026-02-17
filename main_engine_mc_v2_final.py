@@ -68,6 +68,7 @@ import random
 import re
 import uuid
 import threading
+import signal
 import datetime
 import numpy as np
 import sqlite3
@@ -150,8 +151,15 @@ from engines.kelly_allocator import KellyAllocator
 from core.continuous_opportunity import ContinuousOpportunityChecker
 from core.multi_timeframe_scoring import check_position_switching
 from core.database_manager import DatabaseManager, TradingMode
+from core.runtime_config_store import (
+    ensure_runtime_config_schema,
+    get_runtime_config_changes_since,
+    get_runtime_config_last_change_id,
+    get_runtime_config_values,
+)
 from utils.mtf_dl_runtime import MTFDLRuntimeScorer
 from utils.singleton_process_lock import SingletonProcessLock
+from utils.mtf_dashboard import build_mtf_dashboard_payload
 
 PORT = 9999
 DASHBOARD_HOST = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1")).strip() or "127.0.0.1"
@@ -709,6 +717,13 @@ class LiveOrchestrator:
         self._auto_tune_status_cache: dict[str, object] = {}
         self._auto_tune_last_apply_ms = 0
         self._auto_tune_last_batch_id = 0
+        # Runtime config hot-reload (SQLite runtime_config table)
+        self._runtime_config_enabled = str(os.environ.get("RUNTIME_CONFIG_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+        self._runtime_config_reload_sec = float(os.environ.get("RUNTIME_CONFIG_RELOAD_SEC", 1.0) or 1.0)
+        self._runtime_config_last_poll_ms = 0
+        self._runtime_config_last_change_id = 0
+        self._runtime_config_last_apply_ms = 0
+        self._runtime_config_cache: dict[str, str] = {}
         # ── [2026-02-15] Auto Diagnostics Engine (자기 개선 시스템) ──
         self._auto_diag_engine = None
         self._auto_diag_last_ms: int = 0
@@ -806,6 +821,8 @@ class LiveOrchestrator:
         self._batch_leverages = np.ones(self._batch_max_symbols, dtype=np.float64) * DEFAULT_LEVERAGE
         self._batch_ofi_scores = np.zeros(self._batch_max_symbols, dtype=np.float64)
         self._batch_valid_mask = np.zeros(self._batch_max_symbols, dtype=bool)  # which slots are valid
+        # Start runtime-config listener after all mutable runtime fields are initialized.
+        self._init_runtime_config_hot_reload()
         self._log(f"[INIT] Portfolio Management: TOP_N={TOP_N_SYMBOLS}, Kelly={USE_KELLY_ALLOCATION}, Opportunity={USE_CONTINUOUS_OPPORTUNITY}")
         self._log(f"[INIT] SoA Batch Arrays: max_symbols={self._batch_max_symbols}, shape=({self._batch_max_symbols},)")
 
@@ -2366,6 +2383,146 @@ class LiveOrchestrator:
             "timestamp": int(status_ts if status_ts > 0 else now_ts),
             "stale_sec": stale_sec,
         }
+
+    def _init_runtime_config_hot_reload(self) -> None:
+        if not bool(self._runtime_config_enabled):
+            return
+        try:
+            ensure_runtime_config_schema(self._db_path)
+            self._runtime_config_last_change_id = int(get_runtime_config_last_change_id(self._db_path) or 0)
+            current = get_runtime_config_values(self._db_path)
+            if isinstance(current, dict) and current:
+                self._apply_runtime_config_values(current, reason="bootstrap")
+            self._log(
+                f"[RUNTIME_CONFIG] listener ready: enabled=1 reload_sec={self._runtime_config_reload_sec:.2f} "
+                f"last_change_id={self._runtime_config_last_change_id}"
+            )
+        except Exception as e:
+            self._log_err(f"[RUNTIME_CONFIG] init failed: {e}")
+
+    def _sync_runtime_config_fields(self, applied_keys: set[str]) -> None:
+        keys = {str(k or "").strip().upper() for k in (applied_keys or set()) if str(k or "").strip()}
+        if not keys:
+            return
+
+        def _get_float(name: str, default: float) -> float:
+            try:
+                return float(os.environ.get(name, default) or default)
+            except Exception:
+                return float(default)
+
+        def _get_int(name: str, default: int) -> int:
+            try:
+                return int(float(os.environ.get(name, default) or default))
+            except Exception:
+                return int(default)
+
+        def _get_bool(name: str, default: bool) -> bool:
+            try:
+                raw = os.environ.get(name)
+                if raw is None:
+                    return bool(default)
+                return str(raw).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                return bool(default)
+
+        if "MAX_CONCURRENT_POSITIONS" in keys:
+            self.max_positions = max(1, _get_int("MAX_CONCURRENT_POSITIONS", int(self.max_positions)))
+        if "UNIVERSE_REFRESH_SEC" in keys:
+            self._universe_refresh_sec = max(0.5, _get_float("UNIVERSE_REFRESH_SEC", float(self._universe_refresh_sec)))
+        if "PORTFOLIO_JOINT_INTERVAL_SEC" in keys:
+            self.portfolio_joint_interval_sec = max(5.0, _get_float("PORTFOLIO_JOINT_INTERVAL_SEC", float(self.portfolio_joint_interval_sec)))
+        if "AUTO_TUNE_RELOAD_SEC" in keys:
+            self._auto_tune_reload_sec = max(1.0, _get_float("AUTO_TUNE_RELOAD_SEC", float(self._auto_tune_reload_sec)))
+        if "AUTO_REVAL_STATUS_RELOAD_SEC" in keys:
+            self._auto_reval_status_reload_sec = max(1.0, _get_float("AUTO_REVAL_STATUS_RELOAD_SEC", float(self._auto_reval_status_reload_sec)))
+        if "MU_ALPHA_CALIBRATE_INTERVAL_SEC" in keys:
+            self._mu_alpha_calibrate_interval_sec = max(30.0, _get_float("MU_ALPHA_CALIBRATE_INTERVAL_SEC", float(self._mu_alpha_calibrate_interval_sec)))
+        if "MC_HEALTH_INTERVAL_SEC" in keys:
+            self._mc_health_interval_sec = max(10.0, _get_float("MC_HEALTH_INTERVAL_SEC", float(self._mc_health_interval_sec)))
+        if "ADAPTIVE_ENTRY_INTERVAL_SEC" in keys:
+            self._adaptive_entry_interval_sec = max(5.0, _get_float("ADAPTIVE_ENTRY_INTERVAL_SEC", float(self._adaptive_entry_interval_sec)))
+        if "DASHBOARD_REFRESH_SEC" in keys:
+            self._dashboard_refresh_sec = max(0.1, _get_float("DASHBOARD_REFRESH_SEC", float(self._dashboard_refresh_sec)))
+        if "DASHBOARD_FAST_LOOP" in keys:
+            self._dashboard_fast = _get_bool("DASHBOARD_FAST_LOOP", bool(self._dashboard_fast))
+        if "REVAL_TARGET_MIN_NEW_CLOSED" in keys:
+            self._reval_target_min = max(1, _get_int("REVAL_TARGET_MIN_NEW_CLOSED", int(self._reval_target_min)))
+        if "REVAL_TARGET_MAX_NEW_CLOSED" in keys:
+            self._reval_target_max = max(int(self._reval_target_min), _get_int("REVAL_TARGET_MAX_NEW_CLOSED", int(self._reval_target_max)))
+        if "RUNTIME_CONFIG_RELOAD_SEC" in keys:
+            self._runtime_config_reload_sec = max(0.2, _get_float("RUNTIME_CONFIG_RELOAD_SEC", float(self._runtime_config_reload_sec)))
+
+    def _apply_runtime_config_values(self, values: dict[str, object], *, reason: str) -> int:
+        if not isinstance(values, dict) or not values:
+            return 0
+        applied_keys: set[str] = set()
+        for raw_key, raw_val in values.items():
+            key = str(raw_key or "").strip().upper()
+            if not key or not all(ch.isalnum() or ch == "_" for ch in key):
+                continue
+            val_txt = self._normalize_auto_tune_env_value(raw_val)
+            if val_txt is None:
+                continue
+            prev = os.environ.get(key)
+            if prev is not None and str(prev) == str(val_txt):
+                self._runtime_config_cache[key] = str(val_txt)
+                continue
+            os.environ[key] = str(val_txt)
+            self._runtime_config_cache[key] = str(val_txt)
+            applied_keys.add(key)
+        if not applied_keys:
+            return 0
+        self._runtime_config_last_apply_ms = int(now_ms())
+        self._sync_auto_tune_runtime_fields(applied_keys)
+        self._sync_runtime_config_fields(applied_keys)
+        self._log(
+            f"[RUNTIME_CONFIG] hot-updated n={len(applied_keys)} "
+            f"reason={reason} keys={','.join(sorted(list(applied_keys))[:8])}"
+        )
+        return int(len(applied_keys))
+
+    async def _runtime_config_listener_tick(self, ts_ms: int) -> None:
+        if not bool(self._runtime_config_enabled):
+            return
+        try:
+            interval_ms = int(max(0.2, float(self._runtime_config_reload_sec)) * 1000.0)
+        except Exception:
+            interval_ms = 1000
+        if int(ts_ms) - int(self._runtime_config_last_poll_ms or 0) < int(interval_ms):
+            return
+        self._runtime_config_last_poll_ms = int(ts_ms)
+
+        try:
+            changes, new_last = await asyncio.to_thread(
+                get_runtime_config_changes_since,
+                self._db_path,
+                int(self._runtime_config_last_change_id or 0),
+                limit=1000,
+            )
+        except Exception as e:
+            self._log_err(f"[RUNTIME_CONFIG] poll failed: {e}")
+            return
+
+        if int(new_last) > int(self._runtime_config_last_change_id or 0):
+            self._runtime_config_last_change_id = int(new_last)
+        if not changes:
+            return
+
+        latest_by_key: dict[str, str] = {}
+        for row in changes:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "").strip().upper()
+            if not key:
+                continue
+            new_val = row.get("new_value")
+            if new_val is None:
+                continue
+            latest_by_key[key] = str(new_val)
+        if not latest_by_key:
+            return
+        self._apply_runtime_config_values(latest_by_key, reason=f"poll:{self._runtime_config_last_change_id}")
 
     def _normalize_auto_tune_env_value(self, value):
         if isinstance(value, bool):
@@ -21190,6 +21347,10 @@ class LiveOrchestrator:
                 rows = []
                 ts = now_ms()
                 try:
+                    await self._runtime_config_listener_tick(int(ts))
+                except Exception as e:
+                    self._log_err(f"[RUNTIME_CONFIG] listener loop error: {e}")
+                try:
                     self._maybe_reload_auto_tune_overrides(int(ts))
                 except Exception as e:
                     self._log_err(f"[AUTO_TUNE] reload loop error: {e}")
@@ -22349,33 +22510,30 @@ async def safety_mode_handler(request):
 
 async def api_restart_live_handler(request: web.Request) -> web.Response:
     """
-    Provides restart command for live mode with environment variables loaded.
-    Returns the command that should be run in shell to restart engine with proper API keys.
+    Legacy endpoint: restart is intentionally disabled.
+    Runtime config is hot-reloaded from SQLite without process restart.
     """
     orch = request.app.get("orchestrator")
     if not orch:
         return web.json_response({"ok": False, "error": "orchestrator not ready"}, status=500)
-    
-    cwd = os.getcwd()
-    restart_cmd = (
-        f"cd {cwd} && "
-        f"pkill -f main_engine_mc_v2_final.py && "
-        f"sleep 2 && "
-        f"set -a && source state/bybit.env && set +a && "
-        f"ENABLE_LIVE_ORDERS=1 nohup python3 main_engine_mc_v2_final.py > /tmp/engine.log 2>&1 &"
-    )
-    
+
     return web.json_response({
         "ok": True,
-        "message": "Engine restart command ready",
-        "command": restart_cmd,
-        "hint": "Run command in terminal to restart engine with LIVE_ORDERS enabled",
-        "manual_steps": [
-            "1. Open terminal",
-            "2. Copy and paste the 'command' from response",
-            "3. Press Enter to restart"
-        ]
+        "message": "Engine restart disabled. Use runtime_config updates; listener applies changes hot.",
+        "hot_reload": True,
+        "runtime_config_enabled": bool(getattr(orch, "_runtime_config_enabled", False)),
+        "runtime_config_reload_sec": float(getattr(orch, "_runtime_config_reload_sec", 0.0) or 0.0),
+        "last_runtime_apply_ms": int(getattr(orch, "_runtime_config_last_apply_ms", 0) or 0),
     })
+
+
+async def api_mtf_research_handler(request: web.Request) -> web.Response:
+    """Serve MTF-XAI implementation progress/research summary for dashboard."""
+    try:
+        payload = build_mtf_dashboard_payload(BASE_DIR, now_ts_ms=now_ms())
+        return web.json_response(payload, dumps=lambda x: json.dumps(x, ensure_ascii=False))
+    except Exception as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
 
 async def main():
@@ -22426,6 +22584,25 @@ async def main():
 
     runner = None
     site = None
+    app = None
+    runtime_tasks: list[asyncio.Task] = []
+    background_init_task: asyncio.Task | None = None
+    stop_event = asyncio.Event()
+
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(reason: str = "signal") -> None:
+        if stop_event.is_set():
+            return
+        print(f"[BOOT] shutdown requested ({reason})")
+        stop_event.set()
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(_sig, _request_shutdown, _sig.name)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
     try:
         # Start the web server immediately so the dashboard can connect quickly.
         app = web.Application()
@@ -22433,6 +22610,7 @@ async def main():
         app.add_routes([
             web.get("/", index_handler),
             web.get("/ws", ws_handler),
+            web.get("/api/mtf_research", api_mtf_research_handler),
             web.post("/api/liquidate_all", liquidate_all_handler),
             web.post("/api/liquidate_all_safety", liquidate_all_safety_handler),
             web.post("/api/close_limit", close_limit_handler),
@@ -22450,6 +22628,7 @@ async def main():
 
         # Perform long-running initialization in background so server is responsive.
         async def _background_init():
+            nonlocal runtime_tasks
             try:
                 # Instantiate the real orchestrator (this may spawn workers/processes)
                 # On macOS shared_memory/process workers can be unstable; prefer
@@ -22493,16 +22672,18 @@ async def main():
                 real_orch._persist_state(force=True)
 
                 # Start periodic loops and decision pipeline on the real orchestrator
-                asyncio.create_task(real_orch.fetch_prices_loop())
-                asyncio.create_task(real_orch.fetch_ohlcv_loop())
-                asyncio.create_task(real_orch.fetch_orderbook_loop())
-                asyncio.create_task(real_orch.fetch_balance_loop())
-                asyncio.create_task(real_orch.fetch_positions_loop())
-                asyncio.create_task(real_orch.bybit_ws_positions_loop())
-                asyncio.create_task(real_orch.refresh_top_volume_universe_loop())
-                asyncio.create_task(real_orch.hold_eval_loop())
-                asyncio.create_task(real_orch.decision_loop())
-                asyncio.create_task(real_orch.dashboard_loop())
+                runtime_tasks = [
+                    asyncio.create_task(real_orch.fetch_prices_loop()),
+                    asyncio.create_task(real_orch.fetch_ohlcv_loop()),
+                    asyncio.create_task(real_orch.fetch_orderbook_loop()),
+                    asyncio.create_task(real_orch.fetch_balance_loop()),
+                    asyncio.create_task(real_orch.fetch_positions_loop()),
+                    asyncio.create_task(real_orch.bybit_ws_positions_loop()),
+                    asyncio.create_task(real_orch.refresh_top_volume_universe_loop()),
+                    asyncio.create_task(real_orch.hold_eval_loop()),
+                    asyncio.create_task(real_orch.decision_loop()),
+                    asyncio.create_task(real_orch.dashboard_loop()),
+                ]
 
                 print("✅ Background init completed: fetch/decision loops started")
             except Exception as e:
@@ -22511,29 +22692,69 @@ async def main():
                 print(f"[ERR] background_init: {e}\n{tb}")
 
         # Schedule but don't await: server is responsive immediately
-        asyncio.create_task(_background_init())
+        background_init_task = asyncio.create_task(_background_init())
 
-        # Keep running until cancelled
-        await asyncio.Future()
+        # Keep running until shutdown signal is received.
+        await stop_event.wait()
     except OSError as e:
         print(f"[ERR] Failed to bind on port {PORT}: {e}")
     finally:
+        shutdown_timeout = 5.0
+
+        if background_init_task is not None and not background_init_task.done():
+            background_init_task.cancel()
+        if background_init_task is not None:
+            try:
+                await asyncio.wait_for(background_init_task, timeout=shutdown_timeout)
+            except BaseException:
+                pass
+
+        for task in runtime_tasks:
+            if task is not None and not task.done():
+                task.cancel()
+        if runtime_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*runtime_tasks, return_exceptions=True),
+                    timeout=shutdown_timeout,
+                )
+            except Exception:
+                pass
+
+        orch_obj = None
+        if app is not None:
+            try:
+                orch_obj = app.get("orchestrator")
+            except Exception:
+                orch_obj = None
+        hub = getattr(orch_obj, "hub", None)
+        close_fn = getattr(hub, "close", None)
+        if callable(close_fn):
+            try:
+                close_fn()
+            except Exception as e:
+                print(f"[WARN] hub close failed: {e}")
+
         try:
-            await exchange.close()
+            await asyncio.wait_for(exchange.close(), timeout=shutdown_timeout)
             if data_exchange is not exchange:
-                await data_exchange.close()
+                await asyncio.wait_for(data_exchange.close(), timeout=shutdown_timeout)
         except Exception:
             pass
         if site is not None:
             try:
-                await site.stop()
+                await asyncio.wait_for(site.stop(), timeout=shutdown_timeout)
             except Exception:
                 pass
         if runner is not None:
             try:
-                await runner.cleanup()
+                await asyncio.wait_for(runner.cleanup(), timeout=shutdown_timeout)
             except Exception:
                 pass
+        try:
+            GPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
