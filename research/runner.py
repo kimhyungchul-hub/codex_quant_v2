@@ -555,6 +555,10 @@ def run_cf_cycle(
             "cycle_started_ts": cycle_started_ts,
             "last_update_ts": time.time(),
             "running": False,
+            "research_mode": "normal",
+            "deep_mode": False,
+            "cycle_max_combos": int(max_combos),
+            "ensemble_runs": 1,
             "mtf_imageh": mtf_state,
         }
 
@@ -605,6 +609,10 @@ def run_cf_cycle(
             "cycle_started_ts": cycle_started_ts,
             "last_update_ts": time.time(),
             "running": False,
+            "research_mode": "normal",
+            "deep_mode": False,
+            "cycle_max_combos": int(max_combos),
+            "ensemble_runs": 1,
             "new_trade_count": new_trade_count,
             "min_required": MIN_NEW_TRADES_FOR_REANALYSIS,
             "always_run_cf": always_run_cf,
@@ -963,6 +971,14 @@ def main():
             cycle_history.append(cycle_report)
             _save_cycle_history(cycle_history)
             _update_dashboard({
+                "status": result.get("status"),
+                "cycle_count": int(result.get("cycle_count") or 0),
+                "last_update_ts": float(result.get("last_update_ts") or time.time()),
+                "research_mode": str(result.get("research_mode") or "normal"),
+                "ensemble_runs": int(result.get("ensemble_runs") or 1),
+                "cycle_max_combos": int(result.get("cycle_max_combos") or args.max_combos),
+                "always_run_cf": result.get("always_run_cf"),
+                "idle_force_sec": result.get("idle_force_sec"),
                 "research_cycles": cycle_history[-30:],
                 "current_cycle_index": int(result.get("cycle_count") or 0) + 1,
                 "completed_cycles_total": int(result.get("cycle_count") or 0),
