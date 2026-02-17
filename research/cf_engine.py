@@ -21,13 +21,52 @@ import logging
 import math
 import os
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
 logger = logging.getLogger("research.cf_engine")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_DL_SCRIPT = PROJECT_ROOT / "scripts" / "mtf_image_dl_cf.py"
+DEFAULT_DL_REPORT = PROJECT_ROOT / "state" / "mtf_image_dl_cf_report.json"
+DEFAULT_DL_SCORES = PROJECT_ROOT / "state" / "mtf_image_trade_scores.json"
+DEFAULT_DL_MODEL = PROJECT_ROOT / "state" / "mtf_image_model.pt"
+DEFAULT_DL_CACHE = PROJECT_ROOT / "state" / "mtf_ohlcv_cache"
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return int(default)
+    try:
+        return int(float(str(raw).strip()))
+    except Exception:
+        return int(default)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        out = float(str(raw).strip())
+        if not math.isfinite(out):
+            return float(default)
+        return float(out)
+    except Exception:
+        return float(default)
 
 # ─────────────────────────────────────────────────────────────────
 # Data Structures
@@ -533,6 +572,197 @@ class VolatilityGateSimulator(StageSimulator):
                 else:
                     t2.realized_pnl = float(t2.realized_pnl) * 0.60
             out.append(t2)
+        return out
+
+
+class MTFImageDLGateSimulator(StageSimulator):
+    """
+    Multi-timeframe image DL gate.
+
+    - 매 사이클에서 DL 점수 파일을 갱신(옵션)하고
+    - 분위수(quantile) 기준으로 진입 샘플을 필터링하는 CF stage.
+    """
+
+    stage_name = "mtf_image_dl_gate"
+    description = "멀티TF 이미지 DL 게이트: 확률 분위수 기반 진입 필터(global/chop)"
+    max_combos_hint = 60
+
+    def __init__(self):
+        self.script_path = Path(os.environ.get("CF_MTF_DL_SCRIPT_PATH", str(DEFAULT_DL_SCRIPT)))
+        self.db_path = os.environ.get("CF_MTF_DL_DB_PATH", "state/bot_data_live.db")
+        self.report_path = Path(os.environ.get("CF_MTF_DL_REPORT_PATH", str(DEFAULT_DL_REPORT)))
+        self.scores_path = Path(os.environ.get("CF_MTF_DL_SCORES_PATH", str(DEFAULT_DL_SCORES)))
+        self.model_path = Path(os.environ.get("CF_MTF_DL_MODEL_PATH", str(DEFAULT_DL_MODEL)))
+        self.cache_dir = Path(os.environ.get("CF_MTF_DL_CACHE_DIR", str(DEFAULT_DL_CACHE)))
+        self._score_map: dict[str, float] = {}
+
+    def _python_exec(self) -> str:
+        py = PROJECT_ROOT / ".venv" / "bin" / "python"
+        if py.exists():
+            return str(py)
+        return "python3"
+
+    def _refresh_scores(self) -> None:
+        if not _env_bool("CF_MTF_DL_ENABLED", True):
+            return
+        refresh_each = _env_bool("CF_MTF_DL_REFRESH_EACH_CYCLE", True)
+        if (not refresh_each) and self.scores_path.exists():
+            return
+        if not self.script_path.exists():
+            logger.warning(f"[DL_GATE] script missing: {self.script_path}")
+            return
+
+        max_symbols = max(1, _env_int("CF_MTF_DL_MAX_SYMBOLS", 12))
+        max_trades = max(200, _env_int("CF_MTF_DL_MAX_TRADES", 2200))
+        epochs = max(1, _env_int("CF_MTF_DL_EPOCHS", 8))
+        batch_size = max(16, _env_int("CF_MTF_DL_BATCH_SIZE", 96))
+        min_n = max(20, _env_int("CF_MTF_DL_MIN_N", 100))
+        min_hold_sec = max(0.0, _env_float("CF_MTF_DL_MIN_HOLD_SEC", 30.0))
+        train_ratio = min(0.95, max(0.50, _env_float("CF_MTF_DL_TRAIN_RATIO", 0.75)))
+        timeout_sec = max(60, _env_int("CF_MTF_DL_TIMEOUT_SEC", 1800))
+
+        cmd = [
+            self._python_exec(),
+            str(self.script_path),
+            "--db", str(self.db_path),
+            "--out", str(self.report_path),
+            "--scores-out", str(self.scores_path),
+            "--model-out", str(self.model_path),
+            "--cache-dir", str(self.cache_dir),
+            "--max-symbols", str(max_symbols),
+            "--max-trades", str(max_trades),
+            "--epochs", str(epochs),
+            "--batch-size", str(batch_size),
+            "--min-n", str(min_n),
+            "--min-hold-sec", str(min_hold_sec),
+            "--train-ratio", str(train_ratio),
+        ]
+        logger.info("[CF_STAGE] mtf_image_dl_gate training refresh start")
+        try:
+            cp = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            if cp.returncode != 0:
+                tail = (cp.stderr or cp.stdout or "").strip().splitlines()[-4:]
+                logger.warning(
+                    "[DL_GATE] refresh failed rc=%s tail=%s",
+                    cp.returncode,
+                    " | ".join(tail),
+                )
+            else:
+                last = (cp.stdout or "").strip().splitlines()
+                if last:
+                    logger.info("[DL_GATE] refresh done: %s", last[-1])
+                else:
+                    logger.info("[DL_GATE] refresh done")
+        except Exception as e:
+            logger.warning(f"[DL_GATE] refresh exception: {e}")
+
+    def _load_score_map(self) -> None:
+        self._score_map = {}
+        if not self.scores_path.exists():
+            return
+        try:
+            rows = json.loads(self.scores_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"[DL_GATE] score file parse failed: {e}")
+            return
+        if not isinstance(rows, list):
+            return
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            uid = str(r.get("trade_uid") or "").strip()
+            if not uid:
+                continue
+            try:
+                p = float(r.get("mtf_dl_prob"))
+            except Exception:
+                continue
+            if not math.isfinite(p):
+                continue
+            self._score_map[uid] = p
+        if self._score_map:
+            vals = np.asarray(list(self._score_map.values()), dtype=np.float64)
+            logger.info(
+                "[DL_GATE] scores loaded n=%s prob_min=%.6f prob_max=%.6f",
+                len(self._score_map),
+                float(np.min(vals)),
+                float(np.max(vals)),
+            )
+
+    def _parse_quantiles(self) -> list[float]:
+        raw = str(os.environ.get("CF_MTF_DL_GATE_QUANTILES", "0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90") or "")
+        out: list[float] = []
+        for tok in raw.replace(";", ",").split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                q = float(tok)
+            except Exception:
+                continue
+            q = max(0.50, min(0.99, q))
+            if q not in out:
+                out.append(q)
+        return out or [0.60, 0.70, 0.80]
+
+    def get_param_grid(self) -> dict[str, list]:
+        self._refresh_scores()
+        self._load_score_map()
+        if not self._score_map:
+            # score가 없으면 stage를 no-op 처리
+            return {"dl_gate_mode": ["disabled"], "dl_gate_quantile": [0.60]}
+        return {
+            "dl_gate_mode": ["global", "chop_only"],
+            "dl_gate_quantile": self._parse_quantiles(),
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        mode = str(params.get("dl_gate_mode", "global") or "global").strip().lower()
+        q = float(params.get("dl_gate_quantile", 0.70))
+        q = max(0.50, min(0.99, q))
+        if mode == "disabled" or not self._score_map:
+            return list(trades)
+
+        min_scored = max(20, _env_int("CF_MTF_DL_GATE_MIN_SCORED", 80))
+        scored_all = [self._score_map.get(str(t.trade_uid or "").strip()) for t in trades]
+        scored_all = [float(x) for x in scored_all if x is not None and math.isfinite(float(x))]
+        if len(scored_all) < min_scored:
+            return list(trades)
+
+        out: list[Trade] = []
+        if mode == "chop_only":
+            scored_chop = []
+            for t in trades:
+                if str(t.regime or "").strip().lower() != "chop":
+                    continue
+                p = self._score_map.get(str(t.trade_uid or "").strip())
+                if p is None:
+                    continue
+                scored_chop.append(float(p))
+            if len(scored_chop) < max(20, min_scored // 2):
+                return list(trades)
+            thr = float(np.quantile(np.asarray(scored_chop, dtype=np.float64), q))
+            for t in trades:
+                if str(t.regime or "").strip().lower() != "chop":
+                    out.append(t)
+                    continue
+                p = self._score_map.get(str(t.trade_uid or "").strip())
+                if p is None or float(p) >= thr:
+                    out.append(t)
+            return out
+
+        thr = float(np.quantile(np.asarray(scored_all, dtype=np.float64), q))
+        for t in trades:
+            p = self._score_map.get(str(t.trade_uid or "").strip())
+            # 점수 없는 트레이드는 유지(coverage 부족으로 인한 과차단 방지)
+            if p is None or float(p) >= thr:
+                out.append(t)
         return out
 
 
@@ -1417,6 +1647,7 @@ ALL_SIMULATORS = [
     DirectionSimulator(),
     VPINFilterSimulator(),
     VolatilityGateSimulator(),
+    MTFImageDLGateSimulator(),
     ExitReasonSimulator(),
     CapitalAllocationSimulator(),
     RegimeMultiplierSimulator(),
