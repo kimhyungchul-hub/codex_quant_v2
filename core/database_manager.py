@@ -195,6 +195,7 @@ class DatabaseManager:
                     regime TEXT,
                     alpha_vpin REAL,
                     alpha_hurst REAL,
+                    sigma REAL,               -- 진입/청산 시점 사용 sigma(annualized)
                     pred_mu_alpha REAL,
                     pred_mu_dir_conf REAL,
                     policy_score_threshold REAL,
@@ -209,6 +210,7 @@ class DatabaseManager:
                 )
             """)
             self._ensure_trade_schema_columns(cursor)
+            self._backfill_trade_sigma(cursor)
             
             # ─────────────────────────────────────────────────────────────────
             # 2. 자산 가치 기록 (Equity History)
@@ -447,6 +449,7 @@ class DatabaseManager:
             ("regime", "TEXT"),
             ("alpha_vpin", "REAL"),
             ("alpha_hurst", "REAL"),
+            ("sigma", "REAL"),
             ("pred_mu_alpha", "REAL"),
             ("pred_mu_dir_conf", "REAL"),
             ("policy_score_threshold", "REAL"),
@@ -460,6 +463,52 @@ class DatabaseManager:
             if col in existing:
                 continue
             cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+
+    def _backfill_trade_sigma(self, cursor: sqlite3.Cursor) -> None:
+        """
+        trades.sigma를 raw_data의 lev_sigma_*에서 1회성 보강한다.
+        json_extract 미지원 환경은 Python fallback으로 채운다.
+        """
+        try:
+            cursor.execute(
+                """
+                UPDATE trades
+                SET sigma = COALESCE(
+                    NULLIF(CAST(json_extract(raw_data, '$.lev_sigma_used') AS REAL), 0.0),
+                    NULLIF(CAST(json_extract(raw_data, '$.lev_sigma_raw') AS REAL), 0.0),
+                    0.5
+                )
+                WHERE sigma IS NULL
+                """
+            )
+            return
+        except Exception:
+            pass
+
+        try:
+            cursor.execute("SELECT id, raw_data FROM trades WHERE sigma IS NULL")
+            rows = cursor.fetchall()
+            for row in rows:
+                rid = int(row[0])
+                raw = row[1]
+                sigma_val = None
+                try:
+                    parsed = json.loads(raw) if raw else {}
+                    if isinstance(parsed, dict):
+                        for key in ("lev_sigma_used", "lev_sigma_raw", "sigma"):
+                            v = parsed.get(key)
+                            if v is None:
+                                continue
+                            sigma_val = float(v)
+                            if sigma_val > 0:
+                                break
+                except Exception:
+                    sigma_val = None
+                if sigma_val is None or sigma_val <= 0:
+                    sigma_val = 0.5
+                cursor.execute("UPDATE trades SET sigma = ? WHERE id = ?", (float(sigma_val), rid))
+        except Exception:
+            return
 
     def _ensure_slippage_schema_columns(self, cursor: sqlite3.Cursor) -> None:
         """과거 slippage_analysis 스키마에 누락된 컬럼을 보강한다."""
@@ -513,6 +562,11 @@ class DatabaseManager:
         if entry_conf is None:
             # Backward-compatible fallback for older payloads that only carry direction confidence.
             entry_conf = _fn(trade_data.get("pred_mu_dir_conf"))
+        sigma_val = _fn(trade_data.get("sigma"))
+        if sigma_val is None:
+            sigma_val = _fn(trade_data.get("lev_sigma_used"))
+        if sigma_val is None:
+            sigma_val = _fn(trade_data.get("lev_sigma_raw"))
 
         return (
             trade_data.get("symbol"),
@@ -546,6 +600,7 @@ class DatabaseManager:
             trade_data.get("regime"),
             _fn(trade_data.get("alpha_vpin")),
             _fn(trade_data.get("alpha_hurst")),
+            sigma_val,
             _fn(trade_data.get("pred_mu_alpha")),
             _fn(trade_data.get("pred_mu_dir_conf")),
             _fn(trade_data.get("policy_score_threshold")),
@@ -659,12 +714,12 @@ class DatabaseManager:
                     trading_mode, pos_source, exec_type, order_id, timestamp_ms,
                     entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
                     realized_pnl, roe, hold_duration_sec,
-                    trade_uid, entry_id, entry_link_id, regime, alpha_vpin, alpha_hurst,
+                    trade_uid, entry_id, entry_link_id, regime, alpha_vpin, alpha_hurst, sigma,
                     pred_mu_alpha, pred_mu_dir_conf,
                     policy_score_threshold, policy_event_exit_min_score, policy_unrealized_dd_floor,
                     entry_quality_score, one_way_move_score, leverage_signal_score,
                     raw_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, params)
             conn.commit()
 
@@ -678,12 +733,12 @@ class DatabaseManager:
                 trading_mode, pos_source, exec_type, order_id, timestamp_ms,
                 entry_group, entry_rank, entry_reason, entry_ev, entry_kelly, entry_confidence,
                 realized_pnl, roe, hold_duration_sec,
-                trade_uid, entry_id, entry_link_id, regime, alpha_vpin, alpha_hurst,
+                trade_uid, entry_id, entry_link_id, regime, alpha_vpin, alpha_hurst, sigma,
                 pred_mu_alpha, pred_mu_dir_conf,
                 policy_score_threshold, policy_event_exit_min_score, policy_unrealized_dd_floor,
                 entry_quality_score, one_way_move_score, leverage_signal_score,
                 raw_data
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             params,
         )

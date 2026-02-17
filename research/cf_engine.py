@@ -165,6 +165,15 @@ class TradeLoader:
                 ts = d.get("timestamp_ms") or 0
                 if since_ms and ts < since_ms:
                     continue
+                sigma_val = d.get("sigma")
+                if sigma_val is None:
+                    sigma_val = entry.get("sigma")
+                try:
+                    sigma_num = float(sigma_val) if sigma_val is not None else 0.5
+                except Exception:
+                    sigma_num = 0.5
+                if sigma_num <= 0:
+                    sigma_num = 0.5
                 t = Trade(
                     trade_uid=d.get("trade_uid") or link_id,
                     symbol=d.get("symbol") or "",
@@ -185,7 +194,7 @@ class TradeLoader:
                     dir_conf=float(d.get("pred_mu_dir_conf") or entry.get("pred_mu_dir_conf") or 0.5),
                     vpin=float(d.get("alpha_vpin") or entry.get("alpha_vpin") or 0),
                     hurst=float(d.get("alpha_hurst") or entry.get("alpha_hurst") or 0.5),
-                    sigma=float(raw.get("lev_sigma_used") or raw.get("lev_sigma_raw") or 0.5),
+                    sigma=float(sigma_num),
                     entry_quality=float(entry.get("entry_quality_score") or 0),
                     leverage_signal=float(entry.get("leverage_signal_score") or 0),
                     raw=raw,
@@ -462,6 +471,69 @@ class VPINFilterSimulator(StageSimulator):
     def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
         max_vpin = params.get("max_vpin", 0.80)
         return [t for t in trades if t.vpin <= max_vpin]
+
+
+class VolatilityGateSimulator(StageSimulator):
+    """
+    Sigma/VPIN 2축 진입 게이트 + chop 구간 빠른 청산 proxy.
+    목적: chop 내 국소적 한방향 움직임만 선별해 짧게 수확.
+    """
+
+    stage_name = "volatility_gate"
+    description = "변동성 게이트: chop sigma/vpin/dir_conf/mu_alpha 강도 기반 진입 + 빠른 청산"
+    max_combos_hint = 240
+
+    def get_param_grid(self) -> dict[str, list]:
+        return {
+            "scope": ["chop_only", "all_regimes"],
+            "chop_min_sigma": [0.10, 0.20, 0.35, 0.50, 0.80],
+            "chop_max_sigma": [0.80, 1.20, 1.80, 2.50, 4.00],
+            "chop_max_vpin": [0.20, 0.30, 0.40, 0.50, 0.65],
+            "chop_min_dir_conf": [0.52, 0.56, 0.60, 0.64, 0.68],
+            "chop_min_abs_mu_alpha": [0.0, 5.0, 10.0, 20.0, 40.0],
+            "chop_max_hold_sec": [180, 300, 450, 600, 900],
+        }
+
+    def simulate(self, trades: list[Trade], params: dict) -> list[Trade]:
+        scope = str(params.get("scope", "chop_only") or "chop_only").strip().lower()
+        min_sigma = float(params.get("chop_min_sigma", 0.20))
+        max_sigma = float(params.get("chop_max_sigma", 2.50))
+        max_vpin = float(params.get("chop_max_vpin", 0.40))
+        min_dir_conf = float(params.get("chop_min_dir_conf", 0.56))
+        min_abs_mu = float(params.get("chop_min_abs_mu_alpha", 5.0))
+        max_hold_sec = float(params.get("chop_max_hold_sec", 600))
+        if max_sigma < min_sigma:
+            min_sigma, max_sigma = max_sigma, min_sigma
+
+        out: list[Trade] = []
+        for t in trades:
+            regime = str(t.regime or "").strip().lower()
+            apply_gate = bool(scope != "chop_only" or regime == "chop")
+            if not apply_gate:
+                out.append(t)
+                continue
+
+            sigma = float(t.sigma or 0.0)
+            vpin = float(t.vpin or 0.0)
+            dir_conf = float(t.dir_conf or 0.0)
+            mu_abs = abs(float(t.mu_alpha or 0.0))
+            if sigma < min_sigma or sigma > max_sigma:
+                continue
+            if vpin > max_vpin:
+                continue
+            if dir_conf < min_dir_conf:
+                continue
+            if mu_abs < min_abs_mu:
+                continue
+
+            t2 = copy.copy(t)
+            if float(t2.hold_duration_sec or 0.0) > max_hold_sec:
+                if float(t2.realized_pnl or 0.0) > 0:
+                    t2.realized_pnl = float(t2.realized_pnl) * 0.88
+                else:
+                    t2.realized_pnl = float(t2.realized_pnl) * 0.60
+            out.append(t2)
+        return out
 
 
 class ExitReasonSimulator(StageSimulator):
@@ -1344,6 +1416,7 @@ ALL_SIMULATORS = [
     EntryFilterSimulator(),
     DirectionSimulator(),
     VPINFilterSimulator(),
+    VolatilityGateSimulator(),
     ExitReasonSimulator(),
     CapitalAllocationSimulator(),
     RegimeMultiplierSimulator(),

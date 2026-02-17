@@ -6977,6 +6977,42 @@ class LiveOrchestrator:
                 else:
                     chop_vpin_ok = True
 
+        # Chop volatility gate: sigma band + low-toxicity에서만 국소 추세 진입 허용.
+        chop_vol_ok = None
+        if is_entry and regime in ("chop",):
+            try:
+                chop_vol_enabled = str(os.environ.get("CHOP_VOL_GATE_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                chop_vol_enabled = True
+            if chop_vol_enabled:
+                try:
+                    chop_min_sigma = float(os.environ.get("CHOP_VOL_GATE_MIN_SIGMA", 0.20) or 0.20)
+                except Exception:
+                    chop_min_sigma = 0.20
+                try:
+                    chop_max_sigma = float(os.environ.get("CHOP_VOL_GATE_MAX_SIGMA", 2.50) or 2.50)
+                except Exception:
+                    chop_max_sigma = 2.50
+                if chop_max_sigma < chop_min_sigma:
+                    chop_min_sigma, chop_max_sigma = chop_max_sigma, chop_min_sigma
+                sigma_val_chop = self._decision_metric_float(decision, meta, ("sigma_annual", "sigma", "lev_sigma_used"), default=None)
+                if sigma_val_chop is not None and (
+                    float(sigma_val_chop) < float(chop_min_sigma) or float(sigma_val_chop) > float(chop_max_sigma)
+                ):
+                    chop_vol_ok = False
+                    if isinstance(meta, dict):
+                        meta["chop_vol_blocked"] = True
+                        meta["chop_vol_sigma"] = float(sigma_val_chop)
+                        meta["chop_vol_min_sigma"] = float(chop_min_sigma)
+                        meta["chop_vol_max_sigma"] = float(chop_max_sigma)
+                        decision["meta"] = meta
+                    self._log(
+                        f"[CHOP_VOL] {sym} blocked: sigma={float(sigma_val_chop):.4f} "
+                        f"outside [{float(chop_min_sigma):.4f},{float(chop_max_sigma):.4f}]"
+                    )
+                elif sigma_val_chop is not None:
+                    chop_vol_ok = True
+
         # [FIX 2026-02-01] mu_alpha Direction Alignment Gate
         # CF evidence: 70.1% misaligned trades (mu<0 but LONG), WR(aligned)=47% vs WR(misaligned)=31.5%
         # Savings from blocking misaligned: ~$46
@@ -7112,6 +7148,7 @@ class LiveOrchestrator:
             "lev_floor_lock": lev_floor_lock_ok,
             "chop_guard": chop_guard_ok,
             "chop_vpin": chop_vpin_ok,
+            "chop_vol": chop_vol_ok,
             "liq": liq_ok,
             "min_notional": min_notional_ok,
             "min_exposure": min_exposure_ok,
@@ -7126,7 +7163,7 @@ class LiveOrchestrator:
         }
         if not is_entry:
             # Entry-only filters shouldn't show as blocked for non-entry decisions.
-            for k in ("unified", "spread", "event_cvar", "event_exit", "both_ev_neg", "gross_ev", "net_expectancy", "dir_gate", "regime_dir_gate", "mu_align_gate", "tod_filter", "symbol_quality", "lev_floor_lock", "chop_guard", "chop_vpin", "liq", "min_notional", "min_exposure", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
+            for k in ("unified", "spread", "event_cvar", "event_exit", "both_ev_neg", "gross_ev", "net_expectancy", "dir_gate", "regime_dir_gate", "mu_align_gate", "tod_filter", "symbol_quality", "lev_floor_lock", "chop_guard", "chop_vpin", "chop_vol", "liq", "min_notional", "min_exposure", "tick_vol", "fee", "top_n", "pre_mc", "cap", "cap_safety", "cap_positions", "cap_exposure"):
                 out[k] = None
         return out
 
@@ -7276,6 +7313,10 @@ class LiveOrchestrator:
             return False, "tod_filter"
         if fs.get("chop_guard") is False and "chop_guard" not in overrides:
             return False, "chop_guard"
+        if fs.get("chop_vpin") is False and "chop_vpin" not in overrides:
+            return False, "chop_vpin"
+        if fs.get("chop_vol") is False and "chop_vol" not in overrides:
+            return False, "chop_vol"
         sq_filter_enabled = str(os.environ.get("SYMBOL_QUALITY_FILTER_ENABLED", "1")).strip().lower() in ("1", "true", "yes", "on")
         if sq_filter_enabled and fs.get("symbol_quality") is False and "symbol_quality" not in overrides:
             return False, "symbol_quality"
@@ -7733,6 +7774,21 @@ class LiveOrchestrator:
         # ── Signal 3: Volatility ──
         rets_log = [math.log(closes[i] / closes[i - 1]) for i in range(max(1, n - 180), n) if closes[i-1] > 0]
         vol = float(np.std(rets_log)) if rets_log else 0.0
+        try:
+            vol_sig_min = float(os.environ.get("REGIME_VOLATILE_SIGMA_MIN", 0.0018) or 0.0018)
+        except Exception:
+            vol_sig_min = 0.0018
+        try:
+            vol_adx_max = float(os.environ.get("REGIME_VOLATILE_ADX_MAX", 22.0) or 22.0)
+        except Exception:
+            vol_adx_max = 22.0
+        try:
+            vol_slope_pct_max = float(os.environ.get("REGIME_VOLATILE_SLOPE_PCT_MAX", 0.0030) or 0.0030)
+        except Exception:
+            vol_slope_pct_max = 0.0030
+        vol_sig_min = float(max(1e-6, vol_sig_min))
+        vol_adx_max = float(max(1.0, vol_adx_max))
+        vol_slope_pct_max = float(max(1e-5, vol_slope_pct_max))
         
         # ── Signal 4: HMM (기존 alpha_state에서 가져오기) ──
         hmm_vote = 0  # -1=down, 0=chop, +1=up
@@ -7741,7 +7797,7 @@ class LiveOrchestrator:
         
         # ── Ensemble 결정 ──
         # Volatile: 높은 변동성 + 약한 추세
-        if vol > 0.008 and adx_val < 20 and abs(slope_short) < price * 0.003:
+        if vol > vol_sig_min and adx_val < vol_adx_max and abs(slope_short) < price * vol_slope_pct_max:
             return "volatile"
         
         # 강한 추세: ADX > 20 또는 SMA cross + slope 확인
@@ -8778,6 +8834,17 @@ class LiveOrchestrator:
             pos["alpha_vpin"] = float(max(0.0, min(1.0, vpin)))
         if hurst is not None:
             pos["alpha_hurst"] = float(max(0.0, min(1.0, hurst)))
+        sigma_used = _pick_float(
+            meta.get("lev_sigma_used"),
+            meta.get("sigma_annual"),
+            meta.get("sigma"),
+            (decision or {}).get("sigma") if isinstance(decision, dict) else None,
+            ctx.get("sigma"),
+            pos.get("lev_sigma_used"),
+            pos.get("lev_sigma_raw"),
+        )
+        if sigma_used is not None:
+            pos["lev_sigma_used"] = float(max(1e-6, sigma_used))
 
         mu_alpha = _pick_float(
             meta.get("mu_alpha"),
@@ -9190,6 +9257,8 @@ class LiveOrchestrator:
             pos["alpha_vpin"] = 0.0
         if pos.get("alpha_hurst") is None:
             pos["alpha_hurst"] = 0.5
+        if pos.get("lev_sigma_used") is None:
+            pos["lev_sigma_used"] = 0.5
         if pos.get("pred_mu_alpha") is None:
             pos["pred_mu_alpha"] = 0.0
         if pos.get("pred_mu_dir_conf") is None:
@@ -14380,6 +14449,7 @@ class LiveOrchestrator:
             "regime": pos.get("regime"),
             "alpha_vpin": pos.get("alpha_vpin"),
             "alpha_hurst": pos.get("alpha_hurst"),
+            "sigma": pos.get("lev_sigma_used"),
             "policy_score_threshold": pos.get("policy_score_threshold"),
             "policy_event_exit_min_score": pos.get("policy_event_exit_min_score"),
             "policy_unrealized_dd_floor": pos.get("policy_unrealized_dd_floor"),
@@ -14501,6 +14571,7 @@ class LiveOrchestrator:
                 "regime": pos.get("regime"),
                 "alpha_vpin": pos.get("alpha_vpin"),
                 "alpha_hurst": pos.get("alpha_hurst"),
+                "sigma": pos.get("lev_sigma_used"),
                 "pred_mu_alpha": pos.get("pred_mu_alpha"),
                 "pred_mu_dir_conf": pos.get("pred_mu_dir_conf"),
                 "policy_score_threshold": pos.get("policy_score_threshold"),

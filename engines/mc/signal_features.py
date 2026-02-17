@@ -340,7 +340,18 @@ class MonteCarloSignalFeaturesMixin:
             return "bear"
         if label == 2:
             return "bull"
-        return "volatile" if vol > 0.01 else "chop"
+        try:
+            vol_th = float(
+                os.environ.get(
+                    "REGIME_VOLATILE_SIGMA_MIN_CLUSTER",
+                    os.environ.get("REGIME_VOLATILE_SIGMA_MIN", 0.0018),
+                )
+                or 0.0018
+            )
+        except Exception:
+            vol_th = 0.0018
+        vol_th = float(max(1e-6, vol_th))
+        return "volatile" if vol > vol_th else "chop"
 
     # -----------------------------
     # Slippage model
