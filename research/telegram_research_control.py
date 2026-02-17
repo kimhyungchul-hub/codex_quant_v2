@@ -137,6 +137,7 @@ class TelegramResearchControl:
             "- /rq_help : 도움말\n"
             "- /rq_status : 현재 연구 설정/주기\n"
             "- /rq_models : OpenAI 사용 가능 모델 목록\n"
+            "- /rq_ask <질문> : OpenAI 자유 질의응답\n"
             "- /rq_review : 즉시 OpenAI 리뷰 실행\n"
             "- /rq_review <프롬프트> : 사용자 프롬프트를 추가해 즉시 리뷰\n"
             "- /rq_apply all : 최신 OpenAI 제안 전체 env 변경 적용\n"
@@ -176,6 +177,13 @@ class TelegramResearchControl:
             return {"type": "list_models"}
         if low in ("/rq_cf_now", "/research_now", "연구 지금"):
             return {"type": "run_cf_now"}
+
+        if low.startswith("/rq_ask"):
+            parts = raw.split(maxsplit=1)
+            q = parts[1].strip() if len(parts) > 1 else ""
+            if not q:
+                return {"type": "error", "message": "사용법: /rq_ask <질문>"}
+            return {"type": "ask_openai", "question": q}
 
         if low.startswith("/rq_review") or low.startswith("/rq_prompt"):
             parts = raw.split(maxsplit=1)

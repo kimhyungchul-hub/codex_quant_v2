@@ -32,6 +32,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REVIEW_OUTPUT = PROJECT_ROOT / "docs" / "OPENAI_REVIEW.md"
 REVIEW_HISTORY = PROJECT_ROOT / "state" / "openai_review_history.json"
 REVIEW_LATEST = PROJECT_ROOT / "state" / "openai_review_latest.json"
+QA_HISTORY = PROJECT_ROOT / "state" / "openai_qa_history.json"
 
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 DEFAULT_OPENAI_API_URL = "https://api.openai.com/v1/responses"
@@ -475,6 +476,77 @@ def list_available_models() -> list[str]:
         if mid:
             ids.append(mid)
     return sorted(set(ids))
+
+
+def _append_qa_history(row: dict) -> None:
+    rows: list[dict] = []
+    try:
+        if QA_HISTORY.exists():
+            loaded = json.loads(QA_HISTORY.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                rows = [x for x in loaded if isinstance(x, dict)]
+    except Exception:
+        rows = []
+    rows.append(row)
+    rows = rows[-200:]
+    QA_HISTORY.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def ask_openai_question(question: str, *, context: dict | None = None) -> dict:
+    q = str(question or "").strip()
+    if not q:
+        return {"status": "error", "reason": "empty_question"}
+    api_key = _get_api_key()
+    if not api_key:
+        return {"status": "disabled", "reason": "no_api_key"}
+    model = str(os.environ.get("OPENAI_ASK_MODEL") or _runtime_model()).strip() or _runtime_model()
+    api_url = _runtime_api_url()
+
+    prompt_parts = [
+        "# Codex Quant OpenAI Q&A",
+        "당신은 기관급 퀀트 트레이딩 시스템 연구 어시스턴트입니다.",
+        "요청 언어가 한국어면 한국어로 답하고, 추정은 '추정'이라고 명시하세요.",
+        "답변은 짧고 실행 가능한 형태로 작성하세요.",
+        "",
+        "## 사용자 질문",
+        q,
+    ]
+    if isinstance(context, dict) and context:
+        try:
+            prompt_parts.extend(
+                [
+                    "",
+                    "## 현재 실행 컨텍스트(JSON)",
+                    json.dumps(context, ensure_ascii=False, indent=2)[:10000],
+                ]
+            )
+        except Exception:
+            pass
+    prompt_parts.extend(
+        [
+            "",
+            "## 응답 형식",
+            "- 핵심 답변 3~10줄",
+            "- 필요 시 숫자/임계치/명령어를 포함",
+        ]
+    )
+    prompt = "\n".join(prompt_parts)
+    text = _call_openai(prompt, api_key, model=model, api_url=api_url)
+    if not text:
+        return {"status": "error", "reason": "api_call_failed", "model": model}
+    answer = str(text).strip()
+    out = {
+        "status": "ok",
+        "model": model,
+        "question": q[:800],
+        "answer": answer[:12000],
+        "timestamp": float(time.time()),
+    }
+    try:
+        _append_qa_history(out)
+    except Exception:
+        pass
+    return out
 
 
 def apply_latest_review_suggestions(

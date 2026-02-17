@@ -999,6 +999,42 @@ def _handle_telegram_actions(
                     telegram_ctl.send_text("[OpenAI Models] 모델 조회 실패 또는 결과 없음")
                 else:
                     telegram_ctl.send_text("[OpenAI Models]\n" + "\n".join(mids))
+            elif atype == "ask_openai":
+                from research.openai_reviewer import ask_openai_question
+
+                question = str(action.get("question") or "").strip()
+                if not question:
+                    telegram_ctl.send_text("사용법: /rq_ask <질문>")
+                    continue
+                ctx = {
+                    "last_status": str((last_result or {}).get("status") or "unknown"),
+                    "research_mode": str((last_result or {}).get("research_mode") or "normal"),
+                    "cycle_max_combos": int((last_result or {}).get("cycle_max_combos") or args.max_combos),
+                    "ensemble_runs": int((last_result or {}).get("ensemble_runs") or 1),
+                    "latest_findings": [
+                        {
+                            "stage": str(f.get("stage") or ""),
+                            "title": str(f.get("title") or ""),
+                            "confidence": float(f.get("confidence") or 0.0),
+                            "improvement_pct": float(f.get("improvement_pct") or 0.0),
+                        }
+                        for f in (last_findings or [])[:5]
+                        if isinstance(f, dict)
+                    ],
+                }
+                status = ask_openai_question(question, context=ctx)
+                if status.get("status") == "ok":
+                    telegram_ctl.send_text(
+                        "[OpenAI Q&A]\n"
+                        f"Q: {question}\n\n"
+                        f"A:\n{str(status.get('answer') or '').strip()}"
+                    )
+                else:
+                    telegram_ctl.send_text(
+                        "[OpenAI Q&A] 실패\n"
+                        f"- reason: {status.get('reason', 'unknown')}\n"
+                        f"- model: {status.get('model', '?')}"
+                    )
             elif atype == "run_openai_review":
                 prompt_override = action.get("prompt")
                 telegram_ctl.send_text("[Research] OpenAI 리뷰 수동 실행 시작")
