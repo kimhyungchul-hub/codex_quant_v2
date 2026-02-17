@@ -151,6 +151,7 @@ from core.continuous_opportunity import ContinuousOpportunityChecker
 from core.multi_timeframe_scoring import check_position_switching
 from core.database_manager import DatabaseManager, TradingMode
 from utils.mtf_dl_runtime import MTFDLRuntimeScorer
+from utils.singleton_process_lock import SingletonProcessLock
 
 PORT = 9999
 DASHBOARD_HOST = str(os.environ.get("DASHBOARD_HOST", "127.0.0.1")).strip() or "127.0.0.1"
@@ -765,6 +766,7 @@ class LiveOrchestrator:
         self.db = DatabaseManager(db_path=self._db_path)
         self._bootstrap_state_from_db_if_empty()
         self._refresh_closed_trade_counter()
+        self._blocked_entry_last_logged: dict[tuple[str, str, str], int] = {}
         self._load_event_alignment_anchor(force=False)
         self._bootstrap_event_alignment_samples(force=True)
         self._bootstrap_event_alignment_since_anchor(force=True)
@@ -7415,6 +7417,111 @@ class LiveOrchestrator:
             meta = decision.get("meta") or {}
             raw = meta.get("entry_override_filters") or meta.get("override_filters") or meta.get("override_filters_entry")
         return self._normalize_filter_overrides(raw)
+
+    def _record_blocked_entry_candidate(
+        self,
+        sym: str,
+        decision: dict | None,
+        deny_reason: str,
+        ts_ms: int,
+        *,
+        price: float | None = None,
+    ) -> None:
+        if not decision:
+            return
+        if not hasattr(self, "db") or self.db is None:
+            return
+        try:
+            enabled = str(os.environ.get("BLOCKED_ENTRY_CANDIDATE_DB_ENABLED", "1")).strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+        except Exception:
+            enabled = True
+        if not enabled:
+            return
+        action = str(decision.get("action") or "").upper()
+        if action not in ("LONG", "SHORT"):
+            return
+        reason = str(deny_reason or "").strip().lower()
+        if not reason:
+            return
+        try:
+            cooldown_sec = float(os.environ.get("BLOCKED_ENTRY_CANDIDATE_COOLDOWN_SEC", 90.0) or 90.0)
+        except Exception:
+            cooldown_sec = 90.0
+
+        key = (str(sym), str(action), str(reason))
+        try:
+            last_ts = int(self._blocked_entry_last_logged.get(key, 0) or 0)
+        except Exception:
+            last_ts = 0
+        if cooldown_sec > 0 and last_ts > 0:
+            if (int(ts_ms) - int(last_ts)) < int(max(1.0, cooldown_sec) * 1000.0):
+                return
+
+        meta = dict(decision.get("meta") or {})
+        fs = decision.get("filter_states")
+        if not isinstance(fs, dict):
+            fs = meta.get("filter_states") if isinstance(meta.get("filter_states"), dict) else {}
+        blocked_filters = [str(k) for k, v in (fs or {}).items() if v is False]
+        if not blocked_filters:
+            blocked_filters = [reason]
+
+        score = self._safe_float(decision.get("hybrid_score"), None)
+        if score is None:
+            score = self._safe_float(decision.get("unified_score"), None)
+        if score is None:
+            if action == "LONG":
+                score = self._safe_float(meta.get("policy_ev_score_long"), None)
+            elif action == "SHORT":
+                score = self._safe_float(meta.get("policy_ev_score_short"), None)
+
+        meta_snapshot = {
+            "entry_override_filters": meta.get("entry_override_filters"),
+            "filter_states": fs,
+            "mu_alpha": self._safe_float(meta.get("mu_alpha"), None),
+            "mu_dir_prob_long": self._safe_float(meta.get("mu_dir_prob_long"), None),
+            "mu_dir_conf": self._safe_float(meta.get("mu_dir_conf"), None),
+            "mu_dir_edge": self._safe_float(meta.get("mu_dir_edge"), None),
+            "vpin": self._safe_float(meta.get("vpin"), None),
+            "sigma": self._safe_float(meta.get("sigma"), None),
+            "net_expectancy_effective": self._safe_float(meta.get("net_expectancy_effective"), None),
+            "net_expectancy_min": self._safe_float(meta.get("net_expectancy_min"), None),
+            "mtf_dl_entry_ok": meta.get("mtf_dl_entry_ok"),
+            "top_n_ok": meta.get("top_n_ok"),
+            "pre_mc_ok": meta.get("pre_mc_ok"),
+            "cap_ok": meta.get("cap_ok"),
+        }
+
+        payload = {
+            "timestamp_ms": int(ts_ms),
+            "symbol": str(sym),
+            "action": str(action),
+            "deny_reason": str(reason),
+            "blocked_filters": blocked_filters,
+            "regime": str(meta.get("regime") or decision.get("regime") or ""),
+            "price": self._safe_float(price, None),
+            "ev": self._safe_float(decision.get("ev"), None),
+            "confidence": self._safe_float(decision.get("confidence"), None),
+            "kelly": self._safe_float(decision.get("kelly"), None),
+            "score": score,
+            "est_notional": self._safe_float(meta.get("est_notional"), None),
+            "min_entry_notional": self._safe_float(meta.get("min_entry_notional"), None),
+            "top_n_rank": meta.get("top_n_rank"),
+            "top_n_limit": meta.get("top_n_limit"),
+            "meta_json": meta_snapshot,
+        }
+
+        try:
+            self.db.log_blocked_entry_candidate_background(payload, mode=self._trading_mode)
+            self._blocked_entry_last_logged[key] = int(ts_ms)
+            if len(self._blocked_entry_last_logged) > 4096:
+                cutoff = int(ts_ms) - int(max(300.0, cooldown_sec) * 1000.0)
+                self._blocked_entry_last_logged = {
+                    k: v for k, v in self._blocked_entry_last_logged.items() if int(v) >= cutoff
+                }
+        except Exception:
+            return
 
     def _entry_permit(self, sym: str, decision: dict, ts_ms: int) -> tuple[bool, str]:
         fs = None
@@ -16457,6 +16564,13 @@ class LiveOrchestrator:
                     if permit:
                         self._enter_position(sym, decision["action"], float(price), decision, ts, ctx=ctx, leverage_override=dyn_leverage)
                     else:
+                        self._record_blocked_entry_candidate(
+                            sym,
+                            decision,
+                            deny_reason,
+                            int(ts),
+                            price=float(price),
+                        )
                         if log_this_cycle:
                             self._log(f"[{sym}] skip entry (permit: {deny_reason}) ev={decision.get('ev', 0):.4f} win={decision.get('confidence', 0):.2f}")
 
@@ -22423,4 +22537,12 @@ async def main():
 
 
 if __name__ == "__main__":
+    _engine_lock = SingletonProcessLock(Path(__file__).resolve().parent / "state" / "locks" / "trading_engine.lock")
+    if not _engine_lock.acquire(role="trading_engine", extra={"entrypoint": "main_engine_mc_v2_final.py"}):
+        _owner = _engine_lock.owner_pid
+        print(
+            f"[BOOT] another trading engine is already running "
+            f"(owner_pid={_owner if _owner is not None else 'unknown'}); exiting duplicate process."
+        )
+        raise SystemExit(0)
     asyncio.run(main())

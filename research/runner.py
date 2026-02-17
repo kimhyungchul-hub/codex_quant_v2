@@ -44,6 +44,7 @@ from research.documenter import (
     generate_findings_markdown,
     generate_changelog_entry,
 )
+from utils.singleton_process_lock import SingletonProcessLock
 
 logger = logging.getLogger("research.runner")
 
@@ -876,6 +877,14 @@ def run_gemini_cycle(findings: list[dict]) -> dict:
 
 def main():
     setup_logging()
+    lock = SingletonProcessLock(Path(PROJECT_ROOT) / "state" / "locks" / "research_engine.lock")
+    if not lock.acquire(role="research_engine", extra={"entrypoint": "research.runner"}):
+        owner = lock.owner_pid
+        logger.warning(
+            "Another research engine is already running (owner_pid=%s). Exiting duplicate process.",
+            owner if owner is not None else "unknown",
+        )
+        return
     parser = argparse.ArgumentParser(description="Codex Quant Research Engine v2")
     parser.add_argument("--db", default=DEFAULT_DB, help="SQLite database path")
     parser.add_argument("--once", action="store_true", help="Run once and exit")

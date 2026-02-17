@@ -1,6 +1,6 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-18 00:52
+> Auto-generated: 2026-02-18 00:57
 > Baseline: 4638 trades, PnL=$-73.36, WR=36.5%, R:R=1.43
 
 ## Pipeline Stage Impact Summary
@@ -136,42 +136,42 @@
 
 ### DIRECTION_GATE — direction_gate
 
-**Best Finding:** direction_gate: PnL +$94.44
-- Improvement: $+94.44
-- Confidence: 78%
-- Parameters: `{"dir_gate_min_conf": 0.7, "dir_gate_min_edge": 0.06, "dir_gate_min_side_prob": 0.6}`
+**Best Finding:** direction_gate: PnL +$102.30
+- Improvement: $+102.30
+- Confidence: 86%
+- Parameters: `{"dir_gate_min_conf": 0.7, "dir_gate_min_edge": 0.184, "dir_gate_min_side_prob": 0.7}`
 
 ```
 [DIRECTION_GATE] 파라미터 변경 제안:
   dir_gate_min_conf = 0.7
-  dir_gate_min_edge = 0.06
-  dir_gate_min_side_prob = 0.6
-예상 효과: PnL $+94.44, WR -0.4%, R:R +0.89
-신뢰도: 77.8%
+  dir_gate_min_edge = 0.184
+  dir_gate_min_side_prob = 0.7
+예상 효과: PnL $+102.30, WR +6.6%, R:R +0.64
+신뢰도: 86.0%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4638 | 843 | -3795 |
-| pnl | -73.36 | 21.07 | +94.44 |
-| wr | 0.3650 | 0.3606 | -0.0044 |
-| rr | 1.43 | 2.32 | +0.89 |
-| edge | -0.0468 | 0.0590 | +0.1058 |
-| sharpe | -1.31 | 0.58 | +1.90 |
-| pf | 0.82 | 1.31 | +0.49 |
+| n | 4638 | 605 | -4033 |
+| pnl | -73.36 | 28.94 | +102.30 |
+| wr | 0.3650 | 0.4314 | +0.0664 |
+| rr | 1.43 | 2.06 | +0.64 |
+| edge | -0.0468 | 0.1050 | +0.1518 |
+| sharpe | -1.31 | 0.82 | +2.13 |
+| pf | 0.82 | 1.57 | +0.74 |
 
 ### ENTRY_FILTER — 진입 필터
 
 **Best Finding:** entry_filter: PnL +$91.70
 - Improvement: $+91.70
 - Confidence: 69%
-- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.3, "min_ev": 0.02}`
+- Parameters: `{"min_confidence": 0.55, "min_dir_conf": 0.65, "min_entry_quality": 0.4, "min_ev": 0.02}`
 
 ```
 [ENTRY_FILTER] 파라미터 변경 제안:
   min_confidence = 0.55
   min_dir_conf = 0.65
-  min_entry_quality = 0.3
+  min_entry_quality = 0.4
   min_ev = 0.02
 예상 효과: PnL $+91.70, WR +9.2%, R:R +0.29
 신뢰도: 68.5%

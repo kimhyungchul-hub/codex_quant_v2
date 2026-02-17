@@ -52,6 +52,7 @@ class DatabaseManager:
     6. slippage_analysis: 슬리피지 분석 (Live 전용)
     7. diagnostics: 내부 진단 메트릭
     8. exit_policy_state: Exit policy 상태 (영속화)
+    9. entry_blocked_candidates: 미진입 후보(필터 차단) 구조화 로그
     """
     
     def __init__(self, db_path: str = "state/bot_data.db"):
@@ -412,6 +413,32 @@ class DatabaseManager:
                     UNIQUE(timestamp_ms, symbol)
                 )
             """)
+
+            # ─────────────────────────────────────────────────────────────────
+            # 9. 미진입 후보 (Entry blocked candidates)
+            # ─────────────────────────────────────────────────────────────────
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS entry_blocked_candidates (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_ms INTEGER NOT NULL,
+                    trading_mode TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    action TEXT,
+                    deny_reason TEXT NOT NULL,
+                    blocked_filters TEXT,
+                    regime TEXT,
+                    price REAL,
+                    ev REAL,
+                    confidence REAL,
+                    kelly REAL,
+                    score REAL,
+                    est_notional REAL,
+                    min_entry_notional REAL,
+                    top_n_rank INTEGER,
+                    top_n_limit INTEGER,
+                    meta_json TEXT
+                )
+            """)
             
             # ─────────────────────────────────────────────────────────────────
             # 인덱스 생성 (조회 속도 향상)
@@ -432,6 +459,10 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_diag_type ON diagnostics(metric_type);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_evph_ts ON evph_history(timestamp_ms);")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_evph_symbol ON evph_history(symbol);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_blocked_ts ON entry_blocked_candidates(timestamp_ms);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_blocked_symbol ON entry_blocked_candidates(symbol);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_blocked_reason ON entry_blocked_candidates(deny_reason);")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_blocked_mode ON entry_blocked_candidates(trading_mode);")
             
             conn.commit()
             logger.info("Database tables initialized successfully")
@@ -628,6 +659,57 @@ class DatabaseManager:
             equity_data.get("total_leverage"),
         )
 
+    def _prepare_blocked_entry_params(self, candidate_data: Dict[str, Any], mode: TradingMode) -> Tuple:
+        def _fn(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        def _in(val: Any) -> Optional[int]:
+            if val is None:
+                return None
+            try:
+                return int(val)
+            except Exception:
+                return None
+
+        blocked = candidate_data.get("blocked_filters")
+        if isinstance(blocked, (list, tuple, set)):
+            blocked_json = json.dumps([str(x) for x in blocked if x is not None], ensure_ascii=False)
+        elif blocked is None:
+            blocked_json = None
+        else:
+            blocked_json = json.dumps([str(blocked)], ensure_ascii=False)
+
+        meta_json = candidate_data.get("meta_json")
+        if isinstance(meta_json, (dict, list)):
+            meta_json = json.dumps(meta_json, ensure_ascii=False)
+        elif meta_json is not None:
+            meta_json = str(meta_json)
+
+        return (
+            _in(candidate_data.get("timestamp_ms")) or int(time.time() * 1000),
+            mode.value,
+            str(candidate_data.get("symbol") or ""),
+            str(candidate_data.get("action") or "") if candidate_data.get("action") is not None else None,
+            str(candidate_data.get("deny_reason") or ""),
+            blocked_json,
+            str(candidate_data.get("regime") or "") if candidate_data.get("regime") is not None else None,
+            _fn(candidate_data.get("price")),
+            _fn(candidate_data.get("ev")),
+            _fn(candidate_data.get("confidence")),
+            _fn(candidate_data.get("kelly")),
+            _fn(candidate_data.get("score")),
+            _fn(candidate_data.get("est_notional")),
+            _fn(candidate_data.get("min_entry_notional")),
+            _in(candidate_data.get("top_n_rank")),
+            _in(candidate_data.get("top_n_limit")),
+            meta_json,
+        )
+
     def _prepare_position_params(self, symbol: str, pos_data: Dict[str, Any], mode: TradingMode) -> Tuple:
         entry_raw = (
             pos_data.get("entry_time_ms")
@@ -787,6 +869,55 @@ class DatabaseManager:
                 return int((row[0] if row is not None else 0) or 0)
             except Exception:
                 return 0
+
+    def log_blocked_entry_candidate(
+        self,
+        candidate_data: Dict[str, Any],
+        mode: TradingMode = TradingMode.PAPER,
+    ):
+        """미진입 후보(필터 차단)를 구조화 로그로 저장합니다."""
+        with self.lock, self._get_connection() as conn:
+            params = self._prepare_blocked_entry_params(candidate_data, mode)
+            conn.execute(
+                """
+                INSERT INTO entry_blocked_candidates (
+                    timestamp_ms, trading_mode, symbol, action, deny_reason,
+                    blocked_filters, regime, price, ev, confidence, kelly, score,
+                    est_notional, min_entry_notional, top_n_rank, top_n_limit, meta_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+            conn.commit()
+
+    async def log_blocked_entry_candidate_async(
+        self,
+        candidate_data: Dict[str, Any],
+        mode: TradingMode = TradingMode.PAPER,
+    ) -> None:
+        params = self._prepare_blocked_entry_params(candidate_data, mode)
+        await self._execute_async(
+            """
+            INSERT INTO entry_blocked_candidates (
+                timestamp_ms, trading_mode, symbol, action, deny_reason,
+                blocked_filters, regime, price, ev, confidence, kelly, score,
+                est_notional, min_entry_notional, top_n_rank, top_n_limit, meta_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+
+    def log_blocked_entry_candidate_background(
+        self,
+        candidate_data: Dict[str, Any],
+        mode: TradingMode = TradingMode.PAPER,
+    ):
+        coro = self.log_blocked_entry_candidate_async(candidate_data, mode=mode)
+        return self._schedule_async_write(
+            coro,
+            lambda: self.log_blocked_entry_candidate(candidate_data, mode=mode),
+            "log_blocked_entry_candidate",
+        )
 
     # ═══════════════════════════════════════════════════════════════════════
     # 자산 기록 메서드 (Equity History)
@@ -1197,7 +1328,8 @@ class DatabaseManager:
         with self.lock, self._get_connection() as conn:
             cursor = conn.cursor()
             tables = ['trades', 'equity_history', 'positions', 'position_history',
-                      'bot_state', 'slippage_analysis', 'diagnostics', 'evph_history']
+                      'bot_state', 'slippage_analysis', 'diagnostics', 'evph_history',
+                      'entry_blocked_candidates']
             stats = {}
             for table in tables:
                 cursor.execute(f"SELECT COUNT(*) FROM {table}")
