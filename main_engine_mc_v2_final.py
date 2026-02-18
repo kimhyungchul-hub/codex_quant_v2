@@ -15982,6 +15982,26 @@ class LiveOrchestrator:
         ofi_score = ctx.get("ofi_score", 0.0)
 
         try:
+            # Safety hard-stop: when safety_mode is ON, freeze all trading actions
+            # (entry/exit/rebalance) and keep engine in observation-only mode.
+            try:
+                safety_hard_stop = str(os.environ.get("SAFETY_MODE_HARD_STOP", "1")).strip().lower() in ("1", "true", "yes", "on")
+            except Exception:
+                safety_hard_stop = True
+            if bool(self.safety_mode) and bool(safety_hard_stop):
+                decision = dict(decision or {})
+                meta_freeze = dict(decision.get("meta") or {})
+                meta_freeze["safety_mode"] = True
+                meta_freeze["safety_hard_stop"] = True
+                decision["meta"] = meta_freeze
+                decision["action"] = "WAIT"
+                prev_reason = str(decision.get("reason") or "").strip()
+                freeze_reason = "safety_hard_stop"
+                decision["reason"] = f"{prev_reason} | {freeze_reason}" if prev_reason else freeze_reason
+                if log_this_cycle:
+                    self._log(f"[SAFETY_HARD_STOP] {sym} action frozen (entry/exit/rebalance disabled)")
+                return self._row(sym, float(price), ts, decision, candles, ctx=ctx)
+
             # DEBUG: TP/SL keys from decision.meta
             if log_this_cycle and decision:
                 meta = decision.get("meta")
