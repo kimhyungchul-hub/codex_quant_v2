@@ -1,54 +1,65 @@
-# OpenAI Code Review — 2026-02-18 11:28
+# OpenAI Code Review — 2026-02-18 11:54
 
 **Model:** gpt-5.2-codex
 **Risk Score:** 7/10
-**Summary:** 전략 파이프라인은 정교하지만 수수료 이중 차감, 하이브리드 강제 사이징/레버리지, 비결정적 시드 등으로 실제 PnL과 리스크가 왜곡될 가능성이 큽니다.
+**Summary:** 전략은 하이브리드 플래너 중심으로 통일되어 있으나 레버리지/사이징 상한·수수료 이중 차감·VPIN/Chop 게이트 미최적화가 수익성과 리스크에 영향을 줄 가능성이 있습니다.
 
 ## Suggestions
 
-### [P1] net_expectancy 필터의 수수료 이중 차감 제거
-**Category:** logic | **Confidence:** 82%
+### [P1] 하이브리드 출력 레버리지/사이징 상한 강제 클램프
+**Category:** risk | **Confidence:** 74%
 
-문서에 명시된 것처럼 net_expectancy 계산에서 MC EV(이미 수수료 포함)에 추가로 fee_est를 다시 빼는 구조가 있어 유효 EV가 과도하게 음수화됩니다. 이는 거래 기회 과소평가 및 필터 과차단을 유발합니다. net_edge 계산에서 fee_est를 제거하거나, edge_raw를 gross EV로 복원 후 1회만 차감하도록 수정하세요.
+HYBRID_LEVERAGE=100, HYBRID_SIZE_FRAC=1.0 설정이 존재하며 decision.py에서 hybrid 결과의 optimal_leverage/optimal_size가 하드 캡 없이 전달됩니다. 실제 MAX_LEVERAGE/레짐별 UNI_LEV_MAX를 초과하는 값이 paper/live sizing에 반영될 수 있어 청산/과대노출 위험이 큽니다. 결정 결과에 대해 레짐 정책·MAX_LEVERAGE 기준으로 강제 클램프를 추가하세요.
 
-**Code Changes:** main_engine 또는 필터 로직 파일의 _min_filter_states()/net_expectancy 계산부에서 `net_edge = edge_raw - fee_est` → `net_edge = edge_raw` 또는 `net_edge = (edge_raw + fee_est) - fee_est`로 변경. fee_est를 유지하려면 edge_raw를 gross로 재구성해 1회만 차감.
+**Env Changes:** `{'HYBRID_LEVERAGE': '50', 'HYBRID_SIZE_FRAC': '0.35', 'HYBRID_FORCE_SIZE_FRAC': '0'}`
 
-**Expected Impact:** 필터 과차단 완화, EV/score의 실제성과 일치, 거래 기회 회복. 수익성 왜곡 감소.
+**Code Changes:** engines/mc/decision.py: metric_copy['optimal_leverage']와 metric_copy['optimal_size'] 설정 직후, ctx의 max_leverage/RegimePolicy.max_leverage/UNI_LEV_MAX_*와 UNI_MAX_POS_FRAC를 사용해 상한/하한 클램프 로직 추가. core/orchestrator.py:_paper_trade_step에서도 최종 레버리지·사이즈 재클램프.
 
-### [P1] 하이브리드 강제 레버리지/사이징 완화 및 상한 정합성
-**Category:** risk | **Confidence:** 78%
+**Expected Impact:** 과도한 레버리지/풀사이즈 진입 방지, 급격한 MDD 및 강제청산 위험 감소.
 
-현재 HYBRID_LEVERAGE=100, HYBRID_FORCE_SIZE_FRAC=1, HYBRID_SIZE_FRAC=1.0 조합은 리스크 한도를 사실상 우회합니다. 또한 MAX_LEVERAGE=15와 UNI_LEV_MAX=50 간 불일치로 sizing/리스크 모듈 간 충돌이 발생할 수 있습니다. 하이브리드 강제값을 해제하고 레버리지 상한을 운영 상한과 일치시키는 것이 안전합니다.
+### [P1] net_expectancy 이중 수수료 차감 제거
+**Category:** logic | **Confidence:** 70%
 
-**Env Changes:** `{'HYBRID_FORCE_LEVERAGE': '0', 'HYBRID_FORCE_SIZE_FRAC': '0', 'HYBRID_LEVERAGE': '15', 'HYBRID_SIZE_FRAC': '0.20', 'HYBRID_MAX_EXPOSURE': '7.0', 'UNI_LEV_MAX': '15'}`
+docs/SIGNAL_PIPELINE_REFERENCE.md에 명시된대로 net_expectancy 필터에서 MC EV(이미 fee 포함)에서 다시 fee_est를 빼는 이중 차감 문제가 존재합니다. 이는 약한 EV에서 과도한 차단을 유발하여 진입 기회 손실을 초래합니다.
 
-**Code Changes:** engines/mc/decision.py 및 hybrid planner sizing 로직에서 FORCE 플래그가 켜진 경우에도 리스크 캡(UNI_MAX_TOTAL_EXPOSURE, MAX_LEVERAGE)을 우선 적용하도록 우선순위 정렬.
+**Code Changes:** engines/mc/entry_evaluation.py 또는 필터 로직(엔트리 필터 체인)에서 net_edge 계산 시 fee_est를 0으로 두거나, edge_raw에 MC 내 fee를 역산해 복원한 후 1회만 차감하도록 수정.
 
-**Expected Impact:** 레버리지 과잉/전액 노출 방지, 실계좌 리스크 한도와의 정합성 개선, 주문 거절/청산 리스크 감소.
+**Expected Impact:** 불필요한 진입 차단 감소, 낮은 EV 구간의 왜곡 완화로 체결 수익성 개선.
 
-### [P2] MC 시드의 비결정성 제거 (Python hash 사용 금지)
-**Category:** logic | **Confidence:** 73%
+### [P1] VPIN/Chop 게이트 CF 최적값 적용
+**Category:** param | **Confidence:** 66%
 
-현재 시드가 `hash(symbol)`에 의존하여 프로세스 재시작마다 결과가 달라집니다(PYTHONHASHSEED 랜덤). 이는 동일 조건에서 결과 재현성을 깨고 백테스트/실거래 괴리를 키웁니다. 안정적 해시(crc32/xxhash)를 사용해 결정성을 보장하세요.
+최근 CF 결과에서 VPIN 필터 강화(max_vpin=0.3)와 Chop guard 강화(chop_entry_min_dir_conf=0.8, chop_entry_floor_add=0.003)가 유의미한 개선을 보였습니다. 현재 적용값은 완화된 상태(0.5/0.64)로 과도한 잡음 진입 가능성이 큽니다.
 
-**Code Changes:** engines/mc/decision.py: `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)` → `import zlib; seed = int((zlib.crc32(symbol.encode()) ^ seed_window) & 0xFFFFFFFF)`
+**Env Changes:** `{'CHOP_VPIN_MAX': '0.30', 'CHOP_ENTRY_MIN_DIR_CONF': '0.80', 'CHOP_ENTRY_FLOOR_ADD': '0.003'}`
 
-**Expected Impact:** 재현성 향상, 디버깅/CF 분석 정합성 강화, 런 간 결과 변동 감소.
+**Code Changes:** state/bybit.env 및 레짐별 env override에 위 값을 반영. (regime_policy.py에서 CHOP_* 오버라이드 확인)
 
-### [P2] VPIN 과열 구간 제한 (독성 흐름 차단)
-**Category:** param | **Confidence:** 61%
+**Expected Impact:** 잡음/거짓 신호 진입 감소, 승률과 PF 개선 기대.
 
-CF 결과에서 VPIN 필터가 유의미한 개선을 보여줍니다. 현재 UNI_MAX_VPIN_HARD=0.95는 지나치게 관대하여 고독성 유동성 구간 진입을 허용합니다. 보수적으로 0.65~0.35 구간으로 하향하여 손실 구간을 줄일 수 있습니다.
+### [P2] 메타에 대형 벡터 저장 옵션화
+**Category:** perf | **Confidence:** 60%
 
-**Env Changes:** `{'UNI_MAX_VPIN_HARD': '0.65'}`
+entry_evaluation.py에서 ev/cvar/horizon 벡터를 매 심볼마다 리스트로 저장하여 메모리와 직렬화 비용이 증가합니다. 라이브 모드에서는 필요 시에만 저장하도록 플래그화하는 편이 효율적입니다.
 
-**Code Changes:** VPIN 게이트를 참조하는 엔트리 필터(혹은 레버리지 캡)에서 UNI_MAX_VPIN_HARD를 상한으로 강제 적용. 필요 시 경고 로그에 VPIN과 차단 사유 출력.
+**Env Changes:** `{'MC_META_STORE_VECTORS': '0'}`
 
-**Expected Impact:** 독성 흐름 구간 진입 감소, WR 개선 및 tail loss 완화. 거래 수는 감소할 수 있음.
+**Code Changes:** engines/mc/entry_evaluation.py: meta에 ev_vector/cvar_vector/horizon_seq 등을 저장하는 구간을 MC_META_STORE_VECTORS 플래그로 감싸고 기본값을 False로 설정.
+
+**Expected Impact:** 지연 시간/메모리 사용량 감소, GC 부담 완화.
+
+### [P2] 랜덤 시드 안정화 (Python hash 의존 제거)
+**Category:** logic | **Confidence:** 55%
+
+decision.py에서 seed가 Python hash에 의존하여 프로세스 재시작마다 값이 달라질 수 있습니다. 재현성과 디버깅을 위해 stable hash(sha1/xxhash) 기반으로 시드를 생성하는 것이 안전합니다.
+
+**Code Changes:** engines/mc/decision.py: seed 계산 시 hash(symbol) 대신 hashlib.sha1(symbol+window).digest()를 사용해 32bit 정수 시드로 변환.
+
+**Expected Impact:** 재현성 향상, 디버그/백테스트 일관성 확보.
 
 ## Warnings
-- state/bybit.env에 실제 API 키/토큰이 평문으로 포함되어 있어 보안 리스크가 큽니다. 즉시 비밀 관리(환경변수/시크릿 매니저)로 이전하세요.
-- 하이브리드 전용 모드에서 강제 레버리지/사이징이 켜져 있으면 리스크 캡을 우회할 수 있어 실계좌에서 급격한 손실 또는 주문 거절이 발생할 수 있습니다.
+- HYBRID_LEVERAGE=100 및 SIZE_FRAC=1.0 설정은 하이브리드 출력이 그대로 반영될 경우 과도한 노출을 초래할 수 있습니다.
+- MC EV와 별도 비용 추정이 중복될 경우 실제 기대값이 과소평가되어 진입 기회가 과도하게 차단될 수 있습니다.
 
 
 ---
