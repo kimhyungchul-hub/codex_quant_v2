@@ -1,56 +1,65 @@
-# OpenAI Code Review — 2026-02-18 16:29
+# OpenAI Code Review — 2026-02-18 19:16
 
 **Model:** gpt-5.2-codex
 **Risk Score:** 7/10
-**Summary:** 하이브리드 MC 기반 전략은 구조적으로 안정적이지만, 수수료 이중 차감/레버리지 상한 불일치/게이트 파라미터 미적용으로 인해 OOS 성능과 리스크가 악화될 가능성이 큽니다.
+**Summary:** 핵심 리스크는 EV/필터 단계에서의 수수료 이중 차감과 VPIN/volatility 필터 미적용으로 인한 저품질 진입입니다. 레버리지 기본값 및 seed 안정성도 실전 리스크를 키울 수 있어 보완이 필요합니다.
 
 ## Suggestions
 
 ### [P1] net_expectancy 필터의 수수료 이중 차감 제거
 **Category:** logic | **Confidence:** 78%
 
-docs/SIGNAL_PIPELINE_REFERENCE.md에 명시된 문제처럼 net_expectancy 계산에서 fee_est를 EV에 다시 차감하면 MC EV(이미 fee 포함)가 2배로 패널티됩니다. 이는 both_ev_neg 및 net_expectancy 필터 과차단을 유발합니다. fee_est를 0으로 두거나, EV를 gross로 복원한 뒤 차감하도록 수정해야 합니다.
+문서에 명시된 대로 _min_filter_states()에서 edge_raw(이미 MC fee 포함)에서 fee_est를 다시 빼고 있어 EV가 과도하게 음수로 압축됩니다. fee_est를 0으로 두거나 edge_raw를 gross EV로 복원해 단일 차감만 유지해야 합니다. 수정 후 ENTRY_NET_EXPECTANCY_MIN을 0에 가깝게 정상화할 수 있습니다.
 
-**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0003'}`
+**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '0.0'}`
 
-**Code Changes:** engines/mc/entry_evaluation.py 또는 main_engine의 _min_filter_states 내 net_edge 계산부에서 `net_edge = edge_raw - fee_est` → `net_edge = edge_raw` (또는 edge_raw에 fee 역보정 후 차감).
+**Code Changes:** main_engine/_min_filter_states 또는 해당 필터 함수에서 `net_edge = edge_raw - fee_est`를 `net_edge = edge_raw`로 변경하거나, edge_raw를 fee 이전 값으로 복원. MC가 이미 fee 반영하도록 유지.
 
-**Expected Impact:** 필터 과차단 해소로 진입 기회 회복, EV/WR 개선. 특히 chop 구간에서 both_ev_neg 감소.
+**Expected Impact:** 불필요한 진입 차단 감소, EV 분포 왜곡 해소, 트레이드 수 증가와 PnL 개선
 
-### [P1] 레버리지 상한 일관화 및 저신뢰 구간 가변 하한 적용
-**Category:** risk | **Confidence:** 72%
+### [P1] CF 최적 VPIN/Volatility gate 반영 (all_regimes)
+**Category:** param | **Confidence:** 66%
 
-bybit.env에서 MAX_LEVERAGE=15인데 UNI_LEV_MAX=50, UNI_LEV_MIN=10이 공존합니다. decision.py에서는 ctx.max_leverage만 사용해 상위 cap 불일치 위험이 있습니다. 저신뢰/고 VPIN 구간에서는 레버리지 하한(UNI_LEV_MIN=10)이 과도해 강제 고레버리지 진입을 유발할 수 있습니다. 글로벌 캡과 저신뢰 cap을 코드에서 강제 적용하고, 저신뢰 조건에서는 레버리지 하한을 1~3으로 낮추는 조건부 정책을 권장합니다.
+OOS CF에서 vpin_filter(max_vpin=0.3)와 volatility_gate(all_regimes, sigma 0.2~1.8, dir_conf 0.64, mu_alpha 5.0, hold 180s)가 유의미한 개선을 보였습니다. 현재 CHOP_VPIN_MAX=0.5로 모니터링 중이므로 0.3으로 강화하고, scope를 all_regimes로 확장하는 것이 합리적입니다.
 
-**Env Changes:** `{'LEVERAGE_LOW_CONF_CAP': '3.0', 'LEVERAGE_HIGH_VPIN_CAP': '3.0'}`
+**Env Changes:** `{'VOLATILITY_GATE_SCOPE': 'all_regimes', 'CHOP_VOL_GATE_MIN_SIGMA': '0.2', 'CHOP_VOL_GATE_MAX_SIGMA': '1.8', 'CHOP_VPIN_MAX': '0.3', 'CHOP_ENTRY_MIN_DIR_CONF': '0.64', 'CHOP_ENTRY_MIN_MU_ALPHA': '5.0', 'TARGET_HOLD_SEC_MAX_CHOP': '180'}`
 
-**Code Changes:** engines/mc/decision.py: max_leverage 계산 시 `max_leverage = min(ctx_max, config.MAX_LEVERAGE, regime_policy.max_leverage, env UNI_LEV_MAX)` 적용. 레버리지 floor도 `if conf < LEVERAGE_LOW_CONF_THRESHOLD or vpin > LEVERAGE_HIGH_VPIN_THRESHOLD: lev_floor=1~3` 로 조건부 하향.
+**Code Changes:** volatility_gate 및 vpin_filter가 참조하는 env 키가 위 변수명을 그대로 사용하도록 확인. 미사용이면 해당 필터 로직에 env 연결 추가.
 
-**Expected Impact:** 과도한 레버리지 강제 진입 감소, liquidation/급락 손실 억제, 실거래 리스크 하향.
+**Expected Impact:** 저품질/고유동성 진입 차단 → OOS 기준 +$270 수준의 PnL 개선 기대
 
-### [P1] CF 상위 개선안(Volatility gate/VPIN/Regime side block) 적용
-**Category:** param | **Confidence:** 69%
+### [P1] 결정 결과의 기본 optimal_leverage 상한 적용
+**Category:** risk | **Confidence:** 73%
 
-CF 분석에서 유의미한 개선(+$290~$258 OOS)이 확인된 volatility_gate, vpin_filter, regime_side_block, chop_guard, direction_gate 파라미터가 현재 env에 완전 반영되지 않았습니다. 특히 VPIN 0.3, chop_only volatility gate 및 bear_long/bull_short/chop_long 차단이 핵심 개선점입니다.
+decision.py에서 meta에 레버리지가 없으면 `20.0`을 기본으로 주입해 MAX_LEVERAGE(15)를 무시할 수 있습니다. 특히 paper/training에서 과대 레버리지로 성과 왜곡 가능. ctx의 max_leverage 및 global cap으로 클램프 필요.
 
-**Env Changes:** `{'VOLATILITY_GATE_SCOPE': 'chop_only', 'VOLATILITY_GATE_CHOP_MIN_SIGMA': '0.1', 'VOLATILITY_GATE_CHOP_MAX_SIGMA': '2.5', 'VOLATILITY_GATE_CHOP_MAX_VPIN': '0.65', 'VOLATILITY_GATE_CHOP_MIN_DIR_CONF': '0.68', 'VOLATILITY_GATE_CHOP_MIN_ABS_MU_ALPHA': '20.0', 'VOLATILITY_GATE_CHOP_MAX_HOLD_SEC': '300', 'VPIN_MAX_FILTER': '0.3', 'REGIME_SIDE_BLOCK_LIST': 'bear_long,bull_short,chop_long', 'CHOP_ENTRY_FLOOR_ADD': '0.003', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'DIR_GATE_MIN_CONF': '0.65', 'DIR_GATE_MIN_EDGE': '0.1', 'DIR_GATE_MIN_SIDE_PROB': '0.5195'}`
+**Code Changes:** engines/mc/decision.py에서 `metric_copy['optimal_leverage'] = ... or 20.0` 부분을 `min(default, ctx_max_leverage)`로 수정. 예: `ctx_max = float(ctx.get('max_leverage', 15.0))` 후 `opt_lev = min(opt_lev, ctx_max)`.
 
-**Code Changes:** engines/mc/entry_evaluation.py 또는 main_engine 필터 체인에 volatility gate/VPIN filter/side block 조건이 없다면 추가. 이미 존재한다면 env key 매핑 확인 및 적용.
+**Expected Impact:** 레버리지 과대 적용 방지, 실거래/페이퍼 간 괴리 축소
 
-**Expected Impact:** 거래 수 감소 대신 OOS PnL 개선, WR 및 R:R 상승. 특히 chop 구간 손실 억제.
+### [P2] 결정 seed의 비결정성 해소 (Python hash 랜덤성 제거)
+**Category:** logic | **Confidence:** 64%
 
-### [P2] 결정 시드 안정성 개선 (hash 불안정성 제거)
-**Category:** logic | **Confidence:** 61%
+`hash(symbol)`은 런타임마다 salt가 달라져 재현성과 모니터링이 불안정합니다. crc32/xxhash/sha1 등 안정 해시로 대체해 시뮬레이션 재현성을 높이세요.
 
-decision.py에서 `seed = hash(symbol) ^ seed_window` 사용은 Python 해시 시드 랜덤화로 프로세스 재시작 시 결과가 달라질 수 있습니다. 재현성과 디버깅을 위해 안정적 해시(sha256)를 사용하세요.
+**Code Changes:** engines/mc/decision.py의 `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)`를 `seed = zlib.crc32(symbol.encode()) ^ seed_window` 등으로 대체.
 
-**Code Changes:** engines/mc/decision.py: `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)` → `seed = int(int.from_bytes(hashlib.sha256(symbol.encode()).digest()[:4], 'little') ^ seed_window)`
+**Expected Impact:** 결정 결과의 재현성 향상, 실험/백테스트 일관성 개선
 
-**Expected Impact:** 재현성 향상, OOS 디버깅 용이, 스코어/결정 일관성 확보.
+### [P2] chop_guard 강화 (dir_conf 0.8, floor_add 0.003)
+**Category:** param | **Confidence:** 58%
+
+CF에서 chop_guard 강화가 OOS +$243 개선을 보였습니다. 최근 자동 적용에서 CHOP_ENTRY_MIN_DIR_CONF를 0.64까지 완화했으므로 신호 질 저하 가능성이 큽니다. chop 구간 손실이 크므로 guard 재강화를 권장합니다.
+
+**Env Changes:** `{'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'CHOP_ENTRY_FLOOR_ADD': '0.003'}`
+
+**Code Changes:** 엔트리 필터에서 CHOP_ENTRY_MIN_DIR_CONF, CHOP_ENTRY_FLOOR_ADD를 직접 읽는지 확인하고, 미사용 시 env 연결 추가.
+
+**Expected Impact:** 횡보 구간 저품질 진입 감소, 손실 억제
 
 ## Warnings
-- state/bybit.env에 API 키 및 Telegram 토큰이 평문으로 포함되어 있습니다. 즉시 로테이션 및 비밀 관리로 전환 필요.
-- MC_HYBRID_ONLY=1 환경에서는 legacy 레버리지 최적화 블록이 무시됩니다. 설정 변경 시 코드 경로가 달라질 수 있으니 실험 전 분기 확인이 필요합니다.
+- 필터 강화는 거래 수를 크게 감소시킬 수 있으므로 24~48시간 모니터링 및 롤백 플랜 필요
+- 레버리지/홀드 관련 설정이 bybit.env에서 상충되는 값(UNI_LEV_MAX=50 vs MAX_LEVERAGE=15)을 포함하므로, 실제 캡 적용 여부를 반드시 로그로 검증할 것
 
 
 ---
