@@ -1,54 +1,69 @@
-# OpenAI Code Review — 2026-02-18 13:03
+# OpenAI Code Review — 2026-02-18 14:12
 
 **Model:** gpt-5.2-codex
-**Risk Score:** 7/10
-**Summary:** CF 결과와 코드 흐름을 보면 VPIN 필터와 비용 이중차감 문제를 해결하면 기대손실을 크게 줄일 여지가 있으며, 현재 레버리지/사이징 설정은 변동 구간에서 과도한 리스크를 내포합니다.
+**Risk Score:** 8/10
+**Summary:** 하이브리드 MC 체계 자체는 일관적이지만, 비용 이중차감과 과도한 레버리지/사이징 강제 설정이 실계좌 리스크를 급격히 키우고 있습니다. CF로 개선된 필터들이 일부 미적용 상태이며, 데이터/비용 파이프라인 정합성 보강이 필요합니다.
 
 ## Suggestions
 
-### [P1] VPIN 상한을 0.3으로 낮춰 adverse selection 차단
-**Category:** param | **Confidence:** 73%
+### [P1] 하이브리드 레버리지/사이징 강제 설정 완화
+**Category:** risk | **Confidence:** 84%
 
-CF 분석에서 vpin_filter(max_vpin=0.3)가 OOS PnL +$276로 가장 큰 개선치를 보였습니다. 현재 CHOP_VPIN_MAX=0.65, UNI_MAX_VPIN_HARD=0.95로 느슨하여 고 VPIN 구간에서 손실이 누적될 가능성이 큽니다. 전 레짐 공통으로 VPIN 상한을 0.3으로 낮추는 것이 합리적입니다.
+bybit.env에서 HYBRID_LEVERAGE=100, HYBRID_SIZE_FRAC=1.0, HYBRID_FORCE_SIZE_FRAC=1로 고정되어 있어 레짐별 cap/리스크 제어가 무력화됩니다. 실제 레짐 정책(UNI_LEV_MAX_* 등)과 불일치하며, 청산/급변동 리스크가 과도합니다. 하이브리드용 강제 설정을 비활성화하고 레짐 기반 레버리지/사이징을 사용하도록 변경하십시오.
 
-**Env Changes:** `{'CHOP_VPIN_MAX': '0.3', 'UNI_MAX_VPIN_HARD': '0.3', 'LEVERAGE_HIGH_QUALITY_MAX_VPIN': '0.3'}`
+**Env Changes:** `{'HYBRID_FORCE_LEVERAGE': '0', 'HYBRID_FORCE_SIZE_FRAC': '0', 'HYBRID_LEVERAGE': '20.0', 'HYBRID_SIZE_FRAC': '0.15'}`
 
-**Code Changes:** 없음 (환경변수 적용만 필요)
+**Code Changes:** engines/mc/decision.py: 하이브리드 경로에서 meta의 leverage/size_frac를 레짐 정책 max_leverage 및 UNI_MAX_POS_FRAC 기반으로 상한 적용. 하이브리드 플래너 반환값에 대해 hard cap 적용 로직 추가.
 
-**Expected Impact:** 고 VPIN(독성 유동성) 구간 진입 감소로 손실 트레이드 감소, OOS 기준 PnL +$200~$280 기대
+**Expected Impact:** 강제 고레버리지로 인한 급락 손실/청산 확률 감소, 포지션 집중 리스크 완화.
 
-### [P1] net_expectancy 필터의 수수료 이중 차감 제거
-**Category:** logic | **Confidence:** 68%
+### [P1] net_expectancy 비용 이중차감 방지
+**Category:** logic | **Confidence:** 78%
 
-문서에 명시된 대로 net_expectancy 계산에서 MC EV(이미 fee 포함)에서 다시 fee_est를 차감해 실제 EV가 과도하게 낮아집니다. 이중 차감은 특히 짧은 horizon에서 both_ev_neg 차단을 과도하게 발생시키며, 진입 기회 손실로 이어집니다. MC EV를 그대로 쓰거나 fee_est를 0으로 두어 한 번만 비용을 반영하도록 수정해야 합니다.
+docs에서도 언급된 KNOWN ISSUE대로 MC EV에 이미 fee가 포함되어 있는데, net_expectancy에서 추가 fee_est를 차감합니다. 이중차감으로 필터가 과도하게 보수적이며 불필요한 진입 차단을 유발합니다.
 
-**Code Changes:** main_engine(또는 entry filter 구현부)의 _min_filter_states()에서 `net_edge = edge_raw - fee_est`를 `net_edge = edge_raw`로 변경하거나, fee_est를 MC 비용으로 대체. 관련 주석/테스트 업데이트.
+**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0003', 'ENTRY_NET_EXPECTANCY_MIN_CHOP': '-0.0003'}`
 
-**Expected Impact:** 불필요한 차단 감소, EV/score 정합성 개선, 거래 수 회복
+**Code Changes:** entry_evaluation.py 또는 필터 로직(_min_filter_states)에서 net_edge = edge_raw - fee_est를 net_edge = edge_raw 로 수정하거나, fee_est를 0으로 설정하는 옵션 플래그(예: ENTRY_NET_EXPECTANCY_FEE_ADJUST=0) 추가.
 
-### [P2] seed 결정에 안정적 해시 사용
-**Category:** logic | **Confidence:** 83%
+**Expected Impact:** 불필요한 진입 차단 감소, EV 판단의 정합성 회복.
 
-decision.py에서 `hash(symbol)`은 프로세스마다 seed가 바뀌는 Python hash randomization의 영향을 받습니다. 백테스트/리플레이 재현성에 문제가 생길 수 있으므로 안정적 해시(xxhash, md5 등)를 사용해 seed를 고정해야 합니다.
+### [P1] VPIN 필터 적용 (CF 최상위 개선안)
+**Category:** param | **Confidence:** 70%
 
-**Code Changes:** engines/mc/decision.py: `hash(symbol)` 대신 `int(hashlib.md5(symbol.encode()).hexdigest()[:8],16)` 또는 xxhash 사용.
+CF 분석에서 max_vpin=0.3이 OOS +$276 개선으로 가장 유의미합니다. 현재 env에 VPIN 상한 하드게이트가 0.95로만 존재하여 효과가 희석됩니다.
 
-**Expected Impact:** 실험 재현성 향상, 디버깅/CF 결과 안정화
+**Env Changes:** `{'UNI_MAX_VPIN_HARD': '0.30', 'CHOP_MAX_VPIN': '0.30'}`
 
-### [P2] 저신뢰 구간에서 레버리지 하한 강제 해제(동적 floor)
-**Category:** risk | **Confidence:** 61%
+**Code Changes:** regime_policy.py 또는 entry_evaluation.py 필터 체인에서 VPIN 하드게이트를 UNI_MAX_VPIN_HARD/CHOP_MAX_VPIN 기준으로 일관되게 적용.
 
-ENV에 UNI_LEV_MIN=10이 설정되어 있으나, low_conf/vpin_high 상황에서는 레버리지 1x 이하가 더 안전합니다. 현재 코드 흐름이 최소레버리지 우선 적용이면 저신뢰 구간에서도 과도한 레버리지가 유지될 수 있습니다. low_conf 또는 high_vpin일 때는 min leverage를 1~2로 강제하는 분기 로직이 필요합니다.
+**Expected Impact:** 고VPIN 구간 손실 차단으로 손실 감소 및 WR 개선.
 
-**Env Changes:** `{'LEVERAGE_LOW_CONF_CAP': '1.0', 'LEVERAGE_HIGH_VPIN_CAP': '1.0'}`
+### [P2] Volatility gate CF 파라미터 적용 (hold time 축소)
+**Category:** param | **Confidence:** 63%
 
-**Code Changes:** engines/mc/decision.py: 최종 레버리지 결정 전에 `if dir_conf < threshold or vpin > threshold: lev_floor = 1.0` 적용. 최소레버리지 적용 순서를 저신뢰/고 VPIN 캡 이후로 이동.
+volatility_gate 최적안에서 chop_max_hold_sec=300이 수익 개선에 기여. 현재 POLICY_MAX_HOLD_SEC=1800으로 장기 손실 누적 가능성이 큼. 레짐별 최대 보유시간을 CF 값에 맞춰 축소 권장.
 
-**Expected Impact:** 급변/저신뢰 구간의 손실 tail risk 감소, 강제 청산 위험 완화
+**Env Changes:** `{'TARGET_HOLD_SEC_MAX_CHOP': '300', 'POLICY_MAX_HOLD_SEC': '900'}`
+
+**Code Changes:** regime_policy.py: chop 레짐 max_hold_sec를 env로 강제 반영하도록 기본값 조정. exit policy의 max_hold_sec를 레짐별 override 우선으로 변경.
+
+**Expected Impact:** chop 장기 보유 손실 억제, 회전율 개선.
+
+### [P2] MC 배치 메모리 정리 안정화
+**Category:** perf | **Confidence:** 55%
+
+entry_evaluation.py에서 대규모 배열 해제는 try/except로 되어 있으나, price_paths_batch 등 일부가 스코프 밖일 경우 예외 발생 가능. 반복 GC 및 torch 캐시 비우기가 과도하면 지연을 유발할 수 있습니다.
+
+**Env Changes:** `{'MC_PERF_LOG': '1'}`
+
+**Code Changes:** entry_evaluation.py: 메모리 cleanup 섹션에서 존재 여부 확인 후 del. torch cache empty는 일정 주기(예: 10회 중 1회)로 제한. perf 로그로 실제 병목 확인 후 조정.
+
+**Expected Impact:** 불필요한 지연 감소, 안정적인 배치 처리.
 
 ## Warnings
-- 현재 bybit.env에서 HYBRID_SIZE_FRAC=1.0, UNI_LEV_MAX=50 등 매우 공격적 노출이 설정되어 있어 급격한 변동성 상승 시 계좌 손실 위험이 큽니다.
-- Python hash 기반 seed는 프로세스마다 달라져 백테스트/리플레이 결과가 흔들릴 수 있습니다.
+- state/bybit.env에 API 키/Telegram 토큰이 평문 노출되어 있습니다. 즉시 로테이션 및 비공개 저장소 분리 필요.
+- UNI_LEV_MIN=10과 MAX_LEVERAGE=15 조합은 저변동 구간에서 강제 고레버리지로 손실 확대 가능성이 큽니다.
 
 
 ---
