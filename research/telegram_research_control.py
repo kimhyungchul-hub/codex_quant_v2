@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -20,13 +22,254 @@ logger = logging.getLogger("research.telegram_control")
 
 class TelegramResearchControl:
     def __init__(self, project_root: Path) -> None:
-        self.project_root = Path(project_root)
+        self.project_root = Path(project_root).resolve()
         self.offset_file = self.project_root / "state" / "telegram_research_offset.json"
         self.history_file = self.project_root / "state" / "telegram_research_chat_history.json"
+        self.pending_write_file = self.project_root / "state" / "telegram_research_pending_writes.json"
+        self.audit_log_file = self.project_root / "state" / "telegram_research_fs_audit.jsonl"
         self.token = self._env_or_file("TELEGRAM_BOT_TOKEN")
         self.chat_id = self._env_or_file("TELEGRAM_CHAT_ID")
         self.enabled = bool(self.token and self.chat_id)
         self._offset = self._load_offset()
+        try:
+            self.write_confirm_ttl_sec = int(self._env_or_file("TELEGRAM_WRITE_CONFIRM_TTL_SEC", "600") or 600)
+        except Exception:
+            self.write_confirm_ttl_sec = 600
+        try:
+            self.read_max_bytes = int(self._env_or_file("TELEGRAM_READ_MAX_BYTES", "24000") or 24000)
+        except Exception:
+            self.read_max_bytes = 24000
+        try:
+            self.write_max_bytes = int(self._env_or_file("TELEGRAM_WRITE_MAX_BYTES", "24000") or 24000)
+        except Exception:
+            self.write_max_bytes = 24000
+
+    def _audit_fs(
+        self,
+        *,
+        chat_id: str,
+        action: str,
+        path: str | None,
+        status: str,
+        reason: str = "",
+        nonce: str | None = None,
+        bytes_count: int | None = None,
+    ) -> None:
+        row = {
+            "ts": int(time.time()),
+            "chat_id": str(chat_id or ""),
+            "action": str(action or ""),
+            "path": str(path or ""),
+            "status": str(status or ""),
+            "reason": str(reason or ""),
+            "nonce": str(nonce or ""),
+            "bytes": int(bytes_count or 0),
+        }
+        try:
+            self.audit_log_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_log_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
+    def _load_pending_writes(self) -> dict[str, dict]:
+        try:
+            if not self.pending_write_file.exists():
+                return {}
+            row = json.loads(self.pending_write_file.read_text(encoding="utf-8"))
+            if isinstance(row, dict):
+                return {str(k): v for k, v in row.items() if isinstance(v, dict)}
+        except Exception:
+            return {}
+        return {}
+
+    def _save_pending_writes(self, rows: dict[str, dict]) -> None:
+        try:
+            self.pending_write_file.parent.mkdir(parents=True, exist_ok=True)
+            self.pending_write_file.write_text(
+                json.dumps(rows, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _is_protected_path(self, p: Path) -> tuple[bool, str]:
+        try:
+            rel = p.resolve().relative_to(self.project_root)
+        except Exception:
+            return True, "system_path_blocked"
+        rel_posix = rel.as_posix()
+        name = p.name.lower()
+        parts = [x.lower() for x in p.parts]
+        if name == "bybit.env" or rel_posix == "state/bybit.env":
+            return True, "protected_bybit_env"
+        if ".git" in parts or rel_posix.startswith(".git/") or rel_posix == ".git":
+            return True, "protected_git"
+        if ".ssh" in parts:
+            return True, "protected_ssh"
+        if name in {"id_rsa", "id_ed25519", "authorized_keys", "known_hosts"}:
+            return True, "protected_ssh"
+        if name.endswith(".pem") or name.endswith(".ppk"):
+            return True, "protected_ssh"
+        return False, ""
+
+    def _resolve_workspace_path(self, raw_path: str) -> tuple[Path | None, str]:
+        s = str(raw_path or "").strip().strip("'").strip('"')
+        if not s:
+            return None, "missing_path"
+        try:
+            p = Path(s)
+            if p.is_absolute():
+                rp = p.resolve()
+            else:
+                rp = (self.project_root / p).resolve()
+        except Exception:
+            return None, "invalid_path"
+        try:
+            _ = rp.relative_to(self.project_root)
+        except Exception:
+            return None, "system_path_blocked"
+        blocked, reason = self._is_protected_path(rp)
+        if blocked:
+            return None, reason
+        return rp, ""
+
+    def read_workspace_file(self, *, path: str, chat_id: str) -> dict[str, Any]:
+        rp, reason = self._resolve_workspace_path(path)
+        if rp is None:
+            self._audit_fs(chat_id=chat_id, action="read", path=path, status="deny", reason=reason)
+            return {"status": "error", "reason": reason}
+        if not rp.exists():
+            self._audit_fs(chat_id=chat_id, action="read", path=str(rp), status="error", reason="not_found")
+            return {"status": "error", "reason": "not_found", "path": str(rp)}
+        if rp.is_dir():
+            self._audit_fs(chat_id=chat_id, action="read", path=str(rp), status="error", reason="is_directory")
+            return {"status": "error", "reason": "is_directory", "path": str(rp)}
+        try:
+            raw = rp.read_bytes()
+            truncated = False
+            if len(raw) > self.read_max_bytes:
+                raw = raw[: self.read_max_bytes]
+                truncated = True
+            text = raw.decode("utf-8", errors="replace")
+            self._audit_fs(chat_id=chat_id, action="read", path=str(rp), status="ok", bytes_count=len(raw))
+            return {
+                "status": "ok",
+                "path": str(rp),
+                "text": text,
+                "truncated": bool(truncated),
+            }
+        except Exception as e:
+            self._audit_fs(chat_id=chat_id, action="read", path=str(rp), status="error", reason=str(e)[:200])
+            return {"status": "error", "reason": f"read_failed: {e}", "path": str(rp)}
+
+    def stage_workspace_write(self, *, path: str, content: str, chat_id: str) -> dict[str, Any]:
+        rp, reason = self._resolve_workspace_path(path)
+        if rp is None:
+            self._audit_fs(chat_id=chat_id, action="write_stage", path=path, status="deny", reason=reason)
+            return {"status": "error", "reason": reason}
+        payload = str(content or "")
+        if not payload:
+            self._audit_fs(chat_id=chat_id, action="write_stage", path=str(rp), status="error", reason="empty_content")
+            return {"status": "error", "reason": "empty_content"}
+        raw = payload.encode("utf-8", errors="replace")
+        if len(raw) > self.write_max_bytes:
+            self._audit_fs(chat_id=chat_id, action="write_stage", path=str(rp), status="error", reason="content_too_large", bytes_count=len(raw))
+            return {"status": "error", "reason": f"content_too_large(max={self.write_max_bytes}B)"}
+
+        pending = self._load_pending_writes()
+        now_ts = int(time.time())
+        ttl = max(60, int(self.write_confirm_ttl_sec))
+        # prune expired
+        keep: dict[str, dict] = {}
+        for k, v in pending.items():
+            exp = int(v.get("expires_at") or 0)
+            if exp > now_ts:
+                keep[k] = v
+        pending = keep
+
+        nonce = secrets.token_hex(4)
+        pending[nonce] = {
+            "chat_id": str(chat_id or ""),
+            "path": str(rp),
+            "content": payload,
+            "created_at": now_ts,
+            "expires_at": now_ts + ttl,
+            "sha256": sha256(raw).hexdigest(),
+            "bytes": len(raw),
+        }
+        self._save_pending_writes(pending)
+        self._audit_fs(
+            chat_id=chat_id,
+            action="write_stage",
+            path=str(rp),
+            status="staged",
+            nonce=nonce,
+            bytes_count=len(raw),
+        )
+        return {
+            "status": "ok",
+            "nonce": nonce,
+            "path": str(rp),
+            "sha256": sha256(raw).hexdigest(),
+            "bytes": len(raw),
+            "expires_in_sec": ttl,
+        }
+
+    def confirm_workspace_write(self, *, nonce: str, chat_id: str) -> dict[str, Any]:
+        key = str(nonce or "").strip()
+        if not key:
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path="", status="error", reason="missing_nonce")
+            return {"status": "error", "reason": "missing_nonce"}
+        pending = self._load_pending_writes()
+        row = pending.get(key)
+        if not isinstance(row, dict):
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path="", status="error", reason="nonce_not_found", nonce=key)
+            return {"status": "error", "reason": "nonce_not_found"}
+        now_ts = int(time.time())
+        exp = int(row.get("expires_at") or 0)
+        if exp <= now_ts:
+            pending.pop(key, None)
+            self._save_pending_writes(pending)
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path=str(row.get("path") or ""), status="error", reason="nonce_expired", nonce=key)
+            return {"status": "error", "reason": "nonce_expired"}
+        owner_chat = str(row.get("chat_id") or "")
+        if owner_chat and str(chat_id or "") != owner_chat:
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path=str(row.get("path") or ""), status="deny", reason="chat_id_mismatch", nonce=key)
+            return {"status": "error", "reason": "chat_id_mismatch"}
+
+        target = Path(str(row.get("path") or ""))
+        blocked, reason = self._is_protected_path(target)
+        if blocked:
+            pending.pop(key, None)
+            self._save_pending_writes(pending)
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path=str(target), status="deny", reason=reason, nonce=key)
+            return {"status": "error", "reason": reason}
+        try:
+            _ = target.resolve().relative_to(self.project_root)
+        except Exception:
+            pending.pop(key, None)
+            self._save_pending_writes(pending)
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path=str(target), status="deny", reason="system_path_blocked", nonce=key)
+            return {"status": "error", "reason": "system_path_blocked"}
+
+        content = str(row.get("content") or "")
+        raw = content.encode("utf-8", errors="replace")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            pending.pop(key, None)
+            self._save_pending_writes(pending)
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path=str(target), status="ok", nonce=key, bytes_count=len(raw))
+            return {
+                "status": "ok",
+                "path": str(target),
+                "bytes": len(raw),
+                "sha256": str(row.get("sha256") or ""),
+            }
+        except Exception as e:
+            self._audit_fs(chat_id=chat_id, action="write_confirm", path=str(target), status="error", reason=str(e)[:200], nonce=key)
+            return {"status": "error", "reason": f"write_failed: {e}", "path": str(target)}
 
     def _env_or_file(self, name: str, default: str = "") -> str:
         v = str(os.environ.get(name, "") or "").strip()
@@ -144,6 +387,9 @@ class TelegramResearchControl:
             "- /rq_review <프롬프트> : 사용자 프롬프트를 추가해 즉시 리뷰\n"
             "- /rq_apply all : 최신 OpenAI 제안 전체 env 변경 적용\n"
             "- /rq_apply 1,3 : 최신 OpenAI 제안 중 1번과 3번만 적용\n"
+            "- /rq_read <상대경로> : 워크스페이스 파일 읽기(보호경로 제외)\n"
+            "- /rq_write <상대경로>\\n<내용> : 쓰기 요청 스테이징\n"
+            "- /rq_confirm <nonce> : 스테이징된 쓰기 승인/실행\n"
             "- /rq_cf_now : 다음 CF 연구 사이클 즉시 시작\n"
             "- 일반 문장 : 자동으로 /rq_ask 처리\n"
             "- 자연어 '모두 적용해'류 : 자동으로 /rq_apply all 처리\n"
@@ -203,6 +449,31 @@ class TelegramResearchControl:
             if not parsed.get("ok"):
                 return {"type": "error", "message": "사용법: /rq_apply all 또는 /rq_apply 1,3"}
             return {"type": "apply_openai_suggestions", "selection": parsed.get("selection")}
+
+        if low.startswith("/rq_read"):
+            parts = raw.split(maxsplit=1)
+            p = parts[1].strip() if len(parts) > 1 else ""
+            if not p:
+                return {"type": "error", "message": "사용법: /rq_read <상대경로>"}
+            return {"type": "read_workspace_file", "path": p}
+
+        if low.startswith("/rq_write"):
+            body = raw[len("/rq_write") :].lstrip()
+            if not body:
+                return {"type": "error", "message": "사용법: /rq_write <상대경로>\\n<내용>"}
+            first_line, sep, rest = body.partition("\n")
+            p = first_line.strip()
+            content = rest if sep else ""
+            if not p or not content:
+                return {"type": "error", "message": "사용법: /rq_write <상대경로>\\n<내용>"}
+            return {"type": "stage_workspace_write", "path": p, "content": content}
+
+        if low.startswith("/rq_confirm"):
+            parts = raw.split(maxsplit=1)
+            nonce = parts[1].strip() if len(parts) > 1 else ""
+            if not nonce:
+                return {"type": "error", "message": "사용법: /rq_confirm <nonce>"}
+            return {"type": "confirm_workspace_write", "nonce": nonce}
 
         if raw.startswith("/"):
             return {"type": "error", "message": "알 수 없는 명령입니다. /rq_help 를 사용하세요."}

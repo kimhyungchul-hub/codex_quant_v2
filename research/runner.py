@@ -1084,6 +1084,62 @@ def _handle_telegram_actions(
             elif atype == "run_cf_now":
                 force_cf_now = True
                 telegram_ctl.send_text("[Research] 다음 대기 없이 CF 사이클을 즉시 시작합니다.")
+            elif atype == "read_workspace_file":
+                path = str(action.get("path") or "").strip()
+                chat_id = str(action.get("chat_id") or "")
+                status = telegram_ctl.read_workspace_file(path=path, chat_id=chat_id)
+                if status.get("status") == "ok":
+                    text = str(status.get("text") or "")
+                    truncated = bool(status.get("truncated"))
+                    suffix = "\n[truncated]" if truncated else ""
+                    telegram_ctl.send_text(
+                        "[FS READ] OK\n"
+                        f"- path: {status.get('path')}\n\n"
+                        f"{text}{suffix}"
+                    )
+                else:
+                    telegram_ctl.send_text(
+                        "[FS READ] 실패\n"
+                        f"- reason: {status.get('reason', 'unknown')}\n"
+                        f"- path: {status.get('path', path)}"
+                    )
+            elif atype == "stage_workspace_write":
+                path = str(action.get("path") or "").strip()
+                content = str(action.get("content") or "")
+                chat_id = str(action.get("chat_id") or "")
+                status = telegram_ctl.stage_workspace_write(path=path, content=content, chat_id=chat_id)
+                if status.get("status") == "ok":
+                    telegram_ctl.send_text(
+                        "[FS WRITE STAGED]\n"
+                        f"- path: {status.get('path')}\n"
+                        f"- bytes: {status.get('bytes')}\n"
+                        f"- sha256: {status.get('sha256')}\n"
+                        f"- nonce: {status.get('nonce')}\n"
+                        f"- expires_in_sec: {status.get('expires_in_sec')}\n\n"
+                        "적용하려면 /rq_confirm <nonce> 를 보내세요."
+                    )
+                else:
+                    telegram_ctl.send_text(
+                        "[FS WRITE STAGED] 실패\n"
+                        f"- reason: {status.get('reason', 'unknown')}"
+                    )
+            elif atype == "confirm_workspace_write":
+                nonce = str(action.get("nonce") or "").strip()
+                chat_id = str(action.get("chat_id") or "")
+                status = telegram_ctl.confirm_workspace_write(nonce=nonce, chat_id=chat_id)
+                if status.get("status") == "ok":
+                    telegram_ctl.send_text(
+                        "[FS WRITE] 완료\n"
+                        f"- path: {status.get('path')}\n"
+                        f"- bytes: {status.get('bytes')}\n"
+                        f"- sha256: {status.get('sha256')}"
+                    )
+                else:
+                    telegram_ctl.send_text(
+                        "[FS WRITE] 실패\n"
+                        f"- reason: {status.get('reason', 'unknown')}\n"
+                        f"- path: {status.get('path', '-')}"
+                    )
             elif atype == "error":
                 telegram_ctl.send_text(str(action.get("message") or "명령 파싱 오류"))
         except Exception as e:

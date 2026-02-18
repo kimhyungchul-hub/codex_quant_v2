@@ -79,6 +79,23 @@ find_orphan_worker_pids() {
   done | awk '!seen[$0]++' | sort -n
 }
 
+read_lock_owner_pid() {
+  local lock_file="$ROOT_DIR/state/locks/trading_engine.lock"
+  [ -f "$lock_file" ] || return 0
+  python3 - <<PY 2>/dev/null || true
+import json
+from pathlib import Path
+p = Path("$lock_file")
+try:
+    obj = json.loads(p.read_text(encoding="utf-8"))
+    pid = int(obj.get("pid")) if isinstance(obj, dict) and obj.get("pid") is not None else None
+    if pid:
+        print(pid)
+except Exception:
+    pass
+PY
+}
+
 write_pid_file() {
   local pid
   pid="$(find_pid)"
@@ -103,8 +120,15 @@ stop_engine() {
     kill_pid_tree "$pid" KILL
   done
 
-  pkill -f "$ENTRY_FILE" 2>/dev/null || true
-  pkill -f "$entry_base" 2>/dev/null || true
+  local owner_pid
+  owner_pid="$(read_lock_owner_pid)"
+  if [ -n "${owner_pid:-}" ] && ps -p "$owner_pid" >/dev/null 2>&1; then
+    kill_pid_tree "$owner_pid" TERM
+    sleep 0.5
+    if ps -p "$owner_pid" >/dev/null 2>&1; then
+      kill_pid_tree "$owner_pid" KILL
+    fi
+  fi
 
   local orphan_pid
   for orphan_pid in $(find_orphan_worker_pids); do

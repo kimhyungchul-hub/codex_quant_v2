@@ -21453,9 +21453,9 @@ class LiveOrchestrator:
                     except Exception:
                         stream_parallel = False
                     try:
-                        stream_parallel_workers = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", 1) or 1)
+                        stream_parallel_workers = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", 2) or 2)
                     except Exception:
-                        stream_parallel_workers = 1
+                        stream_parallel_workers = 2
                     stream_parallel_workers = max(1, stream_parallel_workers)
 
                     async def _run_decide_batch(ctx_subset: list[dict]) -> tuple[list[dict], str, float]:
@@ -22757,8 +22757,73 @@ async def main():
             pass
 
 
+def _reap_orphan_process_workers(project_root: Path) -> None:
+    """Best-effort cleanup for orphaned multiprocessing workers from prior crashes/restarts."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        lines = (proc.stdout or "").splitlines()
+    except Exception:
+        return
+
+    victim_pids: list[int] = []
+    for line in lines:
+        raw = line.strip()
+        if not raw:
+            continue
+        parts = raw.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except Exception:
+            continue
+        cmd = parts[2]
+        if ppid != 1:
+            continue
+        if "from multiprocessing.spawn import spawn_main" not in cmd and "from multiprocessing.resource_tracker import main" not in cmd:
+            continue
+        try:
+            cwd_probe = subprocess.run(
+                ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+            )
+            cwd = ""
+            for l in (cwd_probe.stdout or "").splitlines():
+                if l.startswith("n"):
+                    cwd = l[1:].strip()
+                    break
+        except Exception:
+            cwd = ""
+        if cwd and Path(cwd) == project_root:
+            victim_pids.append(pid)
+
+    for pid in victim_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    if victim_pids:
+        time.sleep(0.3)
+    for pid in victim_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    _engine_lock = SingletonProcessLock(Path(__file__).resolve().parent / "state" / "locks" / "trading_engine.lock")
+    _project_root = Path(__file__).resolve().parent
+    _reap_orphan_process_workers(_project_root)
+    _engine_lock = SingletonProcessLock(_project_root / "state" / "locks" / "trading_engine.lock")
     if not _engine_lock.acquire(role="trading_engine", extra={"entrypoint": "main_engine_mc_v2_final.py"}):
         _owner = _engine_lock.owner_pid
         print(
