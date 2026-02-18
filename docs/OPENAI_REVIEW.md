@@ -1,75 +1,69 @@
-# OpenAI Code Review — 2026-02-18 08:04
+# OpenAI Code Review — 2026-02-18 09:23
 
 **Model:** gpt-4.1-mini
 **Risk Score:** 7/10
-**Summary:** 코드 전반적으로 레짐별 정책과 MC 기반 진입/청산 의사결정이 체계적으로 구성되어 있으나, 일부 비용 이중 차감과 레버리지 하한/상한 설정, 필터 임계치 조정이 필요하며, 메모리 관리 및 성능 최적화 여지가 존재합니다.
+**Summary:** 전략 코드는 레짐별 동적 정책과 MC 시뮬레이션 기반의 하이브리드 의사결정 체계를 갖추었으나, 일부 파라미터와 비용 처리에서 이중 차감 문제와 레버리지 과다 설정 위험이 존재하며, 메모리 관리와 로그 최적화 여지도 있음.
 
 ## Suggestions
 
-### [P1] EV 계산 시 비용 이중 차감 문제 개선
-**Category:** logic | **Confidence:** 90%
+### [P1] EV 계산 시 비용 이중 차감 문제 수정
+**Category:** logic | **Confidence:** 95%
 
-evaluate_entry_metrics 함수에서 MC 시뮬레이션 결과 EV는 이미 거래 비용이 차감된 값임에도 불구하고, _min_filter_states 등 하류 필터에서 다시 비용을 차감하여 net_edge를 계산하는 로직이 존재함. 이중 차감으로 인해 진입 신호가 과도하게 약화되어 진입 기회 손실 및 과도한 보수적 판단이 발생할 수 있음. 비용 차감 방식을 명확히 하여 EV는 순수 기대수익으로 유지하고, 필터에서 비용 차감 여부를 일관되게 처리해야 함.
+evaluate_entry_metrics 함수 내에서 MC 시뮬레이션 결과 ev_raw(또는 ev)에 이미 비용이 포함되어 있음에도 불구하고, 필터링 단계에서 별도로 수수료/슬리피지 비용을 다시 차감하는 로직이 존재하여 실제 net_edge가 과도하게 낮아지는 현상이 발생함. 이는 진입 필터가 과도하게 보수적으로 작동하게 하여 유효 진입 기회를 놓칠 수 있음. 비용 차감 중복을 제거하거나, net_expectancy 필터에서 비용 차감 부분을 0으로 설정하는 방식으로 수정 필요.
 
-**Code Changes:** engines/mc/entry_evaluation.py 및 관련 필터 로직에서 EV와 비용 처리 부분을 점검하여, EV가 이미 비용 차감된 값인지 명확히 하고, net_edge 계산 시 비용을 중복 차감하지 않도록 수정 필요.
+**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0008'}`
 
-**Expected Impact:** 진입 신호의 왜곡 감소, 필터 통과율 개선, 전체 전략 수익성 향상
+**Code Changes:** engines/mc/entry_evaluation.py 내 evaluate_entry_metrics 및 _min_filter_states 함수에서 비용 차감 중복 제거. 구체적으로 edge_raw가 이미 비용 차감된 값임을 명확히 하고, net_edge 계산 시 비용 차감 부분을 제거하거나 주석 처리.
 
-### [P1] 레버리지 하한 및 상한 환경변수 재조정
-**Category:** param | **Confidence:** 85%
+**Expected Impact:** 진입 필터의 과도한 차단 완화로 진입 기회 증가 및 전체 수익성 개선 기대.
 
-현재 bybit.env에서 UNI_LEV_MIN=10.0, UNI_LEV_MAX=50 등 매우 공격적인 레버리지 범위를 사용 중임. CF 분석 결과 2~10 구간에서 최대 손실 구간이 발견되어 최소 레버리지를 10으로 설정한 것은 위험할 수 있음. 레버리지 하한을 낮추고, 레짐별 상한을 현실적인 수준(예: bull 20, bear 12, chop 6 등)으로 조정하여 리스크를 줄이는 것이 바람직함.
-
-**Env Changes:** `{'UNI_LEV_MIN': '1.0', 'UNI_LEV_MAX': '20', 'UNI_LEV_MAX_BEAR': '12', 'UNI_LEV_MAX_CHOP': '6', 'UNI_LEV_MAX_VOLATILE': '4'}`
-
-**Code Changes:** engines/mc/config.py 및 regime_policy.py에서 레버리지 관련 기본값과 env 변수 적용 로직을 점검 및 조정.
-
-**Expected Impact:** 과도한 레버리지에 따른 청산 위험 감소, 안정적인 포지션 운영 가능
-
-### [P1] 레짐별 진입 필터 및 방향 차단 강화
+### [P1] 레버리지 상한 및 최소값 환경변수 재검토 및 하향 조정
 **Category:** risk | **Confidence:** 90%
 
-CF 분석 결과 bear_long, bull_short, chop_long 등 특정 레짐-방향 조합에서 손실이 지속되어 regime_side_block_list에 해당 조합을 추가하는 것이 수익성 개선에 효과적임. 또한 VPIN 필터(max_vpin=0.3)와 volatility_gate 필터를 강화하여 변동성 및 시장 충격에 따른 진입을 제한하는 것이 리스크 관리에 중요함.
+현재 bybit.env에서 UNI_LEV_MIN=10.0, UNI_LEV_MAX=50 등 매우 공격적인 레버리지 설정이 되어 있음. 과거 청산 손실 사례와 CF 분석 결과를 고려하면, 특히 변동성 높은 레짐에서 최대 레버리지 상한을 낮추고 최소 레버리지도 1~5 사이로 조정하는 것이 리스크 관리에 유리함. 레짐별 max_leverage 값과 MC 내 하드캡을 일치시키고, 급격한 레버리지 변동 방지를 위한 EMA smoothing 강화 필요.
 
-**Env Changes:** `{'REGIME_SIDE_BLOCK_LIST': 'bear_long,bull_short,chop_long', 'MAX_VPIN': '0.3', 'CHOP_VOL_GATE_MIN_SIGMA': '0.1', 'CHOP_VOL_GATE_MAX_SIGMA': '0.8', 'CHOP_VOL_GATE_MAX_VPIN': '0.65', 'CHOP_VOL_GATE_MIN_DIR_CONF': '0.64', 'CHOP_ENTRY_FLOOR_ADD': '0.005', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8'}`
+**Env Changes:** `{'UNI_LEV_MIN': '1.0', 'UNI_LEV_MAX': '16.0', 'MAX_LEVERAGE': '15'}`
 
-**Code Changes:** engines/mc/regime_policy.py에서 regime_side_block 처리 강화 및 entry_evaluation.py에서 VPIN, volatility_gate 필터 적용 로직 점검.
+**Code Changes:** engines/mc/decision.py 및 engines/mc/regime_policy.py에서 레버리지 관련 상수 및 정책값을 환경변수와 일치시키고, _LEV_EMA_MEM 기반 smoothing 강화 로직 추가.
 
-**Expected Impact:** 비효율적 진입 감소, 리스크 조정된 진입으로 손실 최소화 및 수익성 개선
+**Expected Impact:** 과도한 청산 위험 감소 및 포지션 안정성 향상, 장기 수익성 개선 기대.
 
-### [P2] 메모리 관리 및 GPU 활용 최적화
-**Category:** perf | **Confidence:** 75%
+### [P2] VPIN 및 변동성 게이트 필터 파라미터 적용 및 강화
+**Category:** param | **Confidence:** 85%
 
-evaluate_entry_metrics 등 MC 시뮬레이션 후 대형 배열 및 텐서 해제를 명시적으로 수행하고 있으나, 일부 예외 처리 및 캐시 비우기 로직이 완벽하지 않아 메모리 누수가 발생할 수 있음. 또한 GPU 가속 옵션이 환경변수에 따라 동적으로 활성화되나, 실패 시 fallback이 다소 무거울 수 있어 초기 로딩 시점에 명확한 상태 관리가 필요함.
+CF 분석 결과 VPIN 필터(max_vpin=0.3)와 volatility_gate 필터(chop_min_sigma=0.5, chop_max_sigma=2.5 등)의 적용이 수익성 개선에 유의미함. 현재 환경변수에 반영되어 있지 않거나 기본값으로 유지 중인 경우, 이를 bybit.env에 명확히 반영하고, chop regime에 대해서는 chop_entry_floor_add=0.005, chop_entry_min_dir_conf=0.8 등의 파라미터도 적용하여 chop 구간에서의 불필요한 진입을 줄일 필요가 있음.
 
-**Code Changes:** engines/mc/entry_evaluation.py 및 decision.py에서 메모리 해제 및 GPU 초기화 로직 강화. 불필요한 변수 참조 제거 및 gc.collect 호출 위치 최적화.
+**Env Changes:** `{'MAX_VPIN': '0.3', 'CHOP_ENTRY_FLOOR_ADD': '0.005', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'CHOP_MIN_SIGMA': '0.5', 'CHOP_MAX_SIGMA': '2.5'}`
 
-**Expected Impact:** 메모리 누수 감소, 장기 운용 안정성 향상, GPU 활용 효율 개선
+**Code Changes:** regime_policy.py 내 regime별 필터 임계치 및 entry guard 파라미터를 환경변수 기반으로 재설정. entry_evaluation.py에서 VPIN, volatility 관련 필터 로직 강화 및 주석 추가.
 
-### [P2] 진입/청산 의사결정 로직 내 hybrid_only 플래그 명확화
-**Category:** logic | **Confidence:** 70%
+**Expected Impact:** 불필요한 진입 감소 및 손실 구간 필터링 강화로 PnL과 승률 개선 기대.
 
-decision.py에서 hybrid_only 플래그가 환경변수 및 config에 따라 결정되는데, 이 플래그가 True일 경우 기존 로직과 완전히 분리되어 동작함. 다중 환경에서 혼란을 줄이기 위해 hybrid_only 모드와 기존 모드 간 경계 및 전환 조건을 명확히 문서화하고, config 기본값과 env 변수 간 불일치 가능성을 줄여야 함.
+### [P2] 메모리 관리 및 로그 최적화 강화
+**Category:** perf | **Confidence:** 80%
 
-**Code Changes:** engines/mc/decision.py에서 hybrid_only 관련 조건문 정리 및 config.py에서 기본값 일관성 유지. 관련 주석 보강 및 예외 처리 추가.
+evaluate_entry_metrics 함수에서 대용량 배열 및 텐서 해제 후 가비지 컬렉션과 GPU 캐시 비우기 로직이 있으나, 예외 처리 및 로그가 부족하여 문제 발생 시 원인 파악이 어려움. 또한, _throttled_log 함수가 로그 빈도 제한에 사용되나, 로그 레벨과 출력 조건을 환경변수로 세밀하게 조정할 수 있도록 개선 필요.
 
-**Expected Impact:** 의사결정 로직의 예측 가능성 향상, 디버깅 용이성 증가
+**Env Changes:** `{'MC_PERF_LOG': '0'}`
 
-### [P3] TP/SL 및 최대 보유 시간 환경변수 재검토
-**Category:** param | **Confidence:** 60%
+**Code Changes:** entry_evaluation.py 및 decision.py 내 메모리 해제 로직에 상세 예외 로그 추가 및 환경변수 기반 로그 레벨 조정 기능 구현. _throttled_log 함수 개선 및 로그 출력 시 logger 사용 일관화.
 
-현재 bybit.env에서 POLICY_MAX_HOLD_SEC=1800(30분), DEFAULT_TP_PCT=0.04, DEFAULT_SL_PCT=0.005 등으로 설정되어 있음. CF 결과 장기 보유 시 손실 누적이 관찰되어 최대 보유 시간을 짧게 유지하는 것은 타당하나, TP/SL 비율은 시장 변동성 및 레짐별 특성에 맞게 동적으로 조정하는 방안도 고려 필요.
+**Expected Impact:** 메모리 누수 방지 및 디버깅 편의성 향상, 불필요한 로그 출력 감소로 성능 개선 기대.
 
-**Code Changes:** engines/mc/regime_policy.py에서 변동성 정규화 기반 TP/SL 스케일링 로직 점검 및 필요시 동적 조정 기능 추가 검토.
+### [P3] 하이브리드 결정 로직 내 방향 결정 및 점수 계산 정합성 점검
+**Category:** logic | **Confidence:** 75%
 
-**Expected Impact:** 시장 상황에 맞는 TP/SL 조정으로 수익성 및 리스크 균형 개선
+hybrid_only 모드에서 방향 결정 시 mu_alpha 부호 단독 결정 대신 exp_vals 비교로 결정하는 로직은 합리적이나, direction_model 사용 여부와 hybrid planner 결과가 일치하지 않는 경우 fallback 로직이 다소 복잡함. direction 결정 및 policy_score 갱신 부분에서 예외 처리 및 fallback 기준을 명확히 하여 방향성 혼란 가능성을 줄이고, policy_score와 ev_expected 간 일관성 확보 필요.
+
+**Code Changes:** decision.py 내 _decide_hybrid_only 함수에서 direction 결정 로직 리팩토링 및 예외 처리 강화. direction_model과 hybrid planner 결과 불일치 시 fallback 정책 명확화 및 주석 보강.
+
+**Expected Impact:** 방향 결정 오류 감소 및 일관된 의사결정으로 전략 신뢰성 향상.
 
 ## Warnings
-- EV 계산 시 비용 이중 차감 문제로 인해 진입 신호가 과도하게 약화될 수 있으므로 반드시 점검 필요.
-- 과도한 레버리지 설정은 청산 위험을 높일 수 있으므로 보수적 조정 권장.
-- 환경변수에 의존하는 설정이 많아, 운영 시 env 파일과 실제 적용 값 간 불일치에 주의해야 함.
-- 메모리 해제 및 GPU 캐시 초기화 로직이 완벽하지 않을 경우 장기 운용 중 메모리 누수 발생 가능.
-- 진입/청산 hybrid_only 모드 전환 시 기존 로직과의 충돌 가능성에 유의.
+- MC 시뮬레이션 기반 비용 추정과 필터링 단계 비용 차감 중복으로 인해 진입 신호가 과도하게 억제될 수 있으므로 반드시 비용 처리 로직을 점검할 것.
+- 고레버리지 설정은 청산 리스크를 크게 증가시키므로, 실제 시장 변동성 및 유동성 상황에 맞춰 보수적으로 조정할 필요가 있음.
+- 환경변수 및 config 파라미터 변경 시, 전체 파이프라인에 미치는 영향(특히 진입/청산 임계치와 레버리지 제한)을 충분히 테스트해야 함.
+- 대용량 MC 시뮬레이션과 하이브리드 플래너 병행 시 메모리 사용량이 급증할 수 있으므로, 메모리 해제 및 캐시 클리어 로직이 정상 동작하는지 주기적으로 모니터링 필요.
 
 
 ---
