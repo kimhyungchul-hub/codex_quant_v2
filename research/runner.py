@@ -1003,9 +1003,28 @@ def _handle_telegram_actions(
                 from research.openai_reviewer import ask_openai_question
 
                 question = str(action.get("question") or "").strip()
+                chat_id = str(action.get("chat_id") or "")
                 if not question:
                     telegram_ctl.send_text("사용법: /rq_ask <질문>")
                     continue
+                try:
+                    telegram_ctl.append_chat_turn(
+                        role="user",
+                        text=question,
+                        chat_id=chat_id,
+                        source="telegram_message",
+                    )
+                except Exception:
+                    pass
+                try:
+                    n_ctx = int(_file_env_int("TELEGRAM_CHAT_CONTEXT_TURNS", 8))
+                except Exception:
+                    n_ctx = 8
+                recent_ctx = []
+                try:
+                    recent_ctx = telegram_ctl.get_recent_chat_context(chat_id=chat_id, n=max(2, n_ctx))
+                except Exception:
+                    recent_ctx = []
                 ctx = {
                     "last_status": str((last_result or {}).get("status") or "unknown"),
                     "research_mode": str((last_result or {}).get("research_mode") or "normal"),
@@ -1021,14 +1040,25 @@ def _handle_telegram_actions(
                         for f in (last_findings or [])[:5]
                         if isinstance(f, dict)
                     ],
+                    "recent_chat_context": recent_ctx,
                 }
                 status = ask_openai_question(question, context=ctx)
                 if status.get("status") == "ok":
-                    telegram_ctl.send_text(
+                    answer_msg = (
                         "[OpenAI Q&A]\n"
                         f"Q: {question}\n\n"
                         f"A:\n{str(status.get('answer') or '').strip()}"
                     )
+                    telegram_ctl.send_text(answer_msg)
+                    try:
+                        telegram_ctl.append_chat_turn(
+                            role="assistant",
+                            text=str(status.get("answer") or "").strip(),
+                            chat_id=chat_id,
+                            source="openai_qa",
+                        )
+                    except Exception:
+                        pass
                 else:
                     telegram_ctl.send_text(
                         "[OpenAI Q&A] 실패\n"

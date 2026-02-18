@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -21,6 +22,7 @@ class TelegramResearchControl:
     def __init__(self, project_root: Path) -> None:
         self.project_root = Path(project_root)
         self.offset_file = self.project_root / "state" / "telegram_research_offset.json"
+        self.history_file = self.project_root / "state" / "telegram_research_chat_history.json"
         self.token = self._env_or_file("TELEGRAM_BOT_TOKEN")
         self.chat_id = self._env_or_file("TELEGRAM_CHAT_ID")
         self.enabled = bool(self.token and self.chat_id)
@@ -143,6 +145,8 @@ class TelegramResearchControl:
             "- /rq_apply all : 최신 OpenAI 제안 전체 env 변경 적용\n"
             "- /rq_apply 1,3 : 최신 OpenAI 제안 중 1번과 3번만 적용\n"
             "- /rq_cf_now : 다음 CF 연구 사이클 즉시 시작\n"
+            "- 일반 문장 : 자동으로 /rq_ask 처리\n"
+            "- 자연어 '모두 적용해'류 : 자동으로 /rq_apply all 처리\n"
         )
 
     def _parse_apply_selection(self, arg: str) -> dict[str, Any]:
@@ -171,6 +175,8 @@ class TelegramResearchControl:
 
         if low in ("/rq_help", "/research_help", "연구 도움말", "연구 도움"):
             return {"type": "help"}
+        if low in ("/start", "/help"):
+            return {"type": "help"}
         if low in ("/rq_status", "/research_status", "연구 상태"):
             return {"type": "status"}
         if low in ("/rq_models", "/openai_models", "모델 목록"):
@@ -198,7 +204,64 @@ class TelegramResearchControl:
                 return {"type": "error", "message": "사용법: /rq_apply all 또는 /rq_apply 1,3"}
             return {"type": "apply_openai_suggestions", "selection": parsed.get("selection")}
 
-        return None
+        if raw.startswith("/"):
+            return {"type": "error", "message": "알 수 없는 명령입니다. /rq_help 를 사용하세요."}
+
+        # Natural-language routing: "apply all" intent.
+        if any(k in low for k in ("모두 적용", "전부 적용", "전체 적용", "all apply", "apply all")):
+            return {"type": "apply_openai_suggestions", "selection": "all"}
+
+        # Fallback: treat plain text as /rq_ask.
+        return {"type": "ask_openai", "question": raw}
+
+    def _load_history(self) -> list[dict]:
+        try:
+            if not self.history_file.exists():
+                return []
+            rows = json.loads(self.history_file.read_text(encoding="utf-8"))
+            if isinstance(rows, list):
+                return [r for r in rows if isinstance(r, dict)]
+        except Exception:
+            return []
+        return []
+
+    def _save_history(self, rows: list[dict]) -> None:
+        try:
+            self.history_file.parent.mkdir(parents=True, exist_ok=True)
+            self.history_file.write_text(json.dumps(rows[-1000:], ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def append_chat_turn(self, *, role: str, text: str, chat_id: str, source: str = "telegram") -> None:
+        msg = str(text or "").strip()
+        if not msg:
+            return
+        rows = self._load_history()
+        rows.append(
+            {
+                "ts": int(time.time()),
+                "role": str(role or "user"),
+                "text": msg[:4000],
+                "chat_id": str(chat_id or self.chat_id or ""),
+                "source": str(source or "telegram"),
+            }
+        )
+        self._save_history(rows)
+
+    def get_recent_chat_context(self, *, chat_id: str, n: int = 8) -> list[dict]:
+        rows = self._load_history()
+        cid = str(chat_id or self.chat_id or "")
+        filtered = [r for r in rows if str(r.get("chat_id") or "") == cid]
+        out = []
+        for r in filtered[-max(1, int(n)):]:
+            out.append(
+                {
+                    "role": str(r.get("role") or "user"),
+                    "text": str(r.get("text") or ""),
+                    "ts": int(r.get("ts") or 0),
+                }
+            )
+        return out
 
     def poll_actions(self) -> list[dict]:
         if not self.enabled:
