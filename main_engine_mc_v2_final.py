@@ -21453,9 +21453,9 @@ class LiveOrchestrator:
                     except Exception:
                         stream_parallel = False
                     try:
-                        stream_parallel_workers = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", 2) or 2)
+                        stream_parallel_workers = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", 1) or 1)
                     except Exception:
-                        stream_parallel_workers = 2
+                        stream_parallel_workers = 1
                     stream_parallel_workers = max(1, stream_parallel_workers)
 
                     async def _run_decide_batch(ctx_subset: list[dict]) -> tuple[list[dict], str, float]:
