@@ -26,7 +26,7 @@ import requests
 from core.ring_buffer import SharedMemoryRingBuffer
 
 os.environ.setdefault("MC_STREAMING_PARALLEL", "1")
-os.environ.setdefault("MC_STREAMING_PARALLEL_WORKERS", "2")
+os.environ.setdefault("MC_STREAMING_PARALLEL_WORKERS", "1")
 
 
 _ATEXIT_REGISTERED = False
@@ -679,9 +679,9 @@ def create_engine_hub(
     if use_process:
         print("[create_engine_hub] Using ProcessEngineHub (shared memory IPC)")
         try:
-            worker_count = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", "2") or 2)
+            worker_count = int(os.environ.get("MC_STREAMING_PARALLEL_WORKERS", "1") or 1)
         except Exception:
-            worker_count = 2
+            worker_count = 1
         worker_count = max(1, worker_count)
         return ProcessEngineHub(
             capacity=int(getattr(config, "MC_ENGINE_SHM_SLOTS", 32)),
