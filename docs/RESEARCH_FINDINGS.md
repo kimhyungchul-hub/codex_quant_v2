@@ -1,16 +1,16 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-18 20:30
+> Auto-generated: 2026-02-18 21:43
 > Baseline: 4642 trades, PnL=$-368.57, WR=19.3%, R:R=1.79
 
 ## Pipeline Stage Impact Summary
 
 ### VOLATILITY_GATE — volatility_gate
 
-**Best Finding:** volatility_gate: OOS-adjusted PnL +$298.11
-- Improvement: $+298.11
-- Confidence: 72%
-- Parameters: `{"scope": "chop_only", "chop_min_sigma": 0.5, "chop_max_sigma": 1.2, "chop_max_vpin": 0.65, "chop_min_dir_conf": 0.64, "chop_min_abs_mu_alpha": 20.0, "chop_max_hold_sec": 180}`
+**Best Finding:** volatility_gate: OOS-adjusted PnL +$290.13
+- Improvement: $+290.13
+- Confidence: 70%
+- Parameters: `{"scope": "chop_only", "chop_min_sigma": 0.5, "chop_max_sigma": 1.2, "chop_max_vpin": 0.65, "chop_min_dir_conf": 0.68, "chop_min_abs_mu_alpha": 20.0, "chop_max_hold_sec": 900}`
 
 ```
 [VOLATILITY_GATE] 파라미터 변경 제안:
@@ -18,23 +18,23 @@
   chop_min_sigma = 0.5
   chop_max_sigma = 1.2
   chop_max_vpin = 0.65
-  chop_min_dir_conf = 0.64
+  chop_min_dir_conf = 0.68
   chop_min_abs_mu_alpha = 20.0
-  chop_max_hold_sec = 180
-예상 효과: PnL $+320.50 (OOS 보정 $+298.11), WR +5.3%, R:R +0.60
-OOS 검증: pass=True rate=75% trainΔ=+79.38 testΔ=+73.84 penalty=0.93
-신뢰도: 72.0%
+  chop_max_hold_sec = 900
+예상 효과: PnL $+323.26 (OOS 보정 $+290.13), WR +5.3%, R:R +0.62
+OOS 검증: pass=True rate=75% trainΔ=+82.23 testΔ=+73.80 penalty=0.90
+신뢰도: 70.1%
 ```
 
 | Metric | Baseline | CF | Delta |
 |--------|----------|----|----|
-| n | 4642 | 1272 | -3370 |
-| pnl | -368.57 | -48.07 | +320.50 |
-| wr | 0.1932 | 0.2461 | +0.0529 |
-| rr | 1.79 | 2.39 | +0.60 |
-| edge | -0.1650 | -0.0486 | +0.1164 |
-| sharpe | -6.52 | -1.04 | +5.48 |
-| pf | 0.43 | 0.78 | +0.35 |
+| n | 4642 | 1214 | -3428 |
+| pnl | -368.57 | -45.31 | +323.26 |
+| wr | 0.1932 | 0.2463 | +0.0531 |
+| rr | 1.79 | 2.41 | +0.62 |
+| edge | -0.1650 | -0.0471 | +0.1179 |
+| sharpe | -6.52 | -0.97 | +5.55 |
+| pf | 0.43 | 0.79 | +0.36 |
 
 ### VPIN_FILTER — VPIN 필터
 
@@ -257,14 +257,14 @@ OOS 검증: pass=True rate=75% trainΔ=+31.38 testΔ=+27.82 penalty=0.89
 
 ## 🎯 Recommended Actions
 
-1. **volatility_gate: OOS-adjusted PnL +$298.11** (ΔPnL: $+298.11, confidence: 72%)
+1. **volatility_gate: OOS-adjusted PnL +$290.13** (ΔPnL: $+290.13, confidence: 70%)
    - `scope` = `chop_only`
    - `chop_min_sigma` = `0.5`
    - `chop_max_sigma` = `1.2`
    - `chop_max_vpin` = `0.65`
-   - `chop_min_dir_conf` = `0.64`
+   - `chop_min_dir_conf` = `0.68`
    - `chop_min_abs_mu_alpha` = `20.0`
-   - `chop_max_hold_sec` = `180`
+   - `chop_max_hold_sec` = `900`
 
 2. **vpin_filter: OOS-adjusted PnL +$276.06** (ΔPnL: $+276.06, confidence: 65%)
    - `max_vpin` = `0.3`
