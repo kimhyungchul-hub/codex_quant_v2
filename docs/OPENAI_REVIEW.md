@@ -1,69 +1,56 @@
-# OpenAI Code Review — 2026-02-18 09:23
+# OpenAI Code Review — 2026-02-18 10:41
 
-**Model:** gpt-4.1-mini
+**Model:** gpt-5.2-codex
 **Risk Score:** 7/10
-**Summary:** 전략 코드는 레짐별 동적 정책과 MC 시뮬레이션 기반의 하이브리드 의사결정 체계를 갖추었으나, 일부 파라미터와 비용 처리에서 이중 차감 문제와 레버리지 과다 설정 위험이 존재하며, 메모리 관리와 로그 최적화 여지도 있음.
+**Summary:** Hybrid-only MC pipeline는 일관된 방향/스코어 체계를 갖추었지만, 비용 이중 차감과 과도한 레버리지/사이징 강제가 실거래 손실 리스크를 키우고 있습니다.
 
 ## Suggestions
 
-### [P1] EV 계산 시 비용 이중 차감 문제 수정
-**Category:** logic | **Confidence:** 95%
+### [P1] net_expectancy 필터의 fee 이중 차감 제거
+**Category:** logic | **Confidence:** 78%
 
-evaluate_entry_metrics 함수 내에서 MC 시뮬레이션 결과 ev_raw(또는 ev)에 이미 비용이 포함되어 있음에도 불구하고, 필터링 단계에서 별도로 수수료/슬리피지 비용을 다시 차감하는 로직이 존재하여 실제 net_edge가 과도하게 낮아지는 현상이 발생함. 이는 진입 필터가 과도하게 보수적으로 작동하게 하여 유효 진입 기회를 놓칠 수 있음. 비용 차감 중복을 제거하거나, net_expectancy 필터에서 비용 차감 부분을 0으로 설정하는 방식으로 수정 필요.
+문서에 명시된대로 net_expectancy 계산에서 MC EV(이미 fee 포함)에서 다시 fee_est를 차감하는 구조가 존재하면 대부분의 약한 엣지가 과도하게 음수화됩니다. 결과적으로 좋은 후보가 과도하게 걸러져 방향/EV 불일치가 증가할 수 있습니다. fee_est를 0으로 두거나 EV에서 fee를 역산해 중복을 제거하세요.
 
-**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0008'}`
+**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0003'}`
 
-**Code Changes:** engines/mc/entry_evaluation.py 내 evaluate_entry_metrics 및 _min_filter_states 함수에서 비용 차감 중복 제거. 구체적으로 edge_raw가 이미 비용 차감된 값임을 명확히 하고, net_edge 계산 시 비용 차감 부분을 제거하거나 주석 처리.
+**Code Changes:** main_engine 또는 entry filter에서 net_edge = edge_raw - fee_est 계산부 수정. edge_raw가 이미 fee 포함이면 fee_est=0 또는 edge_raw += fee_est 후 필터 적용.
 
-**Expected Impact:** 진입 필터의 과도한 차단 완화로 진입 기회 증가 및 전체 수익성 개선 기대.
+**Expected Impact:** 과도한 후보 차단 감소, EV/score 분포 정상화, 진입 시그널 품질 개선.
 
-### [P1] 레버리지 상한 및 최소값 환경변수 재검토 및 하향 조정
-**Category:** risk | **Confidence:** 90%
+### [P1] 레버리지/사이징 강제값 완화 (HYBRID/UNI)
+**Category:** risk | **Confidence:** 74%
 
-현재 bybit.env에서 UNI_LEV_MIN=10.0, UNI_LEV_MAX=50 등 매우 공격적인 레버리지 설정이 되어 있음. 과거 청산 손실 사례와 CF 분석 결과를 고려하면, 특히 변동성 높은 레짐에서 최대 레버리지 상한을 낮추고 최소 레버리지도 1~5 사이로 조정하는 것이 리스크 관리에 유리함. 레짐별 max_leverage 값과 MC 내 하드캡을 일치시키고, 급격한 레버리지 변동 방지를 위한 EMA smoothing 강화 필요.
+UNI_LEV_MIN=10, HYBRID_SIZE_FRAC=1.0, HYBRID_LEVERAGE=100은 실질적으로 과도한 노출을 유도합니다. MAX_LEVERAGE=15와 충돌하며, 변동성 급등 시 청산 위험이 큽니다. 최소 레버리지 하한을 낮추고 하이브리드 강제 사이징을 해제해야 합니다.
 
-**Env Changes:** `{'UNI_LEV_MIN': '1.0', 'UNI_LEV_MAX': '16.0', 'MAX_LEVERAGE': '15'}`
+**Env Changes:** `{'UNI_LEV_MIN': '3.0', 'HYBRID_FORCE_SIZE_FRAC': '0', 'HYBRID_FORCE_LEVERAGE': '0', 'HYBRID_SIZE_FRAC': '0.25', 'HYBRID_LEVERAGE': '15.0'}`
 
-**Code Changes:** engines/mc/decision.py 및 engines/mc/regime_policy.py에서 레버리지 관련 상수 및 정책값을 환경변수와 일치시키고, _LEV_EMA_MEM 기반 smoothing 강화 로직 추가.
+**Code Changes:** engines/mc/decision.py 및 hybrid planner sizing 경로에서 force_* 플래그가 true일 때만 고정 사이징 적용하도록 조건 확인.
 
-**Expected Impact:** 과도한 청산 위험 감소 및 포지션 안정성 향상, 장기 수익성 개선 기대.
+**Expected Impact:** 레버리지 과다 노출 감소, tail-risk 및 강제 청산 리스크 완화.
 
-### [P2] VPIN 및 변동성 게이트 필터 파라미터 적용 및 강화
-**Category:** param | **Confidence:** 85%
+### [P1] CF 우수 결과 적용: VPIN 필터 및 Volatility Gate
+**Category:** param | **Confidence:** 66%
 
-CF 분석 결과 VPIN 필터(max_vpin=0.3)와 volatility_gate 필터(chop_min_sigma=0.5, chop_max_sigma=2.5 등)의 적용이 수익성 개선에 유의미함. 현재 환경변수에 반영되어 있지 않거나 기본값으로 유지 중인 경우, 이를 bybit.env에 명확히 반영하고, chop regime에 대해서는 chop_entry_floor_add=0.005, chop_entry_min_dir_conf=0.8 등의 파라미터도 적용하여 chop 구간에서의 불필요한 진입을 줄일 필요가 있음.
+최근 CF에서 VPIN_FILTER(max_vpin=0.3)와 volatility_gate(scope=all_regimes, chop_min_sigma=0.5, chop_max_sigma=2.5, chop_max_vpin=0.65, chop_min_dir_conf=0.64, chop_min_abs_mu_alpha=5.0)가 OOS 개선을 보였습니다. 해당 게이트 적용은 chop 구간 손실을 크게 줄일 가능성이 높습니다.
 
-**Env Changes:** `{'MAX_VPIN': '0.3', 'CHOP_ENTRY_FLOOR_ADD': '0.005', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'CHOP_MIN_SIGMA': '0.5', 'CHOP_MAX_SIGMA': '2.5'}`
+**Env Changes:** `{'VPIN_FILTER_MAX': '0.3', 'VOLATILITY_GATE_SCOPE': 'all_regimes', 'CHOP_VOL_GATE_MIN_SIGMA': '0.5', 'CHOP_VOL_GATE_MAX_SIGMA': '2.5', 'CHOP_VOL_GATE_MAX_VPIN': '0.65', 'CHOP_ENTRY_MIN_DIR_CONF': '0.64', 'CHOP_ENTRY_MIN_MU_ALPHA': '5.0'}`
 
-**Code Changes:** regime_policy.py 내 regime별 필터 임계치 및 entry guard 파라미터를 환경변수 기반으로 재설정. entry_evaluation.py에서 VPIN, volatility 관련 필터 로직 강화 및 주석 추가.
+**Code Changes:** volatility gate/VPIN filter 적용부가 환경변수를 읽도록 설정 확인 (필요 시 env 키 매핑 추가).
 
-**Expected Impact:** 불필요한 진입 감소 및 손실 구간 필터링 강화로 PnL과 승률 개선 기대.
+**Expected Impact:** chop 구간 저품질 시그널 필터링 강화, 승률 및 PF 개선 기대.
 
-### [P2] 메모리 관리 및 로그 최적화 강화
-**Category:** perf | **Confidence:** 80%
+### [P2] 결정 seed 안정화 (hash() 비결정성 제거)
+**Category:** logic | **Confidence:** 70%
 
-evaluate_entry_metrics 함수에서 대용량 배열 및 텐서 해제 후 가비지 컬렉션과 GPU 캐시 비우기 로직이 있으나, 예외 처리 및 로그가 부족하여 문제 발생 시 원인 파악이 어려움. 또한, _throttled_log 함수가 로그 빈도 제한에 사용되나, 로그 레벨과 출력 조건을 환경변수로 세밀하게 조정할 수 있도록 개선 필요.
+decide에서 hash(symbol)을 사용하면 PYTHONHASHSEED에 따라 런마다 seed가 달라집니다. 동일 입력의 재현성이 깨져 리서치/디버깅에 불리합니다. 안정적 해시(crc32/xxhash)로 교체하세요.
 
-**Env Changes:** `{'MC_PERF_LOG': '0'}`
+**Code Changes:** engines/mc/decision.py: seed = int(zlib.crc32(symbol.encode()) ^ seed_window) 등으로 변경.
 
-**Code Changes:** entry_evaluation.py 및 decision.py 내 메모리 해제 로직에 상세 예외 로그 추가 및 환경변수 기반 로그 레벨 조정 기능 구현. _throttled_log 함수 개선 및 로그 출력 시 logger 사용 일관화.
-
-**Expected Impact:** 메모리 누수 방지 및 디버깅 편의성 향상, 불필요한 로그 출력 감소로 성능 개선 기대.
-
-### [P3] 하이브리드 결정 로직 내 방향 결정 및 점수 계산 정합성 점검
-**Category:** logic | **Confidence:** 75%
-
-hybrid_only 모드에서 방향 결정 시 mu_alpha 부호 단독 결정 대신 exp_vals 비교로 결정하는 로직은 합리적이나, direction_model 사용 여부와 hybrid planner 결과가 일치하지 않는 경우 fallback 로직이 다소 복잡함. direction 결정 및 policy_score 갱신 부분에서 예외 처리 및 fallback 기준을 명확히 하여 방향성 혼란 가능성을 줄이고, policy_score와 ev_expected 간 일관성 확보 필요.
-
-**Code Changes:** decision.py 내 _decide_hybrid_only 함수에서 direction 결정 로직 리팩토링 및 예외 처리 강화. direction_model과 hybrid planner 결과 불일치 시 fallback 정책 명확화 및 주석 보강.
-
-**Expected Impact:** 방향 결정 오류 감소 및 일관된 의사결정으로 전략 신뢰성 향상.
+**Expected Impact:** 백테스트/실시간 간 의사결정 재현성 개선.
 
 ## Warnings
-- MC 시뮬레이션 기반 비용 추정과 필터링 단계 비용 차감 중복으로 인해 진입 신호가 과도하게 억제될 수 있으므로 반드시 비용 처리 로직을 점검할 것.
-- 고레버리지 설정은 청산 리스크를 크게 증가시키므로, 실제 시장 변동성 및 유동성 상황에 맞춰 보수적으로 조정할 필요가 있음.
-- 환경변수 및 config 파라미터 변경 시, 전체 파이프라인에 미치는 영향(특히 진입/청산 임계치와 레버리지 제한)을 충분히 테스트해야 함.
-- 대용량 MC 시뮬레이션과 하이브리드 플래너 병행 시 메모리 사용량이 급증할 수 있으므로, 메모리 해제 및 캐시 클리어 로직이 정상 동작하는지 주기적으로 모니터링 필요.
+- state/bybit.env에 API 키 및 텔레그램 토큰이 평문으로 포함되어 있어 보안 위험이 큽니다.
+- HYBRID_ONLY 모드에서 정책/필터가 일원화되므로 작은 파라미터 변경이 전체 진입/청산에 큰 영향을 줄 수 있습니다.
 
 
 ---
