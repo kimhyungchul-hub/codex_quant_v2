@@ -231,31 +231,42 @@ def _extract_response_text(resp_json: dict) -> Optional[str]:
 
 
 def _call_openai(prompt: str, api_key: str, *, model: str, api_url: str) -> Optional[str]:
+    def _request(payload: dict) -> Optional[str]:
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(
+            api_url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            return _extract_response_text(data)
+
     payload = {
         "model": model,
         "input": prompt,
         "temperature": 0.3,
         "max_output_tokens": 8192,
     }
-    body = json.dumps(payload).encode("utf-8")
-    req = Request(
-        api_url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
     try:
-        with urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
-            return _extract_response_text(data)
+        return _request(payload)
     except HTTPError as e:
         try:
             detail = e.read().decode("utf-8", errors="ignore")[:400]
         except Exception:
             detail = str(e)
+        if e.code == 400 and "temperature" in str(detail).lower() and "not supported" in str(detail).lower():
+            # Some models (e.g., codex variants) reject temperature in Responses API.
+            try:
+                payload2 = dict(payload)
+                payload2.pop("temperature", None)
+                return _request(payload2)
+            except Exception as e2:
+                logger.error(f"OpenAI retry without temperature failed: {e2}")
         logger.error(f"OpenAI API HTTP error: {e.code} {detail}")
     except URLError as e:
         logger.error(f"OpenAI API network error: {e}")
