@@ -1,52 +1,52 @@
-# OpenAI Code Review — 2026-02-18 10:42
+# OpenAI Code Review — 2026-02-18 11:23
 
 **Model:** gpt-5.2-codex
-**Risk Score:** 8/10
-**Summary:** 전략은 하이브리드 MC 중심으로 통일되어 있으나, 비용 이중 차감과 강제 사이징/과도 레버리지 설정이 리스크를 크게 키우고 있습니다. 레짐별 엔트리 임계치와 시드 결정의 비결정성도 품질 저하 요인이므로 수정이 필요합니다.
+**Risk Score:** 7/10
+**Summary:** 전반적으로 hybrid-only 경로가 안정화되어 있으나, 결정 시드의 비결정성·수수료 이중 차감·과도한 하이브리드 레버리지가 성능/리스크를 악화시킬 여지가 있습니다.
 
 ## Suggestions
 
-### [P1] EV/Net Expectancy 비용 이중 차감 제거
-**Category:** logic | **Confidence:** 84%
+### [P1] 결정 시드의 비결정성 제거 (Python hash salt 문제)
+**Category:** logic | **Confidence:** 86%
 
-문서(SIGNAL_PIPELINE_REFERENCE.md)에서 명시된대로 net_expectancy 필터에서 MC EV(이미 fee 포함)에서 다시 fee_est를 빼고 있어 수익 기대치가 과도하게 악화됩니다. 이는 both_ev_neg 및 net_expectancy 필터가 과도하게 차단하게 만들며, 특히 짧은 horizon에서 drift보다 fee가 과대 반영됩니다.
+현재 결정 시드가 `hash(symbol)`을 사용하여 프로세스마다 다른 시드가 생성됩니다(PYTHONHASHSEED 랜덤화). 백테스트/실시간 결정 재현성이 깨지고, 배치 처리 간 미세한 결정 차이를 유발합니다. 안정적인 해시(crc32/xxhash 등)를 사용해 동일 심볼·시간 윈도우에 항상 동일 시드를 보장해야 합니다.
 
-**Code Changes:** main_engine 또는 _min_filter_states() 내 `net_edge = edge_raw - fee_est` 로직을 `net_edge = edge_raw`로 변경하거나, fee_est를 0으로 두고 MC cost_base를 그대로 사용. 필요 시 `edge_raw_gross = edge_raw + fee_roundtrip_total`로 복원한 뒤 별도 비교.
+**Code Changes:** engines/mc/decision.py: `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)` → `seed = (zlib.crc32(symbol.encode()) ^ seed_window) & 0xFFFFFFFF` (상단에 zlib import 추가).
 
-**Expected Impact:** 불필요한 진입 차단 감소, EV/score 분포 정상화, 실제 수익 기회 유지
+**Expected Impact:** 재현성 향상, 미세 결정 변동 감소, 리서치/튜닝 결과와 실거래 결과의 괴리 축소.
 
-### [P1] Hybrid 강제 사이징/레버리지 해제 및 상한 정합화
+### [P1] Hybrid 강제 레버리지/사이즈 완화 및 MAX_LEVERAGE와 일치
 **Category:** risk | **Confidence:** 79%
 
-현재 HYBRID_SIZE_FRAC=1.0, HYBRID_FORCE_SIZE_FRAC=1, HYBRID_LEVERAGE=100 설정은 MAX_LEVERAGE=15 및 레짐별 cap(UNI_LEV_MAX_*)과 충돌합니다. 하이브리드 경로에서는 sizing이 고정되어 risk-utility/kelly 최적화가 무력화되고, 계정 변동성 및 청산 위험이 급증합니다.
+bybit.env에서 HYBRID_LEVERAGE=100, HYBRID_SIZE_FRAC=1.0, FORCE_SIZE_FRAC=1로 강제되어 있어 MAX_LEVERAGE=15와 충돌하며, 하이브리드 경로가 리스크 세이프티를 우회할 수 있습니다. 하드 캡과 정합되도록 하이브리드 레버리지/노출을 낮추고 강제 옵션을 해제해야 합니다.
 
-**Env Changes:** `{'HYBRID_FORCE_SIZE_FRAC': '0', 'HYBRID_SIZE_FRAC': '0.25', 'HYBRID_LEVERAGE': '15', 'HYBRID_LEV_MAX': '15'}`
+**Env Changes:** `{'HYBRID_LEVERAGE': '15', 'HYBRID_LEV_MAX': '15', 'HYBRID_MAX_EXPOSURE': '7.0', 'HYBRID_FORCE_LEVERAGE': '0', 'HYBRID_FORCE_SIZE_FRAC': '0'}`
 
-**Code Changes:** engines/mc/decision.py 및 hybrid planner 경로에서 `force size/leverage`가 true일 때도 leverage가 MAX_LEVERAGE/UNI_LEV_MAX를 초과하지 않도록 상한 강제. sizing은 `optimal_size`/`kelly` 기반으로 soft clamp 적용.
+**Code Changes:** 설정 변경만으로 충분. 필요시 hybrid planner의 leverage cap 적용 로직에서 MAX_LEVERAGE를 하드 상한으로 동기화.
 
-**Expected Impact:** 청산 리스크 감소, 레버리지와 포지션 크기의 일관성 확보, 실거래 안정성 향상
+**Expected Impact:** 청산 위험·변동성 노출 감소, 노출 캡과 실제 포지션 사이의 불일치 해소.
 
-### [P2] 결정 시드의 비결정성(파이썬 hash salt) 제거
-**Category:** logic | **Confidence:** 72%
+### [P1] net_expectancy 수수료 이중 차감 제거
+**Category:** logic | **Confidence:** 74%
 
-현재 seed = hash(symbol) ^ seed_window는 파이썬 해시 salt로 인해 프로세스 재시작마다 달라져 결과가 재현되지 않습니다. 하이브리드/MC 결과의 일관성을 위해 안정적인 해시 함수 사용이 필요합니다.
+문서(SIGNAL_PIPELINE_REFERENCE)에서 언급된 바와 같이 entry 필터의 net_expectancy가 MC EV(이미 비용 포함)에서 다시 fee_est를 차감해 EV가 과도하게 음수로 치우칩니다. 필터 단계에서 fee_est를 0으로 두거나 gross EV를 사용하는 방식으로 수정해야 합니다.
 
-**Code Changes:** engines/mc/decision.py에서 `hash(symbol)` 대신 `hashlib.blake2b(symbol.encode(), digest_size=4).digest()`로 정수 변환하여 seed 생성.
+**Code Changes:** 엔트리 필터(_min_filter_states 또는 유사 함수)에서 `net_edge = edge_raw - fee_est` → `net_edge = edge_raw` (또는 edge_raw에 fee를 역산하여 gross EV로 환산 후 차감). 관련 코드가 engines/mc/main_engine.py 또는 entry filter 모듈에 위치한 경우 해당 구간 수정.
 
-**Expected Impact:** 백테스트/실시간 간 결과 일관성 증가, 디버깅 및 A/B 비교 정확도 향상
+**Expected Impact:** 과도한 진입 차단 감소, EV 왜곡 제거로 필터 일관성 회복.
 
-### [P2] 레짐별 entry floor/add 미반영 경로 정합화
-**Category:** logic | **Confidence:** 68%
+### [P2] mu/sigma NaN/Inf 가드 및 sigma 하한 강화
+**Category:** risk | **Confidence:** 68%
 
-decision.py의 entry_floor는 UNIFIED_ENTRY_FLOOR만 참고하고 레짐별 entry_floor_add/vol_scale이 반영되지 않는 경로가 존재합니다. 이는 chop/bear에서 의도된 보수적 임계치를 무시할 수 있습니다.
+evaluate_entry_metrics에서 mu/sigma가 None/NaN/Inf일 때 그대로 전달되면 MC 경로가 NaN으로 오염될 수 있습니다. 실시간 데이터 결측 시에도 안전하게 0 또는 최소 sigma로 클램프해야 합니다.
 
-**Code Changes:** decision.py의 진입 판단부에서 get_regime_policy(regime, realized_sigma) 결과를 사용해 `effective_floor = policy.entry_floor + policy.entry_floor_add`로 계산. 하이브리드 경로에도 동일 적용.
+**Code Changes:** engines/mc/entry_evaluation.py: mu/sigma 추출 직후 `if not np.isfinite(mu): mu=0; if not np.isfinite(sigma) or sigma<=0: sigma=1e-6` 추가.
 
-**Expected Impact:** 레짐 적응형 진입 필터 일관성 확보, chop/bear 저품질 진입 감소
+**Expected Impact:** 실시간 이상치/결측 데이터로 인한 MC 결과 붕괴 방지.
 
 ## Warnings
-- state/bybit.env에 API 키/토큰이 평문으로 포함되어 있어 보안 위험이 큽니다. 공개 저장소/로그 유출에 주의하세요.
-- HYBRID_SIZE_FRAC=1.0 및 HYBRID_LEVERAGE=100 설정은 현재 MAX_LEVERAGE=15와 충돌하며, 실거래에서 강제 사이징으로 과도한 노출 위험이 있습니다.
+- bybit.env에 API 키/토큰이 평문으로 포함되어 있습니다. 운영 환경에서는 별도 비밀관리(ENV Vault/Secret Manager)로 이동 필요.
+- MC_HYBRID_ONLY=1 상태에서 비-hybrid 로직은 사실상 사용되지 않으므로, 비-hybrid 경로의 버그 수정은 즉시 효용이 낮습니다.
 
 
 ---
