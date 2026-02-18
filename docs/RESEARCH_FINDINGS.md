@@ -1,9 +1,40 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-18 15:21
+> Auto-generated: 2026-02-18 16:29
 > Baseline: 4642 trades, PnL=$-368.57, WR=19.3%, R:R=1.79
 
 ## Pipeline Stage Impact Summary
+
+### VOLATILITY_GATE — volatility_gate
+
+**Best Finding:** volatility_gate: OOS-adjusted PnL +$290.24
+- Improvement: $+290.24
+- Confidence: 70%
+- Parameters: `{"scope": "chop_only", "chop_min_sigma": 0.1, "chop_max_sigma": 2.5, "chop_max_vpin": 0.65, "chop_min_dir_conf": 0.68, "chop_min_abs_mu_alpha": 20.0, "chop_max_hold_sec": 300}`
+
+```
+[VOLATILITY_GATE] 파라미터 변경 제안:
+  scope = chop_only
+  chop_min_sigma = 0.1
+  chop_max_sigma = 2.5
+  chop_max_vpin = 0.65
+  chop_min_dir_conf = 0.68
+  chop_min_abs_mu_alpha = 20.0
+  chop_max_hold_sec = 300
+예상 효과: PnL $+320.65 (OOS 보정 $+290.24), WR +5.2%, R:R +0.59
+OOS 검증: pass=True rate=75% trainΔ=+80.82 testΔ=+73.15 penalty=0.91
+신뢰도: 69.8%
+```
+
+| Metric | Baseline | CF | Delta |
+|--------|----------|----|----|
+| n | 4642 | 1225 | -3417 |
+| pnl | -368.57 | -47.92 | +320.65 |
+| wr | 0.1932 | 0.2457 | +0.0525 |
+| rr | 1.79 | 2.38 | +0.59 |
+| edge | -0.1650 | -0.0502 | +0.1148 |
+| sharpe | -6.52 | -1.04 | +5.48 |
+| pf | 0.43 | 0.78 | +0.35 |
 
 ### VPIN_FILTER — VPIN 필터
 
@@ -29,37 +60,6 @@ OOS 검증: pass=True rate=75% trainΔ=+62.25 testΔ=+63.65 penalty=1.00
 | edge | -0.1650 | -0.0846 | +0.0804 |
 | sharpe | -6.52 | -2.00 | +4.52 |
 | pf | 0.43 | 0.66 | +0.23 |
-
-### VOLATILITY_GATE — volatility_gate
-
-**Best Finding:** volatility_gate: OOS-adjusted PnL +$269.22
-- Improvement: $+269.22
-- Confidence: 60%
-- Parameters: `{"scope": "all_regimes", "chop_min_sigma": 0.1, "chop_max_sigma": 2.5, "chop_max_vpin": 0.65, "chop_min_dir_conf": 0.64, "chop_min_abs_mu_alpha": 5.0, "chop_max_hold_sec": 300}`
-
-```
-[VOLATILITY_GATE] 파라미터 변경 제안:
-  scope = all_regimes
-  chop_min_sigma = 0.1
-  chop_max_sigma = 2.5
-  chop_max_vpin = 0.65
-  chop_min_dir_conf = 0.64
-  chop_min_abs_mu_alpha = 5.0
-  chop_max_hold_sec = 300
-예상 효과: PnL $+354.43 (OOS 보정 $+269.22), WR -0.6%, R:R +1.97
-OOS 검증: pass=True rate=75% trainΔ=+104.00 testΔ=+78.99 penalty=0.76
-신뢰도: 59.6%
-```
-
-| Metric | Baseline | CF | Delta |
-|--------|----------|----|----|
-| n | 4642 | 919 | -3723 |
-| pnl | -368.57 | -14.13 | +354.43 |
-| wr | 0.1932 | 0.1872 | -0.0060 |
-| rr | 1.79 | 3.77 | +1.97 |
-| edge | -0.1650 | -0.0227 | +0.1423 |
-| sharpe | -6.52 | -0.37 | +6.15 |
-| pf | 0.43 | 0.87 | +0.44 |
 
 ### REGIME_SIDE_BLOCK — regime_side_block
 
@@ -257,17 +257,17 @@ OOS 검증: pass=True rate=75% trainΔ=+31.38 testΔ=+27.82 penalty=0.89
 
 ## 🎯 Recommended Actions
 
-1. **vpin_filter: OOS-adjusted PnL +$276.06** (ΔPnL: $+276.06, confidence: 65%)
-   - `max_vpin` = `0.3`
-
-2. **volatility_gate: OOS-adjusted PnL +$269.22** (ΔPnL: $+269.22, confidence: 60%)
-   - `scope` = `all_regimes`
+1. **volatility_gate: OOS-adjusted PnL +$290.24** (ΔPnL: $+290.24, confidence: 70%)
+   - `scope` = `chop_only`
    - `chop_min_sigma` = `0.1`
    - `chop_max_sigma` = `2.5`
    - `chop_max_vpin` = `0.65`
-   - `chop_min_dir_conf` = `0.64`
-   - `chop_min_abs_mu_alpha` = `5.0`
+   - `chop_min_dir_conf` = `0.68`
+   - `chop_min_abs_mu_alpha` = `20.0`
    - `chop_max_hold_sec` = `300`
+
+2. **vpin_filter: OOS-adjusted PnL +$276.06** (ΔPnL: $+276.06, confidence: 65%)
+   - `max_vpin` = `0.3`
 
 3. **regime_side_block: OOS-adjusted PnL +$258.25** (ΔPnL: $+258.25, confidence: 58%)
    - `regime_side_block_list` = `bear_long,bull_short,chop_long`
