@@ -1,67 +1,56 @@
-# OpenAI Code Review — 2026-02-18 15:21
+# OpenAI Code Review — 2026-02-18 16:29
 
 **Model:** gpt-5.2-codex
 **Risk Score:** 7/10
-**Summary:** 전략 전반은 hybrid-only + 고레버리지 설정과 필터 체인이 결합되어 있으며, 비용 이중차감/레버리지 캡 불일치/VPIN·volatility 게이트 미적용이 성과와 리스크에 동시에 영향을 주고 있습니다. 주요 로직 리스크는 fee 중복 차감과 레버리지 하드캡 우회 가능성입니다.
+**Summary:** 하이브리드 MC 기반 전략은 구조적으로 안정적이지만, 수수료 이중 차감/레버리지 상한 불일치/게이트 파라미터 미적용으로 인해 OOS 성능과 리스크가 악화될 가능성이 큽니다.
 
 ## Suggestions
 
-### [P1] net_expectancy 필터의 fee 이중 차감 제거
-**Category:** logic | **Confidence:** 83%
+### [P1] net_expectancy 필터의 수수료 이중 차감 제거
+**Category:** logic | **Confidence:** 78%
 
-docs에 명시된 것처럼 entry filter에서 `net_edge = edge_raw - fee_est`가 MC EV(이미 비용 포함)에서 다시 비용을 차감하여 과도한 음수 판정을 유발합니다. 이는 both_ev_neg 및 net_expectancy 필터에서 진입을 과도하게 차단하며, EV 분포를 왜곡합니다.
+docs/SIGNAL_PIPELINE_REFERENCE.md에 명시된 문제처럼 net_expectancy 계산에서 fee_est를 EV에 다시 차감하면 MC EV(이미 fee 포함)가 2배로 패널티됩니다. 이는 both_ev_neg 및 net_expectancy 필터 과차단을 유발합니다. fee_est를 0으로 두거나, EV를 gross로 복원한 뒤 차감하도록 수정해야 합니다.
 
-**Env Changes:** `{'ENTRY_NET_EXPECTANCY_FEE_MULT': '0.0'}`
+**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0003'}`
 
-**Code Changes:** main_engine의 _min_filter_states() 또는 net_expectancy 계산에서 `fee_est` 차감을 제거하거나 `fee_est *= ENTRY_NET_EXPECTANCY_FEE_MULT` (default=1.0) 도입. MC EV가 gross일 경우에만 fee를 차감하도록 분기.
+**Code Changes:** engines/mc/entry_evaluation.py 또는 main_engine의 _min_filter_states 내 net_edge 계산부에서 `net_edge = edge_raw - fee_est` → `net_edge = edge_raw` (또는 edge_raw에 fee 역보정 후 차감).
 
-**Expected Impact:** EV 분포 왜곡 제거로 불필요한 차단 감소, 특히 수수료가 큰 짧은 horizon에서 진입 신호 복원. CF/실거래 필터 과민 반응 완화.
+**Expected Impact:** 필터 과차단 해소로 진입 기회 회복, EV/WR 개선. 특히 chop 구간에서 both_ev_neg 감소.
 
-### [P1] 레버리지 하드캡 불일치 해소 (HYBRID_LEVERAGE, UNI_LEV_MAX, MAX_LEVERAGE)
-**Category:** risk | **Confidence:** 78%
+### [P1] 레버리지 상한 일관화 및 저신뢰 구간 가변 하한 적용
+**Category:** risk | **Confidence:** 72%
 
-bybit.env에서 HYBRID_LEVERAGE=100, UNI_LEV_MAX=50, MAX_LEVERAGE=15가 공존하며, hybrid 경로가 하드캡을 우회할 여지가 있습니다. 이는 백테스트와 실거래 레버리지 현실을 분리시키고, 손실 꼬리 위험을 키웁니다.
+bybit.env에서 MAX_LEVERAGE=15인데 UNI_LEV_MAX=50, UNI_LEV_MIN=10이 공존합니다. decision.py에서는 ctx.max_leverage만 사용해 상위 cap 불일치 위험이 있습니다. 저신뢰/고 VPIN 구간에서는 레버리지 하한(UNI_LEV_MIN=10)이 과도해 강제 고레버리지 진입을 유발할 수 있습니다. 글로벌 캡과 저신뢰 cap을 코드에서 강제 적용하고, 저신뢰 조건에서는 레버리지 하한을 1~3으로 낮추는 조건부 정책을 권장합니다.
 
-**Env Changes:** `{'HYBRID_LEVERAGE': '15.0', 'HYBRID_FORCE_LEVERAGE': '0', 'UNI_LEV_MAX': '30', 'UNI_LEV_MAX_CHOP': '15', 'UNI_LEV_MAX_BEAR': '12'}`
+**Env Changes:** `{'LEVERAGE_LOW_CONF_CAP': '3.0', 'LEVERAGE_HIGH_VPIN_CAP': '3.0'}`
 
-**Code Changes:** decide_hybrid_only 및 leverage 산출부에서 `effective_max_lev = min(MAX_LEVERAGE, regime.max_leverage, UNI_LEV_MAX, HYBRID_LEV_MAX)` 강제. hybrid planner가 반환하는 leverage에도 동일 하드캡 적용.
+**Code Changes:** engines/mc/decision.py: max_leverage 계산 시 `max_leverage = min(ctx_max, config.MAX_LEVERAGE, regime_policy.max_leverage, env UNI_LEV_MAX)` 적용. 레버리지 floor도 `if conf < LEVERAGE_LOW_CONF_THRESHOLD or vpin > LEVERAGE_HIGH_VPIN_THRESHOLD: lev_floor=1~3` 로 조건부 하향.
 
-**Expected Impact:** 실거래 리스크 상한 일관화, liquidation tail-risk 완화, 레버리지 관련 백테스트/실거래 괴리 축소.
+**Expected Impact:** 과도한 레버리지 강제 진입 감소, liquidation/급락 손실 억제, 실거래 리스크 하향.
 
-### [P1] CF 상위 개선안 적용 (VPIN/volatility_gate/side_block/chop_guard)
-**Category:** param | **Confidence:** 70%
+### [P1] CF 상위 개선안(Volatility gate/VPIN/Regime side block) 적용
+**Category:** param | **Confidence:** 69%
 
-최근 CF 결과에서 VPIN 필터, 변동성 게이트, 레짐-사이드 차단, chop guard가 모두 유의미한 OOS 개선을 보였으나 env에 반영되지 않았습니다. 특히 max_vpin=0.3은 손실 구간을 직접 차단합니다.
+CF 분석에서 유의미한 개선(+$290~$258 OOS)이 확인된 volatility_gate, vpin_filter, regime_side_block, chop_guard, direction_gate 파라미터가 현재 env에 완전 반영되지 않았습니다. 특히 VPIN 0.3, chop_only volatility gate 및 bear_long/bull_short/chop_long 차단이 핵심 개선점입니다.
 
-**Env Changes:** `{'VPIN_MAX': '0.3', 'VOLATILITY_GATE_SCOPE': 'all_regimes', 'CHOP_VOL_GATE_MIN_SIGMA': '0.1', 'CHOP_VOL_GATE_MAX_SIGMA': '2.5', 'CHOP_VOL_GATE_MAX_VPIN': '0.65', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'CHOP_ENTRY_FLOOR_ADD': '0.003', 'REGIME_SIDE_BLOCK_LIST': 'bear_long,bull_short,chop_long', 'TARGET_HOLD_SEC_MAX_CHOP': '300'}`
+**Env Changes:** `{'VOLATILITY_GATE_SCOPE': 'chop_only', 'VOLATILITY_GATE_CHOP_MIN_SIGMA': '0.1', 'VOLATILITY_GATE_CHOP_MAX_SIGMA': '2.5', 'VOLATILITY_GATE_CHOP_MAX_VPIN': '0.65', 'VOLATILITY_GATE_CHOP_MIN_DIR_CONF': '0.68', 'VOLATILITY_GATE_CHOP_MIN_ABS_MU_ALPHA': '20.0', 'VOLATILITY_GATE_CHOP_MAX_HOLD_SEC': '300', 'VPIN_MAX_FILTER': '0.3', 'REGIME_SIDE_BLOCK_LIST': 'bear_long,bull_short,chop_long', 'CHOP_ENTRY_FLOOR_ADD': '0.003', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'DIR_GATE_MIN_CONF': '0.65', 'DIR_GATE_MIN_EDGE': '0.1', 'DIR_GATE_MIN_SIDE_PROB': '0.5195'}`
 
-**Code Changes:** filters/volatility_gate 및 vpin_filter에서 env 키 명칭을 VPIN_MAX, CHOP_VOL_GATE_*로 통일. regime_side_block 리스트 적용 로직 확인.
+**Code Changes:** engines/mc/entry_evaluation.py 또는 main_engine 필터 체인에 volatility gate/VPIN filter/side block 조건이 없다면 추가. 이미 존재한다면 env key 매핑 확인 및 적용.
 
-**Expected Impact:** OOS 기준 +$200~$270 수준의 손실 구간 차단 기대. chop 손실 축소 및 위험 대비 수익 개선.
+**Expected Impact:** 거래 수 감소 대신 OOS PnL 개선, WR 및 R:R 상승. 특히 chop 구간 손실 억제.
 
-### [P2] 결정 시드 생성 안정화 (Python hash 랜덤화 제거)
-**Category:** logic | **Confidence:** 69%
+### [P2] 결정 시드 안정성 개선 (hash 불안정성 제거)
+**Category:** logic | **Confidence:** 61%
 
-현재 seed는 `hash(symbol)`을 사용하며, Python 해시 랜덤화로 프로세스 재시작마다 결과가 달라집니다. 동일한 데이터에서 결과가 달라지는 비결정성은 리서치/검증 재현성을 저해합니다.
+decision.py에서 `seed = hash(symbol) ^ seed_window` 사용은 Python 해시 시드 랜덤화로 프로세스 재시작 시 결과가 달라질 수 있습니다. 재현성과 디버깅을 위해 안정적 해시(sha256)를 사용하세요.
 
-**Code Changes:** decision.py에서 `seed = (hash(symbol) ^ seed_window)`를 `seed = (xxhash64(symbol) ^ seed_window)` 또는 `int.from_bytes(sha1(symbol).digest()[:4],'little')`로 교체.
+**Code Changes:** engines/mc/decision.py: `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)` → `seed = int(int.from_bytes(hashlib.sha256(symbol.encode()).digest()[:4], 'little') ^ seed_window)`
 
-**Expected Impact:** 재현성 확보, 튜닝/CF 검증 신뢰도 향상.
-
-### [P2] UNI_LEV_MIN=10 강제 상향의 조건부 적용
-**Category:** risk | **Confidence:** 62%
-
-UNI_LEV_MIN=10은 약한 신호에서도 고레버리지를 강제하여 tail-risk를 키울 수 있습니다. CF에서 low-lev 구간 손실이 있다면 조건부(min_conf/high_quality)로 제한하는 것이 합리적입니다.
-
-**Env Changes:** `{'UNI_LEV_MIN': '3.0', 'LEVERAGE_LOW_CONF_CAP': '1.5'}`
-
-**Code Changes:** leverage optimizer에서 `if dir_conf < LEVERAGE_LOW_CONF_THRESHOLD or entry_quality < LEVERAGE_HIGH_QUALITY_MIN_ENTRY_Q: lev = min(lev, LEVERAGE_LOW_CONF_CAP)` 조건 추가.
-
-**Expected Impact:** 약한 신호의 폭발적 손실 방지, 레버리지 분포 완만화.
+**Expected Impact:** 재현성 향상, OOS 디버깅 용이, 스코어/결정 일관성 확보.
 
 ## Warnings
-- state/bybit.env에 API 키/토큰이 평문으로 포함되어 있어 보안 위험이 큽니다. 배포 전 반드시 환경변수/비밀관리로 이동하세요.
-- MC_HYBRID_ONLY=1 상태에서는 비-hybrid 경로의 안전장치가 일부 무시될 수 있으므로, hybrid 하드캡/fee처리 일관성 검증이 필요합니다.
+- state/bybit.env에 API 키 및 Telegram 토큰이 평문으로 포함되어 있습니다. 즉시 로테이션 및 비밀 관리로 전환 필요.
+- MC_HYBRID_ONLY=1 환경에서는 legacy 레버리지 최적화 블록이 무시됩니다. 설정 변경 시 코드 경로가 달라질 수 있으니 실험 전 분기 확인이 필요합니다.
 
 
 ---
