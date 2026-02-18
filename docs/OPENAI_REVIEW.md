@@ -1,56 +1,52 @@
-# OpenAI Code Review — 2026-02-18 10:41
+# OpenAI Code Review — 2026-02-18 10:42
 
 **Model:** gpt-5.2-codex
-**Risk Score:** 7/10
-**Summary:** Hybrid-only MC pipeline는 일관된 방향/스코어 체계를 갖추었지만, 비용 이중 차감과 과도한 레버리지/사이징 강제가 실거래 손실 리스크를 키우고 있습니다.
+**Risk Score:** 8/10
+**Summary:** 전략은 하이브리드 MC 중심으로 통일되어 있으나, 비용 이중 차감과 강제 사이징/과도 레버리지 설정이 리스크를 크게 키우고 있습니다. 레짐별 엔트리 임계치와 시드 결정의 비결정성도 품질 저하 요인이므로 수정이 필요합니다.
 
 ## Suggestions
 
-### [P1] net_expectancy 필터의 fee 이중 차감 제거
-**Category:** logic | **Confidence:** 78%
+### [P1] EV/Net Expectancy 비용 이중 차감 제거
+**Category:** logic | **Confidence:** 84%
 
-문서에 명시된대로 net_expectancy 계산에서 MC EV(이미 fee 포함)에서 다시 fee_est를 차감하는 구조가 존재하면 대부분의 약한 엣지가 과도하게 음수화됩니다. 결과적으로 좋은 후보가 과도하게 걸러져 방향/EV 불일치가 증가할 수 있습니다. fee_est를 0으로 두거나 EV에서 fee를 역산해 중복을 제거하세요.
+문서(SIGNAL_PIPELINE_REFERENCE.md)에서 명시된대로 net_expectancy 필터에서 MC EV(이미 fee 포함)에서 다시 fee_est를 빼고 있어 수익 기대치가 과도하게 악화됩니다. 이는 both_ev_neg 및 net_expectancy 필터가 과도하게 차단하게 만들며, 특히 짧은 horizon에서 drift보다 fee가 과대 반영됩니다.
 
-**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0003'}`
+**Code Changes:** main_engine 또는 _min_filter_states() 내 `net_edge = edge_raw - fee_est` 로직을 `net_edge = edge_raw`로 변경하거나, fee_est를 0으로 두고 MC cost_base를 그대로 사용. 필요 시 `edge_raw_gross = edge_raw + fee_roundtrip_total`로 복원한 뒤 별도 비교.
 
-**Code Changes:** main_engine 또는 entry filter에서 net_edge = edge_raw - fee_est 계산부 수정. edge_raw가 이미 fee 포함이면 fee_est=0 또는 edge_raw += fee_est 후 필터 적용.
+**Expected Impact:** 불필요한 진입 차단 감소, EV/score 분포 정상화, 실제 수익 기회 유지
 
-**Expected Impact:** 과도한 후보 차단 감소, EV/score 분포 정상화, 진입 시그널 품질 개선.
+### [P1] Hybrid 강제 사이징/레버리지 해제 및 상한 정합화
+**Category:** risk | **Confidence:** 79%
 
-### [P1] 레버리지/사이징 강제값 완화 (HYBRID/UNI)
-**Category:** risk | **Confidence:** 74%
+현재 HYBRID_SIZE_FRAC=1.0, HYBRID_FORCE_SIZE_FRAC=1, HYBRID_LEVERAGE=100 설정은 MAX_LEVERAGE=15 및 레짐별 cap(UNI_LEV_MAX_*)과 충돌합니다. 하이브리드 경로에서는 sizing이 고정되어 risk-utility/kelly 최적화가 무력화되고, 계정 변동성 및 청산 위험이 급증합니다.
 
-UNI_LEV_MIN=10, HYBRID_SIZE_FRAC=1.0, HYBRID_LEVERAGE=100은 실질적으로 과도한 노출을 유도합니다. MAX_LEVERAGE=15와 충돌하며, 변동성 급등 시 청산 위험이 큽니다. 최소 레버리지 하한을 낮추고 하이브리드 강제 사이징을 해제해야 합니다.
+**Env Changes:** `{'HYBRID_FORCE_SIZE_FRAC': '0', 'HYBRID_SIZE_FRAC': '0.25', 'HYBRID_LEVERAGE': '15', 'HYBRID_LEV_MAX': '15'}`
 
-**Env Changes:** `{'UNI_LEV_MIN': '3.0', 'HYBRID_FORCE_SIZE_FRAC': '0', 'HYBRID_FORCE_LEVERAGE': '0', 'HYBRID_SIZE_FRAC': '0.25', 'HYBRID_LEVERAGE': '15.0'}`
+**Code Changes:** engines/mc/decision.py 및 hybrid planner 경로에서 `force size/leverage`가 true일 때도 leverage가 MAX_LEVERAGE/UNI_LEV_MAX를 초과하지 않도록 상한 강제. sizing은 `optimal_size`/`kelly` 기반으로 soft clamp 적용.
 
-**Code Changes:** engines/mc/decision.py 및 hybrid planner sizing 경로에서 force_* 플래그가 true일 때만 고정 사이징 적용하도록 조건 확인.
+**Expected Impact:** 청산 리스크 감소, 레버리지와 포지션 크기의 일관성 확보, 실거래 안정성 향상
 
-**Expected Impact:** 레버리지 과다 노출 감소, tail-risk 및 강제 청산 리스크 완화.
+### [P2] 결정 시드의 비결정성(파이썬 hash salt) 제거
+**Category:** logic | **Confidence:** 72%
 
-### [P1] CF 우수 결과 적용: VPIN 필터 및 Volatility Gate
-**Category:** param | **Confidence:** 66%
+현재 seed = hash(symbol) ^ seed_window는 파이썬 해시 salt로 인해 프로세스 재시작마다 달라져 결과가 재현되지 않습니다. 하이브리드/MC 결과의 일관성을 위해 안정적인 해시 함수 사용이 필요합니다.
 
-최근 CF에서 VPIN_FILTER(max_vpin=0.3)와 volatility_gate(scope=all_regimes, chop_min_sigma=0.5, chop_max_sigma=2.5, chop_max_vpin=0.65, chop_min_dir_conf=0.64, chop_min_abs_mu_alpha=5.0)가 OOS 개선을 보였습니다. 해당 게이트 적용은 chop 구간 손실을 크게 줄일 가능성이 높습니다.
+**Code Changes:** engines/mc/decision.py에서 `hash(symbol)` 대신 `hashlib.blake2b(symbol.encode(), digest_size=4).digest()`로 정수 변환하여 seed 생성.
 
-**Env Changes:** `{'VPIN_FILTER_MAX': '0.3', 'VOLATILITY_GATE_SCOPE': 'all_regimes', 'CHOP_VOL_GATE_MIN_SIGMA': '0.5', 'CHOP_VOL_GATE_MAX_SIGMA': '2.5', 'CHOP_VOL_GATE_MAX_VPIN': '0.65', 'CHOP_ENTRY_MIN_DIR_CONF': '0.64', 'CHOP_ENTRY_MIN_MU_ALPHA': '5.0'}`
+**Expected Impact:** 백테스트/실시간 간 결과 일관성 증가, 디버깅 및 A/B 비교 정확도 향상
 
-**Code Changes:** volatility gate/VPIN filter 적용부가 환경변수를 읽도록 설정 확인 (필요 시 env 키 매핑 추가).
+### [P2] 레짐별 entry floor/add 미반영 경로 정합화
+**Category:** logic | **Confidence:** 68%
 
-**Expected Impact:** chop 구간 저품질 시그널 필터링 강화, 승률 및 PF 개선 기대.
+decision.py의 entry_floor는 UNIFIED_ENTRY_FLOOR만 참고하고 레짐별 entry_floor_add/vol_scale이 반영되지 않는 경로가 존재합니다. 이는 chop/bear에서 의도된 보수적 임계치를 무시할 수 있습니다.
 
-### [P2] 결정 seed 안정화 (hash() 비결정성 제거)
-**Category:** logic | **Confidence:** 70%
+**Code Changes:** decision.py의 진입 판단부에서 get_regime_policy(regime, realized_sigma) 결과를 사용해 `effective_floor = policy.entry_floor + policy.entry_floor_add`로 계산. 하이브리드 경로에도 동일 적용.
 
-decide에서 hash(symbol)을 사용하면 PYTHONHASHSEED에 따라 런마다 seed가 달라집니다. 동일 입력의 재현성이 깨져 리서치/디버깅에 불리합니다. 안정적 해시(crc32/xxhash)로 교체하세요.
-
-**Code Changes:** engines/mc/decision.py: seed = int(zlib.crc32(symbol.encode()) ^ seed_window) 등으로 변경.
-
-**Expected Impact:** 백테스트/실시간 간 의사결정 재현성 개선.
+**Expected Impact:** 레짐 적응형 진입 필터 일관성 확보, chop/bear 저품질 진입 감소
 
 ## Warnings
-- state/bybit.env에 API 키 및 텔레그램 토큰이 평문으로 포함되어 있어 보안 위험이 큽니다.
-- HYBRID_ONLY 모드에서 정책/필터가 일원화되므로 작은 파라미터 변경이 전체 진입/청산에 큰 영향을 줄 수 있습니다.
+- state/bybit.env에 API 키/토큰이 평문으로 포함되어 있어 보안 위험이 큽니다. 공개 저장소/로그 유출에 주의하세요.
+- HYBRID_SIZE_FRAC=1.0 및 HYBRID_LEVERAGE=100 설정은 현재 MAX_LEVERAGE=15와 충돌하며, 실거래에서 강제 사이징으로 과도한 노출 위험이 있습니다.
 
 
 ---
