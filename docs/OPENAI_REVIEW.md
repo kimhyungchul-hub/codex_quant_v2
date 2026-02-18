@@ -1,56 +1,74 @@
-# OpenAI Code Review — 2026-02-18 20:30
+# OpenAI Code Review — 2026-02-18 21:43
 
 **Model:** gpt-5.2-codex
 **Risk Score:** 7/10
-**Summary:** 전략 구조는 하이브리드 EV/Ψ 체계로 일관되어 있으나, 수수료 이중 차감 가능성, 레버리지 상한 불일치, 비결정적 시드로 인한 재현성 저하가 핵심 리스크입니다.
+**Summary:** 전략은 하이브리드/유니파이드 구조로 정교하지만, 레버리지 상한 불일치·수수료 이중 차감·비결정적 시드 등 리스크/재현성 문제가 존재합니다.
 
 ## Suggestions
 
-### [P1] Net Expectancy 필터의 수수료 이중 차감 제거
+### [P1] 하이브리드/유니파이드 레버리지 상한 정합화 및 과대 노출 제한
+**Category:** risk | **Confidence:** 72%
+
+env에서 HYBRID_LEVERAGE=100, HYBRID_SIZE_FRAC=1.0, UNI_LEV_MAX=50 등이 MAX_LEVERAGE=15와 충돌합니다. 현재 hybrid-only가 기본이므로 실제 주문/페이퍼에서도 과도한 레버리지/노출 위험이 큽니다. 하드캡을 MAX_LEVERAGE 및 레짐 정책(max_leverage)와 일치시키고, hybrid의 size/노출 상한을 낮추는 것이 필요합니다.
+
+**Env Changes:** `{'HYBRID_LEVERAGE': '15', 'HYBRID_SIZE_FRAC': '0.20', 'HYBRID_MAX_EXPOSURE': '7.0', 'UNI_LEV_MAX': '15', 'UNI_LEV_MAX_TREND': '15', 'UNI_LEV_MAX_CHOP': '12', 'UNI_LEV_MAX_BEAR': '10', 'UNI_LEV_MAX_VOLATILE': '8'}`
+
+**Code Changes:** engines/mc/decision.py: optimal_leverage 산출 직후 `optimal_leverage = min(optimal_leverage, ctx.get('max_leverage', MAX_LEVERAGE), regime_policy.max_leverage)`로 하드 클립 추가. hybrid planner 결과가 meta에 설정되더라도 동일한 상한 적용.
+
+**Expected Impact:** 리스크 폭주·청산 위험 감소, 레버리지 정책 일관성 확보.
+
+### [P1] 시드 생성의 비결정성 제거 (Python hash 랜덤성 문제)
 **Category:** logic | **Confidence:** 78%
 
-문서에 명시된 대로 net_expectancy 계산에서 EV가 이미 fee 반영된 값인데 fee_est를 다시 차감하여 신호가 과도하게 음수로 왜곡될 가능성이 큽니다. EV(net)와 fee_est를 분리하거나 fee_est=0 처리로 이중 차감을 제거해야 합니다.
+현재 seed = hash(symbol) ^ seed_window 사용으로 프로세스마다 결과가 달라집니다(파이썬 해시 랜덤). 백테스트/재현성 및 디버깅이 어렵습니다.
 
-**Env Changes:** `{'ENTRY_NET_EXPECTANCY_MIN': '-0.0002'}`
+**Code Changes:** engines/mc/decision.py: `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)`를 `import hashlib` 후 `seed = int(hashlib.md5(symbol.encode()).hexdigest()[:8],16) ^ seed_window`로 교체.
 
-**Code Changes:** main engine의 _min_filter_states() 또는 net_expectancy 필터 블록에서 `net_edge = edge_raw - fee_est`를 `net_edge = edge_raw`로 변경하거나, `edge_raw`를 gross로 전환해 fee를 1회만 반영하도록 수정. 또한 metrics에 ev_gross를 별도 저장해 필터 기준을 명확히 구분.
+**Expected Impact:** 결정 재현성 향상, 동일 입력에서 동일 결과 보장.
 
-**Expected Impact:** 불필요한 차단 감소, EV/score 분포 정상화, 방향성 필터·chop_guard 과잉 억제 완화.
+### [P1] net_expectancy 필터의 수수료 이중 차감 제거
+**Category:** logic | **Confidence:** 67%
 
-### [P1] 레버리지 상한/하한 정합성 및 과도한 UNI_LEV_MIN 완화
-**Category:** risk | **Confidence:** 66%
+문서에 명시된 바와 같이 entry 필터에서 `edge_raw - fee_est`가 적용되며, edge_raw는 이미 MC EV(수수료 포함)입니다. 이중 차감은 진입 과차단을 유발합니다.
 
-bybit.env의 MAX_LEVERAGE=15와 UNI_LEV_MAX=50/UNI_LEV_MIN=10이 상충합니다. 레짐별 정책과 하드캡 불일치로 실제 캡이 불명확하며, 최소 10x 고정은 저신뢰/고VPIN 구간에서 리스크 급증을 유발합니다.
+**Code Changes:** (필터 로직 파일: main_engine or entry_evaluation filter 영역) `net_edge = edge_raw - fee_est` 를 `net_edge = edge_raw`로 수정하거나 `edge_raw + fee_est`로 보정. 필요 시 fee_est를 0으로 설정하는 우회 옵션 추가.
 
-**Env Changes:** `{'UNI_LEV_MAX': '15', 'UNI_LEV_MAX_CHOP': '8', 'UNI_LEV_MAX_BEAR': '10', 'UNI_LEV_MAX_VOLATILE': '6', 'UNI_LEV_MIN': '3'}`
+**Expected Impact:** EV/score가 불필요하게 음수화되는 현상 완화, 유효 기회 회복.
 
-**Code Changes:** leverage 결정 로직에서 `min(max_leverage_from_env, MAX_LEVERAGE)` 식으로 일원화. RegimePolicy.max_leverage와 global MAX_LEVERAGE를 동시에 만족하도록 clamp 추가.
-
-**Expected Impact:** 과도 레버리지/청산 리스크 감소, 레짐별 안정성 개선.
-
-### [P2] 결정 시드의 비결정성 해소
-**Category:** logic | **Confidence:** 74%
-
-현재 `hash(symbol)`은 PYTHONHASHSEED에 따라 프로세스마다 변해 동일 구간에서도 결과가 달라질 수 있습니다. 시드 안정화는 실시간/백테스트 일관성, 이탈 거래 재현성에 중요합니다.
-
-**Code Changes:** engines/mc/decision.py에서 `seed = int((hash(symbol) ^ seed_window) & 0xFFFFFFFF)`를 `seed = (zlib.crc32(symbol.encode()) ^ seed_window) & 0xFFFFFFFF`로 변경(또는 xxhash 사용).
-
-**Expected Impact:** 동일 입력에서 결정 재현성 향상, 디버깅/분석 용이성 증가.
-
-### [P2] CF 근거 기반 VPIN/Volatility Gate 반영
+### [P1] VPIN 필터 상향 적용 (CF 권고값 반영)
 **Category:** param | **Confidence:** 63%
 
-최근 CF에서 vpin_filter(max_vpin=0.3)와 volatility_gate가 높은 개선을 보였습니다. 이미 일부 반영 중이나, 전역 VPIN 하드캡과 chop 필터를 더 낮춰 노이즈 구간 진입을 감소시키는 것이 유리합니다.
+CF 분석에서 max_vpin=0.3가 OOS PnL 개선을 보였습니다. 현재 CHOP_VPIN_MAX=0.65로 느슨해 고위험 체결을 허용합니다.
 
-**Env Changes:** `{'UNI_MAX_VPIN_HARD': '0.30', 'CHOP_VPIN_MAX': '0.30', 'CHOP_VOL_GATE_MIN_SIGMA': '0.5', 'CHOP_VOL_GATE_MAX_SIGMA': '1.2', 'CHOP_ENTRY_MIN_DIR_CONF': '0.8', 'CHOP_ENTRY_MIN_MU_ALPHA': '20.0'}`
+**Env Changes:** `{'CHOP_VPIN_MAX': '0.30', 'UNI_MAX_VPIN_HARD': '0.65'}`
 
-**Code Changes:** volatility_gate/VPIN gate가 적용되는 필터 단계에서 전역/레짐 값 우선순위를 문서화하고 로그에 현재 적용값을 출력하도록 추가.
+**Code Changes:** VPIN 필터가 적용되는 엔트리 게이트(예: entry_evaluation or min_filter_states)에서 CHOP_VPIN_MAX 및 UNI_MAX_VPIN_HARD를 참조하도록 확인/정합화.
 
-**Expected Impact:** 횡보장 잡음 트레이드 감소, OOS 기준 손실 구간 축소.
+**Expected Impact:** 고 VPIN 구간 거래 감소 → 손실 감소, OOS 성능 개선 기대.
+
+### [P2] chop_guard/volatility_gate CF 권고값 고정
+**Category:** param | **Confidence:** 58%
+
+최근 자동 적용 이력에서 CHOP_ENTRY_MIN_DIR_CONF 값이 0.8 ↔ 0.68 사이로 변동 중입니다. CF 권고는 0.68 및 CHOP_ENTRY_FLOOR_ADD=0.003입니다. 변동은 신호 일관성을 해칩니다.
+
+**Env Changes:** `{'CHOP_ENTRY_MIN_DIR_CONF': '0.68', 'CHOP_ENTRY_FLOOR_ADD': '0.003', 'TARGET_HOLD_SEC_MAX_CHOP': '900'}`
+
+**Code Changes:** regime_policy.py와 entry filters에서 chop regime 설정이 해당 env 값을 우선 사용하도록 확인. (이미 적용되어 있다면 모니터링/고정으로 변경)
+
+**Expected Impact:** chop 영역 과잉 필터링 완화 및 OOS 성능 안정화.
+
+### [P2] 레짐 변동성 스케일과 entry threshold 정합성 보정
+**Category:** logic | **Confidence:** 46%
+
+compute_adaptive_objective에서 score를 vol_norm으로 축소하지만 entry_floor/threshold는 고정값이라 고변동 시 과도한 차단이 발생할 수 있습니다. 스코어 스케일과 threshold를 동일한 기준으로 맞추는 것이 안전합니다.
+
+**Code Changes:** engines/mc/regime_policy.py: `entry_floor`, `score_entry_threshold`, `score_entry_floor`에 vol_scale 또는 1/vol_norm 스케일 적용 옵션 추가(예: `entry_floor *= vol_scale`). 상수값 보호를 위해 상한/하한 clamp 적용.
+
+**Expected Impact:** 변동성 레짐에서 유효 신호의 과차단 감소, 레짐 간 공정한 기준 유지.
 
 ## Warnings
-- state/bybit.env에 API/Telegram/OpenAI 키가 평문으로 존재합니다. 즉시 키를 회전하고 저장소에서 제거하세요.
-- AUTO_APPLY 및 monitoring 적용 이력(F0004/F0006)과 신규 파라미터가 충돌할 수 있으니 적용 순서와 롤백 플랜을 확보하세요.
+- 현재 HYBRID_LEVERAGE=100, HYBRID_SIZE_FRAC=1.0 설정은 MAX_LEVERAGE=15와 불일치하며, 실제 주문/페이퍼 모두에 과대 리스크를 유발할 수 있습니다.
+- Python hash 기반 시드 사용은 프로세스마다 결과가 달라져 백테스트/디버깅 일관성을 해칩니다.
 
 
 ---
