@@ -1,6 +1,6 @@
 # Research Findings — Counterfactual Analysis
 
-> Auto-generated: 2026-02-18 14:12
+> Auto-generated: 2026-02-18 15:21
 > Baseline: 4642 trades, PnL=$-368.57, WR=19.3%, R:R=1.79
 
 ## Pipeline Stage Impact Summary
@@ -217,6 +217,34 @@ OOS 검증: pass=True rate=100% trainΔ=+44.24 testΔ=+32.98 penalty=0.75
 | edge | -0.1650 | -0.1254 | +0.0396 |
 | sharpe | -6.52 | -4.34 | +2.18 |
 | pf | 0.43 | 0.51 | +0.08 |
+
+### LEVERAGE — 레버리지 결정
+
+**Best Finding:** leverage: OOS-adjusted PnL +$107.83
+- Improvement: $+107.83
+- Confidence: 43%
+- Parameters: `{"max_leverage": 30, "regime_max_bull": 20, "regime_max_chop": 3, "regime_max_bear": 12}`
+
+```
+[LEVERAGE] 파라미터 변경 제안:
+  max_leverage = 30
+  regime_max_bull = 20
+  regime_max_chop = 3
+  regime_max_bear = 12
+예상 효과: PnL $+121.61 (OOS 보정 $+107.83), WR -4.5%, R:R +0.83
+OOS 검증: pass=True rate=75% trainΔ=+31.38 testΔ=+27.82 penalty=0.89
+신뢰도: 42.6%
+```
+
+| Metric | Baseline | CF | Delta |
+|--------|----------|----|----|
+| n | 4642 | 4642 | +0 |
+| pnl | -368.57 | -246.96 | +121.61 |
+| wr | 0.1932 | 0.1478 | -0.0454 |
+| rr | 1.79 | 2.62 | +0.83 |
+| edge | -0.1650 | -0.1285 | +0.0365 |
+| sharpe | -6.52 | -5.18 | +1.34 |
+| pf | 0.43 | 0.45 | +0.03 |
 
 ## Regime Performance Breakdown
 
